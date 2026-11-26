@@ -256,6 +256,85 @@ enum LoginShellPathResolver {
     }
 }
 
+enum ProcessTreeTerminator {
+    static func descendantPIDs(of rootPID: Int32) -> [Int32] {
+        let snapshot = Process()
+        snapshot.executableURL = URL(fileURLWithPath: "/bin/ps")
+        snapshot.arguments = ["-axo", "pid=,ppid="]
+        let pipe = Pipe()
+        snapshot.standardOutput = pipe
+        snapshot.standardError = FileHandle.nullDevice
+        guard (try? snapshot.run()) != nil else { return [] }
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
+        snapshot.waitUntilExit()
+        let text = String(decoding: output, as: UTF8.self)
+        var children: [Int32: [Int32]] = [:]
+        for line in text.split(separator: "\n") {
+            let fields = line.split(whereSeparator: \.isWhitespace)
+            guard fields.count == 2,
+                  let pid = Int32(fields[0]),
+                  let parent = Int32(fields[1]) else { continue }
+            children[parent, default: []].append(pid)
+        }
+        var ordered: [Int32] = []
+        var visited: Set<Int32> = [rootPID]
+        func appendDescendants(of pid: Int32) {
+            for child in children[pid, default: []] where visited.insert(child).inserted {
+                appendDescendants(of: child)
+                ordered.append(child)
+            }
+        }
+        appendDescendants(of: rootPID)
+        return ordered
+    }
+
+    static func signalTree(rootPID: Int32, signal: Int32) -> [Int32] {
+        let descendants = descendantPIDs(of: rootPID)
+        for pid in descendants {
+            _ = kill(pid, signal)
+        }
+        _ = kill(rootPID, signal)
+        return descendants
+    }
+
+    static func isProcessAlive(_ pid: Int32) -> Bool {
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    static func terminateAndWait(process: Process, graceSeconds: TimeInterval = 0.5) async {
+        let rootPID = process.processIdentifier
+        guard rootPID > 0 else { return }
+        var trackedPIDs = Set(signalTree(rootPID: rootPID, signal: SIGTERM))
+        if process.isRunning {
+            process.terminate()
+        }
+
+        let deadline = Date().addingTimeInterval(max(0.05, graceSeconds))
+        while Date() < deadline {
+            let anyAlive = process.isRunning || trackedPIDs.contains(where: isProcessAlive)
+            if !anyAlive { break }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        let freshDescendants = signalTree(rootPID: rootPID, signal: SIGKILL)
+        trackedPIDs.formUnion(freshDescendants)
+        for pid in trackedPIDs where isProcessAlive(pid) {
+            _ = kill(pid, SIGKILL)
+        }
+        if process.isRunning {
+            _ = kill(rootPID, SIGKILL)
+        }
+
+        let killDeadline = Date().addingTimeInterval(0.5)
+        while Date() < killDeadline {
+            let anyAlive = process.isRunning || trackedPIDs.contains(where: isProcessAlive)
+            if !anyAlive { break }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+    }
+}
+
 @MainActor
 final class AuthHelperTestRunner: ObservableObject {
     enum Status: Equatable {
@@ -265,9 +344,29 @@ final class AuthHelperTestRunner: ObservableObject {
         case failed(message: String, lines: [String])
     }
 
+    private final class CancellationFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        func markCancelled() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+    }
+
     @Published private(set) var status: Status = .idle
 
     private var activeProcess: Process?
+    private var activePipes: (stdout: Pipe, stderr: Pipe)?
+    private var activeCancellation: CancellationFlag?
+    private var pendingTeardown: Task<Void, Never>?
     private var runToken = UUID()
     private var liveDisplayLines: [String] = []
     private var detectedURLs: [URL] = []
@@ -288,22 +387,33 @@ final class AuthHelperTestRunner: ObservableObject {
 
     func cancel() {
         runToken = UUID()
-        if let process = activeProcess, process.isRunning {
-            process.terminate()
-            let pid = process.processIdentifier
-            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.5) {
-                if process.isRunning {
-                    kill(pid, SIGKILL)
-                }
+        activeCancellation?.markCancelled()
+        activeCancellation = nil
+        if let pipes = activePipes {
+            pipes.stdout.fileHandleForReading.readabilityHandler = nil
+            pipes.stderr.fileHandleForReading.readabilityHandler = nil
+            try? pipes.stdout.fileHandleForReading.close()
+            try? pipes.stderr.fileHandleForReading.close()
+            activePipes = nil
+        }
+        if let process = activeProcess {
+            activeProcess = nil
+            let priorTeardown = pendingTeardown
+            pendingTeardown = Task.detached(priority: .userInitiated) {
+                await priorTeardown?.value
+                await ProcessTreeTerminator.terminateAndWait(process: process)
             }
         }
-        activeProcess = nil
         liveDisplayLines = []
         detectedURLs = []
         heldStdoutLine = nil
         if case .running = status {
             status = .idle
         }
+    }
+
+    func waitForTeardown() async {
+        await pendingTeardown?.value
     }
 
     func run(command: String) {
@@ -316,12 +426,14 @@ final class AuthHelperTestRunner: ObservableObject {
         cancel()
         let token = UUID()
         runToken = token
+        let priorTeardown = pendingTeardown
         status = .running(lines: ["Resolving login-shell PATH…"], detectedURLs: [])
 
         let inherited = ProcessInfo.processInfo.environment
         let userHome = FileManager.default.homeDirectoryForCurrentUser
 
         Task.detached(priority: .userInitiated) { [weak self] in
+            await priorTeardown?.value
             let loginPath = LoginShellPathResolver.captureLoginShellPath(inherited: inherited, userHome: userHome)
             let searchPath = LoginShellPathResolver.mergedSearchPath(
                 loginShellPath: loginPath,
@@ -445,12 +557,19 @@ final class AuthHelperTestRunner: ObservableObject {
         }
 
         let collector = StreamCollector()
+        let cancellation = CancellationFlag()
+        activeCancellation = cancellation
+        activePipes = (stdout: stdoutPipe, stderr: stderrPipe)
         liveDisplayLines = []
         detectedURLs = []
         heldStdoutLine = nil
         status = .running(lines: ["Running auth helper…"], detectedURLs: [])
 
         stdoutPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            guard !cancellation.isCancelled else {
+                handle.readabilityHandler = nil
+                return
+            }
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
@@ -465,6 +584,10 @@ final class AuthHelperTestRunner: ObservableObject {
         }
 
         stderrPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            guard !cancellation.isCancelled else {
+                handle.readabilityHandler = nil
+                return
+            }
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
@@ -481,6 +604,9 @@ final class AuthHelperTestRunner: ObservableObject {
         process.terminationHandler = { [weak self] terminated in
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
+            if cancellation.isCancelled {
+                return
+            }
             let remainingOut = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
             if !remainingOut.isEmpty { _ = collector.appendStdout(remainingOut) }
             let remainingErr = stderrPipe.fileHandleForReading.readDataToEndOfFile()
@@ -492,6 +618,8 @@ final class AuthHelperTestRunner: ObservableObject {
             Task { @MainActor in
                 guard let self, self.runToken == token else { return }
                 self.activeProcess = nil
+                self.activePipes = nil
+                self.activeCancellation = nil
                 let nonEmptyOut = stdoutLines.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
                 let nonEmptyErr = stderrLines.map { SidecarLogRecorder.defaultRedact($0.trimmingCharacters(in: .whitespacesAndNewlines)) }.filter { !$0.isEmpty }
 
@@ -529,6 +657,8 @@ final class AuthHelperTestRunner: ObservableObject {
         } catch {
             stdoutPipe.fileHandleForReading.readabilityHandler = nil
             stderrPipe.fileHandleForReading.readabilityHandler = nil
+            activePipes = nil
+            activeCancellation = nil
             status = .failed(message: "Could not start auth helper: \(error.localizedDescription)", lines: [])
         }
     }

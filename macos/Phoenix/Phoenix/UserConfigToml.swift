@@ -1027,7 +1027,15 @@ enum UserConfigStore {
         rawModelsBlocks: [String]? = nil,
         to url: URL = configURL()
     ) throws {
-        let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let existing: String
+        do {
+            existing = try String(contentsOf: url, encoding: .utf8)
+        } catch let error as NSError where
+            (error.domain == NSCocoaErrorDomain && error.code == NSFileReadNoSuchFileError)
+            || (error.domain == NSPOSIXErrorDomain && error.code == Int(ENOENT))
+        {
+            existing = ""
+        }
         let merged = mergeDocument(existing: existing, llm: llm, rawModelsBlocks: rawModelsBlocks)
         let directory = url.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)

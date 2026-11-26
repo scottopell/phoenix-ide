@@ -2434,4 +2434,64 @@ final class ServerManagerHelpersTests: XCTestCase {
         let untouched = OnboardingAuthHelperConflict.configAfterChoosingAPIKeys(existing: noHelper)
         XCTAssertFalse(untouched.shouldWrite)
     }
+
+    func testUserConfigStoreMergeAndWritePropagatesUnreadableExistingFileWithoutOverwriting() throws {
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let fileURL = tempDir.appendingPathComponent("config.toml")
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let original = """
+        version = 1
+
+        [agents.reviewer]
+        description = "Keep me"
+        instructions = "Never silently delete me"
+        """
+        try Data(original.utf8).write(to: fileURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: fileURL.path)
+
+        // Guard against environments running as root where mode 0000 is still readable.
+        guard (try? String(contentsOf: fileURL, encoding: .utf8)) == nil else {
+            return
+        }
+
+        let replacement = UserLLMConfig(apiKeyHelper: "new-helper")
+        XCTAssertThrowsError(try UserConfigStore.mergeAndWrite(llm: replacement, to: fileURL))
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+        let preserved = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertEqual(preserved, original)
+    }
+
+    func testAuthHelperTestRunnerCancelTerminatesDescendantProcesses() async throws {
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let pidFile = tempDir.appendingPathComponent("child.pid")
+
+        let runner = AuthHelperTestRunner()
+        runner.run(command: "sleep 30 & echo $! > '\(pidFile.path)'; wait")
+
+        var childPID: Int32?
+        let waitDeadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < waitDeadline {
+            if let text = try? String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               let parsed = Int32(text), parsed > 0 {
+                childPID = parsed
+                break
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let spawnedPID = try XCTUnwrap(childPID, "Expected helper shell to spawn background child")
+        XCTAssertTrue(ProcessTreeTerminator.isProcessAlive(spawnedPID))
+
+        runner.cancel()
+        await runner.waitForTeardown()
+
+        XCTAssertFalse(ProcessTreeTerminator.isProcessAlive(spawnedPID), "Cancelling helper test must terminate descendant processes too")
+    }
 }
