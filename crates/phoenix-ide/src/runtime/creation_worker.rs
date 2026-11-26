@@ -18,70 +18,6 @@ use std::time::Duration;
 
 const PRODUCT_CREATION_OWNER_MARKER: &str = "phoenix-product-creation-owner";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StagingOwnershipConflict {
-    MissingDurableToken,
-    ExistingOccupantNotProvablyOwned,
-    OwnerMarkerMissing,
-    OwnerMarkerMismatch,
-    OwnerMarkerUnreadable,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StagingCleanupOutcome {
-    AlreadyAbsent,
-    OwnedCheckoutRetained,
-    CheckoutCustodyUnverified,
-    OwnershipConflict(StagingOwnershipConflict),
-}
-
-fn staging_ownership_conflict_diagnostic(conflict: StagingOwnershipConflict) -> &'static str {
-    match conflict {
-        StagingOwnershipConflict::MissingDurableToken => {
-            "product creation staging cleanup ownership conflict: durable ownership token is missing"
-        }
-        StagingOwnershipConflict::ExistingOccupantNotProvablyOwned => {
-            "product creation staging cleanup ownership conflict: existing occupant is not provably owned by this creation"
-        }
-        StagingOwnershipConflict::OwnerMarkerMissing => {
-            "product creation staging cleanup ownership conflict: owner marker is missing"
-        }
-        StagingOwnershipConflict::OwnerMarkerMismatch => {
-            "product creation staging cleanup ownership conflict: owner marker does not match the durable ownership token"
-        }
-        StagingOwnershipConflict::OwnerMarkerUnreadable => {
-            "product creation staging cleanup ownership conflict: owner marker is unreadable"
-        }
-    }
-}
-
-fn staging_cleanup_blocker(outcome: StagingCleanupOutcome) -> Option<&'static str> {
-    match outcome {
-        StagingCleanupOutcome::AlreadyAbsent => None,
-        StagingCleanupOutcome::OwnedCheckoutRetained => {
-            Some("unpublished worktree retained: ownership does not exclude external writers")
-        }
-        StagingCleanupOutcome::CheckoutCustodyUnverified => Some(
-            "unpublished worktree custody is unverified; inspect its repository and registration",
-        ),
-        StagingCleanupOutcome::OwnershipConflict(conflict) => {
-            Some(staging_ownership_conflict_diagnostic(conflict))
-        }
-    }
-}
-
-fn staging_cleanup_diagnostic(
-    cleanup: &Result<Result<StagingCleanupOutcome, String>, tokio::task::JoinError>,
-) -> String {
-    match cleanup {
-        Ok(Ok(outcome)) => staging_cleanup_blocker(*outcome)
-            .unwrap_or("product creation staging cleanup became ambiguous")
-            .to_string(),
-        Ok(Err(error)) => format!("product creation staging cleanup failed: {error}"),
-        Err(error) => format!("product creation staging cleanup task failed: {error}"),
-    }
-}
-
 async fn checkpoint_product_creation_stage(
     manager: &RuntimeManager,
     claimed: &crate::db::ClaimedProductCreationJob,
@@ -218,15 +154,13 @@ async fn process_claimed_product_creation(
             Stage::MaterializeWorktree,
         )
         .await?;
-        let planned_path =
-            product_worktree_path(Path::new(&repo_root), job.product_conversation_id.as_str())?;
-        if let Some(staged_path) = job.staging_path.as_deref() {
-            if Path::new(staged_path) != planned_path {
-                return Err(
-                    "worktree identity changed after recording creation staging".to_string()
-                );
+        let planned_path = match job.staging_path.as_deref() {
+            Some(path) if job.staging_exact_oid.as_deref() == Some(oid.as_str()) => {
+                PathBuf::from(path)
             }
-        }
+            Some(_) => return Err("staged worktree does not match the durable pin".to_string()),
+            None => product_worktree_path(Path::new(&repo_root), job.product_conversation_id.as_str())?,
+        };
         let reservation_id = format!("{}:worktree", job.request_id);
         let reserved = manager
             .db()
@@ -300,11 +234,16 @@ async fn process_claimed_product_creation(
             move || {
                 let _lock = materialization_lock;
                 let path = planned_path;
-                let already_present = path.try_exists().map_err(|error| {
-                    format!("could not inspect staging path {}: {error}", path.display())
-                })?;
+                let already_present = match std::fs::symlink_metadata(&path) {
+                    Ok(_) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(error) => {
+                        return Err(format!("could not inspect staging path {}: {error}", path.display()));
+                    }
+                };
                 let ownership_token = if already_present {
                     verify_existing_product_creation_staging(
+                        &repo_root,
                         &path,
                         &oid,
                         persisted_ownership_token.as_deref(),
@@ -764,15 +703,27 @@ async fn cleanup_and_retry_unpublished_product_creation(
         .get_product_creation_resource_reservations(request_id)
         .await
         .map_err(|error| error.to_string())?;
-    let ownership_token = cleanup_job.staging_path.as_deref().and_then(|path| {
-        reservations
-            .iter()
-            .find(|reservation| reservation.resource_identity == path)
-            .and_then(|reservation| reservation.ownership_token.as_deref())
+    let may_have_materialized = cleanup_job.staging_path.as_deref().is_some_and(|path| {
+        !reservations.iter().any(|reservation| {
+            reservation.resource_identity == path
+                && reservation.status == "reserved"
+                && reservation.ownership_token.is_none()
+        })
     });
-    let cleaned =
-        cleanup_unpublished_product_staging(manager, cleanup_job, ownership_token).await?;
-    if !cleaned {
+    if let Err(cleanup_error) =
+        reconcile_unpublished_staging(cleanup_job.staging_path.as_deref(), may_have_materialized)
+            .await
+    {
+        manager
+            .db()
+            .mark_product_creation_cleanup_ambiguous(
+                request_id,
+                claim,
+                &cleanup_error,
+                chrono::Utc::now(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
         return Ok(());
     }
     if let Some(resource_identity) = cleanup_job.staging_path.as_deref() {
@@ -799,115 +750,24 @@ async fn cleanup_and_retry_unpublished_product_creation(
     Ok(())
 }
 
-async fn cleanup_unpublished_product_staging(
-    manager: &Arc<RuntimeManager>,
-    job: &crate::db::ProductCreationJobRecord,
-    ownership_token: Option<&str>,
-) -> Result<bool, String> {
-    let cleanup = cleanup_unpublished_product_staging_path(
-        job.staging_path.as_deref(),
-        job.staging_repo_root.as_deref(),
-        ownership_token,
-    )
-    .await;
-    if matches!(cleanup, Ok(Ok(StagingCleanupOutcome::AlreadyAbsent))) {
-        return Ok(true);
-    }
-    let cleanup_error = staging_cleanup_diagnostic(&cleanup);
-    manager
-        .db()
-        .mark_product_creation_cleanup_ambiguous(
-            &job.request_id,
-            &crate::db::ProductCreationClaim {
-                worker_id: job.claim_worker_id.clone().unwrap_or_default(),
-                token: job.claim_token.clone().unwrap_or_default(),
-                generation: job.claim_generation,
-                lease_until: job.claim_lease_until.unwrap_or_else(chrono::Utc::now),
-            },
-            &cleanup_error,
-            chrono::Utc::now(),
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok(false)
-}
-
-async fn cleanup_unpublished_product_staging_path(
+async fn reconcile_unpublished_staging(
     staging_path: Option<&str>,
-    staging_repo_root: Option<&str>,
-    ownership_token: Option<&str>,
-) -> Result<Result<StagingCleanupOutcome, String>, tokio::task::JoinError> {
-    let Some(path) = staging_path.map(ToOwned::to_owned) else {
-        return Ok(Ok(StagingCleanupOutcome::AlreadyAbsent));
-    };
-    let Some(repo_root) = staging_repo_root.map(ToOwned::to_owned) else {
-        return Ok(Err(
-            "unpublished worktree has no durable repository identity".into(),
+    may_have_materialized: bool,
+) -> Result<(), String> {
+    if may_have_materialized {
+        return Err(format!(
+            "unpublished worktree custody is unverified; inspect the checkout and Git registration for {}",
+            staging_path.unwrap_or("the recorded creation reservation"),
         ));
+    }
+    let Some(path) = staging_path else {
+        return Ok(());
     };
-    let ownership_token = ownership_token.map(ToOwned::to_owned);
-    tokio::task::spawn_blocking(move || {
-        let path = PathBuf::from(path);
-        let _lock = RepositoryMutationLock::acquire(Path::new(&repo_root))
-            .map_err(|(message, _)| message)?;
-        match std::fs::symlink_metadata(&path) {
-            Ok(_) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(if ownership_token.is_some() {
-                    StagingCleanupOutcome::CheckoutCustodyUnverified
-                } else {
-                    StagingCleanupOutcome::AlreadyAbsent
-                });
-            }
-            Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
-        }
-        let Some(expected_owner) = ownership_token else {
-            return Ok(StagingCleanupOutcome::OwnershipConflict(
-                StagingOwnershipConflict::MissingDurableToken,
-            ));
-        };
-        if validate_worktree_belongs_to_repository(&repo_root, &path).is_err() {
-            return Ok(StagingCleanupOutcome::OwnershipConflict(
-                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
-            ));
-        }
-        let Ok(actual_root) = crate::git_ops::run_git(&path, &["rev-parse", "--show-toplevel"])
-        else {
-            return Ok(StagingCleanupOutcome::OwnershipConflict(
-                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
-            ));
-        };
-        let Ok(expected_root) = path.canonicalize() else {
-            return Ok(StagingCleanupOutcome::OwnershipConflict(
-                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
-            ));
-        };
-        if Path::new(actual_root.trim()) != expected_root {
-            return Ok(StagingCleanupOutcome::OwnershipConflict(
-                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
-            ));
-        }
-        match read_product_creation_owner_marker(&path) {
-            Ok(Some(actual_owner)) if actual_owner == expected_owner => {}
-            Ok(Some(_)) => {
-                return Ok(StagingCleanupOutcome::OwnershipConflict(
-                    StagingOwnershipConflict::OwnerMarkerMismatch,
-                ));
-            }
-            Ok(None) => {
-                return Ok(StagingCleanupOutcome::OwnershipConflict(
-                    StagingOwnershipConflict::OwnerMarkerMissing,
-                ));
-            }
-            Err(_) => {
-                return Ok(StagingCleanupOutcome::OwnershipConflict(
-                    StagingOwnershipConflict::OwnerMarkerUnreadable,
-                ));
-            }
-        }
-        Ok(StagingCleanupOutcome::OwnedCheckoutRetained)
-    })
-    .await
+    match tokio::fs::symlink_metadata(path).await {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(format!("unpublished path {path} has an occupant without proven custody")),
+        Err(error) => Err(format!("could not inspect {path}: {error}; staging was retained")),
+    }
 }
 
 async fn reconcile_product_creation_cleanup(
@@ -918,17 +778,12 @@ async fn reconcile_product_creation_cleanup(
         if reservation.status == "released" {
             continue;
         }
-        let cleanup_outcome = cleanup_unpublished_product_staging_path(
+        if let Err(cleanup_error) = reconcile_unpublished_staging(
             Some(&reservation.resource_identity),
-            Some(&reservation.repository_identity),
-            reservation.ownership_token.as_deref(),
+            reservation.ownership_token.is_some() || reservation.status != "reserved",
         )
-        .await;
-        if !matches!(
-            cleanup_outcome,
-            Ok(Ok(StagingCleanupOutcome::AlreadyAbsent))
-        ) {
-            let cleanup_error = staging_cleanup_diagnostic(&cleanup_outcome);
+        .await
+        {
             if !manager
                 .db()
                 .mark_product_creation_resource_cleanup_conflict(
@@ -1113,13 +968,42 @@ fn git_common_dir_for_repository_root(repo_root: &Path) -> Result<String, String
 }
 
 fn verify_existing_product_creation_staging(
+    repo_root: &str,
     path: &Path,
     expected_oid: &str,
     persisted_ownership_token: Option<&str>,
 ) -> Result<String, String> {
-    crate::api::handlers::validate_detached_task_worktree(path, expected_oid)?;
     let expected = persisted_ownership_token
         .ok_or_else(|| "existing staging occupant lacked durable ownership".to_string())?;
+    let canonicalize = |path: &Path| path.canonicalize().map_err(|error| error.to_string());
+    let dot_git = path.join(".git");
+    let file_type = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type())
+            .map_err(|error| error.to_string())
+    };
+    if !file_type(path)?.is_dir() || !file_type(&dot_git)?.is_file() {
+        return Err("existing staging path is not a linked worktree directory".to_string());
+    }
+    let common = git_common_dir_for_repository_root(Path::new(repo_root))?;
+    let admin_dir = crate::git_ops::run_git_bounded(
+        path,
+        &["rev-parse", "--absolute-git-dir"],
+        Duration::from_secs(5),
+    )?;
+    let admin_dir = canonicalize(Path::new(admin_dir.trim()))?;
+    let backpointer = admin_dir.join("gitdir");
+    let registrations = canonicalize(&Path::new(&common).join("worktrees"))?;
+    if admin_dir.parent() != Some(registrations.as_path()) || !file_type(&backpointer)?.is_file()
+    {
+        return Err("existing staging has no exact Git registration in the reserved repository".to_string());
+    }
+    let registered = std::fs::read_to_string(backpointer).map_err(|error| error.to_string())?;
+    let registered = admin_dir.join(registered.trim_end_matches(['\r', '\n']));
+    if canonicalize(&registered)? != canonicalize(&dot_git)? {
+        return Err("existing staging registration points to another checkout".to_string());
+    }
+    crate::api::handlers::validate_detached_task_worktree(path, expected_oid)?;
     match read_product_creation_owner_marker(path)? {
         Some(actual) if actual == expected => Ok(expected.to_string()),
         _ => Err("existing staging occupant did not match durable ownership".to_string()),
@@ -2260,25 +2144,6 @@ async fn checkpoint_creation_stage(
 }
 
 #[cfg(test)]
-mod staging_diagnostic_tests {
-    use super::*;
-
-    #[test]
-    fn ownership_conflicts_have_stable_specific_diagnostics() {
-        assert_eq!(
-            staging_ownership_conflict_diagnostic(StagingOwnershipConflict::OwnerMarkerMismatch),
-            "product creation staging cleanup ownership conflict: owner marker does not match the durable ownership token"
-        );
-        assert_eq!(
-            staging_ownership_conflict_diagnostic(
-                StagingOwnershipConflict::ExistingOccupantNotProvablyOwned,
-            ),
-            "product creation staging cleanup ownership conflict: existing occupant is not provably owned by this creation"
-        );
-    }
-}
-
-#[cfg(test)]
 mod product_creation_delivery_replay_tests {
     use super::*;
     use crate::db::{
@@ -2566,6 +2431,7 @@ mod product_creation_delivery_replay_tests {
         let ignored = path.join("late-data");
         std::fs::write(&ignored, "preserve me").unwrap();
 
+        let _lock = RepositoryMutationLock::acquire(Path::new(root)).unwrap();
         cleanup_and_retry_unpublished_product_creation(
             &manager,
             request_id,
@@ -4394,10 +4260,66 @@ mod product_creation_staging_ownership_tests {
         let oid = crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
 
         assert!(
-            verify_existing_product_creation_staging(&path, oid.trim(), Some("owner-token"))
+            verify_existing_product_creation_staging(
+                repo.path().to_str().unwrap(),
+                &path,
+                oid.trim(),
+                Some("owner-token"),
+            )
                 .is_err()
         );
         assert_eq!(std::fs::read_to_string(user_file).unwrap(), "preserve me");
+    }
+
+    #[test]
+    fn standalone_checkout_is_not_adopted_for_reserved_repository() {
+        let repo = initialized_repo();
+        let foreign = initialized_repo();
+        let oid = crate::git_ops::run_git(foreign.path(), &["rev-parse", "HEAD"]).unwrap();
+        assert!(verify_existing_product_creation_staging(
+            repo.path().to_str().unwrap(),
+            foreign.path(),
+            &oid,
+            Some("owner-token"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adoption_requires_the_exact_registration_at_the_recorded_location() {
+        let repo = initialized_repo();
+        let original = repo.path().join(".phoenix/worktrees/recorded");
+        let moved = original.with_file_name("moved");
+        add_detached_worktree(repo.path(), &original);
+        write_product_creation_owner_marker(&original, "owner-token").unwrap();
+        let git = |args: &[&str]| crate::git_ops::run_git(repo.path(), args).unwrap();
+        let oid = git(&["rev-parse", "HEAD"]);
+        let can_adopt_original = || {
+            verify_existing_product_creation_staging(
+                repo.path().to_str().unwrap(),
+                &original,
+                &oid,
+                Some("owner-token"),
+            )
+            .is_ok()
+        };
+        assert!(can_adopt_original());
+        git(&[
+            "worktree",
+            "move",
+            original.to_str().unwrap(),
+            moved.to_str().unwrap(),
+        ]);
+        let registrations = git(&["worktree", "list", "--porcelain", "-z"]);
+        std::os::unix::fs::symlink(&moved, &original).unwrap();
+        assert!(!can_adopt_original());
+        std::fs::remove_file(&original).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        std::fs::copy(moved.join(".git"), original.join(".git")).unwrap();
+        assert!(!can_adopt_original());
+        assert_eq!(git(&["worktree", "list", "--porcelain", "-z"]), registrations);
+        assert!(moved.join(".git").is_file());
     }
 
     #[tokio::test]
@@ -4407,16 +4329,9 @@ mod product_creation_staging_ownership_tests {
         add_detached_worktree(repo.path(), &path);
         write_product_creation_owner_marker(&path, "owner-token").unwrap();
 
-        let outcome = cleanup_unpublished_product_staging_path(
-            Some(path.to_string_lossy().as_ref()),
-            Some(repo.path().to_string_lossy().as_ref()),
-            Some("owner-token"),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let outcome = reconcile_unpublished_staging(path.to_str(), true).await;
 
-        assert_eq!(outcome, StagingCleanupOutcome::OwnedCheckoutRetained);
+        assert!(outcome.is_err());
         assert!(path.join(".git").is_file());
         assert_eq!(
             read_product_creation_owner_marker(&path)
@@ -4438,18 +4353,9 @@ mod product_creation_staging_ownership_tests {
         let ignored = path.join("ignored-data");
         std::fs::write(&ignored, "preserve me").unwrap();
 
-        let outcome = cleanup_unpublished_product_staging_path(
-            path.to_str(),
-            repo.path().to_str(),
-            Some("owner-token"),
-        )
-        .await
-        .expect("join staging cleanup");
+        let outcome = reconcile_unpublished_staging(path.to_str(), true).await;
 
-        assert_eq!(
-            outcome.unwrap(),
-            StagingCleanupOutcome::OwnedCheckoutRetained
-        );
+        assert!(outcome.is_err());
         assert_eq!(std::fs::read_to_string(ignored).unwrap(), "preserve me");
         assert_eq!(std::fs::read_to_string(exclude).unwrap(), "ignored-data\n");
         assert!(
@@ -4469,18 +4375,9 @@ mod product_creation_staging_ownership_tests {
             crate::git_ops::run_git(&path, &["update-index", flag, "README"]).unwrap();
             std::fs::write(path.join("README"), "preserve me").unwrap();
 
-            let outcome = cleanup_unpublished_product_staging_path(
-                path.to_str(),
-                repo.path().to_str(),
-                Some("owner-token"),
-            )
-            .await
-            .expect("join staging cleanup");
+            let outcome = reconcile_unpublished_staging(path.to_str(), true).await;
 
-            assert_eq!(
-                outcome.unwrap(),
-                StagingCleanupOutcome::OwnedCheckoutRetained
-            );
+            assert!(outcome.is_err());
             assert_eq!(
                 std::fs::read_to_string(path.join("README")).unwrap(),
                 "preserve me"
@@ -4493,23 +4390,8 @@ mod product_creation_staging_ownership_tests {
     async fn absent_path_does_not_clear_previous_materialization_authority() {
         let repo = initialized_repo();
         let path = product_worktree_path(repo.path(), "owned").unwrap();
-        for (token, expected) in [
-            (None, StagingCleanupOutcome::AlreadyAbsent),
-            (
-                Some("owner-token"),
-                StagingCleanupOutcome::CheckoutCustodyUnverified,
-            ),
-        ] {
-            let outcome = cleanup_unpublished_product_staging_path(
-                path.to_str(),
-                repo.path().to_str(),
-                token,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(outcome, expected);
-        }
+        assert!(reconcile_unpublished_staging(path.to_str(), false).await.is_ok());
+        assert!(reconcile_unpublished_staging(path.to_str(), true).await.is_err());
     }
 
     #[tokio::test]
@@ -4532,43 +4414,13 @@ mod product_creation_staging_ownership_tests {
         let replacement_file = path.join("replacement-owned-by-user");
         std::fs::write(&replacement_file, "preserve me").unwrap();
 
-        let outcome = cleanup_unpublished_product_staging_path(
-            Some(path.to_string_lossy().as_ref()),
-            Some(repo.path().to_string_lossy().as_ref()),
-            Some("original-owner"),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let outcome = reconcile_unpublished_staging(path.to_str(), true).await;
 
-        assert_eq!(
-            outcome,
-            StagingCleanupOutcome::OwnershipConflict(StagingOwnershipConflict::OwnerMarkerMissing)
-        );
+        assert!(outcome.is_err());
         assert_eq!(
             std::fs::read_to_string(replacement_file).unwrap(),
             "preserve me"
         );
-    }
-}
-
-#[cfg(test)]
-mod worktree_repository_ownership_tests {
-    use super::*;
-
-    #[test]
-    fn standalone_checkout_is_not_adopted_for_reserved_repository() {
-        let expected = tempfile::tempdir().unwrap();
-        let foreign = tempfile::tempdir().unwrap();
-        crate::git_ops::run_git(expected.path(), &["init"]).unwrap();
-        crate::git_ops::run_git(foreign.path(), &["init"]).unwrap();
-
-        let error = validate_worktree_belongs_to_repository(
-            &expected.path().to_string_lossy(),
-            foreign.path(),
-        )
-        .expect_err("foreign checkout must not be adopted");
-        assert_eq!(error.1, ErrorKind::InvalidRequest);
     }
 }
 
@@ -5060,37 +4912,6 @@ mod repository_lock_tests {
         second.try_lock_exclusive().unwrap();
         second.unlock().unwrap();
     }
-}
-
-fn validate_worktree_belongs_to_repository(
-    repo_root: &str,
-    worktree: &Path,
-) -> Result<(), (String, ErrorKind)> {
-    let common_dir = |cwd: &Path| {
-        crate::git_ops::run_git(
-            cwd,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .and_then(|value| {
-            Path::new(value.trim())
-                .canonicalize()
-                .map(|path| path.to_string_lossy().to_string())
-                .map_err(|error| format!("could not canonicalize Git common directory: {error}"))
-        })
-        .map_err(|error| (error, ErrorKind::ServerError))
-    };
-    let expected = common_dir(Path::new(repo_root))?;
-    let actual = common_dir(worktree)?;
-    if actual != expected {
-        return Err((
-            format!(
-                "Existing worktree {} belongs to a different repository",
-                worktree.display()
-            ),
-            ErrorKind::InvalidRequest,
-        ));
-    }
-    Ok(())
 }
 
 fn creation_error_is_retryable(kind: &ErrorKind) -> bool {
