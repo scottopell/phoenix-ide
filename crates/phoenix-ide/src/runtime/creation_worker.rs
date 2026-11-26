@@ -228,7 +228,6 @@ async fn process_claimed_product_creation(
             );
         }
         let had_materialization_authority = persisted_ownership_token.is_some();
-        let persisted_ownership_token = Some(ownership_token.clone());
         let (worktree, ownership_token) = tokio::task::spawn_blocking({
             let repo_root = repo_root.clone();
             let planned_path = planned_path.clone();
@@ -270,6 +269,7 @@ async fn process_claimed_product_creation(
                         ],
                         Duration::from_secs(30),
                     )?;
+                    verify_product_creation_checkout(&repo_root, &path, &oid)?;
                     write_product_creation_owner_marker(&path, &ownership_token)?;
                     ownership_token
                 };
@@ -981,6 +981,18 @@ fn verify_existing_product_creation_staging(
 ) -> Result<String, String> {
     let expected = persisted_ownership_token
         .ok_or_else(|| "existing staging occupant lacked durable ownership".to_string())?;
+    verify_product_creation_checkout(repo_root, path, expected_oid)?;
+    match read_product_creation_owner_marker(path)? {
+        Some(actual) if actual == expected => Ok(expected.to_string()),
+        _ => Err("existing staging occupant did not match durable ownership".to_string()),
+    }
+}
+
+fn verify_product_creation_checkout(
+    repo_root: &str,
+    path: &Path,
+    expected_oid: &str,
+) -> Result<(), String> {
     let canonicalize = |path: &Path| path.canonicalize().map_err(|error| error.to_string());
     let dot_git = path.join(".git");
     let file_type = |path: &Path| {
@@ -1010,11 +1022,7 @@ fn verify_existing_product_creation_staging(
     if canonicalize(&registered)? != canonicalize(&dot_git)? {
         return Err("existing staging registration points to another checkout".to_string());
     }
-    crate::api::handlers::validate_detached_task_worktree(path, expected_oid)?;
-    match read_product_creation_owner_marker(path)? {
-        Some(actual) if actual == expected => Ok(expected.to_string()),
-        _ => Err("existing staging occupant did not match durable ownership".to_string()),
-    }
+    crate::api::handlers::validate_detached_task_worktree(path, expected_oid)
 }
 
 fn product_creation_owner_marker_path(worktree_path: &Path) -> Result<PathBuf, String> {
@@ -2768,6 +2776,80 @@ mod product_creation_delivery_replay_tests {
                 .unwrap(),
             cancelled
         );
+    }
+
+    #[tokio::test]
+    async fn unpublished_cleanup_settles_a_tokenless_reservation() {
+        let (_directory, repo) = initialized_product_repository();
+        let repo_root = repo.to_str().unwrap();
+        let oid = crate::git_ops::run_git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        for delete in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            let manager = test_runtime_manager(db.clone());
+            let request = "cancel-before-git";
+            let claimed = accept_and_claim_product_at(&db, request, &repo).await;
+            let path =
+                product_worktree_path(&repo, claimed.job.product_conversation_id.as_str()).unwrap();
+            let path_str = path.to_str().unwrap();
+            let now = chrono::Utc::now();
+            assert!(db
+                .reserve_product_creation_resource(
+                    "reservation",
+                    request,
+                    &claimed.claim,
+                    repo_root,
+                    path_str,
+                    now,
+                )
+                .await
+                .unwrap());
+            assert!(db
+                .record_product_creation_staging(
+                    request,
+                    &claimed.claim,
+                    path_str,
+                    repo_root,
+                    oid.trim(),
+                )
+                .await
+                .unwrap());
+            let accepted = if delete {
+                db.request_product_creation_deletion(request, now).await
+            } else {
+                db.cancel_product_creation(request, now).await
+            };
+            assert!(accepted.unwrap());
+            assert!(!db
+                .record_product_creation_resource_ownership(
+                    request,
+                    &claimed.claim,
+                    path_str,
+                    "stale-owner",
+                    now,
+                )
+                .await
+                .unwrap());
+            let cleanup = db
+                .claim_next_product_creation_cleanup(
+                    "cleaner",
+                    "cleanup-token",
+                    now,
+                    chrono::Duration::seconds(30),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            reconcile_product_creation_cleanup(&manager, &cleanup)
+                .await
+                .unwrap();
+            assert!(!path.exists());
+            let job = db.get_product_creation_job(request).await.unwrap();
+            if delete {
+                assert!(job.is_none());
+            } else {
+                assert_eq!(job.unwrap().status, "cancelled");
+            }
+        }
     }
 
     #[tokio::test]

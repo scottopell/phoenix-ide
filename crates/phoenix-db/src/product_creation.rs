@@ -2818,7 +2818,9 @@ impl Database {
         };
         sqlx::query(
             "UPDATE product_creation_resource_reservations
-             SET generation = ?3, status = 'cleanup_required', updated_at_unix_micros = ?2
+             SET generation = ?3, updated_at_unix_micros = ?2,
+                 status = CASE WHEN status = 'reserved' AND ownership_token IS NULL
+                    THEN 'reserved' ELSE 'cleanup_required' END
              WHERE request_id = ?1 AND status IN ('reserved', 'present', 'cleanup_required')",
         )
         .bind(request_id)
@@ -2875,7 +2877,9 @@ impl Database {
         }
         sqlx::query(
             "UPDATE product_creation_resource_reservations
-             SET generation = ?3, status = 'cleanup_required', updated_at_unix_micros = ?2
+             SET generation = ?3, updated_at_unix_micros = ?2,
+                 status = CASE WHEN status = 'reserved' AND ownership_token IS NULL
+                    THEN 'reserved' ELSE 'cleanup_required' END
              WHERE request_id = ?1 AND status IN ('reserved', 'present', 'cleanup_required', 'conflict')",
         )
         .bind(request_id)
@@ -3047,7 +3051,8 @@ impl Database {
             "UPDATE product_creation_resource_reservations
              SET status = ?7, updated_at_unix_micros = ?1
              WHERE id = ?2 AND request_id = ?3 AND generation = ?4
-               AND (status = 'cleanup_required' OR status = 'conflict')
+               AND (status IN ('cleanup_required', 'conflict')
+                    OR (status = 'reserved' AND ownership_token IS NULL))
                AND EXISTS (
                    SELECT 1 FROM product_creation_jobs j
                    WHERE j.request_id = ?3 AND j.claim_generation = ?4
