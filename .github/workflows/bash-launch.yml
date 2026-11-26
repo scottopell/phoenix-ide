@@ -80,7 +80,8 @@ jobs:
             -p phoenix-core -p phoenix-tools -p phoenix_ide --lib --success-output final -E '
               (package(phoenix-core) and (test(process_identity::tests) or test(domain::tool_wire::bash_tmux_wire_tests)))
               or (package(phoenix-tools) and (test(bash::operations::tests) or test(bash::launch_protocol::tests)
-                or test(bash::ring::tests) or test(bash::registry::tests) or test(bash::reaper::tests)))
+                or test(bash::ring::tests) or test(bash::registry::tests) or test(bash::reaper::tests)
+                or test(bash::handle::native_retirement::tests)))
               or (package(phoenix_ide) and (test(browser_retirement)
                 or test(coordinator_bash_executes_owned_home_with_zero_ordinary_conversations)
                 or test(real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay)

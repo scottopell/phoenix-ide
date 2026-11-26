@@ -1,5 +1,7 @@
 //! One-shot barriers owned by a single test actor, never by a process-wide registry.
+//! Physical-worktree test drivers are Linux-only; passive checkpoints remain portable.
 
+#[cfg(target_os = "linux")]
 use std::future::Future;
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
@@ -32,6 +34,7 @@ tokio::task_local! {
 }
 
 impl Hooks {
+    #[cfg(target_os = "linux")]
     pub(crate) async fn scope<F: Future>(&self, future: F) -> F::Output {
         ACTOR_HOOKS.scope(self.clone(), future).await
     }
@@ -41,6 +44,7 @@ impl Hooks {
         ACTOR_HOOKS.try_with(Clone::clone).ok()
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn arm(&self, point: Point) -> Pause {
         let (reached, arrival) = oneshot::channel();
         let (release, resume) = oneshot::channel();
@@ -54,6 +58,7 @@ impl Hooks {
         Pause { arrival, release }
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn revalidation_count(&self) -> usize {
         self.revalidations.load(std::sync::atomic::Ordering::SeqCst)
     }
@@ -69,10 +74,12 @@ impl Hooks {
         self.pending_tick.notify_one();
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn pending_tick_count(&self) -> usize {
         self.pending_ticks.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) async fn wait_for_pending_ticks(&self, target: usize) {
         loop {
             let notified = self.pending_tick.notified();
@@ -100,11 +107,13 @@ impl Hooks {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) struct Pause {
     arrival: oneshot::Receiver<()>,
     release: oneshot::Sender<()>,
 }
 
+#[cfg(target_os = "linux")]
 impl Pause {
     pub(crate) async fn reached(&mut self) -> Result<(), &'static str> {
         tokio::time::timeout(std::time::Duration::from_secs(10), &mut self.arrival)

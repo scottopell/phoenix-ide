@@ -9069,7 +9069,7 @@ fn mac_inspect_open_descriptors_until(
                 descriptor.proc_fd,
                 stat.vst_dev as u64,
                 stat.vst_ino,
-                stat.vst_mode & libc::S_IFMT as _,
+                stat.vst_mode & libc::S_IFMT,
             )
         });
         if is_exact_self_borrow {
