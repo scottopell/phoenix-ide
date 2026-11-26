@@ -598,6 +598,38 @@ pub struct ProductCreationGitPublicationFacts {
     pub checkout_fingerprint: String,
 }
 
+pub const PRODUCT_CREATION_OWNER_MARKER: &str = "phoenix-product-creation-owner";
+
+fn publication_registration_matches(
+    checkout: &std::path::Path,
+    facts: &ProductCreationGitPublicationFacts,
+) -> Option<()> {
+    fn read_record(path: &std::path::Path) -> Option<String> {
+        let (_, bytes) = phoenix_core::git::read_worktree_registration_file(path).ok()?;
+        let record = String::from_utf8(bytes).ok()?;
+        Some(record.trim_end_matches(['\r', '\n']).to_owned())
+    }
+
+    let dot_git = checkout.join(".git");
+    let pointer = read_record(&dot_git)?;
+    let admin = checkout
+        .join(pointer.strip_prefix("gitdir: ")?)
+        .canonicalize()
+        .ok()?;
+    let registrations = admin.parent()?;
+    let common = registrations.parent()?;
+    let backpointer = admin.join(read_record(&admin.join("gitdir"))?);
+    let registered_common = admin.join(read_record(&admin.join("commondir"))?);
+    let owner = read_record(&admin.join(PRODUCT_CREATION_OWNER_MARKER))?;
+    (registrations.file_name()? == "worktrees"
+        && backpointer.canonicalize().ok()? == dot_git.canonicalize().ok()?
+        && registered_common.canonicalize().ok()?.as_path() == common
+        && read_record(&admin.join("HEAD"))? == facts.exact_checkout_oid
+        && owner.split_once('\n')?
+            == (facts.ownership_token.as_str(), facts.checkout_fingerprint.as_str()))
+    .then_some(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ProductCreationPublishInput {
     pub request_id: String,
@@ -2318,9 +2350,9 @@ impl Database {
             .bind(scope_id.as_str())
             .fetch_one(&mut *tx)
             .await?;
-            let current = Self::observe_worktree_fingerprint(&path);
             if captured.as_deref() != Some(facts.checkout_fingerprint.as_str())
-                || current != captured
+                || publication_registration_matches(std::path::Path::new(&path), facts).is_none()
+                || Self::observe_worktree_fingerprint(&path) != captured
             {
                 tx.rollback().await?;
                 return Err(DbError::Serialization(
@@ -4022,11 +4054,23 @@ mod product_creation_tests {
         assert_eq!(count, 0);
     }
 
-    fn fixture_checkout_fingerprint(path: &str) -> String {
+    fn fixture_checkout_fingerprint(path: &str, oid: &str) -> String {
         let checkout = std::path::Path::new(path);
+        let admin = checkout.with_extension("git").join("worktrees/registration");
         std::fs::create_dir_all(checkout).unwrap();
-        std::fs::write(checkout.join(".git"), b"gitdir: ../registration\n").unwrap();
-        phoenix_core::git::observe_linked_worktree_fingerprint(checkout).unwrap()
+        std::fs::create_dir_all(&admin).unwrap();
+        let dot_git = checkout.join(".git");
+        std::fs::write(&dot_git, format!("gitdir: {}\n", admin.display())).unwrap();
+        std::fs::write(admin.join("gitdir"), format!("{}\n", dot_git.display())).unwrap();
+        std::fs::write(admin.join("commondir"), "../..\n").unwrap();
+        std::fs::write(admin.join("HEAD"), format!("{oid}\n")).unwrap();
+        let fingerprint = phoenix_core::git::observe_linked_worktree_fingerprint(checkout).unwrap();
+        std::fs::write(
+            admin.join(PRODUCT_CREATION_OWNER_MARKER),
+            format!("fixture-owner\n{fingerprint}"),
+        )
+        .unwrap();
+        fingerprint
     }
 
     async fn record_git_publication_fixture(
@@ -6851,7 +6895,7 @@ mod product_creation_tests {
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("worktree");
         let checkout = checkout.to_str().unwrap();
-        let checkout_fingerprint = fixture_checkout_fingerprint(checkout);
+        let checkout_fingerprint = fixture_checkout_fingerprint(checkout, "unpersisted-oid");
         let db = Database::open_in_memory().await.unwrap();
         db.accept_product_creation("unproven-publication", &intent("/repo", "publish"))
             .await
@@ -6939,6 +6983,14 @@ mod product_creation_tests {
         ));
         assert_unproven_publication_left_no_rows(&db, &scope_id).await;
         std::fs::rename(&original, &marker).unwrap();
+        let head = dir.path().join("worktree.git/worktrees/registration/HEAD");
+        std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
+        assert!(matches!(
+            db.publish_product_creation_atomically(&input).await,
+            Err(DbError::Serialization(message)) if message.contains("checkout identity changed")
+        ));
+        assert_unproven_publication_left_no_rows(&db, &scope_id).await;
+        std::fs::write(&head, "unpersisted-oid\n").unwrap();
         assert!(db
             .publish_product_creation_atomically(&input)
             .await
@@ -9831,7 +9883,7 @@ mod product_creation_tests {
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("worktree");
         let checkout = checkout.to_str().unwrap();
-        let checkout_fingerprint = fixture_checkout_fingerprint(checkout);
+        let checkout_fingerprint = fixture_checkout_fingerprint(checkout, "0123456789abcdef");
         let db = Database::open_in_memory().await.unwrap();
         db.accept_product_creation("req-cascade", &intent("/repo/hidden", "owner"))
             .await
@@ -10086,7 +10138,7 @@ mod product_creation_tests {
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("worktree");
         let checkout = checkout.to_str().unwrap();
-        let checkout_fingerprint = fixture_checkout_fingerprint(checkout);
+        let checkout_fingerprint = fixture_checkout_fingerprint(checkout, "stale-oid");
         let db = Database::open_in_memory().await.unwrap();
         db.accept_product_creation("req-current-root", &intent("/repo/stale", "publish"))
             .await
@@ -10206,7 +10258,7 @@ mod product_creation_tests {
             let oid = format!("oid-{idx}");
             let worktree = dir.path().join(format!("checkout-{idx}"));
             let worktree = worktree.to_str().unwrap();
-            let checkout_fingerprint = fixture_checkout_fingerprint(worktree);
+            let checkout_fingerprint = fixture_checkout_fingerprint(worktree, &oid);
             record_git_publication_fixture(&db, &req, &claim.claim, cwd, worktree, &oid).await;
             db.publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: req,

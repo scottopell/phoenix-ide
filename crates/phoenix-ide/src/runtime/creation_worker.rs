@@ -3,6 +3,7 @@ use crate::api::handlers::AppError;
 use crate::api::handlers::{generate_slug, slugify_label, title_from_text};
 use crate::db::{
     ConvMode, ConversationCreationMetadataUpdate, CreationClaimOutcome, ErrorKind, NonEmptyString,
+    PRODUCT_CREATION_OWNER_MARKER,
 };
 use crate::runtime::{ConversationMetadataUpdate, EvictionReason, RuntimeManager, SseEvent};
 use crate::state_machine::{ConvState, Event};
@@ -15,8 +16,6 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-
-const PRODUCT_CREATION_OWNER_MARKER: &str = "phoenix-product-creation-owner";
 
 async fn checkpoint_product_creation_stage(
     manager: &RuntimeManager,
@@ -1094,7 +1093,7 @@ fn write_product_creation_owner_marker(
 }
 
 #[cfg(test)]
-fn write_test_owner_marker(path: &Path, token: &str) {
+pub(crate) fn write_test_owner_marker(path: &Path, token: &str) {
     let fingerprint = product_creation_checkout_fingerprint(path).unwrap();
     write_product_creation_owner_marker(path, token, &fingerprint).unwrap();
 }

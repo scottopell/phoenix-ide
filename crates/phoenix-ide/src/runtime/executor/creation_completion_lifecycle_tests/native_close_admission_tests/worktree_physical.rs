@@ -424,6 +424,7 @@ impl DisposableGit {
         let (claimed, oid) = self
             .accept_claim_and_stage(fixture, &request_id, &intent, &cwd)
             .await;
+        crate::runtime::creation_worker::write_test_owner_marker(&self.worktree, "fixture-owner");
         let scope = WorkScopeId::new();
         let product_id = claimed.job.product_conversation_id.clone();
         let conversation = self.conversation(product_id.clone(), scope.clone());
