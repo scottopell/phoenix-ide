@@ -33,6 +33,21 @@ function measure() {
   const style = getComputedStyle(chat);
   return {
     prefix: fixture.dataset.prefix, prefixLength: Number(fixture.dataset.prefixLength),
+    stressScroll: (() => {
+      const wrapper = document.querySelector('[data-table-case="stress"] .markdown-table-scroll');
+      const table = wrapper?.querySelector('table');
+      if (!wrapper || !table) return null;
+      const cells = [...table.querySelectorAll('th,td')];
+      const maxScrollLeft = wrapper.scrollWidth - wrapper.clientWidth;
+      wrapper.scrollLeft = maxScrollLeft;
+      const wrapperRect = wrapper.getBoundingClientRect();
+      const tableRect = table.getBoundingClientRect();
+      const cellRects = cells.map(cell => cell.getBoundingClientRect());
+      const lastRect = cellRects.at(-1);
+      const lastCellReachable = lastRect.left >= wrapperRect.left - 1 && lastRect.right <= wrapperRect.right + 1;
+      wrapper.scrollLeft = 0;
+      return { columnCount: table.querySelector('tr')?.querySelectorAll('th,td').length ?? 0, cellCount: cells.length, maxScrollLeft, lastCellReachable, cellsHaveArea: cellRects.every(cell => cell.width > 0 && cell.height > 0), cellsContainedByTable: cellRects.every(cell => cell.left >= tableRect.left - 1 && cell.right <= tableRect.right + 1 && cell.top >= tableRect.top - 1 && cell.bottom <= tableRect.bottom + 1), wrapper: { left: wrapperRect.left, right: wrapperRect.right, width: wrapper.clientWidth, scrollWidth: wrapper.scrollWidth } };
+    })(),
     finalized: fixture.dataset.finalized === 'true',
     document: { clientWidth: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth },
     chat: { ...size(chat), containerType: style.containerType, contentWidth: chat.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight) },
@@ -75,6 +90,19 @@ function validate(sample, complete) {
       check(near(value.row.left + value.row.width / 2, sample.chat.left + sample.chat.width / 2), `${label}: row not centered`);
     }
   }
+  const stress = sample.stressScroll;
+  check(stress !== null, `${label}: missing separate stress table`);
+  if (stress) {
+    check(stress.columnCount >= 3, `${label}: stress table must have at least three columns`);
+    check(stress.cellCount === 16, `${label}: stress table cell count changed`);
+    check(stress.cellsHaveArea, `${label}: stress table has a zero-area cell`);
+    check(stress.cellsContainedByTable, `${label}: stress table cell escapes its table bounds`);
+    check(stress.wrapper.left >= sample.chat.left - 1 && stress.wrapper.right <= sample.chat.right + 1, `${label}: stress table viewport escapes chat`);
+    if (sample.width === 375) {
+      check(stress.maxScrollLeft > 0, `${label}: narrow stress table does not overflow its local scroller`);
+      check(stress.lastCellReachable, `${label}: final stress-table cell is not reachable by horizontal scrolling`);
+    }
+  }
   const { subject, reference } = sample.cases;
   for (const [name, value] of Object.entries(sample.cases)) {
     if (!baseline) {
@@ -88,7 +116,7 @@ function validate(sample, complete) {
     }
     if (complete) {
       check(value.tables.length === 1, `${label}/${name}: expected completed table`);
-      check(JSON.stringify(value.tables.flatMap(table => table.cells.map(cell => cell.text))) === JSON.stringify(expectedCells), `${label}/${name}: table data lost or changed`);
+      if (name !== 'stress') check(JSON.stringify(value.tables.flatMap(table => table.cells.map(cell => cell.text))) === JSON.stringify(expectedCells), `${label}/${name}: table data lost or changed`);
     }
   }
   if (!complete) return;
@@ -114,7 +142,8 @@ function validate(sample, complete) {
 const browser = await (engine === 'webkit' ? webkit : chromium).launch();
 try {
   for (const width of [375, 800, 1280]) {
-    const page = await browser.newPage({ viewport: { width, height: 1000 }, deviceScaleFactor: 1 });
+    const mobileTouch = engine === 'webkit' && width === 375;
+    const page = await browser.newPage({ viewport: { width, height: 1000 }, deviceScaleFactor: 1, ...(mobileTouch ? { isMobile: true, hasTouch: true } : {}) });
     page.on('pageerror', error => errors.push(`${width}: ${error.message}`));
     // Separate runs let both the completed-table/incomplete-tail and full-text
     // checkpoints undergo a real streaming -> finalized component replacement.
@@ -127,7 +156,7 @@ try {
       await page.evaluate(() => document.fonts.ready);
       while (true) {
         await page.waitForSelector('[data-table-ready="true"]');
-        const sample = { width, target, ...await page.evaluate(measure) };
+        const sample = { width, target, mobileTouch, ...await page.evaluate(measure) };
         samples.push(sample);
         validate(sample, ['completed-table-incomplete-tail', 'full-text'].includes(sample.prefix));
         if (sample.prefix === target) break;
@@ -139,7 +168,7 @@ try {
       const before = samples.at(-1);
       await page.getByTestId('finalize-table').click();
       await page.waitForSelector('[data-table-ready="true"][data-finalized="true"]');
-      const after = { width, target, ...await page.evaluate(measure) };
+      const after = { width, target, mobileTouch, ...await page.evaluate(measure) };
       samples.push(after);
       validate(after, true);
       check(after.prefixLength === before.prefixLength, `${stem}: finalization changed prefix`);
@@ -160,7 +189,7 @@ try {
 } catch (error) {
   failures.push(error.stack ?? String(error));
 } finally {
-  await writeFile(path.join(out, 'metrics.json'), JSON.stringify({ baseline, engine, breakoutCount, failures, errors, samples }, null, 2));
+  await writeFile(path.join(out, 'metrics.json'), JSON.stringify({ baseline, engine, engineVersion: browser.version(), breakoutCount, failures, errors, samples }, null, 2));
   await browser.close();
 }
 console.log(`${samples.length} samples; ${breakoutCount} breakouts; artifacts: ${out}`);

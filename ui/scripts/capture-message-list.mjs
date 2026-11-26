@@ -3,10 +3,181 @@ import { runSurfaceCapture } from './capture-ladle-surface.mjs';
 import { captureDelayedImages, prepareDelayedImages } from './message-list-delayed-image.mjs';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import process from 'node:process';
 
 const width = Number(process.env.MESSAGE_LIST_QA_WIDTH ?? 960);
 const height = Number(process.env.MESSAGE_LIST_QA_HEIGHT ?? 900);
 const narrowMarkdownTableMetrics = [];
+
+async function verifyMobileLongMarkdownTable({ page, id, outDir }) {
+  if (id !== 'mobile-long-markdown-table') return false;
+
+  const samples = [];
+  for (const width of [393, 1280]) {
+    await page.setViewportSize({ width, height: 900 });
+    await page.evaluate(() => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+    const metrics = await page.evaluate(() => {
+      const wrapper = document.querySelector('.conversation-markdown-table-scroll');
+      const table = wrapper?.querySelector('table');
+      if (!(wrapper instanceof HTMLElement) || !(table instanceof HTMLTableElement)) {
+        throw new Error('mobile long Markdown table fixture is missing its table');
+      }
+      const headers = [...table.querySelectorAll('thead th')].map((cell) => ({
+        kind: cell.dataset.columnKind,
+        width: cell.getBoundingClientRect().width,
+      }));
+      const bodyCells = [...table.querySelectorAll('tbody td')].map((cell) => {
+        const rect = cell.getBoundingClientRect();
+        const style = getComputedStyle(cell);
+        return {
+          text: cell.textContent?.trim() ?? '',
+          kind: cell.dataset.columnKind,
+          clientWidth: cell.clientWidth,
+          scrollWidth: cell.scrollWidth,
+          contentWidth: cell.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+          left: rect.left,
+          right: rect.right,
+          fontSize: style.fontSize,
+          whiteSpace: style.whiteSpace,
+        };
+      });
+      const rows = [...table.querySelectorAll('tr')].map((row) => [...row.cells].map((cell) => {
+        const rect = cell.getBoundingClientRect();
+        return { left: rect.left, right: rect.right };
+      }));
+      const overlaps = rows.some((cells) => cells.slice(1).some((cell, index) => cell.left < cells[index].right - 1));
+      const stressTables = [...document.querySelectorAll('.conversation-markdown-table-scroll table')].slice(1).map((stressTable) => {
+        const wrapper = stressTable.closest('.conversation-markdown-table-scroll');
+        const cells = [...stressTable.querySelectorAll('tbody td')];
+        wrapper.scrollLeft = 0;
+        const scrollStart = wrapper.scrollLeft;
+        wrapper.scrollLeft = wrapper.scrollWidth;
+        const scrollEnd = { left: wrapper.scrollLeft, max: wrapper.scrollWidth - wrapper.clientWidth };
+        const stressRows = [...stressTable.querySelectorAll('tr')].map((row) => [...row.cells].map((cell) => {
+          const rect = cell.getBoundingClientRect();
+          return { left: rect.left, right: rect.right };
+        }));
+        return {
+          headerKinds: [...stressTable.querySelectorAll('thead th')].map((cell) => cell.dataset.columnKind),
+          wrapperWidth: wrapper.clientWidth,
+          wrapperScrollWidth: wrapper.scrollWidth,
+          scrollStart,
+          scrollEnd,
+          tableWidth: stressTable.getBoundingClientRect().width,
+          bodyKinds: cells.map((cell) => cell.dataset.columnKind),
+          bodyCells: cells.map((cell) => {
+            const style = getComputedStyle(cell);
+            return {
+              clientWidth: cell.clientWidth,
+              scrollWidth: cell.scrollWidth,
+              contentWidth: cell.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+            };
+          }),
+          bodyWhiteSpaces: cells.map((cell) => getComputedStyle(cell).whiteSpace),
+          hasUrl: [...stressTable.querySelectorAll('a')].some((link) => link.href.startsWith('https://')),
+          overlaps: stressRows.some((cells) => cells.slice(1).some((cell, index) => cell.left < cells[index].right - 1)),
+        };
+      });
+      return {
+        viewport: innerWidth,
+        documentWidth: document.documentElement.scrollWidth,
+        wrapperWidth: wrapper.clientWidth,
+        wrapperScrollWidth: wrapper.scrollWidth,
+        tableWidth: table.getBoundingClientRect().width,
+        layout: getComputedStyle(table).tableLayout,
+        headers,
+        bodyCells,
+        overlaps,
+        stressTables,
+        hasCode: Boolean(table.querySelector('code')),
+        hasUrl: [...table.querySelectorAll('a')].some((link) => link.href.startsWith('https://')),
+      };
+    });
+    if (metrics.documentWidth !== width) {
+      throw new Error(`Markdown table caused page-level overflow at ${width}px: ${JSON.stringify(metrics)}`);
+    }
+    if (metrics.headers.length !== 2 || !['label', 'compact'].includes(metrics.headers[0].kind) || metrics.headers[1].kind !== 'prose' || metrics.bodyCells.length < 4 || !metrics.hasCode || !metrics.stressTables[1]?.hasUrl) {
+      throw new Error(`Markdown table fixture lacks the expected long content: ${JSON.stringify(metrics)}`);
+    }
+    if (metrics.overlaps) {
+      throw new Error(`Markdown table cells overlap at ${width}px: ${JSON.stringify(metrics)}`);
+    }
+    if (width <= 600) {
+      if (metrics.layout !== 'auto') {
+        throw new Error(`Mobile Markdown table must preserve intrinsic sizing: ${JSON.stringify(metrics)}`);
+      }
+      if (metrics.bodyCells.some((cell) => cell.contentWidth < 55 || cell.scrollWidth > cell.clientWidth + 1)) {
+        throw new Error(`Mobile table has unreadable or overflowing cell content: ${JSON.stringify(metrics.bodyCells)}`);
+      }
+      if (metrics.stressTables.length !== 4 || metrics.stressTables.some((table) => table.overlaps
+        || table.bodyCells.some((cell) => cell.scrollWidth > cell.clientWidth + 1)
+        || table.scrollStart !== 0
+        || (table.scrollEnd.max > 0 && Math.abs(table.scrollEnd.left - table.scrollEnd.max) > 1))) {
+        throw new Error(`Mobile stress tables overlap or overflow their cell bounds: ${JSON.stringify(metrics.stressTables)}`);
+      }
+      const atomicTable = metrics.stressTables[2];
+      const numericTable = metrics.stressTables[3];
+      if (!atomicTable.bodyKinds.includes('atomic') || !numericTable.bodyKinds.includes('numeric')
+        || atomicTable.bodyWhiteSpaces.some((value) => value !== 'nowrap')
+        || numericTable.bodyWhiteSpaces.some((value) => value !== 'nowrap')
+        || numericTable.wrapperScrollWidth <= numericTable.wrapperWidth
+        || metrics.documentWidth !== width) {
+        throw new Error(`Atomic/numeric mobile cells lost intrinsic no-wrap sizing: ${JSON.stringify(metrics.stressTables)}`);
+      }
+    } else if (metrics.layout !== 'auto') {
+      throw new Error(`Desktop Markdown table should retain intrinsic layout: ${JSON.stringify(metrics)}`);
+    }
+    const candidateScreenshotPath = path.join(outDir, `mobile-long-markdown-table-${width}.png`);
+    await page.screenshot({ path: candidateScreenshotPath, fullPage: true });
+    if (width === 393) {
+      const originalCss = await page.addStyleTag({
+        content: `
+          @media (width <= 600px) {
+            .agent-text-block .conversation-markdown-table-scroll[data-column-count='2'] > table {
+              width: 100% !important;
+              table-layout: fixed !important;
+            }
+            .agent-text-block .conversation-markdown-table-scroll[data-column-count='2'] :where(th, td) {
+              overflow-wrap: anywhere !important;
+            }
+          }
+        `,
+      });
+      const historicalHeadCss = await page.evaluate(() => {
+        const table = document.querySelector('.conversation-markdown-table-scroll table');
+        const wrapper = table?.closest('.conversation-markdown-table-scroll');
+        if (!(table instanceof HTMLTableElement) || !(wrapper instanceof HTMLElement)) return null;
+        const cells = [...table.querySelectorAll('th, td')].map((cell) => {
+          const style = getComputedStyle(cell);
+          return {
+            text: cell.textContent?.trim() ?? '',
+            cellWidth: cell.clientWidth,
+            contentWidth: cell.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight),
+          };
+        });
+        return {
+          wrapperWidth: wrapper.clientWidth,
+          wrapperScrollWidth: wrapper.scrollWidth,
+          tableWidth: table.getBoundingClientRect().width,
+          tableLayout: getComputedStyle(table).tableLayout,
+          cells,
+        };
+      });
+      const historicalScreenshotPath = path.join(outDir, 'mobile-long-markdown-table-393--historical-head-css.png');
+      await page.screenshot({ path: historicalScreenshotPath, fullPage: true });
+      await originalCss.evaluate((element) => element.remove());
+      metrics.historicalHeadCss = historicalHeadCss;
+      metrics.historicalHeadCssScreenshotPath = historicalScreenshotPath;
+      metrics.candidateScreenshotPath = candidateScreenshotPath;
+      const historicalMinimumContentWidth = Math.min(...(historicalHeadCss?.cells ?? []).map((cell) => cell.contentWidth));
+      console.log(`  exact reported fixture minimum content width: HEAD CSS ${historicalMinimumContentWidth}px; candidate ${Math.min(...metrics.bodyCells.map((cell) => cell.contentWidth))}px`);
+    }
+    samples.push(metrics);
+  }
+  await writeFile(path.join(outDir, 'mobile-long-markdown-table-metrics.json'), `${JSON.stringify(samples, null, 2)}\n`);
+  console.log('  verified long two-column Markdown table at 393px and 1280px');
+  return true;
+}
 
 async function verifyWideTable({ page, id, viewport }) {
   if (id !== 'wide-markdown-table' && id !== 'wide-markdown-table-light') return false;
@@ -143,7 +314,7 @@ async function captureCompactChronology({ page, id, outDir }) {
       label: sampleLabel,
       toolDomOrder: Array.from(document.querySelectorAll('[data-tool-id]')).map((node) => node.getAttribute('data-tool-id')),
       groupCount: document.querySelectorAll('.compact-tool-group').length,
-    }));
+    }), label);
     const compactOrder = order.toolDomOrder.filter((toolId) => toolId?.startsWith('chronology-tool-'));
     if (compactOrder.join(',') !== 'chronology-tool-a,chronology-tool-b,chronology-tool-c' || order.groupCount !== 1) {
       throw new Error(`Chronology tools are not in one compact group: ${JSON.stringify(order)}`);
@@ -300,6 +471,20 @@ function collectTableMetrics(label) {
     textSizeAdjust: rootStyle.webkitTextSizeAdjust || rootStyle.textSizeAdjust || '',
     tableClientWidth: table.clientWidth,
     tableScrollWidth: table.scrollWidth,
+    cells: [...table.querySelectorAll('th, td')].map((cell) => {
+      const cellStyle = getComputedStyle(cell);
+      const rect = cell.getBoundingClientRect();
+      const horizontalPadding = parseFloat(cellStyle.paddingLeft) + parseFloat(cellStyle.paddingRight);
+      return {
+        text: cell.textContent?.trim() ?? '',
+        clientWidth: cell.clientWidth,
+        scrollWidth: cell.scrollWidth,
+        contentWidth: cell.clientWidth - horizontalPadding,
+        left: rect.left,
+        right: rect.right,
+        whiteSpace: cellStyle.whiteSpace,
+      };
+    }),
     wrapperClientWidth: wrapper.clientWidth,
     wrapperScrollWidth: wrapper.scrollWidth,
     wrapperInitialScrollLeft: wrapper.scrollLeft,
@@ -321,21 +506,32 @@ function collectTableMetrics(label) {
 async function collectNarrowMarkdownTableMetrics(page, viewport, label, screenshotPath) {
   await page.setViewportSize(viewport);
   await page.waitForSelector('.conversation-markdown-table-scroll table');
-  const patched = await page.evaluate(collectTableMetrics, `${label}:post`);
-  if (screenshotPath) await page.screenshot({ path: screenshotPath, fullPage: true });
-  await page.addStyleTag({
+  await page.evaluate(collectTableMetrics, `${label}:candidate`);
+  const originalCss = await page.addStyleTag({
     content: `
-      .agent-text-block .conversation-markdown-table-scroll > table {
-        width: max-content !important;
-        table-layout: auto !important;
-      }
-      .agent-text-block .conversation-markdown-table-scroll :where(th, td) {
-        overflow-wrap: normal !important;
+      @media (width <= 600px) {
+        .agent-text-block .conversation-markdown-table-scroll[data-column-count='2'] > table {
+          width: 100% !important;
+          table-layout: fixed !important;
+        }
+        .agent-text-block .conversation-markdown-table-scroll[data-column-count='2'] :where(th, td) {
+          overflow-wrap: anywhere !important;
+        }
       }
     `,
   });
-  const baseline = await page.evaluate(collectTableMetrics, `${label}:pre-simulated`);
-  return { baseline, patched };
+  const historical = await page.evaluate(collectTableMetrics, `${label}:historical-head-css`);
+  if (screenshotPath) {
+    const base = screenshotPath.replace(/\.png$/, '');
+    await page.screenshot({ path: `${base}--historical-head-css.png`, fullPage: true });
+  }
+  await originalCss.evaluate((element) => element.remove());
+  const patched = await page.evaluate(collectTableMetrics, `${label}:candidate-after-baseline`);
+  if (screenshotPath) await page.screenshot({ path: screenshotPath, fullPage: true });
+  return {
+    historical: { ...historical, screenshotPath: screenshotPath?.replace(/\.png$/, '--historical-head-css.png') ?? null },
+    patched: { ...patched, screenshotPath: screenshotPath ?? null },
+  };
 }
 
 async function verifyNarrowMarkdownTable({ page, id, outDir }) {
@@ -357,7 +553,7 @@ async function verifyNarrowMarkdownTable({ page, id, outDir }) {
     `${theme}:narrow`,
     path.join(outDir, `${id}--narrow-table.png`),
   );
-  narrowMarkdownTableMetrics.push(desktop.baseline, desktop.patched, narrow.baseline, narrow.patched);
+  narrowMarkdownTableMetrics.push(desktop.historical, desktop.patched, narrow.historical, narrow.patched);
 
   for (const sample of [desktop.patched, narrow.patched]) {
     if (sample.th.fontSize !== sample.td.fontSize
@@ -384,8 +580,24 @@ async function verifyNarrowMarkdownTable({ page, id, outDir }) {
   if (desktop.patched.tableClientWidth !== desktop.patched.wrapperClientWidth) {
     throw new Error(`Narrow table desktop width regressed: ${JSON.stringify(desktop.patched)}`);
   }
-  if (narrow.patched.tableLayout !== 'fixed' || narrow.patched.cellOverflowWrap !== 'anywhere') {
-    throw new Error(`Narrow table did not receive the narrow readability rule: ${JSON.stringify(narrow.patched)}`);
+  const contentWidths = narrow.patched.cells.map((cell) => cell.contentWidth);
+  const historicalMinContentWidth = Math.min(...narrow.historical.cells.map((cell) => cell.contentWidth));
+  const candidateMinContentWidth = Math.min(...contentWidths);
+  if (candidateMinContentWidth < 55) {
+    throw new Error(`Narrow table leaves less than 55px of readable cell content: ${JSON.stringify(narrow.patched)}`);
+  }
+  if (historicalMinContentWidth >= 55) {
+    console.warn(`Original HEAD CSS does not reproduce a <55px content-width regression in this historical fixture (measured ${historicalMinContentWidth}px).`);
+  }
+  console.log(`  ${theme} ${id} narrow-cell content width: HEAD CSS ${historicalMinContentWidth}px; candidate ${candidateMinContentWidth}px`);
+  if (narrow.patched.cells.some((cell) => cell.scrollWidth > cell.clientWidth + 1)) {
+    throw new Error(`Narrow table cell content is clipped or overflows its cell: ${JSON.stringify(narrow.patched.cells)}`);
+  }
+  const wrapper = page.locator('.conversation-markdown-table-scroll');
+  await wrapper.evaluate((element) => { element.scrollLeft = element.scrollWidth; });
+  const scrollEnd = await wrapper.evaluate((element) => ({ left: element.scrollLeft, max: element.scrollWidth - element.clientWidth }));
+  if (scrollEnd.max > 0 && Math.abs(scrollEnd.left - scrollEnd.max) > 1) {
+    throw new Error(`Narrow table horizontal scroll end is unreachable: ${JSON.stringify(scrollEnd)}`);
   }
   console.log(`  verified narrow markdown table metrics (${id})`);
   return true;
@@ -438,6 +650,7 @@ runSurfaceCapture({
   captureStory: async (context) => (
     await captureDelayedImages(context)
       || await captureFindFinalization(context)
+      || await verifyMobileLongMarkdownTable(context)
       || await verifyWideTable(context)
       || await captureCompactChronology(context)
       || await verifyNarrowMarkdownTable(context)
