@@ -50,9 +50,6 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | [287](287_native-task-approval-source-snapshot-and-receipt.md) | Bind native task approval to canonical source, snapshot and receipt | Proposed | REQ-TAT-001–008; REQ-PROJ-003; REQ-BED-028/046; REQ-COMP-001/002; REQ-DWF-043 |
 | [286](286_close-uses-exact-blockers-and-explicit-retry-only.md) | Close uses exact blockers and explicit retry only | Accepted; supersedes branch-local ADR-288's automatic completion policy and ADR-088's in-Close discard/disposable alternative | REQ-WL-002/002a/002b/002c/002d/002e/002f/004; REQ-BED-029 |
 | [285](285_extend-kache-v1-2-2-local-only-qualification-to-linux-x86-64.md) | Extend Kache v1.2.2 strict local-only qualification to Linux x86_64 | Accepted | development methodology; REQ-COMP-001, REQ-COMP-008 |
-| [285](285_share-coordinator-evidence-origin-labels.md) | Share Coordinator evidence origin labels | Accepted | REQ-SCAN-004; REQ-TRACK-005 |
-| [284](284_raise-ordinary-foreground-window-to-eight.md) | Raise the ordinary foreground window to eight | Accepted | ordinary foreground tool batches; bounded execution window |
-| [283](283_run-ordinary-foreground-tool-batches-with-a-bounded-barrier.md) | Run ordinary foreground tool batches with a bounded barrier | Accepted | ordinary foreground tool batches; bounded execution barrier |
 | [282](282_cap-quoted-review-lines-at-a-character-boundary.md) | Cap quoted review lines at 200 UTF-16 units on a character boundary | Accepted | REQ-PF-009, REQ-PF-016 |
 | [274](274_remove-at-file-inclusion.md) | Remove `@file` content inclusion and leave `@` literal | Accepted | REQ-IR-001, REQ-IR-004, REQ-IR-006, REQ-IR-007, REQ-IR-010, REQ-FE-011 |
 | [273](273_fixed-rc9-preparation-without-publication-authority.md) | Fixed RC9 preparation without publication authority | Accepted | REQ-DESKTOP-REL-014 |
@@ -309,7 +306,7 @@ Consult the relevant ADRs before starting work of each kind.
 | Changing Codex route admission or private continuation account identity | 085, preserving 062's advisory discovery policy |
 | Changing MCP credential removal or restart recovery | 086, within 034's compatibility scope |
 | Changing automatic HTTP connection recovery or Slack connection-health reporting | 240, within 034 and 086's recovery scope |
-| Specifying native Close, exact blockers, failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 283 supersedes 285's automatic completion-only policy and 088's in-Close discard/disposable alternative; retain 088's bounded execution/lifecycle policy, 241's writer evidence, and the identity/ownership safeguards of 026/040/041/042/080 |
+| Specifying native Close, exact blockers, failure, startup observation, History cleanup attention, mandatory Global failure delivery, or explicit safe retry | 286 supersedes branch-local 288's automatic completion-only policy and 088's in-Close discard/disposable alternative; retain 088's bounded execution/lifecycle policy, 241's writer evidence, and the identity/ownership safeguards of 026/040/041/042/080 |
 | Creating or restructuring Phoenix spec artifacts | 000 |
 | Deciding whether to create a new `design.md` | 000 |
 | Migrating legacy `specs/*/design.md` content | 000, 001, 002, 003, 004, 005, 006 |
