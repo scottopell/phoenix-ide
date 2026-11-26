@@ -42,6 +42,24 @@ fn server_failure_disposition(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // This private exec protocol must run before browser shims, diagnostics,
+    // configuration, or the application runtime are initialized.
+    let mut args_os = std::env::args_os();
+    let _executable = args_os.next();
+    if args_os.next().as_deref() == Some(std::ffi::OsStr::new("--phoenix-tmux-close-gate-v1")) {
+        let mut helper_args = vec![std::ffi::OsString::from("--phoenix-tmux-close-gate-v1")];
+        helper_args.extend(args_os);
+        if let Some(result) = phoenix_tools::tmux::close_gate::dispatch_if_helper(&helper_args) {
+            match result {
+                Ok(()) => std::process::exit(0),
+                Err(error) => {
+                    eprintln!("tmux close gate rejected: {error}");
+                    std::process::exit(125);
+                }
+            }
+        }
+    }
+
     if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("--bash-launch-v1")) {
         #[cfg(unix)]
         phoenix_tools::bash::launch_protocol::early_exec_from_stdin();

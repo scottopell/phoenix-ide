@@ -214,8 +214,37 @@ impl AppState {
     // platform, mcp, credentials, password, deployment facts, runtime env);
     // bundling them into a struct would only move the same fields behind one
     // more name.
-    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
+        db: Database,
+        llm_registry: Arc<ModelRegistry>,
+        platform: PlatformCapability,
+        mcp_manager: Arc<McpClientManager>,
+        credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
+        password: Option<OwnerPassword>,
+        deployment: Arc<DeploymentConfig>,
+        runtime_env: Arc<PhoenixRuntimeEnvironment>,
+        suggest_token: String,
+        federation_tls_trust: phoenix_core::domain::instance_identity::PeerTlsTrust,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Keep startup's state machine off every caller's future, not just the server entry point.
+        Box::pin(Self::new_boxed_body(
+            db,
+            llm_registry,
+            platform,
+            mcp_manager,
+            credential_helper,
+            password,
+            deployment,
+            runtime_env,
+            suggest_token,
+            federation_tls_trust,
+        ))
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn new_boxed_body(
         db: Database,
         llm_registry: Arc<ModelRegistry>,
         platform: PlatformCapability,

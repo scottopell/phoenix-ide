@@ -674,11 +674,13 @@ mod live {
             let (retired, retirement) = tokio::sync::oneshot::channel();
             let (event, turn_id) = admitted_input(&self.db, source, prompt, &input_id).await;
             acknowledged_tx
-                .send(crate::runtime::AcknowledgedEventRequest {
-                    event,
-                    acknowledgement,
-                    retirement,
-                })
+                .send(crate::runtime::AcknowledgedRuntimeRequest::Event(Box::new(
+                    crate::runtime::AcknowledgedEventRequest {
+                        event,
+                        acknowledgement,
+                        retirement,
+                    },
+                )))
                 .await
                 .unwrap();
             let result = tokio::time::timeout(std::time::Duration::from_secs(120), async {

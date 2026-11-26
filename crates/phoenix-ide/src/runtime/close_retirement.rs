@@ -1,5 +1,51 @@
 //! Exact-instance resource fences and receipts for Close retirement.
 
+pub(crate) mod captured_loss_retry;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WriterInspectionGap {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) detector: CloseWriterDetector,
+    pub(crate) reason: CloseWriterGap,
+    pub(crate) pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RetryAssessmentError {
+    WriterInspectionGap(WriterInspectionGap),
+    Other(String),
+}
+
+impl From<String> for RetryAssessmentError {
+    fn from(error: String) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl From<&str> for RetryAssessmentError {
+    fn from(error: &str) -> Self {
+        Self::Other(error.to_owned())
+    }
+}
+
+impl std::fmt::Display for RetryAssessmentError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WriterInspectionGap(gap) => write!(
+                formatter,
+                "incomplete external-writer inspection at {}; no new run admitted",
+                gap.path.display()
+            ),
+            Self::Other(error) => formatter.write_str(error),
+        }
+    }
+}
+mod native_retry;
+pub(crate) use native_retry::{
+    NativeInitialWorkScopePrecondition, NativeRetryNoLiveResourcesError,
+};
+pub(crate) mod native_initial;
+
 use std::{
     collections::BTreeSet,
     fmt::Write as _,
@@ -9,9 +55,10 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use phoenix_core::domain::close::{
-    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseCompletionOutcome,
-    CloseExpectedRetirementResource, CloseLossItem, CloseOwnedResourceInventory, ClosePhase,
-    CloseRetirementSnapshot, CloseRunOrdinal, CloseRunRef, CloseRunStatus, CloseStopCertainty,
+    AbsenceBasis, CapturedWorktreeIdentity, CloseAttemptId, CloseAttemptScope,
+    CloseCompletionOutcome, CloseExpectedRetirementResource, CloseLossItem,
+    CloseOwnedResourceInventory, ClosePhase, CloseRetiredResource, CloseRetirementSnapshot,
+    CloseRetirementTarget, CloseRunOrdinal, CloseRunRef, CloseRunStatus, CloseStopCertainty,
     GitOidIdentity, GitPathIdentity, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
     RetiredResourceKind, RetirementFailureReason, RetirementOutcome, WorktreeIdentity,
 };
@@ -31,21 +78,25 @@ use phoenix_tools::{
 use super::creation_worker::RepositoryMutationLock;
 use super::RuntimeManager;
 use crate::db::{
-    AdmitCloseSafeRetryRequest, BindCloseWorktreeFinalTombstoneObjectRequest,
-    BindCloseWorktreeFinalTombstoneRequest, CaptureCloseRetirementInventoryRequest,
-    CaptureCloseRetirementInventoryScopeRequest, CloseCleanupFailureAuthority,
-    CloseCleanupFailureResource, CloseCleanupResourceDisposition, CloseProcessResourceKind,
-    CloseProcessStepOutcome, CloseProcessStepSuccess, CloseRetryRequestedBy, CloseSafeRetryEffect,
-    CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
+    BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
+    CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
+    CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
+    CloseProcessResourceKind, CloseProcessStepOutcome, CloseProcessStepSuccess,
+    CloseSafeRetryEffect, CloseWorktreeFinalTombstone, RecordCloseRetirementDispatchRequest,
     RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
     ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
-    TerminalizeInitialCloseCleanupFailureRequest,
+    StoppedCloseOriginalRetirementProof, TerminalizeInitialCloseCleanupFailureRequest,
 };
 use crate::db::{
     CloseDescriptorAccess, CloseFileWriteAccess, CloseWriterAuthority, CloseWriterDetector,
     CloseWriterGap, CloseWriterObservation, CloseWriterProcess,
     RecordCloseWriterObservationRequest,
 };
+
+mod lease_custody;
+pub(crate) use lease_custody::CloseResourceLeaseStore;
+
+use lease_custody::LeaseRegistries;
 
 /// Process-local capability retained from inventory sealing through per-resource
 /// teardown. Durable inventory stores only the permit's stable instance identity.
@@ -55,6 +106,8 @@ pub(crate) struct CloseResourceLease {
     terminal: TerminalRetirementPermit,
     browser: BrowserRetirementPermit,
     resources: Vec<RetiredResourceIdentity>,
+    capture_evidence: Option<native_initial::capture_binding::CaptureEvidenceBinding>,
+    native_initial_entered: Vec<RetiredResourceKind>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -74,6 +127,163 @@ enum CloseLeaseFailure {
         reason: RetirementFailureReason,
         detail: String,
     },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CloseRetirementInventoryPreparationError {
+    BackendStorageOrUnattributed {
+        detail: String,
+    },
+    CapturedScopeIdentity {
+        scope: WorkScopeId,
+        reason: RetirementFailureReason,
+        detail: String,
+    },
+}
+
+struct CloseRetirementInventoryScopeInput {
+    scope: WorkScopeId,
+    captured_worktree: Option<CapturedWorktreeIdentity>,
+    acquired_resources: Vec<RetiredResourceIdentity>,
+}
+
+/// Read-only evidence for the exact source-owned initial inspection adapter.
+pub(crate) struct NativeInitialInspection {
+    pub(crate) request: ReplaceCloseInspectionRequest,
+    pub(crate) empty_generation: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) enum NativeInitialInspectionFailure {
+    Storage(String),
+    Scope {
+        scope: WorkScopeId,
+        reason: RetirementFailureReason,
+        detail: String,
+    },
+}
+
+/// Collect evidence without acquiring leases, changing the registry, writing to `SQLite`,
+/// or interpreting an absent worktree as a successful retirement.
+pub(crate) async fn collect_native_initial_inspection(
+    db: &phoenix_db::Database,
+    attempt_id: CloseAttemptId,
+) -> Result<NativeInitialInspection, NativeInitialInspectionFailure> {
+    use NativeInitialInspectionFailure as Failure;
+
+    let obligation = db
+        .get_close_obligation(attempt_id.as_str())
+        .await
+        .map_err(|error| Failure::Storage(error.to_string()))?;
+    if obligation.attempt_id() != &attempt_id
+        || obligation.phase() != ClosePhase::AwaitingRetirementInspection
+    {
+        return Err(Failure::Storage(
+            "initial inspection is not awaiting retirement inspection".into(),
+        ));
+    }
+    let empty_generation = (obligation.snapshot().is_some())
+        .then(|| format!("server_git_status_v2_retry_{}", uuid::Uuid::new_v4()));
+    let scopes = db
+        .list_close_attempt_scopes(attempt_id.as_str())
+        .await
+        .map_err(|error| Failure::Storage(error.to_string()))?;
+    let mut requests = Vec::with_capacity(scopes.len());
+    for captured in scopes {
+        let scope = captured.scope;
+        let identity = match captured.captured_worktree {
+            None => continue,
+            Some(CapturedWorktreeIdentity::Resolved(identity)) => identity,
+            Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
+                return Err(Failure::Scope {
+                    scope,
+                    reason: RetirementFailureReason::IdentityNotProven,
+                    detail: "captured worktree identity is unresolved".into(),
+                });
+            }
+        };
+        let actual_path = native_initial_inspection_path(&identity, scope.clone())?;
+        if observe_worktree_fingerprint(&actual_path).as_deref()
+            != Some(identity.fingerprint().as_str())
+        {
+            return Err(Failure::Scope {
+                scope,
+                reason: RetirementFailureReason::IdentityNotProven,
+                detail: "captured worktree administrative incarnation changed".into(),
+            });
+        }
+        let (snapshot, losses) =
+            inspect_worktree_at(&identity, actual_path)
+                .await
+                .map_err(|detail| Failure::Scope {
+                    scope: scope.clone(),
+                    reason: RetirementFailureReason::ManualRepairRequired,
+                    detail,
+                })?;
+        let snapshot = rotate_inspection_generation(snapshot, empty_generation.as_deref())
+            .map_err(|detail| Failure::Scope {
+                scope: scope.clone(),
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail,
+            })?;
+        requests.push(ReplaceCloseInspectionScopeRequest {
+            scope,
+            snapshot,
+            losses,
+        });
+    }
+    Ok(NativeInitialInspection {
+        request: ReplaceCloseInspectionRequest {
+            attempt_id,
+            scopes: requests,
+        },
+        empty_generation,
+    })
+}
+
+fn native_initial_inspection_path(
+    identity: &WorktreeIdentity,
+    scope: WorkScopeId,
+) -> Result<PathBuf, NativeInitialInspectionFailure> {
+    use NativeInitialInspectionFailure as Failure;
+
+    let path = worktree_path(identity);
+    let actual_path = match path.try_exists() {
+        Ok(true) => path,
+        Ok(false) => {
+            let quarantine =
+                worktree_quarantine_path(identity).map_err(|detail| Failure::Scope {
+                    scope: scope.clone(),
+                    reason: RetirementFailureReason::IdentityNotProven,
+                    detail,
+                })?;
+            match quarantine.try_exists() {
+                Ok(true) => quarantine,
+                Ok(false) => {
+                    return Err(Failure::Scope {
+                        scope,
+                        reason: RetirementFailureReason::IdentityNotProven,
+                        detail: "captured worktree is absent before inspection".into(),
+                    })
+                }
+                Err(error) => {
+                    return Err(Failure::Scope {
+                        scope,
+                        reason: RetirementFailureReason::ManualRepairRequired,
+                        detail: error.to_string(),
+                    })
+                }
+            }
+        }
+        Err(error) => {
+            return Err(Failure::Scope {
+                scope,
+                reason: RetirementFailureReason::ManualRepairRequired,
+                detail: error.to_string(),
+            })
+        }
+    };
+    Ok(actual_path)
 }
 
 impl CloseLeaseFailure {
@@ -126,10 +336,154 @@ impl std::fmt::Display for CloseLeaseFailure {
     }
 }
 
+/// Read-only candidate assessment, not admission, dispatch, or completion authority.
+#[derive(Debug)]
+pub(crate) struct NativeCloseRetryAssessment {
+    pub original: StoppedCloseOriginalRetirementProof,
+    pub remaining_effects: Vec<CloseSafeRetryEffect>,
+    pub safety_evidence: String,
+}
+
+struct CloseRetryLiveEvidence<'a> {
+    scopes: &'a [CloseAttemptScope],
+    expected: &'a [CloseExpectedRetirementResource],
+    worktree_snapshots: &'a [(CloseRetirementTarget, CloseRetirementSnapshot)],
+    retired: &'a [CloseRetiredResource],
+}
+
+#[allow(clippy::too_many_lines)]
+fn native_close_retry_remaining_effects(
+    run: &CloseRunRef,
+    proof: &StoppedCloseOriginalRetirementProof,
+    worktree_snapshots: &[(CloseRetirementTarget, CloseRetirementSnapshot)],
+) -> Result<Vec<CloseSafeRetryEffect>, String> {
+    if proof.run.run != *run || proof.run.status != CloseRunStatus::Stopped {
+        return Err("native retry assessment requires the exact stopped run".into());
+    }
+    if proof.scopes.is_empty() || proof.resources.is_empty() {
+        return Err("native retry assessment lacks original captured resources".into());
+    }
+    for (index, captured) in proof.scopes.iter().enumerate() {
+        if captured.attempt_id != run.attempt_id
+            || proof.scopes[..index]
+                .iter()
+                .any(|prior| prior.scope == captured.scope)
+        {
+            return Err(
+                "native retry assessment has duplicate or mismatched captured scopes".into(),
+            );
+        }
+        let scope_targets = proof
+            .resources
+            .iter()
+            .filter(|target| target.scope == captured.scope);
+        let work_scope =
+            opaque_resource(RetiredResourceKind::WorkScope, captured.scope.to_string());
+        if scope_targets
+            .clone()
+            .filter(|target| target.resource == work_scope)
+            .count()
+            != 1
+        {
+            return Err(
+                "native retry assessment lacks independent exact WorkScope evidence".into(),
+            );
+        }
+        let worktree_targets = scope_targets
+            .filter(|target| target.resource.kind() == RetiredResourceKind::Worktree)
+            .collect::<Vec<_>>();
+        match &captured.captured_worktree {
+            Some(CapturedWorktreeIdentity::Resolved(identity))
+                if worktree_targets.len() == 1
+                    && worktree_targets[0].resource.identity()
+                        == &LossItemIdentity::Worktree(identity.clone()) => {}
+            None if worktree_targets.is_empty() => {}
+            _ => {
+                return Err(
+                    "native retry assessment has mismatched captured worktree evidence".into(),
+                );
+            }
+        }
+        let confirmed = worktree_snapshots
+            .iter()
+            .filter(|(target, _)| target.scope == captured.scope);
+        if confirmed.count() != usize::from(captured.captured_worktree.is_some()) {
+            return Err(
+                "native retry assessment lacks a unique original worktree inspection".into(),
+            );
+        }
+    }
+    for (target, _) in worktree_snapshots {
+        if !proof
+            .scopes
+            .iter()
+            .any(|captured| captured.scope == target.scope)
+        {
+            return Err("native retry assessment has mismatched worktree snapshot evidence".into());
+        }
+    }
+    for (index, target) in proof.resources.iter().enumerate() {
+        if target.attempt_id != run.attempt_id
+            || target.snapshot != proof.snapshot
+            || !proof
+                .scopes
+                .iter()
+                .any(|captured| captured.scope == target.scope)
+            || proof.resources[..index]
+                .iter()
+                .any(|prior| prior.scope == target.scope && prior.resource == target.resource)
+        {
+            return Err(
+                "native retry assessment has duplicate or mismatched original targets".into(),
+            );
+        }
+        if target.resource.kind() == RetiredResourceKind::WorkScope
+            && target.resource
+                != opaque_resource(RetiredResourceKind::WorkScope, target.scope.to_string())
+        {
+            return Err("native retry assessment has a mismatched WorkScope identity".into());
+        }
+    }
+    for outcome in &proof.outcomes {
+        if outcome.attempt_id != run.attempt_id
+            || outcome.snapshot != proof.snapshot
+            || !proof
+                .resources
+                .iter()
+                .any(|target| target.scope == outcome.scope && target.resource == outcome.resource)
+        {
+            return Err("native retry assessment has mismatched original outcome evidence".into());
+        }
+    }
+    let mut remaining = Vec::new();
+    for target in &proof.resources {
+        let receipts = proof
+            .outcomes
+            .iter()
+            .filter(|outcome| outcome.scope == target.scope && outcome.resource == target.resource)
+            .collect::<Vec<_>>();
+        let [receipt] = receipts.as_slice() else {
+            return Err(
+                "native retry assessment requires a unique original outcome for every resource"
+                    .into(),
+            );
+        };
+        match receipt.outcome {
+            RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. } => {}
+            RetirementOutcome::Residual { .. } => remaining.push(CloseCleanupFailureResource {
+                scope: target.scope.clone(),
+                resource: target.resource.clone(),
+                disposition: CloseCleanupResourceDisposition::Failed,
+            }),
+        }
+    }
+    close_safe_retry_effects(&remaining)
+}
+
 fn close_safe_retry_effects(
     remaining_resources: &[CloseCleanupFailureResource],
 ) -> Result<Vec<CloseSafeRetryEffect>, String> {
-    let plan = remaining_resources
+    let mut plan = remaining_resources
         .iter()
         .map(|remaining| {
             if remaining.disposition == CloseCleanupResourceDisposition::Unknown
@@ -159,6 +513,9 @@ fn close_safe_retry_effects(
     {
         return Err("safe retry requires distinct exact remaining resources".into());
     }
+    // Proof/child identity order is not dispatch order. Establish dependencies
+    // before admission, which rejects work-scope teardown ahead of its resources.
+    plan.sort_by_key(close_safe_retry_effect_rank);
     Ok(plan)
 }
 
@@ -453,6 +810,7 @@ async fn run_close_process_steps<E: CloseProcessStepExecutor>(
 struct LiveCloseProcessStepExecutor<'a> {
     manager: &'a RuntimeManager,
     lease: &'a CloseResourceLease,
+    browser_custody: phoenix_tools::browser::session::BrowserRetirementCustody,
 }
 
 #[async_trait::async_trait]
@@ -563,7 +921,7 @@ impl CloseProcessStepExecutor for LiveCloseProcessStepExecutor<'_> {
         let outcome = require_browser_absent(
             self.manager
                 .browser_sessions()
-                .complete_retirement(&self.lease.browser)
+                .complete_retirement_with_custody(&self.lease.browser, self.browser_custody.clone())
                 .await,
         )
         .map_err(|reason| CloseProcessStepFailure {
@@ -585,23 +943,130 @@ impl CloseProcessStepExecutor for LiveCloseProcessStepExecutor<'_> {
     }
 }
 
-enum CloseSafeRetryTmuxError {
-    Failed(String),
-    PersistenceOrUncertain(String),
-}
-
-fn close_safe_retry_execution_order(plan: &[CloseSafeRetryEffect]) -> Vec<usize> {
-    let mut indices = (0..plan.len()).collect::<Vec<_>>();
-    indices.sort_by_key(|&index| match plan[index].resource.kind() {
+fn close_safe_retry_effect_rank(effect: &CloseSafeRetryEffect) -> u8 {
+    match effect.resource.kind() {
         RetiredResourceKind::TmuxServer => 0,
         RetiredResourceKind::Worktree => 1,
         RetiredResourceKind::WorkScope => 2,
         _ => 3,
-    });
+    }
+}
+
+pub(super) fn close_safe_retry_execution_order(plan: &[CloseSafeRetryEffect]) -> Vec<usize> {
+    let mut indices = (0..plan.len()).collect::<Vec<_>>();
+    indices.sort_by_key(|&index| close_safe_retry_effect_rank(&plan[index]));
     indices
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseRetirementInventoryPolicy {
+    LegacyDurable,
+    NativeInitial,
+}
+
+fn build_close_retirement_inventory_scope_request(
+    attempt_id: CloseAttemptId,
+    snapshot: CloseRetirementSnapshot,
+    input: CloseRetirementInventoryScopeInput,
+    policy: CloseRetirementInventoryPolicy,
+) -> Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError> {
+    let worktree = match input.captured_worktree {
+        None => None,
+        Some(CapturedWorktreeIdentity::Resolved(identity)) => Some(identity),
+        Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
+            return Err(
+                CloseRetirementInventoryPreparationError::CapturedScopeIdentity {
+                    scope: input.scope.clone(),
+                    reason: RetirementFailureReason::IdentityNotProven,
+                    detail: format!(
+                        "scope {} has unresolved captured worktree identity",
+                        input.scope
+                    ),
+                },
+            );
+        }
+    };
+    let mut inventory = CloseOwnedResourceInventory {
+        worktree,
+        work_scopes: BTreeSet::default(),
+        bash_process_groups: BTreeSet::default(),
+        tmux_servers: BTreeSet::default(),
+        pty_sessions: BTreeSet::default(),
+        browser_sessions: BTreeSet::default(),
+        equivalent_live_resources: BTreeSet::default(),
+    };
+    for resource in input.acquired_resources {
+        let kind = resource.kind();
+        if policy == CloseRetirementInventoryPolicy::LegacyDurable {
+            if kind != RetiredResourceKind::TmuxServer {
+                continue;
+            }
+            let LossItemIdentity::Opaque(identity) = resource.identity() else {
+                return Err(
+                    CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                        detail: "registry resource identity was not opaque".to_string(),
+                    },
+                );
+            };
+            inventory.tmux_servers.insert(identity.clone());
+            continue;
+        }
+
+        let target = match kind {
+            RetiredResourceKind::BashProcessGroup => &mut inventory.bash_process_groups,
+            RetiredResourceKind::TmuxServer => &mut inventory.tmux_servers,
+            RetiredResourceKind::PtySession => &mut inventory.pty_sessions,
+            RetiredResourceKind::BrowserSession => &mut inventory.browser_sessions,
+            RetiredResourceKind::Worktree
+            | RetiredResourceKind::WorkScope
+            | RetiredResourceKind::EquivalentLiveResource => {
+                return Err(
+                    CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                        detail: format!("unexpected registry resource kind {kind:?} in native initial inventory"),
+                    },
+                );
+            }
+        };
+        let LossItemIdentity::Opaque(identity) = resource.identity() else {
+            return Err(
+                CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                    detail: "registry resource identity was not opaque".to_string(),
+                },
+            );
+        };
+        target.insert(identity.clone());
+    }
+    Ok(CaptureCloseRetirementInventoryRequest {
+        attempt_id,
+        snapshot,
+        scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+            scope: input.scope,
+            inventory,
+        }],
+    })
+}
+
 impl RuntimeManager {
+    pub(crate) fn native_initial_close_writer_probe(
+        &self,
+        receipt: &phoenix_db::native_close::NativeCloseReceipt,
+        scope: WorkScopeId,
+        snapshot: CloseRetirementSnapshot,
+        resource: RetiredResourceIdentity,
+    ) -> CloseWriterProbe {
+        CloseWriterProbe {
+            persistence_uncertain: None,
+            #[cfg(test)]
+            clean_writer_fixture: self.clean_close_writer_fixture,
+            db: self.db().clone(),
+            runtime: tokio::runtime::Handle::current(),
+            run: CloseRunRef::initial(receipt.admitted.attempt_id.clone()),
+            scope,
+            snapshot,
+            resource,
+        }
+    }
+
     pub(crate) async fn complete_close_retirement_and_publish(
         &self,
         attempt_id: &CloseAttemptId,
@@ -954,11 +1419,15 @@ impl RuntimeManager {
         scope: WorkScopeId,
     ) -> Result<Vec<RetiredResourceIdentity>, String> {
         let mut leases = self.close_retirement_leases.lock().await;
-        if let Some(existing) = leases
-            .get(&(attempt_id.as_str().to_string(), scope.clone()))
-            .map(|lease| lease.resources.clone())
-        {
-            return Ok(existing);
+        let lease_key = (attempt_id.as_str().to_string(), scope.clone());
+        if leases.is_reopening(attempt_id.as_str()) {
+            return Err("Close lease reopening is incomplete".to_string());
+        }
+        if let Some(lease) = leases.complete.get(&lease_key) {
+            return Ok(lease.resources.clone());
+        }
+        if leases.has_acquisition(&lease_key) {
+            return leases.finish_acquisition(&lease_key).await;
         }
         let captured = self
             .db()
@@ -979,170 +1448,41 @@ impl RuntimeManager {
             .get_work_scope_legacy_conversation_id(&scope)
             .await
             .map_err(|error| error.to_string())?;
-        let key = ResourceScopeKey::Work(scope.clone());
-        self.bash_handles().fence_retirement_admission(&key).await;
-        let terminal = self.terminals.begin_retirement(&key);
-        let browser = self.browser_sessions().begin_retirement(&key).await;
-        let tmux_expires = phoenix_tools::tmux::registry::close_deadline();
-        let tmux_discovery = match self
-            .tmux_registry()
-            .discover_persistent_identity(
-                &key,
-                legacy_worktree_path.as_deref(),
-                legacy_conversation_id.as_deref(),
-                tmux_expires,
+        leases
+            .acquire(
+                lease_key,
+                self.close_lease_registries(),
+                legacy_worktree_path,
+                legacy_conversation_id,
             )
             .await
-        {
-            Ok(discovery) => discovery,
-            Err(error) => {
-                self.tmux_registry().fence_retirement_admission(&key).await;
-                return Err(format!("tmux identity discovery failed: {error}"));
-            }
-        };
-        let tmux = match tmux_discovery {
-            discovery @ (PersistentTmuxDiscovery::EndpointAbsent
-            | PersistentTmuxDiscovery::ServerAbsent) => match self
-                .tmux_registry()
-                .begin_retirement_after_discovery(&key, &discovery, tmux_expires)
-                .await
-            {
-                Ok(permit) => permit,
-                Err(outcome) => {
-                    self.tmux_registry().fence_retirement_admission(&key).await;
-                    return Err(format!("tmux retirement fencing failed: {outcome:?}"));
-                }
-            },
-            PersistentTmuxDiscovery::Exact(identity) => {
-                match self
-                    .tmux_registry()
-                    .rehydrate_retirement(&key, &identity, tmux_expires)
-                    .await
-                {
-                    Ok(TmuxRetirementRehydration::Permit(permit)) => permit,
-                    Ok(TmuxRetirementRehydration::AbsenceVerified) => match self
-                        .tmux_registry()
-                        .begin_retirement(&key, None, None, tmux_expires)
-                        .await
-                    {
-                        Ok(permit) => permit,
-                        Err(outcome) => {
-                            self.tmux_registry().fence_retirement_admission(&key).await;
-                            return Err(format!("tmux retirement fencing failed: {outcome:?}"));
-                        }
-                    },
-                    Ok(TmuxRetirementRehydration::Residual { reason }) => {
-                        self.tmux_registry().fence_retirement_admission(&key).await;
-                        return Err(format!("tmux identity is ambiguous: {reason}"));
-                    }
-                    Err(error) => {
-                        self.tmux_registry().fence_retirement_admission(&key).await;
-                        return Err(format!("tmux rehydration failed: {error}"));
-                    }
-                }
-            }
-            PersistentTmuxDiscovery::Ambiguous { reason } => {
-                self.tmux_registry().fence_retirement_admission(&key).await;
-                return Err(format!("tmux identity is ambiguous: {reason}"));
-            }
-        };
-        let bash = self.bash_handles().begin_retirement(&key).await;
-        let mut resources = Vec::new();
-        for target in &bash.exact_process_groups {
-            resources.push(opaque_resource(
-                RetiredResourceKind::BashProcessGroup,
-                target.stable_resource_identity(),
-            ));
+    }
+
+    fn close_lease_registries(&self) -> LeaseRegistries {
+        LeaseRegistries {
+            bash: self.bash_handles().clone(),
+            tmux: self.tmux_registry().clone(),
+            terminal: self.terminals.clone(),
+            browser: self.browser_sessions().clone(),
         }
-        if tmux.had_entry() {
-            resources.push(opaque_resource(
-                RetiredResourceKind::TmuxServer,
-                tmux.instance.stable_identity(),
-            ));
-        }
-        if let Some(instance) = &terminal.instance {
-            resources.push(opaque_resource(
-                RetiredResourceKind::PtySession,
-                instance.stable_identity(),
-            ));
-        }
-        for instance in &browser.instances {
-            resources.push(opaque_resource(
-                RetiredResourceKind::BrowserSession,
-                instance.stable_identity(),
-            ));
-        }
-        leases.insert(
-            (attempt_id.as_str().to_string(), scope),
-            CloseResourceLease {
-                bash,
-                tmux,
-                terminal,
-                browser,
-                resources: resources.clone(),
-            },
-        );
-        Ok(resources)
     }
 
     async fn discard_close_resource_leases(&self, attempt_id: &CloseAttemptId) {
         self.close_retirement_leases
             .lock()
             .await
-            .retain(|(candidate, _), _| candidate != attempt_id.as_str());
+            .discard_completed(attempt_id.as_str());
     }
 
     pub(crate) async fn cancel_close_resource_leases(
         &self,
         attempt_id: &CloseAttemptId,
     ) -> Result<(), String> {
-        let mut leases = self.close_retirement_leases.lock().await;
-        let keys = leases
-            .keys()
-            .filter(|(candidate, _)| candidate == attempt_id.as_str())
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut cancelling = Vec::with_capacity(keys.len());
-        let mut permits = Vec::with_capacity(keys.len());
-        for key in keys {
-            let Some(lease) = leases.remove(&key) else {
-                continue;
-            };
-            let CloseResourceLease {
-                bash,
-                tmux,
-                terminal,
-                browser,
-                resources,
-            } = lease;
-            cancelling.push((key, bash, terminal, browser, resources));
-            permits.push(tmux);
-        }
-        if let Err(error) = self.tmux_registry().cancel_retirement_batch(permits).await {
-            let reason = error.to_string();
-            for ((key, bash, terminal, browser, resources), tmux) in
-                cancelling.into_iter().zip(error.into_permits())
-            {
-                leases.insert(
-                    key,
-                    CloseResourceLease {
-                        bash,
-                        tmux,
-                        terminal,
-                        browser,
-                        resources,
-                    },
-                );
-            }
-            return Err(reason);
-        }
-        drop(leases);
-        for (_, bash, terminal, browser, _) in cancelling {
-            self.bash_handles().cancel_retirement(bash).await;
-            self.terminals.cancel_retirement(terminal);
-            self.browser_sessions().reopen_after_permit(browser).await;
-        }
-        Ok(())
+        self.close_retirement_leases
+            .lock()
+            .await
+            .cancel_attempt(attempt_id.as_str(), self.close_lease_registries())
+            .await
     }
 
     pub(crate) async fn cancel_close_before_retirement(
@@ -1161,92 +1501,133 @@ impl RuntimeManager {
         Ok(())
     }
 
+    /// Builds the exact durable request from captured scopes and their original leases.
+    /// This stage does not persist, classify, repair, or release custody.
+    pub(crate) async fn prepare_close_retirement_inventory(
+        &self,
+        attempt_id: CloseAttemptId,
+        snapshot: CloseRetirementSnapshot,
+    ) -> Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError>
+    {
+        self.prepare_close_retirement_inventory_with_policy(
+            attempt_id,
+            snapshot,
+            CloseRetirementInventoryPolicy::LegacyDurable,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_native_close_initial_retirement_inventory(
+        &self,
+        attempt_id: CloseAttemptId,
+        snapshot: CloseRetirementSnapshot,
+    ) -> Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError>
+    {
+        self.prepare_close_retirement_inventory_with_policy(
+            attempt_id,
+            snapshot,
+            CloseRetirementInventoryPolicy::NativeInitial,
+        )
+        .await
+    }
+
+    async fn prepare_close_retirement_inventory_with_policy(
+        &self,
+        attempt_id: CloseAttemptId,
+        snapshot: CloseRetirementSnapshot,
+        policy: CloseRetirementInventoryPolicy,
+    ) -> Result<CaptureCloseRetirementInventoryRequest, CloseRetirementInventoryPreparationError>
+    {
+        let scopes = self
+            .db()
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .map_err(|error| {
+                CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                    detail: error.to_string(),
+                }
+            })?;
+        let mut requests = Vec::with_capacity(scopes.len());
+        let mut native_scopes = Vec::new();
+        for captured in scopes {
+            if policy == CloseRetirementInventoryPolicy::NativeInitial {
+                native_scopes.push(captured.clone());
+            }
+            let resources = self
+                .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
+                .await
+                .map_err(|detail| {
+                    CloseRetirementInventoryPreparationError::CapturedScopeIdentity {
+                        scope: captured.scope.clone(),
+                        reason: RetirementFailureReason::IdentityNotProven,
+                        detail,
+                    }
+                })?;
+            let request = build_close_retirement_inventory_scope_request(
+                attempt_id.clone(),
+                snapshot.clone(),
+                CloseRetirementInventoryScopeInput {
+                    scope: captured.scope,
+                    captured_worktree: captured.captured_worktree,
+                    acquired_resources: resources,
+                },
+                policy,
+            )?;
+            requests.extend(request.scopes);
+        }
+        let request = CaptureCloseRetirementInventoryRequest {
+            attempt_id,
+            snapshot,
+            scopes: requests,
+        };
+        if policy == CloseRetirementInventoryPolicy::NativeInitial {
+            let evidence = native_initial::capture_binding::read_capture_evidence(
+                self.db(),
+                &request,
+                &native_scopes,
+            )
+            .await
+            .map_err(|detail| {
+                CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed { detail }
+            })?;
+            self.close_retirement_leases
+                .lock()
+                .await
+                .bind_capture_evidence(request.attempt_id.as_str(), &evidence)
+                .map_err(|detail| {
+                    CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                        detail,
+                    }
+                })?;
+        }
+        Ok(request)
+    }
+
     /// Acquires all scope fences, then seals the exact server-owned inventory.
-    #[allow(clippy::too_many_lines)]
     pub(crate) async fn capture_close_retirement_inventory(
         &self,
         attempt_id: CloseAttemptId,
         snapshot: CloseRetirementSnapshot,
     ) -> Result<(), String> {
-        let scopes = self
-            .db()
-            .list_close_attempt_scopes(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut requests = Vec::with_capacity(scopes.len());
-        for captured in scopes {
-            let resources = match self
-                .acquire_close_resource_lease(&attempt_id, captured.scope.clone())
-                .await
-            {
-                Ok(resources) => resources,
-                Err(reason) => {
-                    return self
-                        .route_close_attempt_to_repair(
-                            &attempt_id,
-                            &captured.scope,
-                            RetirementFailureReason::IdentityNotProven,
-                            reason,
-                        )
-                        .await;
-                }
-            };
-            let worktree = match captured.captured_worktree {
-                None => None,
-                Some(CapturedWorktreeIdentity::Resolved(identity)) => Some(identity),
-                Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
-                    return self
-                        .route_close_attempt_to_repair(
-                            &attempt_id,
-                            &captured.scope,
-                            RetirementFailureReason::IdentityNotProven,
-                            format!(
-                                "scope {} has unresolved captured worktree identity",
-                                captured.scope
-                            ),
-                        )
-                        .await;
-                }
-            };
-            let mut inventory = CloseOwnedResourceInventory {
-                worktree,
-                work_scopes: BTreeSet::default(),
-                bash_process_groups: BTreeSet::default(),
-                tmux_servers: BTreeSet::default(),
-                pty_sessions: BTreeSet::default(),
-                browser_sessions: BTreeSet::default(),
-                equivalent_live_resources: BTreeSet::default(),
-            };
-            for resource in resources {
-                if resource.kind() != RetiredResourceKind::TmuxServer {
-                    continue;
-                }
-                let LossItemIdentity::Opaque(identity) = resource.identity() else {
-                    return Err("registry resource identity was not opaque".to_string());
-                };
-                match resource.kind() {
-                    RetiredResourceKind::TmuxServer => {
-                        inventory.tmux_servers.insert(identity.clone());
-                    }
-                    kind => {
-                        return Err(format!("unexpected durable permit resource kind {kind:?}"));
-                    }
-                }
-            }
-            requests.push(CaptureCloseRetirementInventoryScopeRequest {
-                scope: captured.scope,
-                inventory,
-            });
-        }
-        match self
-            .db()
-            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
-                attempt_id: attempt_id.clone(),
-                snapshot,
-                scopes: requests,
-            })
+        let request = match self
+            .prepare_close_retirement_inventory(attempt_id.clone(), snapshot)
             .await
         {
+            Ok(request) => request,
+            Err(CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed {
+                detail,
+            }) => return Err(detail),
+            Err(CloseRetirementInventoryPreparationError::CapturedScopeIdentity {
+                scope,
+                reason,
+                detail,
+            }) => {
+                return self
+                    .route_close_attempt_to_repair(&attempt_id, &scope, reason, detail)
+                    .await;
+            }
+        };
+        match self.db().capture_close_retirement_inventory(request).await {
             Ok(_) => Ok(()),
             Err(error) => {
                 self.cancel_close_resource_leases(&attempt_id)
@@ -1344,6 +1725,7 @@ impl RuntimeManager {
             self.close_retirement_leases
                 .lock()
                 .await
+                .complete
                 .keys()
                 .filter(|(lease_attempt, _)| lease_attempt == attempt_id.as_str())
                 .map(|(_, scope)| scope.clone()),
@@ -1358,6 +1740,7 @@ impl RuntimeManager {
                 .close_retirement_leases
                 .lock()
                 .await
+                .complete
                 .contains_key(&(attempt_id.as_str().to_string(), scope.clone()));
             if !has_lease {
                 for resource in &expected {
@@ -1409,7 +1792,7 @@ impl RuntimeManager {
                         Ok(TmuxRetirementRehydration::Permit(permit)) => {
                             let outcome = self
                                 .tmux_registry()
-                                .complete_retirement(&permit)
+                                .complete_retirement(permit.as_ref())
                                 .await
                                 .map_err(|error| error.to_string())?;
                             match tmux_retirement_outcome(outcome) {
@@ -1576,122 +1959,91 @@ impl RuntimeManager {
         Ok(())
     }
 
-    /// Explicit Global-only safe retry; callers must never use this as startup recovery.
-    #[allow(clippy::too_many_lines)]
-    pub async fn retry_close_runtime_resources(
+    /// Assesses an exact stopped native operation without admitting or executing a successor.
+    pub(crate) async fn assess_native_close_retry(
         &self,
-        failed_run: CloseRunRef,
-    ) -> Result<(), String> {
-        let attempt_id = failed_run.attempt_id.clone();
-        let _execution = self
-            .close_retirement_execution
-            .lock(attempt_id.as_str())
-            .await;
-        let failure = self
-            .db()
-            .list_close_cleanup_failures(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?
-            .into_iter()
-            .find(|failure| failure.run_ordinal == failed_run.ordinal)
-            .ok_or_else(|| {
-                format!(
-                    "Close run {} has no exact retained failure",
-                    failed_run.ordinal.get()
-                )
-            })?;
-        let completion_only = matches!(
-            failure.occurrence.authority,
-            CloseCleanupFailureAuthority::AttemptInterrupted
-        );
-        let plan = if completion_only {
-            if !self
-                .db()
-                .close_retry_verified_completion_eligible(&failed_run)
-                .await
-                .map_err(|error| error.to_string())?
-            {
-                return Err(
-                    "attempt-level interruption has no verified completion authority".into(),
-                );
-            }
-            Vec::new()
-        } else {
-            close_safe_retry_effects(&failure.occurrence.remaining_resources)?
-        };
-        let snapshot = self
-            .db()
-            .get_close_obligation(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?
-            .snapshot()
-            .cloned()
-            .ok_or_else(|| "safe retry lacks original retirement snapshot".to_string())?;
-        let evidence = if completion_only {
-            "prior resource-plan run has exact durable success for every planned effect; this fresh run performs completion only".to_string()
-        } else {
-            self.validate_close_safe_retry(&attempt_id, &snapshot, &plan)
-                .await?
-        };
-        let request = AdmitCloseSafeRetryRequest {
+        failed_run: &CloseRunRef,
+    ) -> Result<NativeCloseRetryAssessment, RetryAssessmentError> {
+        self.assess_native_close_retry_with_writer_probe(
             failed_run,
-            requested_by: CloseRetryRequestedBy::Global,
-            observed_at_us: chrono::Utc::now().timestamp_micros(),
-            precondition_resolution: format!("fresh read-only exact resource checks: {evidence}"),
-            safety_evidence: evidence,
-            remaining_effects: plan,
-        };
-        let run = self
+            |original, quarantine, tombstone, clean_writer_fixture| {
+                #[cfg(not(test))]
+                let _ = clean_writer_fixture;
+                probe_retry_worktree_writers(
+                    original,
+                    quarantine,
+                    tombstone,
+                    #[cfg(test)]
+                    clean_writer_fixture,
+                )
+            },
+        )
+        .await
+    }
+
+    async fn assess_native_close_retry_with_writer_probe<F>(
+        &self,
+        failed_run: &CloseRunRef,
+        mut writer_probe: F,
+    ) -> Result<NativeCloseRetryAssessment, RetryAssessmentError>
+    where
+        F: FnMut(
+            &Path,
+            &Path,
+            Option<&CloseWorktreeFinalTombstone>,
+            bool,
+        ) -> Result<(), RetryAssessmentError>,
+    {
+        let context = self
             .db()
-            .admit_close_safe_retry(&request)
+            .read_native_close_retry_pre_admission_context(failed_run)
             .await
             .map_err(|error| error.to_string())?;
-        let plan = self
-            .db()
-            .list_close_safe_retry_effects(&run)
-            .await
-            .map_err(|error| error.to_string())?;
-        if !plan.is_empty() {
-            self.execute_close_safe_retry(&run, &snapshot, &plan)
-                .await?;
-        }
-        let broadcasters = self.close_retirement_broadcasters(&attempt_id).await?;
-        self.db()
-            .complete_close_safe_retry(&run)
-            .await
-            .map_err(|error| error.to_string())?;
-        self.discard_close_resource_leases(&attempt_id).await;
-        Self::publish_close_retirement_updates(broadcasters, true);
-        Ok(())
+        let original = context.original;
+        let worktree_snapshots = context.worktree_snapshots;
+        let remaining_effects =
+            native_close_retry_remaining_effects(failed_run, &original, &worktree_snapshots)?;
+        let safety_evidence = self
+            .validate_close_safe_retry_with_evidence(
+                &failed_run.attempt_id,
+                &original.snapshot,
+                &remaining_effects,
+                CloseRetryLiveEvidence {
+                    scopes: &original.scopes,
+                    expected: &original.resources,
+                    worktree_snapshots: &worktree_snapshots,
+                    retired: &original.outcomes,
+                },
+                &mut writer_probe,
+            )
+            .await?;
+        Ok(NativeCloseRetryAssessment {
+            original,
+            remaining_effects,
+            safety_evidence,
+        })
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn validate_close_safe_retry(
+    async fn validate_close_safe_retry_with_evidence(
         &self,
         attempt_id: &CloseAttemptId,
         snapshot: &CloseRetirementSnapshot,
         plan: &[CloseSafeRetryEffect],
-    ) -> Result<String, String> {
-        let scopes = self
-            .db()
-            .list_close_attempt_scopes(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        let expected = self
-            .db()
-            .list_close_expected_retirement_resources(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        let inspections = self
-            .db()
-            .list_close_retirement_inspections(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        let retired = self
-            .db()
-            .list_close_retirement_evidence(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
+        evidence: CloseRetryLiveEvidence<'_>,
+        writer_probe: &mut impl FnMut(
+            &Path,
+            &Path,
+            Option<&CloseWorktreeFinalTombstone>,
+            bool,
+        ) -> Result<(), RetryAssessmentError>,
+    ) -> Result<String, RetryAssessmentError> {
+        let CloseRetryLiveEvidence {
+            scopes,
+            expected,
+            worktree_snapshots,
+            retired,
+        } = evidence;
         for effect in plan {
             if !expected
                 .iter()
@@ -1702,7 +2054,7 @@ impl RuntimeManager {
             }
         }
         let mut observations = Vec::new();
-        for captured in &scopes {
+        for captured in scopes {
             let scope = &captured.scope;
             if self
                 .db()
@@ -1710,7 +2062,7 @@ impl RuntimeManager {
                 .await
                 .map_err(|error| error.to_string())?
             {
-                return Err(format!("scope {scope} has unresolved ownership"));
+                return Err(format!("scope {scope} has unresolved ownership").into());
             }
             let planned = plan
                 .iter()
@@ -1723,12 +2075,13 @@ impl RuntimeManager {
                 {
                     return Err(format!(
                         "scope {scope} has a retry effect outside sealed original inventory"
-                    ));
+                    )
+                    .into());
                 }
             }
             match &captured.captured_worktree {
                 Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
-                    return Err(format!("scope {scope} has unresolved worktree identity"));
+                    return Err(format!("scope {scope} has unresolved worktree identity").into());
                 }
                 Some(CapturedWorktreeIdentity::Resolved(identity)) => {
                     let path = worktree_path(identity);
@@ -1751,23 +2104,33 @@ impl RuntimeManager {
                     } else {
                         None
                     };
-                    probe_retry_worktree_writers(&path, &quarantine, tombstone.as_ref())?;
+                    writer_probe(
+                        &path,
+                        &quarantine,
+                        tombstone.as_ref(),
+                        #[cfg(test)]
+                        self.clean_close_writer_fixture,
+                        #[cfg(not(test))]
+                        false,
+                    )?;
                     if let Some(tombstone) = &tombstone {
                         let object = tombstone.root.join("object");
                         if object.try_exists().map_err(|error| error.to_string())? {
-                            let confirmed = inspections
+                            let confirmed = worktree_snapshots
                                 .iter()
-                                .find(|inspection| inspection.target.scope == *scope)
+                                .find(|(target, _)| target.scope == *scope)
                                 .ok_or_else(|| {
                                     format!("scope {scope} lacks a confirmed worktree inspection")
                                 })?;
-                            verify_retained_worktree(identity, object, &confirmed.snapshot).await?;
+                            verify_retained_worktree(identity, object, &confirmed.1).await?;
                         }
                     }
                     let active = path.try_exists().map_err(|error| error.to_string())?;
                     let quarantined = quarantine.try_exists().map_err(|error| error.to_string())?;
                     if active && quarantined {
-                        return Err(format!("scope {scope} has ambiguous worktree locations"));
+                        return Err(
+                            format!("scope {scope} has ambiguous worktree locations").into()
+                        );
                     }
                     let selected = if active {
                         Some(path)
@@ -1782,26 +2145,28 @@ impl RuntimeManager {
                         {
                             return Err(format!(
                                 "scope {scope} captured worktree fingerprint changed"
-                            ));
+                            )
+                            .into());
                         }
                         if planned
                             .iter()
                             .any(|effect| effect.resource.kind() == RetiredResourceKind::Worktree)
                         {
-                            let confirmed = inspections
+                            let confirmed = worktree_snapshots
                                 .iter()
-                                .find(|inspection| inspection.target.scope == *scope)
+                                .find(|(target, _)| target.scope == *scope)
                                 .ok_or_else(|| {
                                     format!("scope {scope} lacks a confirmed worktree inspection")
                                 })?;
                             ensure_no_ignored_content(&path)?;
                             let (fresh, losses) = inspect_worktree_at(identity, path).await?;
-                            if fresh.fingerprint() != confirmed.snapshot.fingerprint()
+                            if fresh.fingerprint() != confirmed.1.fingerprint()
                                 || !losses.is_empty()
                             {
                                 return Err(format!(
                                     "scope {scope} worktree is not unchanged and reconstructible"
-                                ));
+                                )
+                                .into());
                             }
                         }
                         observations.push(format!(
@@ -1826,11 +2191,7 @@ impl RuntimeManager {
                                     RetirementOutcome::Retired
                                         | RetirementOutcome::AbsenceAdopted { .. }
                                 )
-                        }) || self
-                            .db()
-                            .close_resource_has_retry_success(attempt_id, scope, &target.resource)
-                            .await
-                            .map_err(|error| error.to_string())?;
+                        });
                         let dispatched = self
                             .db()
                             .close_retirement_resource_was_dispatched(
@@ -1852,9 +2213,12 @@ impl RuntimeManager {
                             .await
                             .map_err(|error| error.to_string())?;
                         if !prior_success && (!dispatched || cleanup.is_none()) {
-                            return Err(format!(
-                                "scope {scope} absent worktree has no exact prior proof or cleanup authority"
-                            ));
+                            return Err(
+                                format!(
+                                    "scope {scope} absent worktree has no exact prior proof or cleanup authority"
+                                )
+                                .into(),
+                            );
                         }
                         observations.push(format!(
                             "{scope}: absence bound to original captured worktree"
@@ -1871,7 +2235,8 @@ impl RuntimeManager {
                         {
                             return Err(format!(
                                 "scope {scope} worktree retry lacks its exact captured identity"
-                            ));
+                            )
+                            .into());
                         }
                     }
                     RetiredResourceKind::TmuxServer => {
@@ -1917,7 +2282,8 @@ impl RuntimeManager {
                                 {
                                     return Err(format!(
                                         "scope {scope} tmux absence lacks original dispatch"
-                                    ));
+                                    )
+                                    .into());
                                 }
                                 observations.push(format!(
                                     "{scope}: dispatched exact tmux {} absent",
@@ -1927,7 +2293,8 @@ impl RuntimeManager {
                             _ => {
                                 return Err(format!(
                                     "scope {scope} tmux identity differs or is ambiguous"
-                                ));
+                                )
+                                .into());
                             }
                         }
                     }
@@ -1940,7 +2307,8 @@ impl RuntimeManager {
                         {
                             return Err(format!(
                                 "scope {scope} retry identity differs from captured scope"
-                            ));
+                            )
+                            .into());
                         }
                         observations
                             .push(format!("{scope}: original work-scope ownership checked"));
@@ -1955,218 +2323,6 @@ impl RuntimeManager {
             return Err("safe retry has no verifiable scope observations".into());
         }
         Ok(observations.join("; "))
-    }
-
-    async fn execute_close_safe_retry(
-        &self,
-        run: &CloseRunRef,
-        snapshot: &CloseRetirementSnapshot,
-        plan: &[CloseSafeRetryEffect],
-    ) -> Result<(), String> {
-        for index in close_safe_retry_execution_order(plan) {
-            let effect = &plan[index];
-            if effect.resource.kind() != RetiredResourceKind::TmuxServer {
-                continue;
-            }
-            match self.retry_close_tmux(run, snapshot, effect).await {
-                Ok(()) => {}
-                Err(CloseSafeRetryTmuxError::Failed(detail)) => {
-                    return self
-                        .terminalize_close_safe_retry_failure(run, snapshot, effect, &detail)
-                        .await;
-                }
-                Err(CloseSafeRetryTmuxError::PersistenceOrUncertain(detail)) => {
-                    return Err(format!(
-                        "retry tmux effect may have completed but exact success was not durably established; startup observation will classify the still-running run: {detail}"
-                    ));
-                }
-            }
-        }
-        let durable_plan = plan
-            .iter()
-            .filter(|effect| {
-                matches!(
-                    effect.resource.kind(),
-                    RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope
-                )
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if durable_plan.is_empty() {
-            return Ok(());
-        }
-        if let Err(detail) = self
-            .retire_close_worktrees_and_scopes(run, snapshot, Some(&durable_plan))
-            .await
-        {
-            let retained = self
-                .db()
-                .get_close_run(run)
-                .await
-                .map_err(|error| error.to_string())?;
-            if retained.status == CloseRunStatus::Running {
-                return Err(format!(
-                    "retry execution stopped before further effects; startup observation will classify the still-running exact run: {detail}"
-                ));
-            }
-            return Err(detail);
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    async fn retry_close_tmux(
-        &self,
-        run: &CloseRunRef,
-        snapshot: &CloseRetirementSnapshot,
-        effect: &CloseSafeRetryEffect,
-    ) -> Result<(), CloseSafeRetryTmuxError> {
-        let LossItemIdentity::Opaque(value) = effect.resource.identity() else {
-            return Err(CloseSafeRetryTmuxError::Failed(
-                "tmux retry identity is not opaque".into(),
-            ));
-        };
-        let identity = TmuxServerInstanceIdentity::parse_stable_identity(value.as_str())
-            .ok_or_else(|| {
-                CloseSafeRetryTmuxError::Failed("tmux retry identity is malformed".to_string())
-            })?;
-        let key = ResourceScopeKey::Work(effect.scope.clone());
-        let captured = self
-            .db()
-            .list_close_attempt_scopes(run.attempt_id.as_str())
-            .await
-            .map_err(|error| CloseSafeRetryTmuxError::Failed(error.to_string()))?
-            .into_iter()
-            .find(|captured| captured.scope == effect.scope)
-            .ok_or_else(|| {
-                CloseSafeRetryTmuxError::Failed("tmux retry scope was not captured".to_string())
-            })?;
-        let legacy_path = match captured.captured_worktree {
-            Some(CapturedWorktreeIdentity::Resolved(id)) => Some(worktree_path(&id)),
-            _ => None,
-        };
-        let discovery = self
-            .tmux_registry()
-            .discover_persistent_identity(
-                &key,
-                legacy_path.as_deref(),
-                None,
-                phoenix_tools::tmux::registry::close_deadline(),
-            )
-            .await
-            .map_err(|error| CloseSafeRetryTmuxError::Failed(error.to_string()))?;
-        if !matches!(discovery, PersistentTmuxDiscovery::Exact(ref observed) if observed == &identity)
-            && !matches!(
-                discovery,
-                PersistentTmuxDiscovery::EndpointAbsent | PersistentTmuxDiscovery::ServerAbsent
-            )
-        {
-            return Err(CloseSafeRetryTmuxError::Failed(
-                "tmux retry discovery found an ambiguous or different server".into(),
-            ));
-        }
-        let rehydrated = self
-            .tmux_registry()
-            .rehydrate_retirement(
-                &key,
-                &identity,
-                phoenix_tools::tmux::registry::close_deadline(),
-            )
-            .await
-            .map_err(|error| CloseSafeRetryTmuxError::Failed(error.to_string()))?;
-        match rehydrated {
-            TmuxRetirementRehydration::Permit(permit) => {
-                let outcome = self
-                    .tmux_registry()
-                    .complete_retirement(&permit)
-                    .await
-                    .map_err(|error| {
-                        CloseSafeRetryTmuxError::PersistenceOrUncertain(error.to_string())
-                    })?;
-                match tmux_retirement_outcome(outcome) {
-                    Ok(RetirementOutcome::Retired) => self
-                        .record_close_retired(
-                            run,
-                            snapshot,
-                            &effect.scope,
-                            effect.resource.clone(),
-                            "exact retry tmux permit retirement",
-                        )
-                        .await
-                        .map_err(CloseSafeRetryTmuxError::PersistenceOrUncertain),
-                    Ok(RetirementOutcome::AbsenceAdopted { .. }) => self
-                        .record_close_absence_adopted(
-                            run,
-                            snapshot,
-                            &effect.scope,
-                            effect.resource.clone(),
-                            "exact retry tmux permit absence",
-                        )
-                        .await
-                        .map_err(CloseSafeRetryTmuxError::PersistenceOrUncertain),
-                    Ok(RetirementOutcome::Residual { .. }) => Err(CloseSafeRetryTmuxError::Failed(
-                        "tmux retry remains residual".into(),
-                    )),
-                    Err((_, detail)) => Err(CloseSafeRetryTmuxError::Failed(detail)),
-                }
-            }
-            TmuxRetirementRehydration::AbsenceVerified => self
-                .record_close_absence_adopted(
-                    run,
-                    snapshot,
-                    &effect.scope,
-                    effect.resource.clone(),
-                    "exact retry tmux absence",
-                )
-                .await
-                .map_err(CloseSafeRetryTmuxError::PersistenceOrUncertain),
-            TmuxRetirementRehydration::Residual { reason } => {
-                Err(CloseSafeRetryTmuxError::Failed(reason))
-            }
-        }
-    }
-
-    async fn terminalize_close_safe_retry_failure(
-        &self,
-        run: &CloseRunRef,
-        snapshot: &CloseRetirementSnapshot,
-        failed: &CloseSafeRetryEffect,
-        detail: &str,
-    ) -> Result<(), String> {
-        let progress = self
-            .db()
-            .close_safe_retry_progress(run)
-            .await
-            .map_err(|error| error.to_string())?;
-        if !progress.pending.contains(failed) {
-            return Err("retry failure is not a pending exact-run effect".into());
-        }
-        let remaining_resources = progress
-            .pending
-            .iter()
-            .map(|effect| CloseCleanupFailureResource {
-                scope: effect.scope.clone(),
-                resource: effect.resource.clone(),
-                disposition: if effect == failed {
-                    CloseCleanupResourceDisposition::Failed
-                } else {
-                    CloseCleanupResourceDisposition::Unattempted
-                },
-            })
-            .collect();
-        self.terminalize_close_cleanup_failure(
-            run,
-            CloseCleanupFailureAuthority::ExpectedResource {
-                scope: failed.scope.clone(),
-                snapshot: snapshot.clone(),
-                resource: failed.resource.clone(),
-            },
-            remaining_resources,
-            RetirementFailureReason::IdentityNotProven,
-            detail,
-            CloseStopCertainty::ShutdownUncertain,
-        )
-        .await
     }
 
     async fn validate_close_worktrees_before_runtime_retirement(
@@ -2428,6 +2584,7 @@ impl RuntimeManager {
                             let identity = identity.clone();
                             let cleanup_plan = cleanup_plan.clone();
                             let writer_probe = CloseWriterProbe {
+                                persistence_uncertain: None,
                                 #[cfg(test)]
                                 clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
@@ -2569,6 +2726,7 @@ impl RuntimeManager {
                             let confirmed_snapshot = confirmed.snapshot;
                             let identity = identity.clone();
                             let writer_probe = CloseWriterProbe {
+                                persistence_uncertain: None,
                                 #[cfg(test)]
                                 clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
@@ -2767,6 +2925,7 @@ impl RuntimeManager {
                             let runtime = tokio::runtime::Handle::current();
                             let persistence_runtime = runtime.clone();
                             let writer_probe = CloseWriterProbe {
+                                persistence_uncertain: None,
                                 #[cfg(test)]
                                 clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
@@ -3096,7 +3255,7 @@ impl RuntimeManager {
             .await
             .map_err(|error| error.to_string())?;
         let leases = self.close_retirement_leases.lock().await;
-        for ((lease_attempt, scope), lease) in leases.iter() {
+        for ((lease_attempt, scope), lease) in &leases.complete {
             if lease_attempt != attempt_id.as_str() {
                 continue;
             }
@@ -3573,11 +3732,23 @@ impl RuntimeManager {
         expected: &[RetiredResourceIdentity],
     ) -> Result<(), CloseLeaseFailure> {
         let key = (run.attempt_id.as_str().to_string(), scope.clone());
-        let lease = self.close_retirement_leases.lock().await.remove(&key);
-        let Some(lease) = lease else {
+        // Keep both the store guard and the original entry in place across every
+        // await. The lease owns the sole process-epoch permits; removing it here
+        // would let cancellation drop that custody before any reinsertion.
+        let leases = self.close_retirement_leases.lock().await;
+        #[cfg(test)]
+        let completion_hook = leases.completion_hook.clone();
+        let Some(lease) = leases.complete.get(&key) else {
             return Err(CloseLeaseFailure::Unavailable);
         };
-        let result = async {
+        #[cfg(test)]
+        if let Some(hook) = completion_hook {
+            // This must stay after lease lookup, before the first awaited step,
+            // so cancellation exercises custody rather than only lock admission.
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
+        async {
             if expected.iter().any(|resource| {
                 resource.kind() != RetiredResourceKind::TmuxServer
                     || !lease.resources.contains(resource)
@@ -3609,7 +3780,11 @@ impl RuntimeManager {
             };
             let mut executor = LiveCloseProcessStepExecutor {
                 manager: self,
-                lease: &lease,
+                lease,
+                // Legacy execution does not transfer native source/target custody.
+                browser_custody: phoenix_tools::browser::session::BrowserRetirementCustody::new(
+                    std::sync::Arc::new(()),
+                ),
             };
             run_close_process_steps(
                 self.db(),
@@ -3622,9 +3797,7 @@ impl RuntimeManager {
             )
             .await
         }
-        .await;
-        self.close_retirement_leases.lock().await.insert(key, lease);
-        result
+        .await
     }
 }
 
@@ -3638,23 +3811,134 @@ async fn inspect_worktree_at(
     identity: &WorktreeIdentity,
     path: PathBuf,
 ) -> Result<(CloseRetirementSnapshot, Vec<CloseLossItem>), String> {
-    if observe_worktree_fingerprint(&path).as_deref() != Some(identity.fingerprint().as_str()) {
+    // One compatibility budget covers the complete top-level worktree inspection.
+    inspect_worktree_at_until(
+        identity,
+        path,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .await
+}
+
+async fn inspect_worktree_at_until(
+    identity: &WorktreeIdentity,
+    path: PathBuf,
+    deadline: std::time::Instant,
+) -> Result<(CloseRetirementSnapshot, Vec<CloseLossItem>), String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("worktree inspection exceeded its deadline".to_string());
+    }
+    let identity = identity.clone();
+    tokio::task::spawn_blocking(move || {
+        inspect_worktree_at_with_policy_until(
+            &identity,
+            &path,
+            deadline,
+            WorktreeInspectionPolicy::Legacy,
+            &mut run_bounded_spawned_git,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorktreeInspectionPolicy {
+    Legacy,
+    ReadOnlyClean,
+}
+
+/// Synchronous inspection for a future native worker. Call outside `SQLite` writer
+/// admission: only the supplied Git leaf may enter spawn admission. Filesystem
+/// checks are cooperative with the same absolute deadline, not interruptible IO.
+/// Until native scratch-index mutation has its own authority, refuse hidden
+/// suppression, every gitlink (including uninitialized ones), detached HEAD and
+/// dirty status. Successful results use the full legacy observation builder, not
+/// a status-only clean proof or a separate snapshot generation.
+/// Ignored content retains legacy snapshot semantics; deletion still needs the
+/// separate ignored-content guard and its own exact mutation authority.
+fn inspect_worktree_at_with_git_leaf_until(
+    identity: &WorktreeIdentity,
+    path: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<(CloseRetirementSnapshot, Vec<CloseLossItem>), String> {
+    inspect_worktree_at_with_policy_until(
+        identity,
+        path,
+        deadline,
+        WorktreeInspectionPolicy::ReadOnlyClean,
+        git_leaf,
+    )
+}
+
+fn inspect_worktree_at_with_policy_until(
+    identity: &WorktreeIdentity,
+    path: &Path,
+    deadline: std::time::Instant,
+    policy: WorktreeInspectionPolicy,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<(CloseRetirementSnapshot, Vec<CloseLossItem>), String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("worktree inspection exceeded its deadline".to_string());
+    }
+    if observe_worktree_fingerprint(path).as_deref() != Some(identity.fingerprint().as_str()) {
         return Err("captured worktree administrative incarnation changed".to_string());
     }
-    let status_path = path.clone();
-    let output = tokio::task::spawn_blocking(move || run_bounded_git_status(&status_path))
-        .await
-        .map_err(|error| error.to_string())??;
+    let output = run_bounded_git_status_with_leaf_until(path, deadline, git_leaf)?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     let mut observation = canonical_status_observation(&output.stdout);
+    let ignored_paths = observe_ignored_paths_with_leaf_until(path, deadline, git_leaf)?;
+    append_ignored_paths(&mut observation, &ignored_paths);
+    if policy == WorktreeInspectionPolicy::ReadOnlyClean && !observation.is_empty() {
+        return Err("native worktree inspection does not yet support dirty status".to_string());
+    }
     let mut losses = parse_status_losses(&output.stdout);
-    let hidden_path = path.clone();
-    let hidden_dirty =
-        tokio::task::spawn_blocking(move || observe_hidden_worktree_changes(&hidden_path))
-            .await
-            .map_err(|error| error.to_string())??;
+    losses.extend(
+        ignored_paths
+            .iter()
+            .cloned()
+            .map(CloseLossItem::IgnoredPath),
+    );
+    losses.sort_by_key(|loss| (loss.category().as_str(), loss.identity().value()));
+    losses.dedup();
+    let hidden_dirty = match policy {
+        WorktreeInspectionPolicy::Legacy => {
+            observe_hidden_worktree_changes_with_leaf_until(path, deadline, git_leaf)?
+        }
+        WorktreeInspectionPolicy::ReadOnlyClean => {
+            // Unlike the legacy hidden-change observer, this probe does not copy
+            // or mutate an index, even temporarily. Refuse suppression itself,
+            // rather than treating a clean porcelain result as sufficient proof.
+            let flags = run_bounded_git_command_with_leaf_until(
+                path,
+                &["ls-files", "-v", "-z", "--"],
+                None,
+                deadline,
+                "hidden-index inspection",
+                git_leaf,
+            )?;
+            if !flags.status.success() {
+                return Err(format!(
+                    "cannot inspect hidden index flags: {}",
+                    String::from_utf8_lossy(&flags.stderr).trim()
+                ));
+            }
+            // `-v` lowercases any assume-unchanged tag, not only `H`.
+            if flags.stdout.split(|byte| *byte == 0).any(|row| {
+                row.first()
+                    .is_some_and(|flag| *flag == b'S' || flag.is_ascii_lowercase())
+            }) {
+                return Err(
+                    "native worktree inspection does not yet support hidden index suppression"
+                        .to_string(),
+                );
+            }
+            Vec::new()
+        }
+    };
     for path in hidden_dirty {
         observation.extend_from_slice(b"HIDDEN_UNSTAGED\\0");
         observation.extend_from_slice(path.as_bytes());
@@ -3663,64 +3947,130 @@ async fn inspect_worktree_at(
     }
     losses.sort_by_key(|loss| (loss.category().as_str(), loss.identity().value()));
     losses.dedup();
-    let content_path = path.clone();
-    let content_losses = losses.clone();
     let content_observation =
-        tokio::task::spawn_blocking(move || observe_dirty_content(&content_path, &content_losses))
-            .await
-            .map_err(|error| error.to_string())??;
+        observe_dirty_content_with_leaf_until(path, &losses, deadline, git_leaf)?;
     observation.extend_from_slice(&content_observation);
-    observe_detached_head_and_submodules(&path, &mut observation, &mut losses).await?;
-    Ok((snapshot_for(&observation), losses))
+    observe_detached_head_and_submodules_with_leaf_until(
+        path,
+        &mut observation,
+        &mut losses,
+        deadline,
+        policy,
+        git_leaf,
+    )?;
+    let snapshot = snapshot_for(&observation);
+    if std::time::Instant::now() >= deadline {
+        return Err("worktree inspection exceeded its deadline".to_string());
+    }
+    Ok((snapshot, losses))
 }
 
-type WorktreeObservation = Vec<(Vec<u8>, Vec<u8>)>;
-
-async fn observe_detached_head_and_submodules(
+fn observe_detached_head_and_submodules_with_leaf_until(
     path: &Path,
     observation: &mut Vec<u8>,
     losses: &mut Vec<CloseLossItem>,
+    deadline: std::time::Instant,
+    policy: WorktreeInspectionPolicy,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<(), String> {
-    let path = path.to_path_buf();
-    let loss_path = path.clone();
-    let observed = tokio::task::spawn_blocking(move || -> Result<WorktreeObservation, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("detached head inspection exceeded its deadline".to_string());
+    }
+    let (observed, unreachable) = {
+        if std::time::Instant::now() >= deadline {
+            return Err("detached head inspection exceeded its deadline".to_string());
+        }
         let mut visited = std::collections::HashSet::new();
         visited.insert(path.canonicalize().map_err(|error| error.to_string())?);
-        let mut symbolic = phoenix_core::git::command();
-        bind_git_command_to_worktree(&mut symbolic, &path)?;
-        let symbolic = symbolic
-            .args(["symbolic-ref", "-q", "HEAD"])
-            .output()
-            .map_err(|error| error.to_string())?;
+        let symbolic = run_bounded_git_command_with_leaf_until(
+            path,
+            &["symbolic-ref", "-q", "HEAD"],
+            None,
+            deadline,
+            "detached head inspection",
+            git_leaf,
+        )?;
         let mut result = Vec::new();
+        let mut detached_head = None;
         if symbolic.status.success() {
             result.push((
                 b"HEAD_SYMBOLIC".to_vec(),
                 symbolic.stdout.trim_ascii().to_vec(),
             ));
         } else {
-            let mut head = phoenix_core::git::command();
-            bind_git_command_to_worktree(&mut head, &path)?;
-            let head = head
-                .args(["rev-parse", "--verify", "HEAD"])
-                .output()
-                .map_err(|error| error.to_string())?;
+            if policy == WorktreeInspectionPolicy::ReadOnlyClean {
+                return Err(
+                    "native worktree inspection does not yet support detached HEAD".to_string(),
+                );
+            }
+            let head = run_bounded_git_command_with_leaf_until(
+                path,
+                &["rev-parse", "--verify", "HEAD"],
+                None,
+                deadline,
+                "detached head inspection",
+                git_leaf,
+            )?;
             if !head.status.success() {
                 return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
             }
             let head_oid = head.stdout.trim_ascii().to_vec();
             result.push((b"HEAD".to_vec(), head_oid.clone()));
-            result.push((
-                b"DETACHED".to_vec(),
-                detached_reachability_evidence(&path, &head_oid)?,
-            ));
+            let evidence = detached_reachability_evidence_with_leaf_until(
+                path, &head_oid, deadline, git_leaf,
+            )?;
+            result.push((b"DETACHED".to_vec(), evidence.clone()));
+            detached_head = evidence.is_empty().then_some(head_oid);
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        observe_initialized_submodules(&path, &[], &mut result, deadline, &mut visited)?;
-        Ok(result)
-    })
-    .await
-    .map_err(|error| error.to_string())??;
+        match policy {
+            WorktreeInspectionPolicy::Legacy => {
+                observe_initialized_submodules_with_leaf_until(
+                    path,
+                    &[],
+                    &mut result,
+                    deadline,
+                    &mut visited,
+                    git_leaf,
+                )?;
+            }
+            WorktreeInspectionPolicy::ReadOnlyClean => {
+                let gitlinks = observe_gitlink_index_with_leaf_until(
+                    path,
+                    &[],
+                    &mut result,
+                    deadline,
+                    git_leaf,
+                )?;
+                if !gitlinks.is_empty() {
+                    return Err(
+                        "native worktree inspection does not yet support gitlinks".to_string()
+                    );
+                }
+            }
+        }
+        let unreachable = if let Some(head_oid) = detached_head {
+            detached_unreachable_commits_with_leaf_until(path, &head_oid, deadline, git_leaf)?
+        } else {
+            Vec::new()
+        };
+        if std::time::Instant::now() >= deadline {
+            return Err("detached head inspection exceeded its deadline".to_string());
+        }
+        (result, unreachable)
+    };
+    append_detached_and_submodule_observation(observed, &unreachable, observation, losses)?;
+    if std::time::Instant::now() >= deadline {
+        return Err("detached head inspection exceeded its deadline".to_string());
+    }
+    Ok(())
+}
+
+fn append_detached_and_submodule_observation(
+    observed: WorktreeObservation,
+    unreachable: &[Vec<u8>],
+    observation: &mut Vec<u8>,
+    losses: &mut Vec<CloseLossItem>,
+) -> Result<(), String> {
     let head_oid = observed
         .iter()
         .find_map(|(tag, value)| (tag == b"HEAD").then_some(value.clone()));
@@ -3730,15 +4080,15 @@ async fn observe_detached_head_and_submodules(
         observation.extend_from_slice(&value);
         observation.push(0);
         if tag == b"DETACHED" && value.is_empty() {
-            let head = head_oid
-                .as_ref()
-                .ok_or_else(|| "detached worktree has no resolved HEAD".to_string())?;
-            for oid in detached_unreachable_commits(&loss_path, head)? {
+            if head_oid.is_none() {
+                return Err("detached worktree has no resolved HEAD".to_string());
+            }
+            for oid in unreachable {
                 observation.extend_from_slice(b"DETACHED_UNREACHABLE\0");
-                observation.extend_from_slice(&oid);
+                observation.extend_from_slice(oid);
                 observation.push(0);
                 losses.push(CloseLossItem::DetachedUnreachableCommit(
-                    GitOidIdentity::parse_hex(String::from_utf8_lossy(&oid).trim())
+                    GitOidIdentity::parse_hex(String::from_utf8_lossy(oid).trim())
                         .map_err(|error| error.to_string())?,
                 ));
             }
@@ -3754,6 +4104,7 @@ async fn observe_detached_head_and_submodules(
                 b"staged" => CloseLossItem::StagedTrackedPath(path),
                 b"unstaged" => CloseLossItem::UnstagedTrackedPath(path),
                 b"untracked" => CloseLossItem::UntrackedNonIgnoredPath(path),
+                b"ignored" => CloseLossItem::IgnoredPath(path),
                 b"submodule" => CloseLossItem::InitializedSubmoduleState(path),
                 b"detached" => CloseLossItem::DetachedUnreachableCommit(
                     GitOidIdentity::parse_hex(String::from_utf8_lossy(path.as_bytes()).trim())
@@ -3766,32 +4117,66 @@ async fn observe_detached_head_and_submodules(
     Ok(())
 }
 
+type WorktreeObservation = Vec<(Vec<u8>, Vec<u8>)>;
+
+#[cfg(test)]
 fn detached_head_is_unreachable(
     repository: &Path,
     observation: &mut WorktreeObservation,
     relative_path: &[u8],
+    deadline: std::time::Instant,
 ) -> Result<bool, String> {
-    let mut symbolic = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut symbolic, repository)?;
-    let detached = !symbolic
-        .args(["symbolic-ref", "-q", "HEAD"])
-        .status()
-        .map_err(|error| error.to_string())?
-        .success();
+    detached_head_is_unreachable_with_leaf_until(
+        repository,
+        observation,
+        relative_path,
+        deadline,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn detached_head_is_unreachable_with_leaf_until(
+    repository: &Path,
+    observation: &mut WorktreeObservation,
+    relative_path: &[u8],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<bool, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("detached head inspection exceeded its deadline".to_string());
+    }
+    let symbolic = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["symbolic-ref", "-q", "HEAD"],
+        None,
+        deadline,
+        "detached head inspection",
+        git_leaf,
+    )?;
+    let detached = !symbolic.status.success();
     if !detached {
+        if std::time::Instant::now() >= deadline {
+            return Err("detached head inspection exceeded its deadline".to_string());
+        }
         return Ok(false);
     }
-    let mut head = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut head, repository)?;
-    let head = head
-        .args(["rev-parse", "--verify", "HEAD"])
-        .output()
-        .map_err(|error| error.to_string())?;
+    let head = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["rev-parse", "--verify", "HEAD"],
+        None,
+        deadline,
+        "detached head inspection",
+        git_leaf,
+    )?;
     if !head.status.success() {
         return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
     }
     let head_oid = head.stdout.trim_ascii().to_vec();
-    let evidence = detached_reachability_evidence(repository, &head_oid)?;
+    let evidence =
+        detached_reachability_evidence_with_leaf_until(repository, &head_oid, deadline, git_leaf)?;
+    if std::time::Instant::now() >= deadline {
+        return Err("detached head inspection exceeded its deadline".to_string());
+    }
     observation.push((
         [b"SUBMODULE_DETACHED\0".as_slice(), relative_path].concat(),
         evidence.clone(),
@@ -3799,32 +4184,71 @@ fn detached_head_is_unreachable(
     Ok(evidence.is_empty())
 }
 
+// Retained for direct compatibility assertions in the unit tests only.
+#[cfg(test)]
 fn detached_unreachable_commits(
     repository: &Path,
     head_oid: &[u8],
 ) -> Result<Vec<Vec<u8>>, String> {
+    detached_unreachable_commits_until(
+        repository,
+        head_oid,
+        std::time::Instant::now() + std::time::Duration::from_secs(5),
+    )
+}
+
+#[cfg(test)]
+fn detached_unreachable_commits_until(
+    repository: &Path,
+    head_oid: &[u8],
+    deadline: std::time::Instant,
+) -> Result<Vec<Vec<u8>>, String> {
+    detached_unreachable_commits_with_leaf_until(
+        repository,
+        head_oid,
+        deadline,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn detached_unreachable_commits_with_leaf_until(
+    repository: &Path,
+    head_oid: &[u8],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<Vec<u8>>, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("detached commit reachability exceeded its deadline".to_string());
+    }
     let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
-    let mut stash = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut stash, repository)?;
-    let stash_exists = stash
-        .args(["show-ref", "--verify", "--quiet", "refs/stash"])
-        .status()
-        .map_err(|error| error.to_string())?
-        .success();
-    let mut command = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut command, repository)?;
-    command.args([
+    let stash = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["show-ref", "--verify", "--quiet", "refs/stash"],
+        None,
+        deadline,
+        "detached commit reachability",
+        git_leaf,
+    )?;
+    let stash_exists = stash.status.success();
+    let mut arguments = vec![
         "rev-list",
         head_text,
         "--not",
         "--branches",
         "--remotes",
         "--tags",
-    ]);
+    ];
     if stash_exists {
-        command.arg("refs/stash");
+        arguments.push("refs/stash");
     }
-    let output = command.output().map_err(|error| error.to_string())?;
+    let output = run_bounded_git_command_with_leaf_until(
+        repository,
+        &arguments,
+        None,
+        deadline,
+        "detached commit reachability",
+        git_leaf,
+    )?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
@@ -3836,12 +4260,33 @@ fn detached_unreachable_commits(
         .collect())
 }
 
-fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<Vec<u8>, String> {
+#[cfg(test)]
+fn detached_reachability_evidence_until(
+    repository: &Path,
+    head_oid: &[u8],
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
+    detached_reachability_evidence_with_leaf_until(
+        repository,
+        head_oid,
+        deadline,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn detached_reachability_evidence_with_leaf_until(
+    repository: &Path,
+    head_oid: &[u8],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<u8>, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("detached reachability evidence exceeded its deadline".to_string());
+    }
     let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
-    let mut reachable = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut reachable, repository)?;
-    let reachable = reachable
-        .args([
+    let reachable = run_bounded_git_command_with_leaf_until(
+        repository,
+        &[
             "for-each-ref",
             "--contains",
             head_text,
@@ -3850,9 +4295,12 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
             "refs/remotes",
             "refs/tags",
             "refs/stash",
-        ])
-        .output()
-        .map_err(|error| error.to_string())?;
+        ],
+        None,
+        deadline,
+        "detached reachability evidence",
+        git_leaf,
+    )?;
     if !reachable.status.success() {
         return Err(String::from_utf8_lossy(&reachable.stderr)
             .trim()
@@ -3861,27 +4309,36 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
     if !reachable.stdout.is_empty() {
         return Ok(reachable.stdout);
     }
-    let _ = head_oid;
-    let mut listing = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut listing, repository)?;
-    let listing = listing
-        .args(["worktree", "list", "--porcelain", "-z"])
-        .output()
-        .map_err(|error| error.to_string())?;
+    let listing = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["worktree", "list", "--porcelain", "-z"],
+        None,
+        deadline,
+        "detached reachability evidence",
+        git_leaf,
+    )?;
     if !listing.status.success() {
         return Err(String::from_utf8_lossy(&listing.stderr).trim().to_string());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("detached reachability evidence exceeded its deadline".to_string());
     }
     let repository = repository
         .canonicalize()
         .map_err(|error| format!("cannot canonicalize inspected worktree: {error}"))?;
-    let mut git_dir = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut git_dir, &repository)?;
-    let git_dir = git_dir
-        .args(["rev-parse", "--absolute-git-dir"])
-        .output()
-        .map_err(|error| error.to_string())?;
+    let git_dir = run_bounded_git_command_with_leaf_until(
+        &repository,
+        &["rev-parse", "--absolute-git-dir"],
+        None,
+        deadline,
+        "detached reachability evidence",
+        git_leaf,
+    )?;
     if !git_dir.status.success() {
         return Err(String::from_utf8_lossy(&git_dir.stderr).trim().to_string());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("detached reachability evidence exceeded its deadline".to_string());
     }
     let git_dir = path_buf_from_git_bytes(git_dir.stdout.trim_ascii())
         .canonicalize()
@@ -3897,24 +4354,33 @@ fn detached_reachability_evidence(repository: &Path, head_oid: &[u8]) -> Result<
                 .as_ref()
                 .and_then(|path| path.canonicalize().ok())
                 .is_some_and(|path| path != repository && path != git_dir);
-            let _ = (oid, is_other);
+            let _ = (oid, is_other, head_oid);
         }
     }
     Ok(Vec::new())
 }
 
-fn git_directory_for_worktree(repository: &Path) -> Result<PathBuf, String> {
+#[allow(clippy::too_many_lines)]
+fn git_directory_for_worktree_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+) -> Result<PathBuf, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
     let dot_git = repository.join(".git");
-    let metadata = std::fs::symlink_metadata(&dot_git).map_err(|error| {
+    check_directory_deletion_deadline(Some(deadline))?;
+    let metadata = std::fs::symlink_metadata(&dot_git);
+    check_directory_deletion_deadline(Some(deadline))?;
+    let metadata = metadata.map_err(|error| {
         format!(
             "cannot inspect Git metadata at {}: {error}",
             dot_git.display()
         )
     })?;
     if metadata.is_dir() {
-        return dot_git
-            .canonicalize()
-            .map_err(|error| format!("cannot resolve Git directory: {error}"));
+        check_directory_deletion_deadline(Some(deadline))?;
+        let resolved = dot_git.canonicalize();
+        check_directory_deletion_deadline(Some(deadline))?;
+        return resolved.map_err(|error| format!("cannot resolve Git directory: {error}"));
     }
     if !metadata.is_file() {
         return Err(format!(
@@ -3922,7 +4388,10 @@ fn git_directory_for_worktree(repository: &Path) -> Result<PathBuf, String> {
             dot_git.display()
         ));
     }
-    let pointer = std::fs::read(&dot_git)
+    check_directory_deletion_deadline(Some(deadline))?;
+    let pointer = std::fs::read(&dot_git);
+    check_directory_deletion_deadline(Some(deadline))?;
+    let pointer = pointer
         .map_err(|error| format!("cannot read Git metadata at {}: {error}", dot_git.display()))?;
     let pointer = pointer
         .strip_prefix(b"gitdir: ")
@@ -3940,29 +4409,41 @@ fn git_directory_for_worktree(repository: &Path) -> Result<PathBuf, String> {
     } else {
         repository.join(&pointer)
     };
-    if let Ok(candidate) = candidate.canonicalize() {
+    check_directory_deletion_deadline(Some(deadline))?;
+    let resolved = candidate.canonicalize();
+    check_directory_deletion_deadline(Some(deadline))?;
+    if let Ok(candidate) = resolved {
         return Ok(candidate);
     }
 
-    let parent_repository = repository
-        .ancestors()
-        .skip(1)
-        .find(|ancestor| ancestor.join(".git").exists())
-        .ok_or_else(|| {
-            format!(
-                "cannot resolve moved Git directory for {}",
-                repository.display()
-            )
-        })?;
-    let parent_git_dir = git_directory_for_worktree(parent_repository)?;
+    let mut parent_repository = None;
+    for ancestor in repository.ancestors().skip(1) {
+        check_directory_deletion_deadline(Some(deadline))?;
+        let exists = ancestor.join(".git").exists();
+        check_directory_deletion_deadline(Some(deadline))?;
+        if exists {
+            parent_repository = Some(ancestor);
+            break;
+        }
+    }
+    check_directory_deletion_deadline(Some(deadline))?;
+    let parent_repository = parent_repository.ok_or_else(|| {
+        format!(
+            "cannot resolve moved Git directory for {}",
+            repository.display()
+        )
+    })?;
+    let parent_git_dir = git_directory_for_worktree_until(parent_repository, deadline)?;
     let components = pointer.components().collect::<Vec<_>>();
     let mut candidates = std::collections::BTreeSet::new();
     for (index, component) in components.iter().enumerate() {
+        check_directory_deletion_deadline(Some(deadline))?;
         if component.as_os_str() != std::ffi::OsStr::new("modules") {
             continue;
         }
         let mut candidate = parent_git_dir.join("modules");
         for component in &components[index + 1..] {
+            check_directory_deletion_deadline(Some(deadline))?;
             if let std::path::Component::Normal(component) = component {
                 candidate.push(component);
             } else {
@@ -3973,10 +4454,14 @@ fn git_directory_for_worktree(repository: &Path) -> Result<PathBuf, String> {
         if candidate.as_os_str().is_empty() {
             continue;
         }
-        if let Ok(candidate) = candidate.canonicalize() {
+        check_directory_deletion_deadline(Some(deadline))?;
+        let resolved = candidate.canonicalize();
+        check_directory_deletion_deadline(Some(deadline))?;
+        if let Ok(candidate) = resolved {
             candidates.insert(candidate);
         }
     }
+    check_directory_deletion_deadline(Some(deadline))?;
     if candidates.len() != 1 {
         return Err(format!(
             "cannot resolve the exact moved Git directory for {} from its pre-move gitdir binding",
@@ -3988,47 +4473,66 @@ fn git_directory_for_worktree(repository: &Path) -> Result<PathBuf, String> {
         .expect("exactly one candidate exists"))
 }
 
-fn capture_git_directory_bindings(
+fn capture_git_directory_bindings_until(
     root: &Path,
+    deadline: std::time::Instant,
+) -> Result<std::collections::BTreeMap<PathBuf, PathBuf>, String> {
+    capture_git_directory_bindings_with_leaf_until(root, deadline, &mut run_bounded_spawned_git)
+}
+
+fn capture_git_directory_bindings_with_leaf_until(
+    root: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<std::collections::BTreeMap<PathBuf, PathBuf>, String> {
     fn capture(
         repository: &Path,
         relative: &Path,
         deadline: std::time::Instant,
         bindings: &mut std::collections::BTreeMap<PathBuf, PathBuf>,
+        git_leaf: &mut WorktreeGitLeaf<'_>,
     ) -> Result<(), String> {
+        check_directory_deletion_deadline(Some(deadline))?;
         bindings.insert(
             relative.to_path_buf(),
-            git_directory_for_worktree(repository)?,
+            git_directory_for_worktree_until(repository, deadline)?,
         );
-        let (_, gitlinks) = index_gitlinks(repository, deadline)?;
+        let (_, gitlinks) = index_gitlinks_with_leaf_until(repository, deadline, git_leaf)?;
         for gitlink in gitlinks {
+            check_directory_deletion_deadline(Some(deadline))?;
             let path = path_buf_from_git_bytes(gitlink.path.as_bytes());
             let submodule = repository.join(&path);
             if !submodule.join(".git").exists() {
                 continue;
             }
-            capture(&submodule, &relative.join(path), deadline, bindings)?;
+            capture(
+                &submodule,
+                &relative.join(path),
+                deadline,
+                bindings,
+                git_leaf,
+            )?;
         }
         Ok(())
     }
 
+    check_directory_deletion_deadline(Some(deadline))?;
     let mut bindings = std::collections::BTreeMap::new();
-    capture(
-        root,
-        Path::new(""),
-        std::time::Instant::now() + std::time::Duration::from_secs(10),
-        &mut bindings,
-    )?;
+    capture(root, Path::new(""), deadline, &mut bindings, git_leaf)?;
+    check_directory_deletion_deadline(Some(deadline))?;
     Ok(bindings)
 }
 
-fn verify_git_directory_bindings(
+fn verify_git_directory_bindings_until(
     root: &Path,
     expected: &std::collections::BTreeMap<PathBuf, PathBuf>,
+    deadline: std::time::Instant,
 ) -> Result<(), String> {
+    check_directory_deletion_deadline(Some(deadline))?;
     for (relative, expected_git_dir) in expected {
-        let observed = git_directory_for_worktree(&root.join(relative))?;
+        check_directory_deletion_deadline(Some(deadline))?;
+        let observed = git_directory_for_worktree_until(&root.join(relative), deadline)?;
+        check_directory_deletion_deadline(Some(deadline))?;
         if &observed != expected_git_dir {
             return Err(format!(
                 "Git administrative binding changed for {}",
@@ -4039,31 +4543,52 @@ fn verify_git_directory_bindings(
     Ok(())
 }
 
-fn bind_git_command_to_worktree(
+fn bind_git_command_to_worktree_until(
     command: &mut std::process::Command,
     repository: &Path,
+    deadline: std::time::Instant,
 ) -> Result<(), String> {
     command
-        .env("GIT_DIR", git_directory_for_worktree(repository)?)
+        .env(
+            "GIT_DIR",
+            git_directory_for_worktree_until(repository, deadline)?,
+        )
         .env("GIT_WORK_TREE", repository)
         .current_dir(repository);
     Ok(())
 }
 
-fn run_bounded_git_status(repository: &Path) -> Result<std::process::Output, String> {
-    run_bounded_git_status_until(
-        repository,
-        std::time::Instant::now() + std::time::Duration::from_secs(5),
-    )
-}
+/// Executes one prepared Git command, not an enclosing inspection. A native
+/// callback owns spawn admission, child supervision and output collection under
+/// its original effect context. It may return only after confirmed writer release
+/// and completed child/pipe custody. Unknown release or unresolved completion must
+/// retain the calling stack without returning or unwinding (including scratch
+/// index owners held by enclosing helpers).
+/// Helpers call this outside any `SQLite` writer callback and never refresh the
+/// supplied absolute deadline. Legacy callers use `run_bounded_spawned_git`.
+type WorktreeGitLeaf<'a> = dyn FnMut(std::process::Command, std::time::Instant, &str) -> Result<std::process::Output, String>
+    + 'a;
 
+#[cfg(test)]
 fn run_bounded_git_status_until(
     repository: &Path,
     deadline: std::time::Instant,
 ) -> Result<std::process::Output, String> {
+    run_bounded_git_status_with_leaf_until(repository, deadline, &mut run_bounded_spawned_git)
+}
+
+fn run_bounded_git_status_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<std::process::Output, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("Git status inspection exceeded its deadline".to_string());
+    }
     let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
-    bind_git_command_to_worktree(&mut command, repository)?;
+    bind_git_command_to_worktree_until(&mut command, repository, deadline)?;
     command
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args([
             "status",
             "--porcelain=v1",
@@ -4080,18 +4605,62 @@ fn run_bounded_git_status_until(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    run_bounded_spawned_git(command, deadline, "Git status inspection")
+    execute_worktree_git_leaf_until(command, deadline, "Git status inspection", git_leaf)
 }
 
-fn run_bounded_git_command_until(
+// This read-only registry query starts from captured Git metadata, not a
+// worktree. Never route it through the worktree-only .git pointer resolver.
+fn list_registered_worktrees_in_common_directory_until(
+    common_git_dir: &Path,
+    deadline: std::time::Instant,
+) -> Result<std::process::Output, String> {
+    list_registered_worktrees_in_common_directory_with_leaf_until(
+        common_git_dir,
+        deadline,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn list_registered_worktrees_in_common_directory_with_leaf_until(
+    common_git_dir: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<std::process::Output, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
+    let mut command = phoenix_core::git::command();
+    command
+        .current_dir(common_git_dir)
+        .env("GIT_DIR", common_git_dir)
+        .env_remove("GIT_WORK_TREE")
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    execute_worktree_git_leaf_until(
+        command,
+        deadline,
+        "exact Worktree registration inspection",
+        git_leaf,
+    )
+}
+
+fn run_bounded_git_command_with_leaf_until(
     repository: &Path,
     arguments: &[&str],
     index: Option<&Path>,
     deadline: std::time::Instant,
     operation: &str,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<std::process::Output, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err(format!("{operation} exceeded its deadline"));
+    }
     let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
-    bind_git_command_to_worktree(&mut command, repository)?;
+    bind_git_command_to_worktree_until(&mut command, repository, deadline)?;
     command
         .args(arguments)
         .stdout(std::process::Stdio::piped())
@@ -4104,9 +4673,10 @@ fn run_bounded_git_command_until(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    run_bounded_spawned_git(command, deadline, operation)
+    execute_worktree_git_leaf_until(command, deadline, operation, git_leaf)
 }
 
+#[cfg(test)]
 fn run_bounded_git_paths_until(
     repository: &Path,
     arguments: &[&str],
@@ -4116,9 +4686,32 @@ fn run_bounded_git_paths_until(
     deadline: std::time::Instant,
     operation: &str,
 ) -> Result<std::process::Output, String> {
+    run_bounded_git_paths_with_leaf_until(
+        repository,
+        arguments,
+        paths,
+        literal_pathspec,
+        index,
+        deadline,
+        operation,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_bounded_git_paths_with_leaf_until(
+    repository: &Path,
+    arguments: &[&str],
+    paths: &[Vec<u8>],
+    literal_pathspec: bool,
+    index: &Path,
+    deadline: std::time::Instant,
+    operation: &str,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<std::process::Output, String> {
     // `Command::args` accepts path OsStrings, preserving bytes on Unix.
     let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
-    bind_git_command_to_worktree(&mut command, repository)?;
+    bind_git_command_to_worktree_until(&mut command, repository, deadline)?;
     command
         .args(arguments)
         .args(paths.iter().map(|path| path_buf_from_git_bytes(path)))
@@ -4133,7 +4726,19 @@ fn run_bounded_git_paths_until(
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
     }
-    run_bounded_spawned_git(command, deadline, operation)
+    execute_worktree_git_leaf_until(command, deadline, operation, git_leaf)
+}
+
+fn execute_worktree_git_leaf_until(
+    command: std::process::Command,
+    deadline: std::time::Instant,
+    operation: &str,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<std::process::Output, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err(format!("{operation} exceeded its deadline"));
+    }
+    git_leaf(command, deadline, operation)
 }
 
 fn run_bounded_spawned_git(
@@ -4141,6 +4746,9 @@ fn run_bounded_spawned_git(
     deadline: std::time::Instant,
     operation: &str,
 ) -> Result<std::process::Output, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err(format!("{operation} exceeded its deadline"));
+    }
     let child = command.spawn().map_err(|error| error.to_string())?;
     wait_bounded_child_output(child, deadline, operation)
 }
@@ -4150,30 +4758,35 @@ fn wait_bounded_child_output(
     deadline: std::time::Instant,
     operation: &str,
 ) -> Result<std::process::Output, String> {
-    let stdout = child.stdout.take().ok_or("Git stdout was not piped")?;
-    let stderr = child.stderr.take().ok_or("Git stderr was not piped")?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::BufReader::new(stdout), &mut bytes).map(|_| bytes)
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::io::BufReader::new(stderr), &mut bytes).map(|_| bytes)
-    });
+    let Some(stdout) = child.stdout.take() else {
+        terminate_bounded_child(&mut child);
+        return Err("Git stdout was not piped".into());
+    };
+    let Some(stderr) = child.stderr.take() else {
+        terminate_bounded_child(&mut child);
+        return Err("Git stderr was not piped".into());
+    };
+    let stdout_reader = std::thread::spawn(move || read_git_pipe(stdout, None));
+    let stderr_reader = std::thread::spawn(move || read_git_pipe(stderr, None));
     let status = loop {
-        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status))
+                if stdout_reader.is_finished()
+                    && stderr_reader.is_finished()
+                    && std::time::Instant::now() < deadline =>
+            {
+                break status;
+            }
+            Ok(_) => {}
+            Err(error) => {
+                terminate_bounded_child(&mut child);
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(error.to_string());
+            }
         }
         if std::time::Instant::now() >= deadline {
-            #[cfg(unix)]
-            unsafe {
-                let process_group = i32::try_from(child.id())
-                    .map_err(|error| format!("Git process id overflow: {error}"))?;
-                libc::kill(-process_group, libc::SIGKILL);
-            }
-            #[cfg(not(unix))]
-            let _ = child.kill();
-            child.wait().map_err(|error| error.to_string())?;
+            terminate_bounded_child(&mut child);
             let _ = stdout_reader.join();
             let _ = stderr_reader.join();
             return Err(format!("{operation} exceeded its deadline"));
@@ -4195,6 +4808,45 @@ fn wait_bounded_child_output(
     })
 }
 
+fn read_git_pipe(
+    pipe: impl std::io::Read,
+    limit: Option<usize>,
+) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read as _;
+    let mut reader = std::io::BufReader::new(pipe);
+    let mut bytes = Vec::new();
+    let mut chunk = [0; 8192];
+    let mut overflow = false;
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        let remaining = limit.unwrap_or(usize::MAX).saturating_sub(bytes.len());
+        bytes.extend_from_slice(&chunk[..n.min(remaining)]);
+        overflow |= n > remaining;
+    }
+    if overflow {
+        return Err(std::io::Error::other(
+            "Git output exceeded its capture limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn terminate_bounded_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        if let Ok(process_group) = i32::try_from(child.id()) {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+        let _ = child.kill();
+    }
+    #[cfg(not(unix))]
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 struct IndexedGitlink {
     path: GitPathIdentity,
     stage_zero_oid: Option<Vec<u8>>,
@@ -4203,16 +4855,26 @@ struct IndexedGitlink {
 
 type IndexedGitlinks = (Vec<u8>, Vec<IndexedGitlink>);
 
+#[cfg(test)]
 fn index_gitlinks(
     repository: &Path,
     deadline: std::time::Instant,
 ) -> Result<IndexedGitlinks, String> {
-    let output = run_bounded_git_command_until(
+    index_gitlinks_with_leaf_until(repository, deadline, &mut run_bounded_spawned_git)
+}
+
+fn index_gitlinks_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<IndexedGitlinks, String> {
+    let output = run_bounded_git_command_with_leaf_until(
         repository,
         &["ls-files", "--stage", "-z", "--"],
         None,
         deadline,
         "gitlink inspection",
+        git_leaf,
     )?;
     if !output.status.success() {
         return Err(format!(
@@ -4259,22 +4921,41 @@ fn index_gitlinks(
     Ok((output.stdout, gitlinks.into_values().collect()))
 }
 
+fn observe_gitlink_index_with_leaf_until(
+    repository: &Path,
+    relative_prefix: &[u8],
+    observation: &mut WorktreeObservation,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<IndexedGitlink>, String> {
+    let (index_observation, gitlinks) =
+        index_gitlinks_with_leaf_until(repository, deadline, git_leaf)?;
+    observation.push((
+        [b"SUBMODULE_GITLINK_INDEX\0".as_slice(), relative_prefix].concat(),
+        index_observation,
+    ));
+    Ok(gitlinks)
+}
+
 #[allow(clippy::too_many_lines)]
-fn observe_initialized_submodules(
+fn observe_initialized_submodules_with_leaf_until(
     repository: &Path,
     relative_prefix: &[u8],
     observation: &mut WorktreeObservation,
     deadline: std::time::Instant,
     visited: &mut std::collections::HashSet<PathBuf>,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<(), String> {
     if std::time::Instant::now() >= deadline {
         return Err("Git submodule inspection exceeded its aggregate deadline".to_string());
     }
-    let (index_observation, gitlinks) = index_gitlinks(repository, deadline)?;
-    observation.push((
-        [b"SUBMODULE_GITLINK_INDEX\0".as_slice(), relative_prefix].concat(),
-        index_observation,
-    ));
+    let gitlinks = observe_gitlink_index_with_leaf_until(
+        repository,
+        relative_prefix,
+        observation,
+        deadline,
+        git_leaf,
+    )?;
     for gitlink in gitlinks {
         if std::time::Instant::now() >= deadline {
             return Err("Git submodule inspection exceeded its aggregate deadline".to_string());
@@ -4334,7 +5015,7 @@ fn observe_initialized_submodules(
             return Err("initialized submodule graph contains a cycle".to_string());
         }
 
-        let status = run_bounded_git_status(&submodule_path)?;
+        let status = run_bounded_git_status_with_leaf_until(&submodule_path, deadline, git_leaf)?;
         if !status.status.success() {
             return Err(format!(
                 "cannot inspect initialized submodule {}: {}",
@@ -4342,33 +5023,52 @@ fn observe_initialized_submodules(
                 String::from_utf8_lossy(&status.stderr).trim()
             ));
         }
+        let ignored_paths =
+            observe_ignored_paths_with_leaf_until(&submodule_path, deadline, git_leaf)?;
         let mut submodule_losses = parse_status_losses(&status.stdout);
-        for hidden in observe_hidden_worktree_changes(&submodule_path)? {
+        submodule_losses.extend(
+            ignored_paths
+                .iter()
+                .cloned()
+                .map(CloseLossItem::IgnoredPath),
+        );
+        for hidden in
+            observe_hidden_worktree_changes_with_leaf_until(&submodule_path, deadline, git_leaf)?
+        {
             let loss = CloseLossItem::UnstagedTrackedPath(hidden);
             if !submodule_losses.contains(&loss) {
                 submodule_losses.push(loss);
             }
         }
         let mut submodule_status = canonical_status_observation(&status.stdout);
-        submodule_status
-            .extend_from_slice(&observe_dirty_content(&submodule_path, &submodule_losses)?);
+        append_ignored_paths(&mut submodule_status, &ignored_paths);
+        submodule_status.extend_from_slice(&observe_dirty_content_with_leaf_until(
+            &submodule_path,
+            &submodule_losses,
+            deadline,
+            git_leaf,
+        )?);
         observation.push((
             [b"SUBMODULE_STATUS\0".as_slice(), relative_path.as_slice()].concat(),
             submodule_status,
         ));
 
-        let mut symbolic_head = phoenix_core::git::command();
-        bind_git_command_to_worktree(&mut symbolic_head, &submodule_path)?;
-        let symbolic_head = symbolic_head
-            .args(["symbolic-ref", "-q", "HEAD"])
-            .output()
-            .map_err(|error| error.to_string())?;
-        let mut submodule_head = phoenix_core::git::command();
-        bind_git_command_to_worktree(&mut submodule_head, &submodule_path)?;
-        let submodule_head = submodule_head
-            .args(["rev-parse", "--verify", "HEAD"])
-            .output()
-            .map_err(|error| error.to_string())?;
+        let symbolic_head = run_bounded_git_command_with_leaf_until(
+            &submodule_path,
+            &["symbolic-ref", "-q", "HEAD"],
+            None,
+            deadline,
+            "Git submodule HEAD inspection",
+            git_leaf,
+        )?;
+        let submodule_head = run_bounded_git_command_with_leaf_until(
+            &submodule_path,
+            &["rev-parse", "--verify", "HEAD"],
+            None,
+            deadline,
+            "Git submodule HEAD inspection",
+            git_leaf,
+        )?;
         if !submodule_head.status.success() && symbolic_head.status.success() {
             observation.push((
                 [
@@ -4398,8 +5098,13 @@ fn observe_initialized_submodules(
             ]
             .concat(),
         ));
-        let detached_loss =
-            detached_head_is_unreachable(&submodule_path, observation, &relative_path)?;
+        let detached_loss = detached_head_is_unreachable_with_leaf_until(
+            &submodule_path,
+            observation,
+            &relative_path,
+            deadline,
+            git_leaf,
+        )?;
         let gitlink_changed = gitlink.stage_zero_oid.as_deref() != Some(submodule_head_oid);
         if gitlink_changed || gitlink.has_unmerged_stage {
             observation.push((
@@ -4412,7 +5117,12 @@ fn observe_initialized_submodules(
             ));
         }
         if detached_loss {
-            for oid in detached_unreachable_commits(&submodule_path, submodule_head_oid)? {
+            for oid in detached_unreachable_commits_with_leaf_until(
+                &submodule_path,
+                submodule_head_oid,
+                deadline,
+                git_leaf,
+            )? {
                 observation.push((
                     [b"SUBMODULE_LOSS\0detached\0".as_slice(), oid.as_slice()].concat(),
                     Vec::new(),
@@ -4434,6 +5144,7 @@ fn observe_initialized_submodules(
                 CloseLossItem::StagedTrackedPath(path) => (b"staged".as_slice(), path),
                 CloseLossItem::UnstagedTrackedPath(path) => (b"unstaged".as_slice(), path),
                 CloseLossItem::UntrackedNonIgnoredPath(path) => (b"untracked".as_slice(), path),
+                CloseLossItem::IgnoredPath(path) => (b"ignored".as_slice(), path),
                 _ => continue,
             };
             let full_path = join_git_paths(&relative_path, nested_path.as_bytes())?;
@@ -4448,13 +5159,28 @@ fn observe_initialized_submodules(
                 Vec::new(),
             ));
         }
-        observe_initialized_submodules(
+        for nested_path in &ignored_paths {
+            let full_path = join_git_paths(&relative_path, nested_path.as_bytes())?;
+            observation.push((
+                [
+                    b"SUBMODULE_LOSS\0ignored\0".as_slice(),
+                    full_path.as_slice(),
+                ]
+                .concat(),
+                Vec::new(),
+            ));
+        }
+        observe_initialized_submodules_with_leaf_until(
             &submodule_path,
             &relative_path,
             observation,
             deadline,
             visited,
+            git_leaf,
         )?;
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("Git submodule inspection exceeded its aggregate deadline".to_string());
     }
     Ok(())
 }
@@ -4619,6 +5345,38 @@ where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
 {
+    inspect_and_remove_exact_worktree_with_hook_and_plan_until(
+        runtime,
+        identity,
+        confirmed_snapshot,
+        administrative_dir,
+        administrative_dir_incarnation,
+        final_tombstone,
+        bind_tombstone,
+        after_quarantine,
+        effects,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+}
+
+// This owns a physical lock, not native Close destructive authority. Preparation
+// may probe Git/create its lock file but performs no teardown. The caller retains
+// custody until the consuming graph returns, including non-preemptible filesystem
+// operations and completion of its blocking worker.
+struct PreparedPhysicalWorktreeRemoval {
+    identity: WorktreeIdentity,
+    inspection_path: PathBuf,
+    common_git_dir: PathBuf,
+    common_git_dir_incarnation: String,
+    deadline: std::time::Instant,
+    repository_lock: RepositoryMutationLock,
+}
+
+fn prepare_physical_worktree_removal_until(
+    identity: &WorktreeIdentity,
+    deadline: std::time::Instant,
+) -> Result<Option<PreparedPhysicalWorktreeRemoval>, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
     if !path
@@ -4628,28 +5386,119 @@ where
             .try_exists()
             .map_err(|error| format!("cannot observe quarantined worktree path: {error}"))?
     {
+        return Ok(None);
+    }
+    let inspection_path = if path.exists() { path } else { quarantine };
+    let common_git_dir = exact_worktree_common_git_dir_until(&inspection_path, deadline)?;
+    let common_git_dir_incarnation = observe_administrative_dir_incarnation(&common_git_dir)?;
+    check_directory_deletion_deadline(Some(deadline))?;
+    let repository_lock =
+        RepositoryMutationLock::acquire_common_directory_until(&common_git_dir, deadline)
+            .map_err(|(message, _)| message)?;
+    check_directory_deletion_deadline(Some(deadline))?;
+    if observe_administrative_dir_incarnation(&common_git_dir)? != common_git_dir_incarnation {
+        return Err("worktree repository incarnation changed while acquiring its lock".to_string());
+    }
+    check_directory_deletion_deadline(Some(deadline))?;
+    Ok(Some(PreparedPhysicalWorktreeRemoval {
+        identity: identity.clone(),
+        inspection_path,
+        common_git_dir,
+        common_git_dir_incarnation,
+        deadline,
+        repository_lock,
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_and_remove_exact_worktree_with_hook_and_plan_until<F, B>(
+    runtime: &tokio::runtime::Handle,
+    identity: &WorktreeIdentity,
+    confirmed_snapshot: &CloseRetirementSnapshot,
+    administrative_dir: &Path,
+    administrative_dir_incarnation: &str,
+    final_tombstone: Option<&CloseWorktreeFinalTombstone>,
+    bind_tombstone: B,
+    after_quarantine: F,
+    effects: CloseWorktreeEffects,
+    deadline: std::time::Instant,
+) -> Result<ExactWorktreeRemoval, String>
+where
+    F: FnOnce(&Path) + Send + 'static,
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+{
+    let Some(prepared) = prepare_physical_worktree_removal_until(identity, deadline)? else {
         return Ok(ExactWorktreeRemoval::Residual {
             detail: format!(
                 "captured worktree and quarantine are absent; refusing to delete unverified Git registration {}",
                 administrative_dir.display()
             ),
         });
+    };
+    inspect_and_remove_prepared_worktree_with_hook_and_plan_until(
+        runtime,
+        prepared,
+        confirmed_snapshot,
+        administrative_dir,
+        administrative_dir_incarnation,
+        final_tombstone,
+        bind_tombstone,
+        after_quarantine,
+        effects,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inspect_and_remove_prepared_worktree_with_hook_and_plan_until<F, B>(
+    runtime: &tokio::runtime::Handle,
+    prepared: PreparedPhysicalWorktreeRemoval,
+    confirmed_snapshot: &CloseRetirementSnapshot,
+    administrative_dir: &Path,
+    administrative_dir_incarnation: &str,
+    final_tombstone: Option<&CloseWorktreeFinalTombstone>,
+    bind_tombstone: B,
+    after_quarantine: F,
+    effects: CloseWorktreeEffects,
+) -> Result<ExactWorktreeRemoval, String>
+where
+    F: FnOnce(&Path) + Send + 'static,
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+{
+    let PreparedPhysicalWorktreeRemoval {
+        identity,
+        inspection_path,
+        common_git_dir,
+        common_git_dir_incarnation,
+        deadline,
+        repository_lock,
+    } = prepared;
+    check_directory_deletion_deadline(Some(deadline))?;
+    if !inspection_path
+        .try_exists()
+        .map_err(|error| format!("cannot observe prepared worktree path: {error}"))?
+    {
+        return Err("prepared worktree path disappeared before removal".to_string());
     }
-    let _repository_lock =
-        RepositoryMutationLock::acquire(if path.exists() { &path } else { &quarantine })
-            .map_err(|(message, _)| message)?;
-    let inspection_path = if path.exists() { &path } else { &quarantine };
-    let (fresh_snapshot, _) =
-        runtime.block_on(inspect_worktree_at(identity, inspection_path.clone()))?;
+    if exact_worktree_common_git_dir_until(&inspection_path, deadline)? != common_git_dir
+        || observe_administrative_dir_incarnation(&common_git_dir)? != common_git_dir_incarnation
+    {
+        return Err("prepared worktree repository binding changed before removal".to_string());
+    }
+    check_directory_deletion_deadline(Some(deadline))?;
+    let (fresh_snapshot, _) = runtime.block_on(inspect_worktree_at_until(
+        &identity,
+        inspection_path.clone(),
+        deadline,
+    ))?;
     if fresh_snapshot.fingerprint() != confirmed_snapshot.fingerprint() {
         return Ok(ExactWorktreeRemoval::ReinspectionRequired {
             detail: "worktree changed after Close inspection confirmation; fresh confirmation is required"
                 .to_string(),
         });
     }
-    ensure_no_ignored_content(inspection_path)?;
+    ensure_no_ignored_content_until(&inspection_path, deadline)?;
     runtime.block_on(quarantine_and_remove_exact_worktree(
-        identity,
+        &identity,
         confirmed_snapshot,
         administrative_dir.to_path_buf(),
         administrative_dir_incarnation.to_string(),
@@ -4657,6 +5506,8 @@ where
         bind_tombstone,
         after_quarantine,
         effects,
+        deadline,
+        repository_lock,
     ))
 }
 
@@ -4665,11 +5516,32 @@ fn path_is_within(candidate: &Path, directory: &Path) -> bool {
 }
 
 fn exact_worktree_common_git_dir(worktree: &Path) -> Result<PathBuf, String> {
-    let output = phoenix_core::git::command()
-        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-        .current_dir(worktree)
-        .output()
-        .map_err(|error| error.to_string())?;
+    exact_worktree_common_git_dir_until(
+        worktree,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+}
+
+fn exact_worktree_common_git_dir_until(
+    worktree: &Path,
+    deadline: std::time::Instant,
+) -> Result<PathBuf, String> {
+    exact_worktree_common_git_dir_with_leaf_until(worktree, deadline, &mut run_bounded_spawned_git)
+}
+
+fn exact_worktree_common_git_dir_with_leaf_until(
+    worktree: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<PathBuf, String> {
+    let output = run_bounded_git_command_with_leaf_until(
+        worktree,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        None,
+        deadline,
+        "Git common-directory inspection",
+        git_leaf,
+    )?;
     if !output.status.success() {
         return Err("captured worktree is not server-owned Git worktree".to_string());
     }
@@ -4719,6 +5591,7 @@ unsafe fn errno_location() -> *mut libc::c_int {
 unsafe fn renameat_exclusive(
     directory: libc::c_int,
     source: *const libc::c_char,
+    destination_directory: libc::c_int,
     destination: *const libc::c_char,
 ) -> libc::c_int {
     // SAFETY: caller supplies valid descriptors and NUL-terminated names.
@@ -4727,7 +5600,7 @@ unsafe fn renameat_exclusive(
             libc::SYS_renameat2,
             directory,
             source,
-            directory,
+            destination_directory,
             destination,
             libc::RENAME_NOREPLACE,
         )
@@ -4743,46 +5616,413 @@ unsafe fn renameat_exclusive(
 unsafe fn renameat_exclusive(
     directory: libc::c_int,
     source: *const libc::c_char,
+    destination_directory: libc::c_int,
     destination: *const libc::c_char,
 ) -> libc::c_int {
     // SAFETY: caller supplies valid descriptors and NUL-terminated names.
-    unsafe { libc::renameatx_np(directory, source, directory, destination, libc::RENAME_EXCL) }
+    unsafe {
+        libc::renameatx_np(
+            directory,
+            source,
+            destination_directory,
+            destination,
+            libc::RENAME_EXCL,
+        )
+    }
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 unsafe fn renameat_exclusive(
     _directory: libc::c_int,
     _source: *const libc::c_char,
+    _destination_directory: libc::c_int,
     _destination: *const libc::c_char,
 ) -> libc::c_int {
     -1
 }
 
 #[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DeletionEntryIdentity {
+    device: u64,
+    inode: u64,
+    kind: libc::mode_t,
+}
+
+#[cfg(unix)]
+impl DeletionEntryIdentity {
+    fn from_stat(stat: &libc::stat) -> Self {
+        Self {
+            // Preserve the signed macOS dev_t conversion used by slot identities.
+            #[cfg(target_os = "macos")]
+            device: i64::from(stat.st_dev).cast_unsigned(),
+            #[cfg(not(target_os = "macos"))]
+            device: stat.st_dev,
+            inode: stat.st_ino,
+            kind: stat.st_mode & libc::S_IFMT,
+        }
+    }
+
+    fn pair(self) -> (u64, u64) {
+        (self.device, self.inode)
+    }
+}
+
+#[cfg(unix)]
+fn deletion_descriptor_stat(descriptor: &std::os::fd::OwnedFd) -> Result<libc::stat, String> {
+    use std::os::fd::AsRawFd as _;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: descriptor is retained and stat is writable.
+    if unsafe { libc::fstat(descriptor.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+        return Err(format!(
+            "cannot identify retained deletion descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fstat initialized stat.
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(unix)]
+fn deletion_slot_stat(
+    parent: &std::os::fd::OwnedFd,
+    name: &std::ffi::CStr,
+) -> Result<libc::stat, String> {
+    use std::os::fd::AsRawFd as _;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: parent/name are retained; no symlink is followed.
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } < 0
+    {
+        return Err(format!(
+            "cannot revalidate deletion slot: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fstatat initialized stat.
+    Ok(unsafe { stat.assume_init() })
+}
+
+#[cfg(unix)]
+fn open_deletion_parent(path: &Path) -> Result<std::sync::Arc<std::os::fd::OwnedFd>, String> {
+    use std::os::fd::FromRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "deletion parent contains NUL")?;
+    // SAFETY: path is a valid C string; reject a symlink at the parent slot.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "cannot retain deletion parent: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: fd is newly owned.
+    Ok(std::sync::Arc::new(unsafe {
+        std::os::fd::OwnedFd::from_raw_fd(fd)
+    }))
+}
+
+/// Pins BOTH the entry and its parent, not merely the parent descriptor. Each
+/// effect rechecks the no-follow slot identity after admission waits. This is
+/// still check-then-unlink, not an atomic compare-and-unlink primitive.
+#[cfg(unix)]
+#[derive(Clone)]
+struct OwnedDeletionSlot {
+    parent: std::sync::Arc<std::os::fd::OwnedFd>,
+    parent_identity: DeletionEntryIdentity,
+    name: std::ffi::CString,
+    retained: std::sync::Arc<std::os::fd::OwnedFd>,
+    identity: DeletionEntryIdentity,
+}
+
+// Keep the owning slot borrowed through the synchronous scan: no dup or raw-fd lease.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn deletion_descriptor_device(stat: &libc::stat) -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        // libproc exposes the same dev_t bits unsigned, unlike fstat's signed dev_t.
+        u64::from(stat.st_dev.cast_unsigned())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        stat.st_dev
+    }
+}
+
+struct SelfDeletionDescriptorBorrow<'a> {
+    #[cfg(unix)]
+    witness: &'a OwnedDeletionSlot,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pid: libc::pid_t,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fd: libc::c_int,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    device: u64,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    inode: u64,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    kind: libc::mode_t,
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    _borrow: std::marker::PhantomData<&'a ()>,
+}
+
+#[cfg(unix)]
+impl OwnedDeletionSlot {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn self_descriptor_borrow(&self) -> Result<SelfDeletionDescriptorBorrow<'_>, String> {
+        use std::os::fd::AsRawFd as _;
+        self.validate()?;
+        let stat = deletion_descriptor_stat(&self.retained)?;
+        if stat.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return Err(
+                "self-descriptor exemption requires the live owned directory object".into(),
+            );
+        }
+        Ok(SelfDeletionDescriptorBorrow {
+            witness: self,
+            pid: unsafe { libc::getpid() },
+            fd: self.retained.as_raw_fd(),
+            device: deletion_descriptor_device(&stat),
+            inode: stat.st_ino,
+            kind: stat.st_mode & libc::S_IFMT,
+        })
+    }
+
+    fn capture(
+        parent: &std::sync::Arc<std::os::fd::OwnedFd>,
+        name: &std::ffi::CStr,
+        expected: DeletionEntryIdentity,
+    ) -> Result<Self, String> {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let flags = if expected.kind == libc::S_IFDIR {
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW
+        } else {
+            // Retain symlinks themselves and avoid opening FIFOs/devices for I/O.
+            #[cfg(target_os = "linux")]
+            {
+                libc::O_PATH | libc::O_NOFOLLOW
+            }
+            #[cfg(target_os = "macos")]
+            {
+                libc::O_EVTONLY | libc::O_SYMLINK
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                return Err("retained deletion slots unsupported on this Unix platform".into());
+            }
+        };
+        // SAFETY: parent/name are live; flags do not follow the entry symlink.
+        let fd =
+            unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(format!(
+                "cannot retain deletion slot: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: fd is newly owned.
+        let retained = std::sync::Arc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
+        let witness = Self {
+            parent: std::sync::Arc::clone(parent),
+            parent_identity: DeletionEntryIdentity::from_stat(&deletion_descriptor_stat(parent)?),
+            name: name.to_owned(),
+            retained,
+            identity: expected,
+        };
+        witness.validate()?;
+        Ok(witness)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if DeletionEntryIdentity::from_stat(&deletion_descriptor_stat(&self.parent)?)
+            != self.parent_identity
+            || DeletionEntryIdentity::from_stat(&deletion_descriptor_stat(&self.retained)?)
+                != self.identity
+            || DeletionEntryIdentity::from_stat(&deletion_slot_stat(&self.parent, &self.name)?)
+                != self.identity
+        {
+            return Err("identity-bound deletion slot was replaced; replacement preserved".into());
+        }
+        Ok(())
+    }
+
+    fn unlink(self, deadline: Option<std::time::Instant>) -> Result<(), String> {
+        use std::os::fd::AsRawFd as _;
+        check_directory_deletion_deadline(deadline)?;
+        self.validate()?;
+        let flags = if self.identity.kind == libc::S_IFDIR {
+            libc::AT_REMOVEDIR
+        } else {
+            0
+        };
+        // SAFETY: self retains descriptor/name/identity through this syscall.
+        if unsafe { libc::unlinkat(self.parent.as_raw_fd(), self.name.as_ptr(), flags) } < 0 {
+            return Err(format!(
+                "cannot unlink identity-bound deletion slot: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Owned final relocation leaf. The destination is the EXACT retained root FD,
+/// not a path re-resolved after admission; exclusive rename never overwrites an
+/// existing object. Source and root slot checks are intentionally non-atomic.
+#[cfg(unix)]
+struct OwnedWorktreeRenameLeaf {
+    source_path: PathBuf,
+    source: OwnedDeletionSlot,
+    root: OwnedDeletionSlot,
+}
+
+#[cfg(unix)]
+impl OwnedWorktreeRenameLeaf {
+    fn rename(self, deadline: Option<std::time::Instant>) -> Result<std::io::Result<()>, String> {
+        use std::os::fd::AsRawFd as _;
+        check_directory_deletion_deadline(deadline)?;
+        self.source.validate()?;
+        self.root.validate()?;
+        let object = std::ffi::CString::new("object").expect("static name");
+        // SAFETY: self retains both verified descriptors and names. The kernel
+        // supplies non-overwrite semantics; the source identity check is separate.
+        if unsafe {
+            renameat_exclusive(
+                self.source.parent.as_raw_fd(),
+                self.source.name.as_ptr(),
+                self.root.retained.as_raw_fd(),
+                object.as_ptr(),
+            )
+        } < 0
+        {
+            return Ok(Err(std::io::Error::last_os_error()));
+        }
+        let moved =
+            DeletionEntryIdentity::from_stat(&deletion_slot_stat(&self.root.retained, &object)?);
+        if moved != self.source.identity {
+            return Err("final tombstone object differs from owned rename source".into());
+        }
+        Ok(Ok(()))
+    }
+}
+
+/// Mandatory per-syscall admission for shared worktree deletion leaves.
+///
+/// Implementations execute the owned effect synchronously to completion or refuse
+/// it without calling it; effects must not outlive this call. An executor error
+/// (including an unknown outcome after execution) stops traversal without retry
+/// or compensation. Native callers reenter their original effect context here.
+/// Preparation and durable custody callbacks stay outside it; descriptor/slot
+/// identity revalidation belongs inside each admitted mutation callback.
+trait WorktreeMutationExecutor {
+    fn execute<T, F>(&mut self, effect: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static;
+}
+
+/// Compatibility only: legacy callers retain their existing direct execution.
+struct DirectWorktreeMutationExecutor;
+
+impl WorktreeMutationExecutor for DirectWorktreeMutationExecutor {
+    fn execute<T, F>(&mut self, effect: F) -> Result<T, String>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> Result<T, String> + Send + 'static,
+    {
+        effect()
+    }
+}
+
+#[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "legacy direct-execution signature retained for compatibility"
+)]
 fn bind_deletion_entry_to_private_slot(
     directory: libc::c_int,
     name: &std::ffi::CStr,
     expected: &libc::stat,
 ) -> Result<(std::ffi::CString, libc::stat), String> {
+    use std::os::fd::FromRawFd as _;
+
+    // Duplicate before constructing any 'static mutation closure. Invalid legacy
+    // descriptors produce an OS error rather than an invalid BorrowedFd.
+    // SAFETY: fcntl validates the input descriptor and returns a new owned fd.
+    let duplicate = unsafe { libc::fcntl(directory, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(format!(
+            "cannot duplicate deletion descriptor: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: duplicate is newly owned on success above.
+    let directory = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
+    bind_deletion_entry_to_private_slot_with_executor(
+        &std::sync::Arc::new(directory),
+        name,
+        expected,
+        None,
+        &mut DirectWorktreeMutationExecutor,
+    )
+}
+
+#[cfg(unix)]
+fn bind_deletion_entry_to_private_slot_with_executor<E: WorktreeMutationExecutor>(
+    directory: &std::sync::Arc<std::os::fd::OwnedFd>,
+    name: &std::ffi::CStr,
+    expected: &libc::stat,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(std::ffi::CString, libc::stat), String> {
+    use std::os::fd::AsRawFd as _;
+
     let slot = std::ffi::CString::new(format!(
         ".phoenix-delete-entry-{}",
         uuid::Uuid::new_v4().simple()
     ))
     .expect("generated deletion slot contains no NUL");
-    // SAFETY: the descriptor and C strings are valid. Exclusive rename
-    // cannot overwrite another entry at the unpredictable destination.
-    if unsafe { renameat_exclusive(directory, name.as_ptr(), slot.as_ptr()) } < 0 {
-        return Err(format!(
-            "cannot bind deletion entry to private slot: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
+    let effect_directory = std::sync::Arc::clone(directory);
+    let effect_name = name.to_owned();
+    let effect_slot = slot.clone();
+    executor.execute(move || {
+        check_directory_deletion_deadline(deadline)?;
+        // SAFETY: the effect owns the descriptor and C strings. Exclusive
+        // rename cannot overwrite another entry at the private destination.
+        if unsafe {
+            renameat_exclusive(
+                effect_directory.as_raw_fd(),
+                effect_name.as_ptr(),
+                effect_directory.as_raw_fd(),
+                effect_slot.as_ptr(),
+            )
+        } < 0
+        {
+            return Err(format!(
+                "cannot bind deletion entry to private slot: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    })?;
 
     let mut moved = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: descriptor and slot are valid; moved points to writable storage.
     if unsafe {
         libc::fstatat(
-            directory,
+            directory.as_raw_fd(),
             slot.as_ptr(),
             moved.as_mut_ptr(),
             libc::AT_SYMLINK_NOFOLLOW,
@@ -4814,7 +6054,6 @@ fn remove_directory_contents_at(directory: &std::os::fd::OwnedFd) -> Result<(), 
 }
 
 #[cfg(unix)]
-#[allow(clippy::too_many_lines)]
 fn remove_directory_contents_at_with_hook<H>(
     directory: &std::os::fd::OwnedFd,
     after_inspection: &mut H,
@@ -4822,8 +6061,59 @@ fn remove_directory_contents_at_with_hook<H>(
 where
     H: FnMut(libc::c_int, &std::ffi::CStr),
 {
+    // Preserve existing unbounded callers; deadline-aware callers supply their own
+    // captured absolute deadline to the shared implementation below.
+    remove_directory_contents_at_with_hook_and_deadline(directory, after_inspection, None)
+}
+
+fn check_directory_deletion_deadline(deadline: Option<std::time::Instant>) -> Result<(), String> {
+    if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+        return Err("descriptor-bound directory deletion exceeded its deadline".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+fn remove_directory_contents_at_with_hook_and_deadline<H>(
+    directory: &std::os::fd::OwnedFd,
+    after_inspection: &mut H,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), String>
+where
+    H: FnMut(libc::c_int, &std::ffi::CStr),
+{
+    check_directory_deletion_deadline(deadline)?;
+    let directory = directory
+        .try_clone()
+        .map_err(|error| format!("cannot duplicate deletion descriptor: {error}"))?;
+    remove_directory_contents_at_with_hook_and_deadline_with_executor(
+        &std::sync::Arc::new(directory),
+        after_inspection,
+        deadline,
+        &mut DirectWorktreeMutationExecutor,
+    )
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_lines)]
+fn remove_directory_contents_at_with_hook_and_deadline_with_executor<H, E>(
+    directory: &std::sync::Arc<std::os::fd::OwnedFd>,
+    after_inspection: &mut H,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(), String>
+where
+    H: FnMut(libc::c_int, &std::ffi::CStr),
+    E: WorktreeMutationExecutor,
+{
     use std::ffi::CStr;
-    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::fd::AsRawFd as _;
+
+    // These are cooperative checks, not a hard wall-clock bound on in-flight
+    // syscalls. Destructive custody stays with this synchronous walk until return;
+    // expiry is not proof of removal and may leave an identity-bound private slot.
+    check_directory_deletion_deadline(deadline)?;
     // SAFETY: dup returns a new owned descriptor or -1. fdopendir consumes only
     // that duplicate, while the caller retains the descriptor used by openat.
     let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
@@ -4846,6 +6136,7 @@ where
 
     let result = (|| {
         loop {
+            check_directory_deletion_deadline(deadline)?;
             // SAFETY: stream remains valid until closed below. errno is reset so
             // a null result can distinguish end-of-directory from an error.
             unsafe { *errno_location() = 0 };
@@ -4854,7 +6145,7 @@ where
             if entry.is_null() {
                 let error = std::io::Error::last_os_error();
                 return if error.raw_os_error() == Some(0) {
-                    Ok(())
+                    check_directory_deletion_deadline(deadline)
                 } else {
                     Err(format!("cannot read deletion descriptor: {error}"))
                 };
@@ -4883,92 +6174,86 @@ where
             // SAFETY: fstatat initialized metadata on success.
             let metadata = unsafe { metadata.assume_init() };
             after_inspection(directory.as_raw_fd(), name);
-            let (slot, moved) =
-                bind_deletion_entry_to_private_slot(directory.as_raw_fd(), name, &metadata)?;
-            if moved.st_mode & libc::S_IFMT == libc::S_IFDIR {
-                // SAFETY: openat does not follow the private slot because O_NOFOLLOW is set.
-                let child = unsafe {
-                    libc::openat(
-                        directory.as_raw_fd(),
-                        slot.as_ptr(),
-                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )
-                };
-                if child < 0 {
-                    return Err(format!(
-                        "cannot open identity-bound deletion subdirectory: {}",
-                        std::io::Error::last_os_error()
-                    ));
-                }
-                // SAFETY: child is a newly owned descriptor on success above.
-                let child = unsafe { OwnedFd::from_raw_fd(child) };
-                let mut opened = std::mem::MaybeUninit::<libc::stat>::uninit();
-                // SAFETY: child is valid and opened points to writable storage.
-                if unsafe { libc::fstat(child.as_raw_fd(), opened.as_mut_ptr()) } < 0 {
-                    return Err(format!(
-                        "cannot identify opened deletion subdirectory: {}",
-                        std::io::Error::last_os_error()
-                    ));
-                }
-                // SAFETY: fstat initialized opened on success.
-                let opened = unsafe { opened.assume_init() };
-                if opened.st_dev != moved.st_dev || opened.st_ino != moved.st_ino {
-                    return Err(
-                        "private deletion slot was replaced before descriptor binding".to_string(),
-                    );
-                }
-                remove_directory_contents_at_with_hook(&child, after_inspection)?;
-                // SAFETY: unlinkat targets only the unpredictable identity-checked slot.
-                if unsafe {
-                    libc::unlinkat(directory.as_raw_fd(), slot.as_ptr(), libc::AT_REMOVEDIR)
-                } < 0
-                {
-                    return Err(format!(
-                        "cannot remove identity-bound deletion subdirectory: {}",
-                        std::io::Error::last_os_error()
-                    ));
-                }
-            } else {
-                // SAFETY: unlinkat targets only the unpredictable identity-checked slot.
-                if unsafe { libc::unlinkat(directory.as_raw_fd(), slot.as_ptr(), 0) } < 0 {
-                    return Err(format!(
-                        "cannot remove identity-bound deletion entry: {}",
-                        std::io::Error::last_os_error()
-                    ));
-                }
+            check_directory_deletion_deadline(deadline)?;
+            let (slot, moved) = bind_deletion_entry_to_private_slot_with_executor(
+                directory, name, &metadata, deadline, executor,
+            )?;
+            let witness = OwnedDeletionSlot::capture(
+                directory,
+                &slot,
+                DeletionEntryIdentity::from_stat(&moved),
+            )?;
+            if witness.identity.kind == libc::S_IFDIR {
+                remove_directory_contents_at_with_hook_and_deadline_with_executor(
+                    &witness.retained,
+                    after_inspection,
+                    deadline,
+                    executor,
+                )?;
             }
+            check_directory_deletion_deadline(deadline)?;
+            let effect_witness = witness.clone();
+            executor.execute(move || effect_witness.unlink(deadline))?;
         }
     })();
     // SAFETY: stream is the valid DIR pointer returned by fdopendir.
     unsafe { libc::closedir(stream) };
-    result
+    result?;
+    check_directory_deletion_deadline(deadline)
 }
 
+#[cfg(test)]
 fn reserve_private_tombstone(root: &Path, description: &str) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        let mut builder = std::fs::DirBuilder::new();
-        builder
-            .mode(0o700)
-            .create(root)
-            .map_err(|error| format!("cannot reserve private {description} tombstone: {error}"))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (root, description);
-        Err("identity-bound deletion is unsupported on this platform".to_string())
-    }
+    reserve_private_tombstone_with_executor(
+        root,
+        description,
+        None,
+        &mut DirectWorktreeMutationExecutor,
+    )
+}
+
+fn reserve_private_tombstone_with_executor<E: WorktreeMutationExecutor>(
+    root: &Path,
+    description: &str,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(), String> {
+    let root = root.to_path_buf();
+    let description = description.to_string();
+    executor.execute(move || {
+        check_directory_deletion_deadline(deadline)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut builder = std::fs::DirBuilder::new();
+            builder
+                .mode(0o700)
+                .create(root)
+                .map_err(|error| format!("cannot reserve private {description} tombstone: {error}"))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (root, description);
+            Err("identity-bound deletion is unsupported on this platform".to_string())
+        }
+    })
 }
 
 #[cfg(unix)]
-fn tombstone_identity(root: &Path) -> Result<(u64, u64), String> {
-    use std::os::unix::fs::MetadataExt as _;
-    let metadata = std::fs::symlink_metadata(root)
-        .map_err(|error| format!("cannot identify private final tombstone: {error}"))?;
-    Ok((metadata.dev(), metadata.ino()))
+fn validate_private_tombstone_root(
+    is_directory: bool,
+    owner: u32,
+    mode: u64,
+) -> Result<(), String> {
+    // SAFETY: geteuid has no preconditions and does not mutate process state.
+    let effective_uid = unsafe { libc::geteuid() };
+    if !is_directory || owner != effective_uid || mode & 0o077 != 0 {
+        return Err("private final tombstone must be an effective-user-owned directory with owner-only permissions".to_string());
+    }
+    Ok(())
 }
 
+#[cfg(test)]
 #[allow(
     clippy::cast_sign_loss,
     clippy::too_many_lines,
@@ -4982,7 +6267,7 @@ fn remove_identity_bound_directory<F, B, A, O>(
     expected_identity: &str,
     observe_identity: O,
     before_final_move: F,
-    mut bind_root: B,
+    bind_root: B,
     after_identity_observation: A,
     description: &str,
 ) -> Result<(), String>
@@ -4992,7 +6277,263 @@ where
     A: FnOnce(&Path, &Path) -> Result<(), String>,
     O: Fn(&Path) -> Result<String, String>,
 {
-    before_final_move(deletion_target);
+    remove_identity_bound_directory_with_deadline(
+        deletion_target,
+        tombstone_root,
+        expected_identity,
+        observe_identity,
+        before_final_move,
+        bind_root,
+        after_identity_observation,
+        description,
+        None,
+    )
+}
+
+#[allow(
+    dead_code,
+    reason = "legacy direct-execution signature retained for compatibility"
+)]
+fn remove_empty_tombstone_before_deadline(tombstone: &Path, deadline: Option<std::time::Instant>) {
+    let _ = remove_empty_tombstone_before_deadline_with_executor(
+        tombstone,
+        deadline,
+        &mut DirectWorktreeMutationExecutor,
+    );
+}
+
+fn remove_empty_tombstone_before_deadline_with_executor<E: WorktreeMutationExecutor>(
+    tombstone: &Path,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(), String> {
+    check_directory_deletion_deadline(deadline)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let parent = open_deletion_parent(tombstone.parent().ok_or("tombstone has no parent")?)?;
+        let name = std::ffi::CString::new(
+            tombstone
+                .file_name()
+                .ok_or("tombstone has no name")?
+                .as_bytes(),
+        )
+        .map_err(|_| "tombstone name contains NUL")?;
+        let stat = deletion_slot_stat(&parent, &name)?;
+        let identity = DeletionEntryIdentity::from_stat(&stat);
+        if identity.kind != libc::S_IFDIR {
+            return Err("empty tombstone cleanup requires a no-follow directory".into());
+        }
+        let witness = OwnedDeletionSlot::capture(&parent, &name, identity)?;
+        let effect_witness = witness.clone();
+        executor.execute(move || effect_witness.unlink(deadline))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (tombstone, executor);
+        return Err("identity-bound deletion is unsupported on this platform".into());
+    }
+    Ok(())
+}
+
+// This helper accepts a budget but does not establish original physical authority or ownership.
+#[allow(clippy::too_many_arguments)]
+fn remove_identity_bound_directory_with_deadline<F, B, A, O>(
+    deletion_target: &Path,
+    tombstone_root: Option<&Path>,
+    expected_identity: &str,
+    observe_identity: O,
+    before_final_move: F,
+    bind_root: B,
+    after_identity_observation: A,
+    description: &str,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path),
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String>,
+    A: FnOnce(&Path, &Path) -> Result<(), String>,
+    O: Fn(&Path) -> Result<String, String>,
+{
+    remove_identity_bound_directory_with_deadline_with_executor(
+        deletion_target,
+        tombstone_root,
+        expected_identity,
+        observe_identity,
+        before_final_move,
+        bind_root,
+        after_identity_observation,
+        description,
+        deadline,
+        &mut DirectWorktreeMutationExecutor,
+    )
+}
+
+// Admission surrounds individual mutations, never recursive traversal or durable
+// bind_root callbacks: those callbacks may themselves need a database writer.
+trait WorktreeDeletionDriver: WorktreeMutationExecutor {
+    fn allows_existing_root(&self) -> bool {
+        true
+    }
+
+    fn cleanup_after_failure(&self) -> bool {
+        true
+    }
+
+    /// The physical driver adds immutable registration checks inside the same
+    /// admitted closure as the rename, after any wait for source-entry authority.
+    #[cfg(unix)]
+    fn rename_to_tombstone(
+        &mut self,
+        leaf: OwnedWorktreeRenameLeaf,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<std::io::Result<()>, String> {
+        self.execute(move || leaf.rename(deadline))
+    }
+
+    fn before_move(&mut self, source: &Path) -> Result<(), String>;
+    fn bind_root(
+        &mut self,
+        root: &Path,
+        root_identity: (u64, u64),
+        object_identity: Option<(u64, u64)>,
+    ) -> Result<(), String>;
+    fn observe_identity(&mut self, object: &Path) -> Result<String, String>;
+    fn after_move(
+        &mut self,
+        root: &Path,
+        object: &Path,
+        self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+    ) -> Result<(), String>;
+}
+
+struct CallbackWorktreeDeletionDriver<'a, F, B, A, O, E> {
+    before: Option<F>,
+    bind: B,
+    after: Option<A>,
+    observe: O,
+    executor: &'a mut E,
+}
+
+impl<F, B, A, O, E: WorktreeMutationExecutor> WorktreeMutationExecutor
+    for CallbackWorktreeDeletionDriver<'_, F, B, A, O, E>
+{
+    fn execute<T, C>(&mut self, effect: C) -> Result<T, String>
+    where
+        T: Send + 'static,
+        C: FnOnce() -> Result<T, String> + Send + 'static,
+    {
+        self.executor.execute(effect)
+    }
+}
+
+impl<F, B, A, O, E> WorktreeDeletionDriver for CallbackWorktreeDeletionDriver<'_, F, B, A, O, E>
+where
+    F: FnOnce(&Path),
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String>,
+    A: FnOnce(&Path, &Path) -> Result<(), String>,
+    O: Fn(&Path) -> Result<String, String>,
+    E: WorktreeMutationExecutor,
+{
+    fn before_move(&mut self, source: &Path) -> Result<(), String> {
+        self.before.take().expect("one final move")(source);
+        Ok(())
+    }
+
+    fn bind_root(
+        &mut self,
+        root: &Path,
+        identity: (u64, u64),
+        object: Option<(u64, u64)>,
+    ) -> Result<(), String> {
+        (self.bind)(root, identity, object)
+    }
+
+    fn observe_identity(&mut self, object: &Path) -> Result<String, String> {
+        (self.observe)(object)
+    }
+
+    fn after_move(
+        &mut self,
+        root: &Path,
+        object: &Path,
+        _self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+    ) -> Result<(), String> {
+        self.after.take().expect("one final move")(root, object)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn remove_identity_bound_directory_with_deadline_with_executor<F, B, A, O, E>(
+    deletion_target: &Path,
+    tombstone_root: Option<&Path>,
+    expected_identity: &str,
+    observe_identity: O,
+    before_final_move: F,
+    bind_root: B,
+    after_identity_observation: A,
+    description: &str,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path),
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String>,
+    A: FnOnce(&Path, &Path) -> Result<(), String>,
+    O: Fn(&Path) -> Result<String, String>,
+    E: WorktreeMutationExecutor,
+{
+    remove_identity_bound_directory_with_driver(
+        deletion_target,
+        tombstone_root,
+        expected_identity,
+        description,
+        deadline,
+        &mut CallbackWorktreeDeletionDriver {
+            before: Some(before_final_move),
+            bind: bind_root,
+            after: Some(after_identity_observation),
+            observe: observe_identity,
+            executor,
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn remove_identity_bound_directory_with_driver<D: WorktreeDeletionDriver>(
+    _deletion_target: &Path,
+    _tombstone_root: Option<&Path>,
+    _expected_identity: &str,
+    description: &str,
+    deadline: Option<std::time::Instant>,
+    _executor: &mut D,
+) -> Result<(), String> {
+    check_directory_deletion_deadline(deadline)?;
+    Err(format!(
+        "identity-bound {description} deletion is unsupported on this platform"
+    ))
+}
+
+#[cfg(unix)]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_sign_loss,
+    clippy::unnecessary_cast
+)]
+fn remove_identity_bound_directory_with_driver<D: WorktreeDeletionDriver>(
+    deletion_target: &Path,
+    tombstone_root: Option<&Path>,
+    expected_identity: &str,
+    description: &str,
+    deadline: Option<std::time::Instant>,
+    executor: &mut D,
+) -> Result<(), String> {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    check_directory_deletion_deadline(deadline)?;
+    executor.before_move(deletion_target)?;
+    let fresh_root = tombstone_root.is_none() || !executor.allows_existing_root();
     let parent = deletion_target
         .parent()
         .ok_or_else(|| format!("{description} has no parent directory"))?;
@@ -5005,146 +6546,141 @@ where
             "private {description} tombstone is outside deletion parent"
         ));
     }
-    if !tombstone_root.exists() {
-        reserve_private_tombstone(&tombstone_root, description)?;
+    check_directory_deletion_deadline(deadline)?;
+    let parent_descriptor = open_deletion_parent(parent)?;
+    let source_name = std::ffi::CString::new(
+        deletion_target
+            .file_name()
+            .ok_or("missing deletion leaf")?
+            .as_bytes(),
+    )
+    .map_err(|_| "deletion source name contains NUL")?;
+    let source_identity =
+        DeletionEntryIdentity::from_stat(&deletion_slot_stat(&parent_descriptor, &source_name)?);
+    if source_identity.kind != libc::S_IFDIR {
+        return Err("final deletion source is not a no-follow directory".into());
     }
-    #[cfg(not(unix))]
-    {
-        return Err(format!(
-            "identity-bound {description} deletion is unsupported on this platform"
-        ));
-    }
+    let source_witness =
+        OwnedDeletionSlot::capture(&parent_descriptor, &source_name, source_identity)?;
+    let root_name = std::ffi::CString::new(
+        tombstone_root
+            .file_name()
+            .ok_or("missing tombstone leaf")?
+            .as_bytes(),
+    )
+    .map_err(|_| "tombstone name contains NUL")?;
+    // Creation and descriptor binding complete in one admitted callback, before
+    // the durable root bind or any move. Never reopen this reservation by path.
+    let root_witness = if fresh_root || !tombstone_root.exists() {
+        let parent_descriptor = std::sync::Arc::clone(&parent_descriptor);
+        executor.execute(move || {
+            check_directory_deletion_deadline(deadline)?;
+            // SAFETY: descriptor/name are owned; mkdirat never replaces an entry.
+            if unsafe { libc::mkdirat(parent_descriptor.as_raw_fd(), root_name.as_ptr(), 0o700) }
+                < 0
+            {
+                return Err(format!(
+                    "cannot reserve private tombstone: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let stat = deletion_slot_stat(&parent_descriptor, &root_name)?;
+            OwnedDeletionSlot::capture(
+                &parent_descriptor,
+                &root_name,
+                DeletionEntryIdentity::from_stat(&stat),
+            )
+        })?
+    } else {
+        let stat = deletion_slot_stat(&parent_descriptor, &root_name)?;
+        OwnedDeletionSlot::capture(
+            &parent_descriptor,
+            &root_name,
+            DeletionEntryIdentity::from_stat(&stat),
+        )?
+    };
+    let root_stat = deletion_descriptor_stat(&root_witness.retained)?;
+    validate_private_tombstone_root(
+        root_witness.identity.kind == libc::S_IFDIR,
+        root_stat.st_uid,
+        u64::from(root_stat.st_mode),
+    )?;
     let tombstone = tombstone_root.join("object");
-    #[cfg(unix)]
-    let verified_root = tombstone_identity(&tombstone_root)
-        .map_err(|error| format!("cannot identify private {description} tombstone: {error}"))?;
-    if let Err(error) = bind_root(&tombstone_root, verified_root, None) {
-        let _ = std::fs::remove_dir(&tombstone_root);
+    let verified_root = root_witness.identity.pair();
+    check_directory_deletion_deadline(deadline)?;
+    if let Err(error) = executor.bind_root(&tombstone_root, verified_root, None) {
+        if !executor.cleanup_after_failure() {
+            return Err(error);
+        }
+        let cleanup = root_witness.clone();
+        executor.execute(move || cleanup.unlink(deadline))?;
         return Err(error);
     }
-    if let Err(error) = std::fs::rename(deletion_target, &tombstone) {
-        let _ = std::fs::remove_dir(&tombstone_root);
+    check_directory_deletion_deadline(deadline)?;
+    // Keep syscall failure distinct from executor refusal: refusal must return
+    // immediately, without even a compensating tombstone cleanup admission.
+    let rename_result = executor.rename_to_tombstone(
+        OwnedWorktreeRenameLeaf {
+            source_path: deletion_target.to_path_buf(),
+            source: source_witness.clone(),
+            root: root_witness.clone(),
+        },
+        deadline,
+    )?;
+    if let Err(error) = rename_result {
+        // Legacy callers may clean their empty reservation. Native Close stops
+        // at the first failed syscall and retains the bound root as evidence.
+        if executor.cleanup_after_failure() {
+            let cleanup = root_witness.clone();
+            executor.execute(move || cleanup.unlink(deadline))?;
+        }
         return Err(format!(
             "cannot move {description} into private final tombstone: {error}"
         ));
     }
-    #[cfg(unix)]
-    let verified_object = {
-        use std::os::unix::fs::MetadataExt as _;
-        let metadata = std::fs::symlink_metadata(&tombstone)
-            .map_err(|error| format!("cannot identify identity-bound {description}: {error}"))?;
-        (metadata.dev(), metadata.ino())
+    check_directory_deletion_deadline(deadline)?;
+    let object_witness = OwnedDeletionSlot {
+        parent: std::sync::Arc::clone(&root_witness.retained),
+        parent_identity: root_witness.identity,
+        name: std::ffi::CString::new("object").expect("static name"),
+        retained: std::sync::Arc::clone(&source_witness.retained),
+        identity: source_witness.identity,
     };
-    bind_root(&tombstone_root, verified_root, Some(verified_object))?;
-    if observe_identity(&tombstone)? != expected_identity {
+    object_witness.validate()?;
+    let verified_object = object_witness.identity.pair();
+    check_directory_deletion_deadline(deadline)?;
+    executor.bind_root(&tombstone_root, verified_root, Some(verified_object))?;
+    check_directory_deletion_deadline(deadline)?;
+    if executor.observe_identity(&tombstone)? != expected_identity {
         return Err(format!(
             "{description} identity changed before final deletion; replacement preserved at {}",
             tombstone.display()
         ));
     }
-    after_identity_observation(&tombstone_root, &tombstone)?;
-    #[cfg(unix)]
-    {
-        use std::ffi::CString;
-        use std::os::fd::FromRawFd as _;
-        use std::os::unix::ffi::OsStrExt as _;
-
-        let tombstone_name = CString::new("object").expect("static name contains no NUL");
-        let root = CString::new(tombstone_root.as_os_str().as_bytes())
-            .map_err(|_| format!("private {description} tombstone path contains NUL"))?;
-        // SAFETY: root is a valid C path; O_NOFOLLOW rejects a replaced symlink.
-        let root_descriptor = unsafe {
-            libc::open(
-                root.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if root_descriptor < 0 {
-            return Err(format!(
-                "cannot open private {description} tombstone without following replacements: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: root_descriptor is newly owned on success above.
-        let root_descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(root_descriptor) };
-        let mut opened_root = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: descriptor is open and fstat initializes opened_root on success.
-        if unsafe {
-            libc::fstat(
-                std::os::fd::AsRawFd::as_raw_fd(&root_descriptor),
-                opened_root.as_mut_ptr(),
-            )
-        } < 0
-        {
-            return Err(format!(
-                "cannot identify opened private {description} tombstone: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: fstat succeeded.
-        let opened_root = unsafe { opened_root.assume_init() };
-        if (opened_root.st_dev as u64, opened_root.st_ino as u64) != verified_root {
-            return Err(format!(
-                "private {description} tombstone root was replaced before descriptor binding; replacement preserved at {}",
-                tombstone_root.display()
-            ));
-        }
-        // SAFETY: openat is rooted in the private descriptor and O_NOFOLLOW rejects replacement links.
-        let object_descriptor = unsafe {
-            libc::openat(
-                std::os::fd::AsRawFd::as_raw_fd(&root_descriptor),
-                tombstone_name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if object_descriptor < 0 {
-            return Err(format!(
-                "cannot open identity-bound {description}: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: object_descriptor is newly owned on success above.
-        let object_descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(object_descriptor) };
-        let mut opened_object = std::mem::MaybeUninit::<libc::stat>::uninit();
-        // SAFETY: descriptor is open and fstat initializes opened_object on success.
-        if unsafe {
-            libc::fstat(
-                std::os::fd::AsRawFd::as_raw_fd(&object_descriptor),
-                opened_object.as_mut_ptr(),
-            )
-        } < 0
-        {
-            return Err(format!(
-                "cannot identify opened identity-bound {description}: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: fstat succeeded.
-        let opened_object = unsafe { opened_object.assume_init() };
-        if (opened_object.st_dev as u64, opened_object.st_ino as u64) != verified_object {
-            return Err(format!(
-                "identity-bound {description} object was replaced before descriptor binding; replacement preserved at {}",
-                tombstone.display()
-            ));
-        }
-        remove_directory_contents_at(&object_descriptor)?;
-        // SAFETY: unlinkat is rooted at the still-open private directory and does not follow names.
-        if unsafe {
-            libc::unlinkat(
-                std::os::fd::AsRawFd::as_raw_fd(&root_descriptor),
-                tombstone_name.as_ptr(),
-                libc::AT_REMOVEDIR,
-            )
-        } < 0
-        {
-            return Err(format!(
-                "cannot unlink identity-bound {description}: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-    }
-    std::fs::remove_dir(&tombstone_root)
-        .map_err(|error| format!("cannot remove empty {description} tombstone: {error}"))
+    check_directory_deletion_deadline(deadline)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let self_descriptor = Some(object_witness.self_descriptor_borrow()?);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let self_descriptor: Option<SelfDeletionDescriptorBorrow<'_>> = None;
+    executor.after_move(&tombstone_root, &tombstone, self_descriptor.as_ref())?;
+    check_directory_deletion_deadline(deadline)?;
+    root_witness.validate()?;
+    object_witness.validate()?;
+    remove_directory_contents_at_with_hook_and_deadline_with_executor(
+        &object_witness.retained,
+        &mut |_, _| {},
+        deadline,
+        executor,
+    )?;
+    // Keep the original descriptors alive through release classification of each
+    // admitted leaf, including final reservation removal through its parent FD.
+    check_directory_deletion_deadline(deadline)?;
+    let object_effect = object_witness.clone();
+    executor.execute(move || object_effect.unlink(deadline))?;
+    check_directory_deletion_deadline(deadline)?;
+    let root_effect = root_witness.clone();
+    executor.execute(move || root_effect.unlink(deadline))?;
+    check_directory_deletion_deadline(deadline)
 }
 
 #[cfg(unix)]
@@ -5272,6 +6808,13 @@ where
         return FinalTombstoneRecovery::Residual(
             "recorded final tombstone root was replaced; preserved for manual repair".to_string(),
         );
+    }
+    if let Err(detail) = validate_private_tombstone_root(
+        root_stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+        root_stat.st_uid,
+        u64::from(root_stat.st_mode),
+    ) {
+        return FinalTombstoneRecovery::Residual(detail);
     }
     let name = CString::new("object").expect("static name contains no NUL");
     let (expected_object_device, expected_object_inode) = match (
@@ -5478,6 +7021,92 @@ fn administrative_dir_quarantine_path(
     Ok(parent.join(format!(".phoenix-close-admin-{suffix}")))
 }
 
+fn administrative_dir_final_tombstone_path(quarantine: &Path) -> PathBuf {
+    let mut path = quarantine.as_os_str().to_os_string();
+    path.push("-delete");
+    PathBuf::from(path)
+}
+
+fn fresh_administrative_dir_final_tombstone_path(quarantine: &Path) -> PathBuf {
+    let mut path = administrative_dir_final_tombstone_path(quarantine).into_os_string();
+    path.push(format!("-{}", uuid::Uuid::new_v4().simple()));
+    PathBuf::from(path)
+}
+
+fn reject_administrative_final_tombstone_residuals(
+    quarantine: &Path,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), String> {
+    let legacy = administrative_dir_final_tombstone_path(quarantine);
+    check_directory_deletion_deadline(deadline)?;
+    let legacy_metadata = std::fs::symlink_metadata(&legacy);
+    check_directory_deletion_deadline(deadline)?;
+    match legacy_metadata {
+        Ok(_) => {
+            return Err(format!(
+                "worktree administrative cleanup has an unresolved final tombstone at {}",
+                legacy.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect administrative final tombstone: {error}"
+            ))
+        }
+    }
+    let parent = legacy
+        .parent()
+        .ok_or_else(|| "administrative final tombstone has no parent".to_string())?;
+    let mut prefix = legacy
+        .file_name()
+        .ok_or_else(|| "administrative final tombstone has no name".to_string())?
+        .to_os_string();
+    prefix.push("-");
+    check_directory_deletion_deadline(deadline)?;
+    let entries = std::fs::read_dir(parent);
+    check_directory_deletion_deadline(deadline)?;
+    let mut entries = match entries {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            check_directory_deletion_deadline(deadline)?;
+            let metadata = std::fs::symlink_metadata(parent);
+            check_directory_deletion_deadline(deadline)?;
+            return match metadata {
+                // An absent parent cannot contain a legacy or randomized residual.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err("cannot enumerate administrative final tombstones: parent is present or inaccessible".to_string()),
+            };
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot enumerate administrative final tombstones: {error}"
+            ))
+        }
+    };
+    loop {
+        check_directory_deletion_deadline(deadline)?;
+        let entry = entries.next();
+        check_directory_deletion_deadline(deadline)?;
+        let Some(entry) = entry else {
+            return Ok(());
+        };
+        let entry = entry.map_err(|error| {
+            format!("cannot read administrative final tombstone entry: {error}")
+        })?;
+        if entry
+            .file_name()
+            .as_encoded_bytes()
+            .starts_with(prefix.as_encoded_bytes())
+        {
+            return Err(format!(
+                "worktree administrative cleanup has an unresolved final tombstone at {}",
+                entry.path().display()
+            ));
+        }
+    }
+}
+
 fn remove_exact_worktree_administrative_dir(
     administrative_dir: &Path,
     expected_incarnation: &str,
@@ -5489,6 +7118,19 @@ fn remove_exact_worktree_administrative_dir(
     )
 }
 
+fn remove_exact_worktree_administrative_dir_until(
+    administrative_dir: &Path,
+    expected_incarnation: &str,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    remove_exact_worktree_administrative_dir_with_hook_and_deadline(
+        administrative_dir,
+        expected_incarnation,
+        |_| {},
+        Some(deadline),
+    )
+}
+
 fn remove_exact_worktree_administrative_dir_with_hook<F>(
     administrative_dir: &Path,
     expected_incarnation: &str,
@@ -5497,11 +7139,51 @@ fn remove_exact_worktree_administrative_dir_with_hook<F>(
 where
     F: FnOnce(&Path),
 {
+    remove_exact_worktree_administrative_dir_with_hook_and_deadline(
+        administrative_dir,
+        expected_incarnation,
+        before_final_move,
+        None,
+    )
+}
+
+fn remove_exact_worktree_administrative_dir_with_hook_and_deadline<F>(
+    administrative_dir: &Path,
+    expected_incarnation: &str,
+    before_final_move: F,
+    deadline: Option<std::time::Instant>,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path),
+{
+    remove_exact_worktree_administrative_dir_with_hook_and_deadline_with_executor(
+        administrative_dir,
+        expected_incarnation,
+        before_final_move,
+        deadline,
+        &mut DirectWorktreeMutationExecutor,
+    )
+}
+
+fn remove_exact_worktree_administrative_dir_with_hook_and_deadline_with_executor<F, E>(
+    administrative_dir: &Path,
+    expected_incarnation: &str,
+    before_final_move: F,
+    deadline: Option<std::time::Instant>,
+    executor: &mut E,
+) -> Result<(), String>
+where
+    F: FnOnce(&Path),
+    E: WorktreeMutationExecutor,
+{
+    check_directory_deletion_deadline(deadline)?;
     let quarantine = administrative_dir_quarantine_path(administrative_dir, expected_incarnation)?;
+    reject_administrative_final_tombstone_residuals(&quarantine, deadline)?;
     let source_exists = administrative_dir
         .try_exists()
         .map_err(|error| error.to_string())?;
     let quarantine_exists = quarantine.try_exists().map_err(|error| error.to_string())?;
+    check_directory_deletion_deadline(deadline)?;
     let deletion_target = match (source_exists, quarantine_exists) {
         (false, false) => return Ok(()),
         (true, true) => {
@@ -5515,26 +7197,43 @@ where
             if observe_administrative_dir_incarnation(administrative_dir)? != expected_incarnation {
                 return Err("worktree administrative-directory incarnation changed".to_string());
             }
-            std::fs::rename(administrative_dir, &quarantine).map_err(|error| {
-                format!("cannot quarantine exact worktree administrative directory: {error}")
+            check_directory_deletion_deadline(deadline)?;
+            let source = administrative_dir.to_path_buf();
+            let destination = quarantine.clone();
+            executor.execute(move || {
+                check_directory_deletion_deadline(deadline)?;
+                std::fs::rename(source, destination).map_err(|error| {
+                    format!("cannot quarantine exact worktree administrative directory: {error}")
+                })
             })?;
             quarantine
         }
     };
+    check_directory_deletion_deadline(deadline)?;
     if observe_administrative_dir_incarnation(&deletion_target)? != expected_incarnation {
         return Err(
             "quarantined worktree administrative-directory incarnation changed".to_string(),
         );
     }
-    remove_identity_bound_directory(
+    check_directory_deletion_deadline(deadline)?;
+    let final_tombstone = fresh_administrative_dir_final_tombstone_path(&deletion_target);
+    reserve_private_tombstone_with_executor(
+        &final_tombstone,
+        "retired worktree administrative directory",
+        deadline,
+        executor,
+    )?;
+    remove_identity_bound_directory_with_deadline_with_executor(
         &deletion_target,
-        None,
+        Some(&final_tombstone),
         expected_incarnation,
         observe_administrative_dir_incarnation,
         before_final_move,
         |_, _, _| Ok(()),
         |_, _| Ok(()),
         "retired worktree administrative directory",
+        deadline,
+        executor,
     )
 }
 
@@ -5571,7 +7270,14 @@ fn classify_fsmonitor_stop(output: &std::process::Output) -> Result<FsmonitorSto
     }
     if output.status.code() == Some(128)
         && output.stdout.is_empty()
-        && output.stderr.trim_ascii() == b"fatal: fsmonitor--daemon is not running"
+        // Exact C-locale diagnostics from Git's fsmonitor-ipc.c and
+        // builtin/fsmonitor--daemon.c (#else !HAVE_FSMONITOR_DAEMON_BACKEND).
+        // Unsupported Git builds (including Linux) have no applicable daemon.
+        && matches!(
+            output.stderr.strip_suffix(b"\n").unwrap_or(&output.stderr),
+            b"fatal: fsmonitor--daemon is not running"
+                | b"fatal: fsmonitor--daemon not supported on this platform"
+        )
     {
         return Ok(FsmonitorStop::NotRunning);
     }
@@ -5582,21 +7288,50 @@ fn classify_fsmonitor_stop(output: &std::process::Output) -> Result<FsmonitorSto
     ))
 }
 
-fn stop_bound_fsmonitor_daemons(path: &Path) -> Result<FsmonitorStop, String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let submodules = run_bounded_git_command_until(
-        path,
-        &[
-            "submodule",
-            "foreach",
-            "--quiet",
-            "--recursive",
-            r#"output=$(git fsmonitor--daemon stop 2>&1); result=$?; if [ "$result" -eq 0 ] || { [ "$result" -eq 128 ] && [ "$output" = 'fatal: fsmonitor--daemon is not running' ]; }; then exit 0; fi; printf '%s\n' "$output" >&2; exit "$result""#,
-        ],
-        None,
-        deadline,
-        "submodule fsmonitor shutdown",
-    )?;
+#[cfg(test)]
+fn stop_bound_fsmonitor_daemons_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<FsmonitorStop, String> {
+    stop_bound_fsmonitor_daemons_with_admission_until(path, deadline, None)
+}
+
+fn stop_bound_fsmonitor_daemons_with_admission_until(
+    path: &Path,
+    deadline: std::time::Instant,
+    first_submodule_spawn_admission: Option<SubmoduleSpawnAdmissionEffect>,
+) -> Result<FsmonitorStop, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("submodule fsmonitor shutdown exceeded its deadline".to_string());
+    }
+    let arguments = [
+        "submodule",
+        "foreach",
+        "--quiet",
+        "--recursive",
+        r#"output=$(git fsmonitor--daemon stop 2>&1); result=$?; if [ "$result" -eq 0 ] || { [ "$result" -eq 128 ] && { [ "$output" = 'fatal: fsmonitor--daemon is not running' ] || [ "$output" = 'fatal: fsmonitor--daemon not supported on this platform' ]; }; }; then exit 0; fi; printf '%s\n' "$output" >&2; exit "$result""#,
+    ];
+    let mut command = phoenix_core::git::command_with_config(&[("core.fsmonitor", "false")]);
+    bind_git_command_to_worktree_until(&mut command, path, deadline)?;
+    command
+        .args(arguments)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(
+            "Close teardown deadline elapsed before recursive fsmonitor shutdown spawn".to_string(),
+        );
+    }
+    let child = match first_submodule_spawn_admission {
+        Some(admit_spawn) => admit_spawn(&mut command, deadline)?,
+        None => command.spawn().map_err(|error| error.to_string())?,
+    };
+    let submodules = wait_bounded_child_output(child, deadline, "submodule fsmonitor shutdown")?;
     if !submodules.status.success() {
         return Err(format!(
             "submodule fsmonitor shutdown failed ({}): {}",
@@ -5604,12 +7339,24 @@ fn stop_bound_fsmonitor_daemons(path: &Path) -> Result<FsmonitorStop, String> {
             String::from_utf8_lossy(&submodules.stderr).trim()
         ));
     }
-    let worktree = run_bounded_git_command_until(
+    stop_bound_fsmonitor_with_leaf_until(path, deadline, &mut run_bounded_spawned_git)
+}
+
+/// Stops only this bound repository's daemon. Native callers must enumerate
+/// initialized submodules and invoke this leaf for each one; the legacy recursive
+/// `submodule foreach` helper above launches descendants outside leaf admission.
+fn stop_bound_fsmonitor_with_leaf_until(
+    path: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<FsmonitorStop, String> {
+    let worktree = run_bounded_git_command_with_leaf_until(
         path,
         &["fsmonitor--daemon", "stop"],
         None,
         deadline,
         "worktree fsmonitor shutdown",
+        git_leaf,
     )?;
     classify_fsmonitor_stop(&worktree)
 }
@@ -5624,6 +7371,22 @@ impl ExternalWriterEvidence {
     fn blocks_retirement(&self) -> bool {
         matches!(self, Self::Blocked(_))
     }
+}
+
+#[derive(Debug)]
+enum WriterScanError {
+    Gap(CloseWriterGap),
+    Stopped(String),
+}
+
+impl From<CloseWriterGap> for WriterScanError {
+    fn from(gap: CloseWriterGap) -> Self {
+        Self::Gap(gap)
+    }
+}
+
+fn writer_scan_check(deadline: std::time::Instant) -> Result<(), WriterScanError> {
+    check_directory_deletion_deadline(Some(deadline)).map_err(WriterScanError::Stopped)
 }
 
 fn writer_gap(
@@ -5645,7 +7408,10 @@ fn writer_gap(
 }
 
 #[derive(Clone)]
-struct CloseWriterProbe {
+pub(crate) struct CloseWriterProbe {
+    // Native execution must not classify an untyped writer-observation commit
+    // error as a proven terminal failure.
+    persistence_uncertain: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     clean_writer_fixture: bool,
     db: crate::db::Database,
@@ -5657,19 +7423,43 @@ struct CloseWriterProbe {
 }
 
 impl CloseWriterProbe {
+    fn observe_until<F>(
+        &self,
+        path: &Path,
+        deadline: std::time::Instant,
+        production: F,
+    ) -> Result<ExternalWriterEvidence, String>
+    where
+        F: FnOnce(&Path, std::time::Instant) -> Result<ExternalWriterEvidence, String>,
+    {
+        check_directory_deletion_deadline(Some(deadline))?;
+        #[cfg(test)]
+        if self.clean_writer_fixture {
+            return Ok(ExternalWriterEvidence::NoPositiveEvidence);
+        }
+        let evidence = production(path, deadline)?;
+        check_directory_deletion_deadline(Some(deadline))?;
+        self.retain_until(evidence, deadline)
+    }
+
     fn observe(
         &self,
         path: &Path,
         production: fn(&Path) -> Result<ExternalWriterEvidence, String>,
     ) -> Result<ExternalWriterEvidence, String> {
-        #[cfg(test)]
-        if self.clean_writer_fixture {
-            return Ok(ExternalWriterEvidence::NoPositiveEvidence);
-        }
-        self.retain(production(path)?)
+        self.observe_until(
+            path,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            |path, _deadline| production(path),
+        )
     }
 
-    fn retain(&self, evidence: ExternalWriterEvidence) -> Result<ExternalWriterEvidence, String> {
+    fn retain_until(
+        &self,
+        evidence: ExternalWriterEvidence,
+        deadline: std::time::Instant,
+    ) -> Result<ExternalWriterEvidence, String> {
+        check_directory_deletion_deadline(Some(deadline))?;
         if let ExternalWriterEvidence::Blocked(observation) = &evidence {
             self.runtime
                 .block_on(self.db.record_close_writer_observation(
@@ -5682,8 +7472,12 @@ impl CloseWriterProbe {
                     },
                 ))
                 .map_err(|error| {
+                    if let Some(uncertain) = &self.persistence_uncertain {
+                        uncertain.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                     format!("cannot persist Close writer observation; target preserved: {error}")
                 })?;
+            check_directory_deletion_deadline(Some(deadline))?;
             if let CloseWriterObservation::InspectionGap {
                 detector,
                 pid,
@@ -5695,6 +7489,7 @@ impl CloseWriterProbe {
                 ));
             }
         }
+        check_directory_deletion_deadline(Some(deadline))?;
         Ok(evidence)
     }
 }
@@ -5715,7 +7510,7 @@ fn probe_retry_worktree_writers_with<F>(
     quarantine: &Path,
     tombstone: Option<&CloseWorktreeFinalTombstone>,
     mut observe: F,
-) -> Result<(), String>
+) -> Result<(), RetryAssessmentError>
 where
     F: FnMut(&Path) -> Result<RetryTargetObservation, String>,
 {
@@ -5726,11 +7521,19 @@ where
     {
         match observe(path)? {
             RetryTargetObservation::Present(ExternalWriterEvidence::Blocked(
-                CloseWriterObservation::InspectionGap { .. },
+                CloseWriterObservation::InspectionGap {
+                    detector,
+                    pid,
+                    reason,
+                },
             )) => {
-                return Err(format!(
-                    "incomplete external-writer inspection at {}; no new run admitted",
-                    path.display()
+                return Err(RetryAssessmentError::WriterInspectionGap(
+                    WriterInspectionGap {
+                        path: path.to_path_buf(),
+                        detector,
+                        reason,
+                        pid,
+                    },
                 ))
             }
             RetryTargetObservation::Present(ExternalWriterEvidence::Blocked(
@@ -5739,7 +7542,8 @@ where
                 return Err(format!(
                     "external writer holds exact retry target {}; no new run admitted",
                     path.display()
-                ))
+                )
+                .into())
             }
             RetryTargetObservation::Absent
             | RetryTargetObservation::Present(ExternalWriterEvidence::NoPositiveEvidence) => {}
@@ -5752,13 +7556,23 @@ fn probe_retry_worktree_writers(
     original: &Path,
     quarantine: &Path,
     tombstone: Option<&CloseWorktreeFinalTombstone>,
-) -> Result<(), String> {
+    #[cfg(test)] clean_writer_fixture: bool,
+) -> Result<(), RetryAssessmentError> {
     probe_retry_worktree_writers_with(original, quarantine, tombstone, |path| {
         if !path
             .try_exists()
             .map_err(|error| format!("cannot probe retry writer target: {error}"))?
         {
             return Ok(RetryTargetObservation::Absent);
+        }
+        // Match the existing per-manager deletion-checkpoint fixture. The
+        // runner's ambient /proc access is not evidence about this isolated
+        // Git fixture; production and non-opted-in tests retain the detector.
+        #[cfg(test)]
+        if clean_writer_fixture {
+            return Ok(RetryTargetObservation::Present(
+                ExternalWriterEvidence::NoPositiveEvidence,
+            ));
         }
         Ok(RetryTargetObservation::Present(
             quarantine_has_external_writer(path)?,
@@ -5781,13 +7595,35 @@ async fn verify_retained_worktree(
     Ok(())
 }
 
-fn quarantine_has_external_writer(path: &Path) -> Result<ExternalWriterEvidence, String> {
+fn quarantine_has_external_writer_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_external_writer_until_with_self_descriptor(path, deadline, None)
+}
+
+fn quarantine_has_external_writer_until_with_self_descriptor(
+    path: &Path,
+    deadline: std::time::Instant,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<ExternalWriterEvidence, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
+    let descriptor_evidence = quarantine_has_open_descriptors_until_with_self_descriptor(
+        path,
+        deadline,
+        self_descriptor,
+    )?;
+    check_directory_deletion_deadline(Some(deadline))?;
+    if descriptor_evidence.blocks_retirement() {
+        return Ok(descriptor_evidence);
+    }
     for probe in [
-        quarantine_has_open_descriptors,
-        quarantine_has_process_cwd,
-        quarantine_has_writable_mappings,
+        quarantine_has_process_cwd_until,
+        quarantine_has_writable_mappings_until,
     ] {
-        let evidence = probe(path)?;
+        check_directory_deletion_deadline(Some(deadline))?;
+        let evidence = probe(path, deadline)?;
+        check_directory_deletion_deadline(Some(deadline))?;
         if evidence.blocks_retirement() {
             return Ok(evidence);
         }
@@ -5795,35 +7631,53 @@ fn quarantine_has_external_writer(path: &Path) -> Result<ExternalWriterEvidence,
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
-#[cfg(target_os = "linux")]
-fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    // SAFETY: `geteuid` has no preconditions.
-    let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_writable_mappings_in(path, Path::new("/proc"), effective_uid)
+fn quarantine_has_external_writer(path: &Path) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_external_writer_until(
+        path,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_writable_mappings_in(
     path: &Path,
     proc_root: &Path,
     effective_uid: libc::uid_t,
 ) -> Result<ExternalWriterEvidence, String> {
-    linux_writer_scan(
+    quarantine_has_writable_mappings_in_until(
+        path,
+        proc_root,
+        effective_uid,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_writable_mappings_in_until(
+    path: &Path,
+    proc_root: &Path,
+    effective_uid: libc::uid_t,
+    deadline: std::time::Instant,
+) -> Result<ExternalWriterEvidence, String> {
+    linux_writer_scan_until(
         path,
         proc_root,
         effective_uid,
         CloseWriterDetector::LinuxMapping,
+        deadline,
         |process, canonical| {
-            let mappings = std::fs::read_to_string(process.join("maps"))
-                .map_err(|_| CloseWriterGap::Unavailable)?;
+            writer_scan_check(deadline)?;
+            let mappings_result = std::fs::read_to_string(process.join("maps"));
+            writer_scan_check(deadline)?;
+            let mappings = mappings_result.map_err(|_| CloseWriterGap::Unavailable)?;
             for mapping in mappings.lines() {
+                writer_scan_check(deadline)?;
                 let mut fields = mapping.split_whitespace();
                 let _address = fields.next().ok_or(CloseWriterGap::Malformed)?;
                 let permissions = fields.next().ok_or(CloseWriterGap::Malformed)?;
                 let _offset = fields.next().ok_or(CloseWriterGap::Malformed)?;
                 let _device = fields.next().ok_or(CloseWriterGap::Malformed)?;
                 let _inode = fields.next().ok_or(CloseWriterGap::Malformed)?;
-                // The first five fields contain no spaces; the remaining bytes are the path.
                 let mut remainder = mapping;
                 for _ in 0..5 {
                     remainder = remainder.trim_start();
@@ -5837,7 +7691,7 @@ fn quarantine_has_writable_mappings_in(
                 }
                 let mapped_path = PathBuf::from(remainder.trim_start());
                 if permissions.len() != 4 {
-                    return Err(CloseWriterGap::Malformed);
+                    return Err(CloseWriterGap::Malformed.into());
                 }
                 if permissions.as_bytes()[1] == b'w'
                     && permissions.as_bytes()[3] == b's'
@@ -5855,7 +7709,10 @@ fn quarantine_has_writable_mappings_in(
 }
 
 #[cfg(target_os = "macos")]
-fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidence, String> {
+fn quarantine_has_writable_mappings_mac_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<ExternalWriterEvidence, String> {
     use std::ffi::CStr;
     use std::mem::{size_of, MaybeUninit};
     use std::os::unix::ffi::OsStrExt as _;
@@ -5892,61 +7749,69 @@ fn quarantine_has_writable_mappings(path: &Path) -> Result<ExternalWriterEvidenc
     }
 
     const PROC_PIDREGIONPATHINFO: i32 = 8;
-    mac_writer_scan(path, CloseWriterDetector::MacMapping, |pid, canonical| {
-        let mut address = 0_u64;
-        loop {
-            let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
-            let bytes = unsafe {
-                libc::proc_pidinfo(
-                    pid,
-                    PROC_PIDREGIONPATHINFO,
-                    address,
-                    info.as_mut_ptr().cast(),
-                    i32::try_from(size_of::<ProcRegionWithPathInfo>())
-                        .expect("region path info fits i32"),
-                )
-            };
-            if bytes == 0
-                && address > 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
-            {
-                return Ok(None);
+    mac_writer_scan_until(
+        path,
+        CloseWriterDetector::MacMapping,
+        deadline,
+        |pid, canonical| {
+            let mut address = 0_u64;
+            loop {
+                writer_scan_check(deadline)?;
+                let mut info = MaybeUninit::<ProcRegionWithPathInfo>::zeroed();
+                let bytes = unsafe {
+                    libc::proc_pidinfo(
+                        pid,
+                        PROC_PIDREGIONPATHINFO,
+                        address,
+                        info.as_mut_ptr().cast(),
+                        i32::try_from(size_of::<ProcRegionWithPathInfo>())
+                            .expect("region path info fits i32"),
+                    )
+                };
+                writer_scan_check(deadline)?;
+                if bytes == 0
+                    && address > 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
+                {
+                    return Ok(None);
+                }
+                if bytes == 0 {
+                    return Err(CloseWriterGap::Unavailable.into());
+                }
+                if usize::try_from(bytes).ok() != Some(size_of::<ProcRegionWithPathInfo>()) {
+                    return Err(CloseWriterGap::Malformed.into());
+                }
+                // SAFETY: the complete C structure was initialized by the successful call.
+                let info = unsafe { info.assume_init() };
+                let next = info
+                    .region
+                    .address
+                    .checked_add(info.region.size)
+                    .ok_or(CloseWriterGap::Malformed)?;
+                if next <= address {
+                    return Err(CloseWriterGap::Malformed.into());
+                }
+                address = next;
+                let path_bytes = info.vnode.vip_path.as_flattened();
+                // SAFETY: reinterpret the initialized, bounded C character buffer as bytes.
+                let path_bytes = unsafe {
+                    std::slice::from_raw_parts(path_bytes.as_ptr().cast::<u8>(), path_bytes.len())
+                };
+                let mapped_path = CStr::from_bytes_until_nul(path_bytes)
+                    .map_err(|_| CloseWriterGap::Malformed)?;
+                let mapped_path =
+                    PathBuf::from(std::ffi::OsStr::from_bytes(mapped_path.to_bytes()));
+                if mac_mapping_is_writer(info.region.protection, info.region.share_mode)
+                    && path_is_within(&mapped_path, canonical)
+                {
+                    return Ok(Some((
+                        mapped_path,
+                        CloseWriterAuthority::WritableSharedMapping,
+                    )));
+                }
             }
-            if bytes == 0 {
-                return Err(CloseWriterGap::Unavailable);
-            }
-            if usize::try_from(bytes).ok() != Some(size_of::<ProcRegionWithPathInfo>()) {
-                return Err(CloseWriterGap::Malformed);
-            }
-            // SAFETY: the complete C structure was initialized by the successful call.
-            let info = unsafe { info.assume_init() };
-            let next = info
-                .region
-                .address
-                .checked_add(info.region.size)
-                .ok_or(CloseWriterGap::Malformed)?;
-            if next <= address {
-                return Err(CloseWriterGap::Malformed);
-            }
-            address = next;
-            let path_bytes = info.vnode.vip_path.as_flattened();
-            // SAFETY: reinterpret the initialized, bounded C character buffer as bytes.
-            let path_bytes = unsafe {
-                std::slice::from_raw_parts(path_bytes.as_ptr().cast::<u8>(), path_bytes.len())
-            };
-            let mapped_path =
-                CStr::from_bytes_until_nul(path_bytes).map_err(|_| CloseWriterGap::Malformed)?;
-            let mapped_path = PathBuf::from(std::ffi::OsStr::from_bytes(mapped_path.to_bytes()));
-            if mac_mapping_is_writer(info.region.protection, info.region.share_mode)
-                && path_is_within(&mapped_path, canonical)
-            {
-                return Ok(Some((
-                    mapped_path,
-                    CloseWriterAuthority::WritableSharedMapping,
-                )));
-            }
-        }
-    })
+        },
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -5954,31 +7819,43 @@ fn quarantine_has_writable_mappings(_path: &Path) -> Result<ExternalWriterEviden
     Err("writable memory-mapping inspection is unsupported on this platform".to_string())
 }
 
-#[cfg(target_os = "linux")]
-fn quarantine_has_process_cwd(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    // SAFETY: `geteuid` has no preconditions.
-    let effective_uid = unsafe { libc::geteuid() };
-    quarantine_has_process_cwd_in(path, Path::new("/proc"), effective_uid)
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_process_cwd_in(
     path: &Path,
     proc_root: &Path,
     effective_uid: libc::uid_t,
 ) -> Result<ExternalWriterEvidence, String> {
-    linux_writer_scan(
+    quarantine_has_process_cwd_in_until(
+        path,
+        proc_root,
+        effective_uid,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_process_cwd_in_until(
+    path: &Path,
+    proc_root: &Path,
+    effective_uid: libc::uid_t,
+    deadline: std::time::Instant,
+) -> Result<ExternalWriterEvidence, String> {
+    linux_writer_scan_until(
         path,
         proc_root,
         effective_uid,
         CloseWriterDetector::LinuxCwd,
+        deadline,
         |process, canonical| {
-            let cwd =
-                std::fs::read_link(process.join("cwd")).map_err(|_| CloseWriterGap::Unavailable)?;
-            let repeated =
-                std::fs::read_link(process.join("cwd")).map_err(|_| CloseWriterGap::Unavailable)?;
+            writer_scan_check(deadline)?;
+            let cwd_result = std::fs::read_link(process.join("cwd"));
+            writer_scan_check(deadline)?;
+            let cwd = cwd_result.map_err(|_| CloseWriterGap::Unavailable)?;
+            let repeated_result = std::fs::read_link(process.join("cwd"));
+            writer_scan_check(deadline)?;
+            let repeated = repeated_result.map_err(|_| CloseWriterGap::Unavailable)?;
             if cwd != repeated {
-                return Err(CloseWriterGap::ProcessChanged);
+                return Err(CloseWriterGap::ProcessChanged.into());
             }
             Ok(path_is_within(&cwd, canonical)
                 .then_some((cwd, CloseWriterAuthority::WorkingDirectory)))
@@ -5987,77 +7864,106 @@ fn quarantine_has_process_cwd_in(
 }
 
 #[cfg(target_os = "macos")]
-fn macos_all_pids() -> Option<Vec<i32>> {
-    macos_all_pids_with(|buffer, buffer_bytes| unsafe {
-        libc::proc_listpids(1, 0, buffer, buffer_bytes)
-    })
+fn macos_all_pids_until(deadline: std::time::Instant) -> Result<Vec<i32>, WriterScanError> {
+    macos_all_pids_with_until(
+        |buffer, buffer_bytes| unsafe { libc::proc_listpids(1, 0, buffer, buffer_bytes) },
+        deadline,
+    )
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(test)]
 fn macos_all_pids_with(mut list: impl FnMut(*mut libc::c_void, i32) -> i32) -> Option<Vec<i32>> {
-    use std::mem::size_of;
+    macos_all_pids_with_until(
+        &mut list,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .ok()
+}
 
+#[cfg(any(target_os = "macos", test))]
+fn macos_all_pids_with_until(
+    mut list: impl FnMut(*mut libc::c_void, i32) -> i32,
+    deadline: std::time::Instant,
+) -> Result<Vec<i32>, WriterScanError> {
+    use std::mem::size_of;
     let mut capacity = 4096_usize;
     loop {
+        writer_scan_check(deadline)?;
         let mut pids = vec![0_i32; capacity];
-        let capacity_bytes = pids.len().checked_mul(size_of::<i32>())?;
-        let capacity_bytes_i32 = i32::try_from(capacity_bytes).ok()?;
+        let capacity_bytes = capacity
+            .checked_mul(size_of::<i32>())
+            .ok_or(WriterScanError::Gap(CloseWriterGap::Unavailable))?;
+        let capacity_bytes_i32 = i32::try_from(capacity_bytes)
+            .map_err(|_| WriterScanError::Gap(CloseWriterGap::Unavailable))?;
+        writer_scan_check(deadline)?;
         let pid_bytes = list(pids.as_mut_ptr().cast(), capacity_bytes_i32);
+        writer_scan_check(deadline)?;
         if pid_bytes <= 0 {
-            return None;
+            return Err(WriterScanError::Gap(CloseWriterGap::Unavailable));
         }
-        let pid_bytes = usize::try_from(pid_bytes).ok()?;
+        let pid_bytes = usize::try_from(pid_bytes)
+            .map_err(|_| WriterScanError::Gap(CloseWriterGap::Malformed))?;
         if pid_bytes < capacity_bytes {
-            // A non-integral short result is not a trustworthy PID inventory.
             if !pid_bytes.is_multiple_of(size_of::<i32>()) {
-                return None;
+                return Err(WriterScanError::Gap(CloseWriterGap::Malformed));
             }
             pids.truncate(pid_bytes / size_of::<i32>());
-            return Some(pids);
+            return Ok(pids);
         }
         capacity = capacity
             .checked_mul(2)
-            .filter(|capacity| *capacity <= 1_048_576)?;
+            .filter(|capacity| *capacity <= 1_048_576)
+            .ok_or(WriterScanError::Gap(CloseWriterGap::Unavailable))?;
     }
 }
 
 #[cfg(target_os = "macos")]
-fn quarantine_has_process_cwd(path: &Path) -> Result<ExternalWriterEvidence, String> {
+fn quarantine_has_process_cwd_mac_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<ExternalWriterEvidence, String> {
     use std::ffi::CStr;
     use std::mem::{size_of, MaybeUninit};
     use std::os::unix::ffi::OsStrExt as _;
 
-    mac_writer_scan(path, CloseWriterDetector::MacCwd, |pid, canonical| {
-        let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
-        let bytes = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDVNODEPATHINFO,
-                0,
-                info.as_mut_ptr().cast(),
-                i32::try_from(size_of::<libc::proc_vnodepathinfo>())
-                    .expect("vnode path info fits i32"),
-            )
-        };
-        if bytes
-            != i32::try_from(size_of::<libc::proc_vnodepathinfo>())
-                .expect("vnode path info size fits i32")
-        {
-            return Err(CloseWriterGap::Unavailable);
-        }
-        // SAFETY: the complete C structure was initialized above.
-        let info = unsafe { info.assume_init() };
-        let cwd_bytes = info.pvi_cdir.vip_path.as_flattened();
-        // SAFETY: reinterpret the initialized bounded C path buffer as bytes.
-        let cwd_bytes =
-            unsafe { std::slice::from_raw_parts(cwd_bytes.as_ptr().cast::<u8>(), cwd_bytes.len()) };
-        let cwd = CStr::from_bytes_until_nul(cwd_bytes).map_err(|_| CloseWriterGap::Malformed)?;
-        let cwd = PathBuf::from(std::ffi::OsStr::from_bytes(cwd.to_bytes()));
-        Ok(
-            path_is_within(&cwd, canonical)
-                .then_some((cwd, CloseWriterAuthority::WorkingDirectory)),
-        )
-    })
+    mac_writer_scan_until(
+        path,
+        CloseWriterDetector::MacCwd,
+        deadline,
+        |pid, canonical| {
+            writer_scan_check(deadline)?;
+            let mut info = MaybeUninit::<libc::proc_vnodepathinfo>::uninit();
+            let bytes = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDVNODEPATHINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    i32::try_from(size_of::<libc::proc_vnodepathinfo>())
+                        .expect("vnode path info fits i32"),
+                )
+            };
+            writer_scan_check(deadline)?;
+            if bytes
+                != i32::try_from(size_of::<libc::proc_vnodepathinfo>())
+                    .expect("vnode path info size fits i32")
+            {
+                return Err(CloseWriterGap::Unavailable.into());
+            }
+            // SAFETY: the complete C structure was initialized above.
+            let info = unsafe { info.assume_init() };
+            let cwd_bytes = info.pvi_cdir.vip_path.as_flattened();
+            // SAFETY: reinterpret the initialized bounded C path buffer as bytes.
+            let cwd_bytes = unsafe {
+                std::slice::from_raw_parts(cwd_bytes.as_ptr().cast::<u8>(), cwd_bytes.len())
+            };
+            let cwd =
+                CStr::from_bytes_until_nul(cwd_bytes).map_err(|_| CloseWriterGap::Malformed)?;
+            let cwd = PathBuf::from(std::ffi::OsStr::from_bytes(cwd.to_bytes()));
+            Ok(path_is_within(&cwd, canonical)
+                .then_some((cwd, CloseWriterAuthority::WorkingDirectory)))
+        },
+    )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -6119,66 +8025,134 @@ fn linux_process_is_zombie(status: &str) -> Result<bool, String> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_zombie_has_no_sibling_threads(process: &Path, status: &str) -> Result<(), String> {
-    let validate = |sample: &str| -> Result<(), String> {
+fn linux_writer_io_diagnostic(operation: &str, path: &Path, error: &std::io::Error) {
+    tracing::debug!(
+        operation,
+        path = %path.display(),
+        error_kind = ?error.kind(),
+        raw_os_error = ?error.raw_os_error(),
+        "Linux Close writer scan I/O failed"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn linux_zombie_has_no_sibling_threads_until(
+    process: &Path,
+    status: &str,
+    deadline: std::time::Instant,
+) -> Result<(), WriterScanError> {
+    writer_scan_check(deadline)?;
+    let validate = |sample: &str| -> Result<(), WriterScanError> {
         let mut counts = sample
             .lines()
             .filter_map(|line| line.strip_prefix("Threads:"));
         if counts.next().map(str::trim) != Some("1")
             || counts.next().is_some()
-            || !linux_process_is_zombie(sample)?
+            || !linux_process_is_zombie(sample).map_err(|error| {
+                tracing::debug!(operation = "zombie_state_parse", path = %process.display(), %error);
+                CloseWriterGap::Unavailable
+            })?
         {
-            return Err("zombie thread-group leader has siblings or uncertain thread state".into());
+            tracing::debug!(operation = "zombie_single_thread_validate", path = %process.display());
+            return Err(CloseWriterGap::Unavailable.into());
         }
         Ok(())
     };
     validate(status)?;
     // A zombie group leader can coexist with live sibling threads. Only exclude
     // the single-task group, never infer absence from the leader's state alone.
-    let mut tasks = std::fs::read_dir(process.join("task"))
-        .map_err(|error| format!("cannot inspect zombie thread group: {error}"))?;
-    let task = tasks
-        .next()
-        .ok_or("zombie thread inventory is empty")?
-        .map_err(|error| format!("cannot inspect zombie thread: {error}"))?;
-    if Some(task.file_name().as_os_str()) != process.file_name() || tasks.next().is_some() {
-        return Err("zombie thread inventory contains siblings or is unstable".into());
+    writer_scan_check(deadline)?;
+    let inventory = std::fs::read_dir(process.join("task"));
+    writer_scan_check(deadline)?;
+    let mut tasks = inventory.map_err(|error| {
+        linux_writer_io_diagnostic("zombie_task_read_dir", &process.join("task"), &error);
+        CloseWriterGap::Unavailable
+    })?;
+    writer_scan_check(deadline)?;
+    let task_result = tasks.next();
+    writer_scan_check(deadline)?;
+    let task = task_result
+        .ok_or_else(|| {
+            tracing::debug!(operation = "zombie_task_inventory_empty", path = %process.display());
+            CloseWriterGap::Unavailable
+        })?
+        .map_err(|error| {
+            linux_writer_io_diagnostic("zombie_task_entry", &process.join("task"), &error);
+            CloseWriterGap::Unavailable
+        })?;
+    if Some(task.file_name().as_os_str()) != process.file_name() {
+        tracing::debug!(
+            operation = "zombie_task_identity",
+            path = %process.display(),
+            task = ?task.file_name()
+        );
+        return Err(CloseWriterGap::Unavailable.into());
     }
-    let after = std::fs::read_to_string(process.join("status"))
-        .map_err(|error| format!("cannot recheck zombie state: {error}"))?;
+    writer_scan_check(deadline)?;
+    let sibling = tasks.next();
+    writer_scan_check(deadline)?;
+    if sibling.is_some() {
+        if let Some(Err(error)) = &sibling {
+            linux_writer_io_diagnostic("zombie_sibling_entry", &process.join("task"), error);
+        }
+        tracing::debug!(operation = "zombie_sibling_present", path = %process.display());
+        return Err(CloseWriterGap::Unavailable.into());
+    }
+    writer_scan_check(deadline)?;
+    let after_result = std::fs::read_to_string(process.join("status"));
+    writer_scan_check(deadline)?;
+    let after = after_result.map_err(|error| {
+        linux_writer_io_diagnostic("zombie_status_reread", &process.join("status"), &error);
+        CloseWriterGap::Unavailable
+    })?;
     validate(&after)?;
-    if LinuxProcessEffectiveUid::parse_status(status)?
-        != LinuxProcessEffectiveUid::parse_status(&after)?
-    {
-        return Err("zombie credentials changed during inspection".into());
+    if LinuxProcessEffectiveUid::parse_status(status).map_err(|error| {
+        tracing::debug!(operation = "zombie_uid_parse_before", path = %process.display(), %error);
+        CloseWriterGap::Unavailable
+    })? != LinuxProcessEffectiveUid::parse_status(&after).map_err(|error| {
+        tracing::debug!(operation = "zombie_uid_parse_after", path = %process.display(), %error);
+        CloseWriterGap::Unavailable
+    })? {
+        tracing::debug!(operation = "zombie_uid_changed", path = %process.display());
+        return Err(CloseWriterGap::Unavailable.into());
     }
     Ok(())
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_owner(
+fn linux_process_owner_until(
     process: &std::fs::DirEntry,
     effective_uid: libc::uid_t,
     inventory: &str,
-) -> Result<LinuxProcessOwner, String> {
-    let status = match std::fs::read_to_string(process.path().join("status")) {
+    deadline: std::time::Instant,
+) -> Result<LinuxProcessOwner, WriterScanError> {
+    writer_scan_check(deadline)?;
+    let status_result = std::fs::read_to_string(process.path().join("status"));
+    writer_scan_check(deadline)?;
+    let status = match status_result {
         Ok(status) => status,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            linux_writer_io_diagnostic("owner_status_read", &process.path().join("status"), &error);
             return Ok(LinuxProcessOwner::Vanished);
         }
         Err(error) => {
-            return Err(format!(
+            linux_writer_io_diagnostic("owner_status_read", &process.path().join("status"), &error);
+            tracing::debug!(
                 "cannot attribute process {} {inventory} inventory from kernel credentials: {error}",
                 process.file_name().to_string_lossy()
-            ));
+            );
+            return Err(CloseWriterGap::Unavailable.into());
         }
     };
     let process_effective_uid =
         LinuxProcessEffectiveUid::parse_status(&status).map_err(|error| {
-            format!(
-            "cannot attribute process {} {inventory} inventory from kernel credentials: {error}",
-            process.file_name().to_string_lossy()
-        )
+            tracing::debug!(
+                operation = "owner_uid_parse",
+                path = %process.path().join("status").display(),
+                "cannot attribute process {} {inventory} inventory from kernel credentials: {error}",
+                process.file_name().to_string_lossy()
+            );
+            CloseWriterGap::Unavailable
         })?;
 
     // The scanned proc files use `PTRACE_MODE_READ_FSCREDS`: Linux compares the
@@ -6189,8 +8163,17 @@ fn linux_process_owner(
         if process_effective_uid == LinuxProcessEffectiveUid(effective_uid) {
             // Exclude only a positively single-task zombie, not a zombie leader
             // whose live sibling threads may still retain shared write authority.
-            if linux_process_is_zombie(&status)? {
-                linux_zombie_has_no_sibling_threads(&process.path(), &status)?;
+            if linux_process_is_zombie(&status).map_err(|error| {
+                tracing::debug!(
+                    operation = "owner_state_parse",
+                    path = %process.path().join("status").display(),
+                    inventory,
+                    ?process_effective_uid,
+                    %error
+                );
+                CloseWriterGap::Unavailable
+            })? {
+                linux_zombie_has_no_sibling_threads_until(&process.path(), &status, deadline)?;
                 LinuxProcessOwner::Zombie
             } else {
                 LinuxProcessOwner::Relevant
@@ -6202,35 +8185,67 @@ fn linux_process_owner(
 }
 
 #[cfg(target_os = "linux")]
-fn linux_writer_process(
+fn linux_writer_process_until(
     process: &Path,
     boot_id: &str,
-) -> Result<CloseWriterProcess, CloseWriterGap> {
+    deadline: std::time::Instant,
+) -> Result<CloseWriterProcess, WriterScanError> {
+    writer_scan_check(deadline)?;
     let pid = process
         .file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.parse().ok())
-        .ok_or(CloseWriterGap::Malformed)?;
-    let stat =
-        std::fs::read_to_string(process.join("stat")).map_err(|_| CloseWriterGap::Unavailable)?;
-    let (_, tail) = stat.rsplit_once(')').ok_or(CloseWriterGap::Malformed)?;
+        .ok_or_else(|| {
+            tracing::debug!(operation = "process_pid_parse", path = %process.display());
+            CloseWriterGap::Malformed
+        })?;
+    writer_scan_check(deadline)?;
+    let stat_result = std::fs::read_to_string(process.join("stat"));
+    writer_scan_check(deadline)?;
+    let stat = stat_result.map_err(|error| {
+        linux_writer_io_diagnostic("process_stat_read", &process.join("stat"), &error);
+        CloseWriterGap::Unavailable
+    })?;
+    let (_, tail) = stat.rsplit_once(')').ok_or_else(|| {
+        tracing::debug!(operation = "process_stat_tail_parse", pid, path = %process.display());
+        CloseWriterGap::Malformed
+    })?;
     let start_ticks = tail
         .split_whitespace()
         .nth(19)
-        .ok_or(CloseWriterGap::Malformed)?
+        .ok_or_else(|| {
+            tracing::debug!(operation = "process_start_ticks_missing", pid, path = %process.display());
+            CloseWriterGap::Malformed
+        })?
         .parse::<u64>()
-        .map_err(|_| CloseWriterGap::Malformed)?;
-    let executable =
-        std::fs::read_link(process.join("exe")).map_err(|_| CloseWriterGap::Unavailable)?;
+        .map_err(|error| {
+            tracing::debug!(
+                operation = "process_start_ticks_parse",
+                pid,
+                path = %process.display(),
+                %error
+            );
+            CloseWriterGap::Malformed
+        })?;
+    writer_scan_check(deadline)?;
+    let executable_result = std::fs::read_link(process.join("exe"));
+    writer_scan_check(deadline)?;
+    let executable = executable_result.map_err(|error| {
+        linux_writer_io_diagnostic("process_exe_read_link", &process.join("exe"), &error);
+        tracing::debug!(operation = "process_identity_incomplete", pid, start_ticks);
+        CloseWriterGap::Unavailable
+    })?;
     Ok(CloseWriterProcess {
         pid,
-        incarnation: OpaqueIdentity::parse(format!("{boot_id}:{start_ticks}"))
-            .map_err(|_| CloseWriterGap::Malformed)?,
+        incarnation: OpaqueIdentity::parse(format!("{boot_id}:{start_ticks}")).map_err(|_| {
+            tracing::debug!(operation = "process_incarnation_parse", pid, start_ticks);
+            CloseWriterGap::Malformed
+        })?,
         executable,
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn linux_writer_scan(
     path: &Path,
     proc_root: &Path,
@@ -6241,21 +8256,47 @@ fn linux_writer_scan(
         &Path,
     ) -> Result<Option<(PathBuf, CloseWriterAuthority)>, CloseWriterGap>,
 ) -> Result<ExternalWriterEvidence, String> {
-    let canonical = path
-        .canonicalize()
-        .map_err(|error| format!("cannot bind Close writer target: {error}"))?;
-    let Ok(boot_id) = std::fs::read_to_string(proc_root.join("sys/kernel/random/boot_id")) else {
-        return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+    linux_writer_scan_until(
+        path,
+        proc_root,
+        effective_uid,
+        detector,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        |process, canonical| inspect(process, canonical).map_err(WriterScanError::from),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn linux_writer_scan_until(
+    path: &Path,
+    proc_root: &Path,
+    effective_uid: libc::uid_t,
+    detector: CloseWriterDetector,
+    deadline: std::time::Instant,
+    mut inspect: impl FnMut(
+        &Path,
+        &Path,
+    ) -> Result<Option<(PathBuf, CloseWriterAuthority)>, WriterScanError>,
+) -> Result<ExternalWriterEvidence, String> {
+    let canonical = linux_writer_target_until(path, deadline)?;
+    let (boot_id, mut processes) = match linux_writer_inventory_until(proc_root, deadline) {
+        Ok(inventory) => inventory,
+        Err(WriterScanError::Stopped(message)) => return Err(message),
+        Err(WriterScanError::Gap(reason)) => return Ok(writer_gap(detector, None, reason)),
     };
-    if boot_id.trim().is_empty() {
-        return Ok(writer_gap(detector, None, CloseWriterGap::Malformed));
-    }
-    let Ok(processes) = std::fs::read_dir(proc_root) else {
-        return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
-    };
-    for process in processes {
-        let Ok(process) = process else {
-            return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+    loop {
+        check_directory_deletion_deadline(Some(deadline))?;
+        let next = processes.next();
+        check_directory_deletion_deadline(Some(deadline))?;
+        let Some(process_result) = next else {
+            break;
+        };
+        let process = match process_result {
+            Ok(process) => process,
+            Err(error) => {
+                linux_writer_io_diagnostic("process_inventory_entry", proc_root, &error);
+                return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+            }
         };
         let Some(pid) = process
             .file_name()
@@ -6264,24 +8305,59 @@ fn linux_writer_scan(
         else {
             continue;
         };
-        match linux_process_owner(&process, effective_uid, detector.as_str()) {
+        let owner = linux_process_owner_until(&process, effective_uid, detector.as_str(), deadline);
+        check_directory_deletion_deadline(Some(deadline))?;
+        match owner {
+            Err(WriterScanError::Stopped(message)) => return Err(message),
             Ok(LinuxProcessOwner::Unrelated | LinuxProcessOwner::Zombie) => continue,
             Ok(LinuxProcessOwner::Relevant) => {}
-            _ => return Ok(writer_gap(detector, Some(pid), CloseWriterGap::Unavailable)),
+            result => {
+                tracing::debug!(
+                    operation = "owner_before",
+                    detector = detector.as_str(),
+                    pid,
+                    ?result
+                );
+                return Ok(writer_gap(detector, Some(pid), CloseWriterGap::Unavailable));
+            }
         }
-        let before = match linux_writer_process(&process.path(), boot_id.trim()) {
+        let before = match linux_writer_identity_before_until(
+            &process.path(),
+            boot_id.trim(),
+            detector,
+            pid,
+            deadline,
+        ) {
             Ok(identity) => identity,
-            Err(reason) => return Ok(writer_gap(detector, Some(pid), reason)),
+            Err(WriterScanError::Stopped(message)) => return Err(message),
+            Err(WriterScanError::Gap(reason)) => {
+                return Ok(writer_gap(detector, Some(pid), reason));
+            }
         };
-        let observed = match inspect(&process.path(), &canonical) {
+        let observed_result = inspect(&process.path(), &canonical);
+        check_directory_deletion_deadline(Some(deadline))?;
+        let observed = match observed_result {
             Ok(observed) => observed,
-            Err(reason) => return Ok(writer_gap(detector, Some(pid), reason)),
+            Err(WriterScanError::Stopped(message)) => return Err(message),
+            Err(WriterScanError::Gap(reason)) => {
+                tracing::debug!(
+                    operation = "inspect_process",
+                    detector = detector.as_str(),
+                    pid,
+                    ?before,
+                    ?reason
+                );
+                return Ok(writer_gap(detector, Some(pid), reason));
+            }
         };
-        let after = linux_writer_process(&process.path(), boot_id.trim());
-        if after.as_ref() != Ok(&before)
-            || linux_process_owner(&process, effective_uid, detector.as_str())
-                != Ok(LinuxProcessOwner::Relevant)
-        {
+        if !linux_writer_process_still_matches_until(
+            &process,
+            boot_id.trim(),
+            effective_uid,
+            detector,
+            deadline,
+            &before,
+        )? {
             return Ok(writer_gap(
                 detector,
                 Some(pid),
@@ -6289,6 +8365,7 @@ fn linux_writer_scan(
             ));
         }
         if let Some((matched_path, authority)) = observed {
+            check_directory_deletion_deadline(Some(deadline))?;
             return Ok(ExternalWriterEvidence::Blocked(
                 CloseWriterObservation::Authority {
                     detector,
@@ -6299,7 +8376,130 @@ fn linux_writer_scan(
             ));
         }
     }
+    check_directory_deletion_deadline(Some(deadline))?;
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_writer_identity_before_until(
+    process: &Path,
+    boot_id: &str,
+    detector: CloseWriterDetector,
+    pid: u32,
+    deadline: std::time::Instant,
+) -> Result<CloseWriterProcess, WriterScanError> {
+    let before_result = linux_writer_process_until(process, boot_id, deadline);
+    writer_scan_check(deadline)?;
+    if let Err(WriterScanError::Gap(reason)) = &before_result {
+        tracing::debug!(
+            operation = "identity_before",
+            detector = detector.as_str(),
+            pid,
+            ?reason
+        );
+    }
+    before_result
+}
+
+#[cfg(target_os = "linux")]
+fn linux_writer_target_until(path: &Path, deadline: std::time::Instant) -> Result<PathBuf, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
+    let canonical_result = path.canonicalize();
+    check_directory_deletion_deadline(Some(deadline))?;
+    let canonical =
+        canonical_result.map_err(|error| format!("cannot bind Close writer target: {error}"))?;
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_writer_inventory_until(
+    proc_root: &Path,
+    deadline: std::time::Instant,
+) -> Result<(String, std::fs::ReadDir), WriterScanError> {
+    writer_scan_check(deadline)?;
+    let boot_result = std::fs::read_to_string(proc_root.join("sys/kernel/random/boot_id"));
+    writer_scan_check(deadline)?;
+    let boot_id = match boot_result {
+        Ok(boot_id) => boot_id,
+        Err(error) => {
+            linux_writer_io_diagnostic(
+                "boot_id_read",
+                &proc_root.join("sys/kernel/random/boot_id"),
+                &error,
+            );
+            return Err(CloseWriterGap::Unavailable.into());
+        }
+    };
+    if boot_id.trim().is_empty() {
+        tracing::debug!(operation = "boot_id_empty", path = %proc_root.display());
+        return Err(CloseWriterGap::Malformed.into());
+    }
+    writer_scan_check(deadline)?;
+    let inventory = std::fs::read_dir(proc_root);
+    writer_scan_check(deadline)?;
+    let processes = match inventory {
+        Ok(processes) => processes,
+        Err(error) => {
+            linux_writer_io_diagnostic("process_read_dir", proc_root, &error);
+            return Err(CloseWriterGap::Unavailable.into());
+        }
+    };
+    Ok((boot_id, processes))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_writer_process_still_matches_until(
+    process: &std::fs::DirEntry,
+    boot_id: &str,
+    effective_uid: libc::uid_t,
+    detector: CloseWriterDetector,
+    deadline: std::time::Instant,
+    before: &CloseWriterProcess,
+) -> Result<bool, String> {
+    let after = linux_writer_process_until(&process.path(), boot_id, deadline);
+    check_directory_deletion_deadline(Some(deadline))?;
+    let after = match after {
+        Err(WriterScanError::Stopped(message)) => return Err(message),
+        result => result,
+    };
+    let owner_after =
+        linux_process_owner_until(process, effective_uid, detector.as_str(), deadline);
+    check_directory_deletion_deadline(Some(deadline))?;
+    let owner_after = match owner_after {
+        Err(WriterScanError::Stopped(message)) => return Err(message),
+        result => result,
+    };
+    if !matches!(after, Ok(ref identity) if identity == before)
+        || !matches!(owner_after, Ok(LinuxProcessOwner::Relevant))
+    {
+        tracing::debug!(
+            operation = "process_revalidation",
+            detector = detector.as_str(),
+            pid = before.pid,
+            ?before,
+            ?after,
+            ?owner_after
+        );
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn self_descriptor_borrow_matches(
+    borrow: &SelfDeletionDescriptorBorrow<'_>,
+    pid: libc::pid_t,
+    fd: libc::c_int,
+    device: u64,
+    inode: u64,
+    kind: libc::mode_t,
+) -> bool {
+    pid == borrow.pid
+        && fd == borrow.fd
+        && device == borrow.device
+        && inode == borrow.inode
+        && kind == borrow.kind
+        && borrow.witness.validate().is_ok()
 }
 
 fn descriptor_authority(
@@ -6340,12 +8540,7 @@ fn linux_fd_access(info: &str) -> Result<CloseDescriptorAccess, CloseWriterGap> 
     }
 }
 
-#[cfg(target_os = "linux")]
-fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    quarantine_has_open_descriptors_in(path, Path::new("/proc"))
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_open_descriptors_in(
     path: &Path,
     proc_root: &Path,
@@ -6355,57 +8550,208 @@ fn quarantine_has_open_descriptors_in(
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn quarantine_has_open_descriptors_with_info_reader(
     path: &Path,
     proc_root: &Path,
-    mut read_info: impl FnMut(&Path) -> std::io::Result<String>,
+    read_info: impl FnMut(&Path) -> std::io::Result<String>,
 ) -> Result<ExternalWriterEvidence, String> {
-    use std::os::unix::fs::MetadataExt as _;
+    quarantine_has_open_descriptors_with_info_reader_until(
+        path,
+        proc_root,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+        read_info,
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn quarantine_has_open_descriptors_with_info_reader_until(
+    path: &Path,
+    proc_root: &Path,
+    deadline: std::time::Instant,
+    read_info: impl FnMut(&Path) -> std::io::Result<String>,
+) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_open_descriptors_with_info_reader_until_scoped(
+        path, proc_root, deadline, read_info, None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_open_descriptors_with_info_reader_until_scoped(
+    path: &Path,
+    proc_root: &Path,
+    deadline: std::time::Instant,
+    mut read_info: impl FnMut(&Path) -> std::io::Result<String>,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<ExternalWriterEvidence, String> {
     // SAFETY: geteuid has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
-    linux_writer_scan(
+    linux_writer_scan_until(
         path,
         proc_root,
         effective_uid,
         CloseWriterDetector::LinuxDescriptor,
+        deadline,
         |process, canonical| {
-            let descriptors =
-                std::fs::read_dir(process.join("fd")).map_err(|_| CloseWriterGap::Unavailable)?;
-            for descriptor in descriptors {
-                let descriptor = descriptor.map_err(|_| CloseWriterGap::Unavailable)?;
-                let candidate = std::fs::read_link(descriptor.path())
-                    .map_err(|_| CloseWriterGap::DescriptorChanged)?;
+            writer_scan_check(deadline)?;
+            let inventory = std::fs::read_dir(process.join("fd"));
+            writer_scan_check(deadline)?;
+            let mut descriptors = inventory.map_err(|error| {
+                linux_writer_io_diagnostic("fd_read_dir", &process.join("fd"), &error);
+                CloseWriterGap::Unavailable
+            })?;
+            loop {
+                writer_scan_check(deadline)?;
+                let next = descriptors.next();
+                writer_scan_check(deadline)?;
+                let Some(descriptor_result) = next else {
+                    break;
+                };
+                let descriptor = descriptor_result.map_err(|error| {
+                    linux_writer_io_diagnostic("fd_inventory_entry", &process.join("fd"), &error);
+                    CloseWriterGap::Unavailable
+                })?;
+                writer_scan_check(deadline)?;
+                let candidate_result = std::fs::read_link(descriptor.path());
+                writer_scan_check(deadline)?;
+                let candidate = candidate_result.map_err(|error| {
+                    linux_writer_io_diagnostic("fd_read_link", &descriptor.path(), &error);
+                    CloseWriterGap::DescriptorChanged
+                })?;
                 if !path_is_within(&candidate, canonical) {
                     continue;
                 }
-                let metadata = std::fs::metadata(descriptor.path())
-                    .map_err(|_| CloseWriterGap::DescriptorChanged)?;
+                writer_scan_check(deadline)?;
+                let metadata_result = std::fs::metadata(descriptor.path());
+                writer_scan_check(deadline)?;
+                let metadata = metadata_result.map_err(|error| {
+                    linux_writer_io_diagnostic("fd_metadata", &descriptor.path(), &error);
+                    CloseWriterGap::DescriptorChanged
+                })?;
                 let info_path = process.join("fdinfo").join(descriptor.file_name());
-                let info = read_info(&info_path).map_err(|_| CloseWriterGap::DescriptorChanged)?;
-                let access = linux_fd_access(&info)?;
-                let repeated = std::fs::metadata(descriptor.path())
-                    .map_err(|_| CloseWriterGap::DescriptorChanged)?;
-                if (metadata.dev(), metadata.ino()) != (repeated.dev(), repeated.ino())
-                    || std::fs::read_link(descriptor.path()).ok().as_ref() != Some(&candidate)
-                    || linux_fd_access(
-                        &read_info(&info_path).map_err(|_| CloseWriterGap::DescriptorChanged)?,
-                    )? != access
-                {
-                    return Err(CloseWriterGap::DescriptorChanged);
-                }
+                writer_scan_check(deadline)?;
+                let info_result = read_info(&info_path);
+                writer_scan_check(deadline)?;
+                let info = info_result.map_err(|error| {
+                    linux_writer_io_diagnostic("fdinfo_read", &info_path, &error);
+                    CloseWriterGap::DescriptorChanged
+                })?;
+                let access = linux_fd_access(&info).inspect_err(|reason| {
+                    tracing::debug!(
+                        operation = "fdinfo_access_parse",
+                        path = %info_path.display(),
+                        ?reason
+                    );
+                })?;
+                revalidate_linux_descriptor_until(
+                    &descriptor,
+                    &candidate,
+                    &metadata,
+                    access,
+                    &info_path,
+                    deadline,
+                    &mut read_info,
+                )?;
                 if let Some(authority) =
                     descriptor_authority(metadata.is_dir(), metadata.is_file(), access)
                 {
+                    let is_exact_self_borrow = self_descriptor.is_some_and(|borrow| {
+                        linux_descriptor_matches_self_borrow(
+                            process,
+                            &descriptor,
+                            &metadata,
+                            borrow,
+                        )
+                    });
+                    if is_exact_self_borrow {
+                        continue;
+                    }
                     return Ok(Some((candidate, authority)));
                 }
                 if !metadata.is_file() {
-                    return Err(CloseWriterGap::Unsupported);
+                    tracing::debug!(operation = "fd_type_unsupported", path = %descriptor.path().display());
+                    return Err(CloseWriterGap::Unsupported.into());
                 }
             }
             Ok(None)
         },
     )
+}
+
+#[cfg(target_os = "linux")]
+fn revalidate_linux_descriptor_until(
+    descriptor: &std::fs::DirEntry,
+    candidate: &Path,
+    metadata: &std::fs::Metadata,
+    access: CloseDescriptorAccess,
+    info_path: &Path,
+    deadline: std::time::Instant,
+    read_info: &mut impl FnMut(&Path) -> std::io::Result<String>,
+) -> Result<(), WriterScanError> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    writer_scan_check(deadline)?;
+    let repeated_result = std::fs::metadata(descriptor.path());
+    writer_scan_check(deadline)?;
+    let repeated = repeated_result.map_err(|error| {
+        linux_writer_io_diagnostic("fd_metadata_repeat", &descriptor.path(), &error);
+        CloseWriterGap::DescriptorChanged
+    })?;
+    writer_scan_check(deadline)?;
+    let repeated_link = std::fs::read_link(descriptor.path());
+    writer_scan_check(deadline)?;
+    let repeated_info = read_info(info_path);
+    writer_scan_check(deadline)?;
+    let repeated_info = repeated_info.map_err(|error| {
+        linux_writer_io_diagnostic("fdinfo_read_repeat", info_path, &error);
+        CloseWriterGap::DescriptorChanged
+    })?;
+    if let Err(error) = &repeated_link {
+        linux_writer_io_diagnostic("fd_read_link_repeat", &descriptor.path(), error);
+    }
+    if (metadata.dev(), metadata.ino()) != (repeated.dev(), repeated.ino())
+        || repeated_link.ok().as_deref() != Some(candidate)
+        || linux_fd_access(&repeated_info).inspect_err(|reason| {
+            tracing::debug!(
+                operation = "fdinfo_access_parse_repeat",
+                path = %info_path.display(),
+                ?reason
+            );
+        })? != access
+    {
+        tracing::debug!(operation = "fd_revalidation", path = %descriptor.path().display());
+        return Err(CloseWriterGap::DescriptorChanged.into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descriptor_matches_self_borrow(
+    process: &Path,
+    descriptor: &std::fs::DirEntry,
+    metadata: &std::fs::Metadata,
+    borrow: &SelfDeletionDescriptorBorrow<'_>,
+) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let pid = process
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|value| value.parse::<libc::pid_t>().ok());
+    let fd = descriptor
+        .file_name()
+        .to_str()
+        .and_then(|value| value.parse::<libc::c_int>().ok());
+    pid.zip(fd).is_some_and(|(pid, fd)| {
+        self_descriptor_borrow_matches(
+            borrow,
+            pid,
+            fd,
+            metadata.dev(),
+            metadata.ino(),
+            metadata.mode() & libc::S_IFMT,
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -6438,12 +8784,14 @@ fn mac_mapping_is_writer(protection: u32, share_mode: u32) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn mac_writer_process(
+fn mac_writer_process_until(
     pid: libc::pid_t,
     effective_uid: libc::uid_t,
-) -> Result<Option<CloseWriterProcess>, CloseWriterGap> {
+    deadline: std::time::Instant,
+) -> Result<Option<CloseWriterProcess>, WriterScanError> {
     use std::mem::{size_of, MaybeUninit};
     use std::os::unix::ffi::OsStrExt as _;
+    writer_scan_check(deadline)?;
     let mut info = MaybeUninit::<libc::proc_bsdinfo>::zeroed();
     // SAFETY: output buffer matches PROC_PIDTBSDINFO and is valid for the call.
     let bytes = unsafe {
@@ -6455,8 +8803,9 @@ fn mac_writer_process(
             i32::try_from(size_of::<libc::proc_bsdinfo>()).expect("bsd info fits i32"),
         )
     };
+    writer_scan_check(deadline)?;
     if usize::try_from(bytes).ok() != Some(size_of::<libc::proc_bsdinfo>()) {
-        return Err(CloseWriterGap::Unavailable);
+        return Err(CloseWriterGap::Unavailable.into());
     }
     // SAFETY: the complete structure was initialized above.
     let info = unsafe { info.assume_init() };
@@ -6464,18 +8813,21 @@ fn mac_writer_process(
         return Ok(None);
     }
     let mut executable = [0_u8; 4096];
+    writer_scan_check(deadline)?;
     // SAFETY: executable is a writable buffer with the declared length.
     let bytes = unsafe { libc::proc_pidpath(pid, executable.as_mut_ptr().cast(), 4096) };
+    writer_scan_check(deadline)?;
     if bytes <= 0 {
-        return Err(CloseWriterGap::Unavailable);
+        return Err(CloseWriterGap::Unavailable.into());
     }
     let end = executable
         .iter()
         .position(|byte| *byte == 0)
         .ok_or(CloseWriterGap::Malformed)?;
     if end == 0 {
-        return Err(CloseWriterGap::Malformed);
+        return Err(CloseWriterGap::Malformed.into());
     }
+    writer_scan_check(deadline)?;
     Ok(Some(CloseWriterProcess {
         pid: u32::try_from(pid).map_err(|_| CloseWriterGap::Malformed)?,
         incarnation: OpaqueIdentity::parse(format!(
@@ -6511,42 +8863,61 @@ fn stable_writer_observation(
 }
 
 #[cfg(target_os = "macos")]
-fn mac_writer_scan(
+fn mac_writer_scan_until(
     path: &Path,
     detector: CloseWriterDetector,
+    deadline: std::time::Instant,
     mut inspect: impl FnMut(
         libc::pid_t,
         &Path,
-    ) -> Result<Option<(PathBuf, CloseWriterAuthority)>, CloseWriterGap>,
+    ) -> Result<Option<(PathBuf, CloseWriterAuthority)>, WriterScanError>,
 ) -> Result<ExternalWriterEvidence, String> {
-    let canonical = path
-        .canonicalize()
-        .map_err(|error| format!("cannot bind Close writer target: {error}"))?;
-    let Some(pids) = macos_all_pids() else {
-        return Ok(writer_gap(detector, None, CloseWriterGap::Unavailable));
+    check_directory_deletion_deadline(Some(deadline))?;
+    let canonical_result = path.canonicalize();
+    check_directory_deletion_deadline(Some(deadline))?;
+    let canonical =
+        canonical_result.map_err(|error| format!("cannot bind Close writer target: {error}"))?;
+    let pids_result = macos_all_pids_until(deadline);
+    check_directory_deletion_deadline(Some(deadline))?;
+    let pids = match pids_result {
+        Ok(pids) => pids,
+        Err(WriterScanError::Stopped(s)) => return Err(s),
+        Err(WriterScanError::Gap(reason)) => return Ok(writer_gap(detector, None, reason)),
     };
-    // SAFETY: geteuid has no preconditions.
     let effective_uid = unsafe { libc::geteuid() };
     for pid in pids.into_iter().filter(|pid| *pid > 0) {
-        let before = match mac_writer_process(pid, effective_uid) {
+        check_directory_deletion_deadline(Some(deadline))?;
+        let before_result = mac_writer_process_until(pid, effective_uid, deadline);
+        check_directory_deletion_deadline(Some(deadline))?;
+        let before = match before_result {
             Ok(Some(identity)) => identity,
             Ok(None) => continue,
-            Err(reason) => return Ok(writer_gap(detector, u32::try_from(pid).ok(), reason)),
+            Err(WriterScanError::Stopped(message)) => return Err(message),
+            Err(WriterScanError::Gap(gap)) => {
+                return Ok(writer_gap(detector, u32::try_from(pid).ok(), gap))
+            }
         };
-        let observed = match inspect(pid, &canonical) {
-            Ok(observed) => observed,
-            Err(reason) => return Ok(writer_gap(detector, Some(before.pid), reason)),
+        let observed_result = inspect(pid, &canonical);
+        check_directory_deletion_deadline(Some(deadline))?;
+        let observed = match observed_result {
+            Ok(v) => v,
+            Err(WriterScanError::Stopped(s)) => return Err(s),
+            Err(WriterScanError::Gap(g)) => return Ok(writer_gap(detector, Some(before.pid), g)),
         };
-        let evidence = stable_writer_observation(
-            detector,
-            before,
-            observed,
-            mac_writer_process(pid, effective_uid),
-        );
+        let after_result = mac_writer_process_until(pid, effective_uid, deadline);
+        check_directory_deletion_deadline(Some(deadline))?;
+        let after = match after_result {
+            Ok(identity) => Ok(identity),
+            Err(WriterScanError::Gap(gap)) => Err(gap),
+            Err(WriterScanError::Stopped(message)) => return Err(message),
+        };
+        let evidence = stable_writer_observation(detector, before, observed, after);
         if evidence.blocks_retirement() {
+            check_directory_deletion_deadline(Some(deadline))?;
             return Ok(evidence);
         }
     }
+    check_directory_deletion_deadline(Some(deadline))?;
     Ok(ExternalWriterEvidence::NoPositiveEvidence)
 }
 
@@ -6592,11 +8963,15 @@ fn mac_vnode_fd_info(pid: libc::pid_t, fd: i32) -> Result<MacVnodeFdInfoWithPath
 }
 
 #[cfg(target_os = "macos")]
-fn mac_vnode_descriptors(pid: libc::pid_t) -> Result<Vec<libc::proc_fdinfo>, CloseWriterGap> {
+fn mac_vnode_descriptors_until(
+    pid: libc::pid_t,
+    deadline: std::time::Instant,
+) -> Result<Vec<libc::proc_fdinfo>, WriterScanError> {
     use std::mem::size_of;
 
     let mut descriptor_capacity = 256_usize;
     loop {
+        writer_scan_check(deadline)?;
         let mut descriptors = vec![
             libc::proc_fdinfo {
                 proc_fd: 0,
@@ -6605,8 +8980,9 @@ fn mac_vnode_descriptors(pid: libc::pid_t) -> Result<Vec<libc::proc_fdinfo>, Clo
             descriptor_capacity
         ];
         let capacity_bytes = descriptors.len() * size_of::<libc::proc_fdinfo>();
-        let capacity_bytes_i32 =
-            i32::try_from(capacity_bytes).map_err(|_| CloseWriterGap::Unavailable)?;
+        let capacity_bytes_i32 = i32::try_from(capacity_bytes)
+            .map_err(|_| WriterScanError::Gap(CloseWriterGap::Unavailable))?;
+        writer_scan_check(deadline)?;
         // SAFETY: the vector provides writable storage for exactly the byte count passed.
         let descriptor_bytes = unsafe {
             libc::proc_pidinfo(
@@ -6617,37 +8993,49 @@ fn mac_vnode_descriptors(pid: libc::pid_t) -> Result<Vec<libc::proc_fdinfo>, Clo
                 capacity_bytes_i32,
             )
         };
+        writer_scan_check(deadline)?;
         if descriptor_bytes <= 0 {
-            return Err(CloseWriterGap::Unavailable);
+            return Err(WriterScanError::Gap(CloseWriterGap::Unavailable));
         }
         let descriptor_bytes =
             usize::try_from(descriptor_bytes).expect("positive descriptor byte count");
         if descriptor_bytes % size_of::<libc::proc_fdinfo>() != 0 {
-            return Err(CloseWriterGap::Malformed);
+            return Err(WriterScanError::Gap(CloseWriterGap::Malformed));
         }
         if !descriptor_inventory_may_be_truncated(descriptor_bytes, capacity_bytes) {
             descriptors.truncate(descriptor_bytes / size_of::<libc::proc_fdinfo>());
-            descriptors
-                .retain(|descriptor| descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32);
-            return Ok(descriptors);
+            let mut vnode_descriptors = Vec::new();
+            for descriptor in descriptors {
+                writer_scan_check(deadline)?;
+                if descriptor.proc_fdtype == libc::PROX_FDTYPE_VNODE as u32 {
+                    vnode_descriptors.push(descriptor);
+                }
+            }
+            writer_scan_check(deadline)?;
+            return Ok(vnode_descriptors);
         }
         descriptor_capacity = descriptor_capacity
             .checked_mul(2)
             .filter(|capacity| *capacity <= 1_048_576)
-            .ok_or(CloseWriterGap::Unavailable)?;
+            .ok_or(WriterScanError::Gap(CloseWriterGap::Unavailable))?;
     }
 }
 
 #[cfg(target_os = "macos")]
-fn mac_inspect_open_descriptors(
+fn mac_inspect_open_descriptors_until(
     pid: libc::pid_t,
     canonical: &Path,
-) -> Result<Option<(PathBuf, CloseWriterAuthority)>, CloseWriterGap> {
+    deadline: std::time::Instant,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<Option<(PathBuf, CloseWriterAuthority)>, WriterScanError> {
     use std::ffi::CStr;
     use std::os::unix::ffi::OsStrExt as _;
 
-    for descriptor in mac_vnode_descriptors(pid)? {
-        let info = mac_vnode_fd_info(pid, descriptor.proc_fd)?;
+    for descriptor in mac_vnode_descriptors_until(pid, deadline)? {
+        writer_scan_check(deadline)?;
+        let info_result = mac_vnode_fd_info(pid, descriptor.proc_fd);
+        writer_scan_check(deadline)?;
+        let info = info_result.map_err(WriterScanError::from)?;
         let path_bytes = info.vnode.vip_path.as_flattened();
         // SAFETY: path_bytes points to the initialized kernel path buffer; bounded below.
         let path_bytes = unsafe {
@@ -6657,38 +9045,177 @@ fn mac_inspect_open_descriptors(
             CStr::from_bytes_until_nul(path_bytes).map_err(|_| CloseWriterGap::Malformed)?;
         let candidate = PathBuf::from(std::ffi::OsStr::from_bytes(candidate.to_bytes()));
         if !path_is_within(&candidate, canonical) {
+            writer_scan_check(deadline)?;
             continue;
         }
-        let repeated = mac_vnode_fd_info(pid, descriptor.proc_fd)?;
+        writer_scan_check(deadline)?;
+        let repeated_result = mac_vnode_fd_info(pid, descriptor.proc_fd);
+        writer_scan_check(deadline)?;
+        let repeated = repeated_result.map_err(WriterScanError::from)?;
         if info.file.open_flags != repeated.file.open_flags
             || info.vnode.vip_vi.vi_stat.vst_dev != repeated.vnode.vip_vi.vi_stat.vst_dev
             || info.vnode.vip_vi.vi_stat.vst_ino != repeated.vnode.vip_vi.vi_stat.vst_ino
             || info.vnode.vip_vi.vi_stat.vst_mode != repeated.vnode.vip_vi.vi_stat.vst_mode
             || info.vnode.vip_path != repeated.vnode.vip_path
         {
-            return Err(CloseWriterGap::DescriptorChanged);
+            writer_scan_check(deadline)?;
+            return Err(WriterScanError::Gap(CloseWriterGap::DescriptorChanged));
         }
-        if let Some(authority) =
-            mac_descriptor_authority(info.vnode.vip_vi.vi_stat.vst_mode, info.file.open_flags)?
+        let stat = info.vnode.vip_vi.vi_stat;
+        let is_exact_self_borrow = self_descriptor.is_some_and(|borrow| {
+            self_descriptor_borrow_matches(
+                borrow,
+                pid,
+                descriptor.proc_fd,
+                stat.vst_dev as u64,
+                stat.vst_ino,
+                stat.vst_mode & libc::S_IFMT as _,
+            )
+        });
+        if is_exact_self_borrow {
+            writer_scan_check(deadline)?;
+            continue;
+        }
+        if let Some(authority) = mac_descriptor_authority(stat.vst_mode, info.file.open_flags)
+            .map_err(WriterScanError::from)?
         {
+            writer_scan_check(deadline)?;
             return Ok(Some((candidate, authority)));
         }
+        writer_scan_check(deadline)?;
     }
+    writer_scan_check(deadline)?;
     Ok(None)
 }
 
 #[cfg(target_os = "macos")]
-fn quarantine_has_open_descriptors(path: &Path) -> Result<ExternalWriterEvidence, String> {
-    mac_writer_scan(
+fn quarantine_has_open_descriptors_mac_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_open_descriptors_mac_until_scoped(path, deadline, None)
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_has_open_descriptors_mac_until_scoped(
+    path: &Path,
+    deadline: std::time::Instant,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<ExternalWriterEvidence, String> {
+    mac_writer_scan_until(
         path,
         CloseWriterDetector::MacDescriptor,
-        mac_inspect_open_descriptors,
+        deadline,
+        |pid, canonical| {
+            mac_inspect_open_descriptors_until(pid, canonical, deadline, self_descriptor)
+        },
     )
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn quarantine_has_open_descriptors(_path: &Path) -> Result<ExternalWriterEvidence, String> {
     Err("open-descriptor inspection is unsupported on this platform".to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_open_descriptors_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_open_descriptors_until_with_self_descriptor(path, deadline, None)
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_has_open_descriptors_until_with_self_descriptor(
+    path: &Path,
+    deadline: std::time::Instant,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<ExternalWriterEvidence, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
+    let result = quarantine_has_open_descriptors_with_info_reader_until_scoped(
+        path,
+        Path::new("/proc"),
+        deadline,
+        |path| std::fs::read_to_string(path),
+        self_descriptor,
+    );
+    check_directory_deletion_deadline(Some(deadline))?;
+    result
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_has_open_descriptors_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<ExternalWriterEvidence, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
+    quarantine_has_open_descriptors_mac_until(path, deadline)
+}
+
+#[cfg(target_os = "macos")]
+fn quarantine_has_open_descriptors_until_with_self_descriptor(
+    path: &Path,
+    deadline: std::time::Instant,
+    self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<ExternalWriterEvidence, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
+    quarantine_has_open_descriptors_mac_until_scoped(path, deadline, self_descriptor)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn quarantine_has_open_descriptors_until_with_self_descriptor(
+    path: &Path,
+    deadline: std::time::Instant,
+    _self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+) -> Result<ExternalWriterEvidence, String> {
+    quarantine_has_open_descriptors_until(path, deadline)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn quarantine_has_open_descriptors_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<ExternalWriterEvidence, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
+    let result = quarantine_has_open_descriptors(path);
+    check_directory_deletion_deadline(Some(deadline))?;
+    result
+}
+
+fn quarantine_has_process_cwd_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<ExternalWriterEvidence, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
+    #[cfg(target_os = "linux")]
+    let result = {
+        let uid = unsafe { libc::geteuid() };
+        quarantine_has_process_cwd_in_until(path, Path::new("/proc"), uid, deadline)
+    };
+    #[cfg(target_os = "macos")]
+    let result = quarantine_has_process_cwd_mac_until(path, deadline);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let result = quarantine_has_process_cwd(path);
+    check_directory_deletion_deadline(Some(deadline))?;
+    result
+}
+
+fn quarantine_has_writable_mappings_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<ExternalWriterEvidence, String> {
+    check_directory_deletion_deadline(Some(deadline))?;
+    #[cfg(target_os = "linux")]
+    let result = {
+        let uid = unsafe { libc::geteuid() };
+        quarantine_has_writable_mappings_in_until(path, Path::new("/proc"), uid, deadline)
+    };
+    #[cfg(target_os = "macos")]
+    let result = quarantine_has_writable_mappings_mac_until(path, deadline);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let result = quarantine_has_writable_mappings(path);
+    check_directory_deletion_deadline(Some(deadline))?;
+    result
 }
 
 fn both_worktree_paths_absent(path: &Path, quarantine: &Path) -> Result<bool, String> {
@@ -6713,10 +9240,6 @@ fn complete_persisted_worktree_administrative_cleanup(
     planned_administrative_dir_incarnation: &str,
 ) -> Result<(), String> {
     validate_cleanup_plan_registration_incarnation(identity, planned_administrative_dir)?;
-    let quarantine = administrative_dir_quarantine_path(
-        planned_administrative_dir,
-        planned_administrative_dir_incarnation,
-    )?;
     if !planned_administrative_dir_is_absent(planned_administrative_dir)? {
         if observe_administrative_dir_incarnation(planned_administrative_dir)?
             != planned_administrative_dir_incarnation
@@ -6726,8 +9249,6 @@ fn complete_persisted_worktree_administrative_cleanup(
             );
         }
         validate_live_persisted_worktree_registration(identity, planned_administrative_dir)?;
-    } else if planned_administrative_dir_is_absent(&quarantine)? {
-        return Ok(());
     }
     remove_exact_worktree_administrative_dir(
         planned_administrative_dir,
@@ -6803,36 +9324,66 @@ fn decode_hex_bytes(encoded: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-type StopFsmonitorEffect = Box<dyn FnOnce(&Path) -> Result<FsmonitorStop, String> + Send>;
+pub(super) type SubmoduleSpawnAdmissionEffect = Box<
+    dyn FnOnce(
+            &mut std::process::Command,
+            std::time::Instant,
+        ) -> Result<std::process::Child, String>
+        + Send,
+>;
+type StopFsmonitorEffect = Box<
+    dyn FnOnce(
+            &Path,
+            std::time::Instant,
+            Option<SubmoduleSpawnAdmissionEffect>,
+        ) -> Result<FsmonitorStop, String>
+        + Send,
+>;
 type OpenDescriptorsEffect =
-    Box<dyn FnOnce(&Path) -> Result<ExternalWriterEvidence, String> + Send>;
-type ExternalWriterEffect = Box<dyn FnOnce(&Path) -> Result<bool, String> + Send>;
+    Box<dyn FnOnce(&Path, std::time::Instant) -> Result<ExternalWriterEvidence, String> + Send>;
+type ExternalWriterEffect =
+    Box<dyn FnOnce(&Path, std::time::Instant) -> Result<bool, String> + Send>;
 
 /// Host-interacting effects of exact-worktree quarantine and removal, gathered
 /// at one narrow adapter so a test can supply deterministic observations instead
 /// of launching the real fsmonitor shutdown or scanning the host `/proc`.
 ///
 /// Production always uses [`CloseWorktreeEffects::production`], whose fields are
-/// the real functions; there is no test-only global switch. The decision logic
-/// in [`quarantine_and_remove_exact_worktree_with_effects`] is identical whether
-/// the real or an injected adapter is supplied.
-struct CloseWorktreeEffects {
+/// the real functions; there is no test-only global switch. The shared decision
+/// logic in [`quarantine_and_remove_exact_worktree_with_repository_lock_until`]
+/// is identical whether the real or an injected adapter is supplied.
+pub(super) struct CloseWorktreeEffects {
     stop_fsmonitor: StopFsmonitorEffect,
+    first_submodule_spawn_admission: Option<SubmoduleSpawnAdmissionEffect>,
     observe_open_descriptors: OpenDescriptorsEffect,
     observe_external_writer: ExternalWriterEffect,
 }
 
 impl CloseWorktreeEffects {
     fn production(probe: CloseWriterProbe) -> Self {
+        Self::production_with_first_submodule_spawn_admission(probe, None)
+    }
+
+    pub(super) fn production_with_first_submodule_spawn_admission(
+        probe: CloseWriterProbe,
+        first_submodule_spawn_admission: Option<SubmoduleSpawnAdmissionEffect>,
+    ) -> Self {
         let descriptor_probe = probe.clone();
         Self {
-            stop_fsmonitor: Box::new(stop_bound_fsmonitor_daemons),
-            observe_open_descriptors: Box::new(move |path| {
-                descriptor_probe.observe(path, quarantine_has_open_descriptors)
+            stop_fsmonitor: Box::new(|path, deadline, admission| {
+                stop_bound_fsmonitor_daemons_with_admission_until(path, deadline, admission)
             }),
-            observe_external_writer: Box::new(move |path| {
+            first_submodule_spawn_admission,
+            observe_open_descriptors: Box::new(move |path, deadline| {
+                descriptor_probe.observe_until(
+                    path,
+                    deadline,
+                    quarantine_has_open_descriptors_until,
+                )
+            }),
+            observe_external_writer: Box::new(move |path, deadline| {
                 Ok(probe
-                    .observe(path, quarantine_has_external_writer)?
+                    .observe_until(path, deadline, quarantine_has_external_writer_until)?
                     .blocks_retirement())
             }),
         }
@@ -6850,12 +9401,14 @@ async fn quarantine_and_remove_exact_worktree<F, B>(
     bind_tombstone: B,
     after_quarantine: F,
     effects: CloseWorktreeEffects,
+    deadline: std::time::Instant,
+    repository_lock: RepositoryMutationLock,
 ) -> Result<ExactWorktreeRemoval, String>
 where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
 {
-    quarantine_and_remove_exact_worktree_with_effects(
+    quarantine_and_remove_exact_worktree_with_repository_lock_until(
         identity,
         confirmed_snapshot,
         planned_administrative_dir,
@@ -6864,10 +9417,13 @@ where
         bind_tombstone,
         after_quarantine,
         effects,
+        deadline,
+        Some(repository_lock),
     )
     .await
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_lines)]
 #[allow(clippy::too_many_arguments)]
 async fn quarantine_and_remove_exact_worktree_with_effects<F, B>(
@@ -6884,8 +9440,73 @@ where
     F: FnOnce(&Path) + Send + 'static,
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
 {
+    quarantine_and_remove_exact_worktree_with_effects_until(
+        identity,
+        confirmed_snapshot,
+        planned_administrative_dir,
+        planned_administrative_dir_incarnation,
+        final_tombstone,
+        bind_tombstone,
+        after_quarantine,
+        effects,
+        std::time::Instant::now() + std::time::Duration::from_secs(30),
+    )
+    .await
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn quarantine_and_remove_exact_worktree_with_effects_until<F, B>(
+    identity: &WorktreeIdentity,
+    confirmed_snapshot: &CloseRetirementSnapshot,
+    planned_administrative_dir: PathBuf,
+    planned_administrative_dir_incarnation: String,
+    final_tombstone: Option<CloseWorktreeFinalTombstone>,
+    bind_tombstone: B,
+    after_quarantine: F,
+    effects: CloseWorktreeEffects,
+    deadline: std::time::Instant,
+) -> Result<ExactWorktreeRemoval, String>
+where
+    F: FnOnce(&Path) + Send + 'static,
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+{
+    quarantine_and_remove_exact_worktree_with_repository_lock_until(
+        identity,
+        confirmed_snapshot,
+        planned_administrative_dir,
+        planned_administrative_dir_incarnation,
+        final_tombstone,
+        bind_tombstone,
+        after_quarantine,
+        effects,
+        deadline,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+async fn quarantine_and_remove_exact_worktree_with_repository_lock_until<F, B>(
+    identity: &WorktreeIdentity,
+    confirmed_snapshot: &CloseRetirementSnapshot,
+    planned_administrative_dir: PathBuf,
+    planned_administrative_dir_incarnation: String,
+    final_tombstone: Option<CloseWorktreeFinalTombstone>,
+    bind_tombstone: B,
+    after_quarantine: F,
+    effects: CloseWorktreeEffects,
+    deadline: std::time::Instant,
+    repository_lock: Option<RepositoryMutationLock>,
+) -> Result<ExactWorktreeRemoval, String>
+where
+    F: FnOnce(&Path) + Send + 'static,
+    B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String> + Send + 'static,
+{
+    check_directory_deletion_deadline(Some(deadline))?;
     let CloseWorktreeEffects {
         stop_fsmonitor,
+        first_submodule_spawn_admission,
         observe_open_descriptors,
         observe_external_writer,
     } = effects;
@@ -6899,34 +9520,16 @@ where
     let inspection_identity = identity.clone();
     let confirmed_fingerprint = confirmed_snapshot.fingerprint().to_string();
     tokio::task::spawn_blocking(move || {
+        let _repository_lock = repository_lock;
         let inspection_path = if resuming_quarantine {
             &quarantine
         } else {
             &path
         };
-        let common = phoenix_core::git::command()
-            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .current_dir(inspection_path)
-            .output()
-            .map_err(|error| error.to_string())?;
-        if !common.status.success() {
-            return Err("captured worktree is not server-owned Git worktree".to_string());
-        }
-        let common = path_buf_from_git_bytes(common.stdout.trim_ascii());
-        let repo = if common.join("HEAD").is_file() && !common.join(".git").exists() {
-            common.clone()
-        } else {
-            common
-                .parent()
-                .map(Path::to_path_buf)
-                .ok_or_else(|| "captured worktree has no common repository root".to_string())?
-        };
+        check_directory_deletion_deadline(Some(deadline))?;
+        let common = exact_worktree_common_git_dir_until(inspection_path, deadline)?;
         let target = std::fs::canonicalize(inspection_path).map_err(|error| error.to_string())?;
-        let listed = phoenix_core::git::command()
-            .args(["worktree", "list", "--porcelain", "-z"])
-            .current_dir(&repo)
-            .output()
-            .map_err(|error| error.to_string())?;
+        let listed = list_registered_worktrees_in_common_directory_until(&common, deadline)?;
         let registered = listed.status.success()
             && listed.stdout.split(|byte| *byte == 0).any(|field| {
                 field
@@ -6943,9 +9546,15 @@ where
             return Err("captured worktree administrative incarnation changed".to_string());
         }
 
-        if let Err(detail) = stop_fsmonitor(inspection_path) {
+        check_directory_deletion_deadline(Some(deadline))?;
+        if let Err(detail) = stop_fsmonitor(
+            inspection_path,
+            deadline,
+            first_submodule_spawn_admission,
+        ) {
             return Ok(ExactWorktreeRemoval::StopFailed { detail });
         }
+        check_directory_deletion_deadline(Some(deadline))?;
         let verification_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -6955,22 +9564,25 @@ where
             git_bindings: Option<&std::collections::BTreeMap<PathBuf, PathBuf>>,
         | -> Result<(), String> {
             if let Some(git_bindings) = git_bindings {
-                verify_git_directory_bindings(candidate, git_bindings)?;
+                verify_git_directory_bindings_until(candidate, git_bindings, deadline)?;
             }
-            let (fresh, _) = verification_runtime
-                .block_on(inspect_worktree_at(&inspection_identity, candidate.to_path_buf()))?;
+            let (fresh, _) = verification_runtime.block_on(inspect_worktree_at_until(
+                &inspection_identity,
+                candidate.to_path_buf(),
+                deadline,
+            ))?;
             if fresh.fingerprint() != confirmed_fingerprint {
                 return Err(
                     "worktree changed after Close inspection confirmation; fresh confirmation is required"
                         .to_string(),
                 );
             }
-            ensure_no_ignored_content(candidate)
+            ensure_no_ignored_content_until(candidate, deadline)
         };
         if let Err(detail) = verify_confirmed_snapshot(inspection_path, None) {
             return Ok(ExactWorktreeRemoval::ReinspectionRequired { detail });
         }
-        let verified_git_bindings = capture_git_directory_bindings(inspection_path)?;
+        let verified_git_bindings = capture_git_directory_bindings_until(inspection_path, deadline)?;
         if !resuming_quarantine {
             if quarantine
                 .try_exists()
@@ -6983,16 +9595,24 @@ where
                     ),
                 });
             }
+            check_directory_deletion_deadline(Some(deadline))?;
             std::fs::rename(&path, &quarantine)
                 .map_err(|error| format!("cannot quarantine captured worktree: {error}"))?;
         }
+        check_directory_deletion_deadline(Some(deadline))?;
         if observe_worktree_fingerprint(&quarantine).as_deref() != Some(expected.as_str()) {
-            let _ = std::fs::rename(&quarantine, &path);
+            if check_directory_deletion_deadline(Some(deadline)).is_ok() {
+                let _ = std::fs::rename(&quarantine, &path);
+            }
             return Err("quarantined worktree administrative incarnation changed".to_string());
         }
 
+        check_directory_deletion_deadline(Some(deadline))?;
         after_quarantine(&path);
-        if observe_open_descriptors(&quarantine)?.blocks_retirement() {
+        check_directory_deletion_deadline(Some(deadline))?;
+        let open_descriptors = observe_open_descriptors(&quarantine, deadline)?;
+        check_directory_deletion_deadline(Some(deadline))?;
+        if open_descriptors.blocks_retirement() {
             return Ok(ExactWorktreeRemoval::Residual {
                 detail: format!(
                     "open descriptors can still modify the confirmed worktree; retained at {}",
@@ -7012,7 +9632,10 @@ where
                 ),
             });
         }
-        if observe_external_writer(&quarantine)? {
+        check_directory_deletion_deadline(Some(deadline))?;
+        let external_writer = observe_external_writer(&quarantine, deadline)?;
+        check_directory_deletion_deadline(Some(deadline))?;
+        if external_writer {
             return Ok(ExactWorktreeRemoval::Residual {
                 detail: format!(
                     "an external process can still write the confirmed worktree; retained at {}",
@@ -7035,7 +9658,7 @@ where
         let expected = observe_worktree_fingerprint(&quarantine).ok_or_else(|| {
             "cannot observe quarantined worktree identity before final deletion".to_string()
         })?;
-        remove_identity_bound_directory(
+        remove_identity_bound_directory_with_deadline(
             &quarantine,
             final_tombstone
                 .as_ref()
@@ -7050,11 +9673,14 @@ where
             bind_tombstone,
             |_, object| verify_confirmed_snapshot(object, Some(&verified_git_bindings)),
             "quarantined worktree",
+            Some(deadline),
         )?;
-        remove_exact_worktree_administrative_dir(
+        remove_exact_worktree_administrative_dir_until(
             &administrative_dir,
             &planned_administrative_dir_incarnation,
+            deadline,
         )?;
+        check_directory_deletion_deadline(Some(deadline))?;
         Ok(ExactWorktreeRemoval::Retired)
     })
     .await
@@ -7114,10 +9740,29 @@ where
 }
 
 fn ensure_no_ignored_content(path: &Path) -> Result<(), String> {
+    ensure_no_ignored_content_until(
+        path,
+        std::time::Instant::now() + std::time::Duration::from_secs(10),
+    )
+}
+
+fn ensure_no_ignored_content_until(
+    path: &Path,
+    deadline: std::time::Instant,
+) -> Result<(), String> {
+    ensure_no_ignored_content_with_git_leaf_until(path, deadline, &mut run_bounded_spawned_git)
+}
+
+fn ensure_no_ignored_content_with_git_leaf_until(
+    path: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<(), String> {
     fn inspect(
         path: &Path,
         deadline: std::time::Instant,
         visited: &mut std::collections::HashSet<PathBuf>,
+        git_leaf: &mut WorktreeGitLeaf<'_>,
     ) -> Result<(), String> {
         if std::time::Instant::now() >= deadline {
             return Err("ignored-content inspection exceeded its deadline".into());
@@ -7126,24 +9771,10 @@ fn ensure_no_ignored_content(path: &Path) -> Result<(), String> {
         if !visited.insert(canonical) {
             return Err("initialized submodule graph contains a cycle".into());
         }
-        let status = run_bounded_git_status_until(path, deadline)?;
-        if !status.status.success() {
-            return Err(format!(
-                "cannot inspect ignored content: {}",
-                String::from_utf8_lossy(&status.stderr).trim()
-            ));
-        }
-        if status
-            .stdout
-            .split(|byte| *byte == 0)
-            .any(|row| row.starts_with(b"!! "))
-        {
-            return Err(format!(
-                "ignored content at {} has no exact discard authority; worktree preserved",
-                path.display()
-            ));
-        }
-        let (_, gitlinks) = index_gitlinks(path, deadline)?;
+        ensure_no_ignored_content_with_status_leaf_until(path, deadline, |path, deadline| {
+            run_bounded_git_status_with_leaf_until(path, deadline, git_leaf)
+        })?;
+        let (_, gitlinks) = index_gitlinks_with_leaf_until(path, deadline, git_leaf)?;
         for gitlink in gitlinks {
             if std::time::Instant::now() >= deadline {
                 return Err("ignored-content inspection exceeded its deadline".into());
@@ -7154,23 +9785,105 @@ fn ensure_no_ignored_content(path: &Path) -> Result<(), String> {
                 .try_exists()
                 .map_err(|error| error.to_string())?
             {
-                inspect(&submodule, deadline, visited)?;
+                inspect(&submodule, deadline, visited, git_leaf)?;
             }
         }
         Ok(())
     }
     inspect(
         path,
-        std::time::Instant::now() + std::time::Duration::from_secs(10),
+        deadline,
         &mut std::collections::HashSet::new(),
+        git_leaf,
     )
+}
+
+/// One ignored-content status leaf, with execution supplied explicitly by the caller.
+///
+/// This is deliberately not the recursive ignored-content inspection: a native
+/// caller must admit every submodule probe separately, using its captured binding.
+/// A clean result here alone is never full inspection or removal authority.
+fn ensure_no_ignored_content_with_status_leaf_until(
+    path: &Path,
+    deadline: std::time::Instant,
+    status_leaf: impl FnOnce(&Path, std::time::Instant) -> Result<std::process::Output, String>,
+) -> Result<(), String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("ignored-content inspection exceeded its deadline".into());
+    }
+    let status = status_leaf(path, deadline)?;
+    if std::time::Instant::now() >= deadline {
+        return Err("ignored-content inspection exceeded its deadline".into());
+    }
+    if !status.status.success() {
+        return Err(format!(
+            "cannot inspect ignored content: {}",
+            String::from_utf8_lossy(&status.stderr).trim()
+        ));
+    }
+    if status
+        .stdout
+        .split(|byte| *byte == 0)
+        .any(|row| row.starts_with(b"!! "))
+    {
+        return Err(format!(
+            "ignored content at {} has no exact discard authority; worktree preserved",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn observe_ignored_paths_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<GitPathIdentity>, String> {
+    let output = run_bounded_git_command_with_leaf_until(
+        repository,
+        &[
+            "ls-files",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "-z",
+            "--",
+        ],
+        None,
+        deadline,
+        "exact ignored-path inspection",
+        git_leaf,
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "cannot enumerate exact ignored paths: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let mut paths = output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| GitPathIdentity::from_bytes(path.to_vec()))
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|path| path.as_bytes().to_vec());
+    paths.dedup();
+    Ok(paths)
+}
+
+fn append_ignored_paths(observation: &mut Vec<u8>, paths: &[GitPathIdentity]) {
+    for path in paths {
+        observation.extend_from_slice(b"IGNORED_PATH\0");
+        observation.extend_from_slice(path.as_bytes());
+        observation.push(0);
+    }
 }
 
 fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
     let mut observation = Vec::with_capacity(status.len());
     let mut rows = status.split(|byte| *byte == 0);
     while let Some(row) = rows.next() {
-        if row.len() < 4 || &row[..2] == b"!!" {
+        if row.len() < 4 {
             continue;
         }
         observation.extend_from_slice(row);
@@ -7185,13 +9898,35 @@ fn canonical_status_observation(status: &[u8]) -> Vec<u8> {
     observation
 }
 
-/// Detect modifications that `git status` intentionally suppresses for index entries
-/// marked assume-unchanged or skip-worktree. All index mutations happen in a copied index.
-fn observe_hidden_worktree_changes(repository: &Path) -> Result<Vec<GitPathIdentity>, String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    let index_path = git_index_path(repository, deadline)?;
+#[cfg(test)]
+fn observe_hidden_worktree_changes_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+) -> Result<Vec<GitPathIdentity>, String> {
+    observe_hidden_worktree_changes_with_leaf_until(
+        repository,
+        deadline,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn observe_hidden_worktree_changes_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<GitPathIdentity>, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("hidden worktree inspection exceeded its deadline".into());
+    }
+    let index_path = git_index_path_with_leaf_until(repository, deadline, git_leaf)?;
     if !index_path.exists() {
+        if std::time::Instant::now() >= deadline {
+            return Err("hidden worktree inspection exceeded its deadline".into());
+        }
         return Ok(Vec::new());
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err("hidden worktree inspection exceeded its deadline".into());
     }
     let private_index = tempfile::NamedTempFile::new_in(
         index_path
@@ -7199,30 +9934,28 @@ fn observe_hidden_worktree_changes(repository: &Path) -> Result<Vec<GitPathIdent
             .ok_or("Git index has no parent directory")?,
     )
     .map_err(|error| error.to_string())?;
+    if std::time::Instant::now() >= deadline {
+        return Err("hidden worktree inspection exceeded its deadline".into());
+    }
     std::fs::copy(&index_path, private_index.path())
         .map_err(|error| format!("cannot copy Git index for hidden-change inspection: {error}"))?;
     let private_index = private_index.path();
-    let flags = run_bounded_git_command_until(
-        repository,
-        &["ls-files", "-v", "-z", "--"],
-        Some(private_index),
-        deadline,
-        "hidden-index inspection",
-    )?;
-    if !flags.status.success() {
-        return Err(format!(
-            "cannot inspect hidden index flags: {}",
-            String::from_utf8_lossy(&flags.stderr).trim()
-        ));
-    }
-    let candidates = hidden_index_candidates(&flags.stdout);
+    let candidates =
+        inspect_hidden_index_candidates(repository, private_index, deadline, git_leaf)?;
     if candidates.is_empty() {
+        if std::time::Instant::now() >= deadline {
+            return Err("hidden worktree inspection exceeded its deadline".into());
+        }
         return Ok(Vec::new());
     }
-    let sparse_absent = sparse_checkout_absent_paths(repository, &candidates, deadline)?;
+    let sparse_absent =
+        sparse_checkout_absent_paths_with_leaf_until(repository, &candidates, deadline, git_leaf)?;
 
     let mut dirty = BTreeSet::new();
     for batch in candidates.chunks(256) {
+        if std::time::Instant::now() >= deadline {
+            return Err("hidden worktree inspection exceeded its deadline".into());
+        }
         let batch_paths = batch
             .iter()
             .filter(|candidate| !sparse_absent.contains(candidate.path.as_slice()))
@@ -7232,42 +9965,14 @@ fn observe_hidden_worktree_changes(repository: &Path) -> Result<Vec<GitPathIdent
             continue;
         }
         // Path arguments are OsStrings below so non-UTF-8 paths remain literal.
-        let clear = run_bounded_git_paths_until(
-            repository,
-            &["update-index", "--no-assume-unchanged", "--"],
-            &batch_paths,
-            true,
-            private_index,
-            deadline,
-            "hidden-index flag clearing",
-        )?;
-        if !clear.status.success() {
-            return Err(format!(
-                "cannot clear hidden flags in private index: {}",
-                String::from_utf8_lossy(&clear.stderr).trim()
-            ));
-        }
-        let clear_skip = run_bounded_git_paths_until(
-            repository,
-            &["update-index", "--no-skip-worktree", "--"],
-            &batch_paths,
-            true,
-            private_index,
-            deadline,
-            "hidden-index flag clearing",
-        )?;
-        if !clear_skip.status.success() {
-            return Err(format!(
-                "cannot clear hidden flags in private index: {}",
-                String::from_utf8_lossy(&clear_skip.stderr).trim()
-            ));
-        }
-        let diff = run_bounded_git_command_until(
+        clear_hidden_index_flags(repository, private_index, &batch_paths, deadline, git_leaf)?;
+        let diff = run_bounded_git_command_with_leaf_until(
             repository,
             &["diff-files", "--raw", "-z", "--no-ext-diff"],
             Some(private_index),
             deadline,
             "hidden worktree comparison",
+            git_leaf,
         )?;
         if !diff.status.success() {
             return Err(format!(
@@ -7282,7 +9987,75 @@ fn observe_hidden_worktree_changes(repository: &Path) -> Result<Vec<GitPathIdent
                 .filter(|path| batch.contains(path)),
         );
     }
+    if std::time::Instant::now() >= deadline {
+        return Err("hidden worktree inspection exceeded its deadline".into());
+    }
     Ok(dirty.into_iter().map(GitPathIdentity::from_bytes).collect())
+}
+
+fn clear_hidden_index_flags(
+    repository: &Path,
+    private_index: &Path,
+    batch_paths: &[Vec<u8>],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<(), String> {
+    let clear = run_bounded_git_paths_with_leaf_until(
+        repository,
+        &["update-index", "--no-assume-unchanged", "--"],
+        batch_paths,
+        true,
+        private_index,
+        deadline,
+        "hidden-index flag clearing",
+        git_leaf,
+    )?;
+    if !clear.status.success() {
+        return Err(format!(
+            "cannot clear hidden flags in private index: {}",
+            String::from_utf8_lossy(&clear.stderr).trim()
+        ));
+    }
+    let clear_skip = run_bounded_git_paths_with_leaf_until(
+        repository,
+        &["update-index", "--no-skip-worktree", "--"],
+        batch_paths,
+        true,
+        private_index,
+        deadline,
+        "hidden-index flag clearing",
+        git_leaf,
+    )?;
+    if !clear_skip.status.success() {
+        return Err(format!(
+            "cannot clear hidden flags in private index: {}",
+            String::from_utf8_lossy(&clear_skip.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_hidden_index_candidates(
+    repository: &Path,
+    private_index: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<HiddenIndexCandidate>, String> {
+    let flags = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["ls-files", "-v", "-z", "--"],
+        Some(private_index),
+        deadline,
+        "hidden-index inspection",
+        git_leaf,
+    )?;
+    if !flags.status.success() {
+        return Err(format!(
+            "cannot inspect hidden index flags: {}",
+            String::from_utf8_lossy(&flags.stderr).trim()
+        ));
+    }
+    Ok(hidden_index_candidates(&flags.stdout))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7315,10 +10088,25 @@ fn hidden_index_candidates(entries: &[u8]) -> Vec<HiddenIndexCandidate> {
         .collect()
 }
 
+#[cfg(test)]
 fn sparse_checkout_absent_paths(
     repository: &Path,
     candidates: &[HiddenIndexCandidate],
     deadline: std::time::Instant,
+) -> Result<BTreeSet<Vec<u8>>, String> {
+    sparse_checkout_absent_paths_with_leaf_until(
+        repository,
+        candidates,
+        deadline,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn sparse_checkout_absent_paths_with_leaf_until(
+    repository: &Path,
+    candidates: &[HiddenIndexCandidate],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<BTreeSet<Vec<u8>>, String> {
     let skip_absent = candidates
         .iter()
@@ -7334,7 +10122,7 @@ fn sparse_checkout_absent_paths(
         return Ok(BTreeSet::new());
     }
 
-    let sparse_patterns = git_index_path(repository, deadline)?
+    let sparse_patterns = git_index_path_with_leaf_until(repository, deadline, git_leaf)?
         .parent()
         .ok_or("Git index has no parent directory")?
         .join("info")
@@ -7343,11 +10131,13 @@ fn sparse_checkout_absent_paths(
         return Ok(BTreeSet::new());
     }
 
-    let sparse_matches = git_sparse_checkout_selected_paths(
+    let cone = git_sparse_checkout_cone_mode_with_leaf_until(repository, deadline, git_leaf)?;
+    let sparse_matches = git_sparse_checkout_selected_paths_with_leaf_until(
         repository,
         &skip_absent,
-        git_sparse_checkout_cone_mode(repository, deadline)?,
+        cone,
         deadline,
+        git_leaf,
     )?
     .into_iter()
     .collect::<BTreeSet<_>>();
@@ -7357,56 +10147,106 @@ fn sparse_checkout_absent_paths(
         .collect())
 }
 
+#[cfg(test)]
 fn git_sparse_checkout_cone_mode(
     repository: &Path,
     deadline: std::time::Instant,
 ) -> Result<bool, String> {
-    let output = run_bounded_git_command_until(
+    git_sparse_checkout_cone_mode_with_leaf_until(
+        repository,
+        deadline,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn git_sparse_checkout_cone_mode_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<bool, String> {
+    let output = run_bounded_git_command_with_leaf_until(
         repository,
         &["config", "--bool", "--get", "core.sparseCheckoutCone"],
         None,
         deadline,
         "sparse-checkout cone inspection",
+        git_leaf,
     )?;
     Ok(output.status.success() && output.stdout.trim_ascii() == b"true")
 }
 
+#[cfg(test)]
 fn git_sparse_checkout_selected_paths(
     repository: &Path,
     paths: &[Vec<u8>],
     cone: bool,
     deadline: std::time::Instant,
 ) -> Result<Vec<Vec<u8>>, String> {
+    git_sparse_checkout_selected_paths_with_leaf_until(
+        repository,
+        paths,
+        cone,
+        deadline,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn git_sparse_checkout_selected_paths_with_leaf_until(
+    repository: &Path,
+    paths: &[Vec<u8>],
+    cone: bool,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<Vec<u8>>, String> {
+    const OPERATION: &str = "sparse-checkout rule inspection";
+    if std::time::Instant::now() >= deadline {
+        return Err(format!("{OPERATION} exceeded its deadline"));
+    }
+
+    let mut input = tempfile::tempfile()
+        .map_err(|error| format!("cannot prepare sparse-checkout probe paths: {error}"))?;
+    {
+        use std::io::Write as _;
+        for path in paths {
+            if std::time::Instant::now() >= deadline {
+                return Err(format!("{OPERATION} exceeded its deadline"));
+            }
+            // Filesystem writes are cooperative and cannot be preempted mid-write.
+            input
+                .write_all(path)
+                .and_then(|()| input.write_all(&[0]))
+                .map_err(|error| format!("cannot write sparse-checkout probe paths: {error}"))?;
+        }
+    }
+    if std::time::Instant::now() >= deadline {
+        return Err(format!("{OPERATION} exceeded its deadline"));
+    }
+    {
+        use std::io::Seek as _;
+        input
+            .rewind()
+            .map_err(|error| format!("cannot rewind sparse-checkout probe paths: {error}"))?;
+    }
+
     let mut command = phoenix_core::git::command();
-    bind_git_command_to_worktree(&mut command, repository)?;
+    bind_git_command_to_worktree_until(&mut command, repository, deadline)?;
     command
         .arg("sparse-checkout")
         .arg("check-rules")
         .arg("-z")
-        .stdin(std::process::Stdio::piped())
+        .stdin(std::process::Stdio::from(input))
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .env("GIT_OPTIONAL_LOCKS", "0");
     if cone {
         command.arg("--cone");
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("cannot inspect sparse-checkout rules: {error}"))?;
+    #[cfg(unix)]
     {
-        use std::io::Write as _;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or("cannot open sparse-checkout stdin")?;
-        for path in paths {
-            stdin
-                .write_all(path)
-                .and_then(|()| stdin.write_all(&[0]))
-                .map_err(|error| format!("cannot write sparse-checkout probe paths: {error}"))?;
-        }
+        use std::os::unix::process::CommandExt as _;
+        command.process_group(0);
     }
-    let output = wait_bounded_child_output(child, deadline, "sparse-checkout rule inspection")?;
+    let output = execute_worktree_git_leaf_until(command, deadline, OPERATION, git_leaf)?;
     if !output.status.success() {
         return Err(format!(
             "cannot inspect sparse-checkout rules: {}",
@@ -7437,13 +10277,23 @@ fn raw_diff_paths(raw: &[u8]) -> Vec<Vec<u8>> {
     paths
 }
 
+#[cfg(test)]
 fn git_index_path(repository: &Path, deadline: std::time::Instant) -> Result<PathBuf, String> {
-    let output = run_bounded_git_command_until(
+    git_index_path_with_leaf_until(repository, deadline, &mut run_bounded_spawned_git)
+}
+
+fn git_index_path_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<PathBuf, String> {
+    let output = run_bounded_git_command_with_leaf_until(
         repository,
         &["rev-parse", "--git-path", "index"],
         None,
         deadline,
         "Git index path inspection",
+        git_leaf,
     )?;
     if !output.status.success() {
         return Err(format!(
@@ -7460,8 +10310,32 @@ fn git_index_path(repository: &Path, deadline: std::time::Instant) -> Result<Pat
     })
 }
 
-fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<Vec<u8>, String> {
+#[cfg(test)]
+fn observe_dirty_content_until(
+    repository: &Path,
+    losses: &[CloseLossItem],
+    deadline: std::time::Instant,
+) -> Result<Vec<u8>, String> {
+    observe_dirty_content_with_leaf_until(
+        repository,
+        losses,
+        deadline,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn observe_dirty_content_with_leaf_until(
+    repository: &Path,
+    losses: &[CloseLossItem],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<Vec<u8>, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("dirty content inspection exceeded its deadline".into());
+    }
     let mut observation = Vec::new();
+    // These checks are cooperative: a blocking filesystem operation already in
+    // progress cannot be interrupted when the deadline elapses.
     let mut paths = losses
         .iter()
         .filter_map(|loss| match loss.identity() {
@@ -7473,8 +10347,12 @@ fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<
         .collect::<Vec<_>>();
     paths.sort();
     paths.dedup();
-    let staged_entries = staged_index_entries_for_paths(repository, &paths)?;
+    let staged_entries =
+        staged_index_entries_for_paths_with_leaf_until(repository, &paths, deadline, git_leaf)?;
     for path in paths {
+        if std::time::Instant::now() >= deadline {
+            return Err("dirty content inspection exceeded its deadline".into());
+        }
         observation.extend_from_slice(b"CONTENT\0");
         observation.extend_from_slice(&path);
         observation.push(0);
@@ -7501,6 +10379,8 @@ fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<
                 );
             }
             Ok(metadata) if metadata.is_file() => {
+                use std::io::Read as _;
+
                 observation.extend_from_slice(b"FILE_SHA256\0");
                 #[cfg(unix)]
                 {
@@ -7514,7 +10394,9 @@ fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<
                 let mut digest = Sha256::new();
                 let mut buffer = vec![0_u8; 64 * 1024];
                 loop {
-                    use std::io::Read as _;
+                    if std::time::Instant::now() >= deadline {
+                        return Err("dirty content inspection exceeded its deadline".into());
+                    }
                     let read = file
                         .read(&mut buffer)
                         .map_err(|error| format!("cannot hash dirty file contents: {error}"))?;
@@ -7543,25 +10425,55 @@ fn observe_dirty_content(repository: &Path, losses: &[CloseLossItem]) -> Result<
         }
         observation.push(0);
     }
+    if std::time::Instant::now() >= deadline {
+        return Err("dirty content inspection exceeded its deadline".into());
+    }
     Ok(observation)
 }
 
-fn staged_index_entries_for_paths(
+#[cfg(test)]
+fn staged_index_entries_for_paths_until(
     repository: &Path,
     paths: &[Vec<u8>],
+    deadline: std::time::Instant,
 ) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, String> {
+    staged_index_entries_for_paths_with_leaf_until(
+        repository,
+        paths,
+        deadline,
+        &mut run_bounded_spawned_git,
+    )
+}
+
+fn staged_index_entries_for_paths_with_leaf_until(
+    repository: &Path,
+    paths: &[Vec<u8>],
+    deadline: std::time::Instant,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<std::collections::BTreeMap<Vec<u8>, Vec<Vec<u8>>>, String> {
+    if std::time::Instant::now() >= deadline {
+        return Err("dirty index inspection exceeded its deadline".into());
+    }
     let mut entries = std::collections::BTreeMap::new();
     for batch in paths.chunks(256) {
-        let mut command = phoenix_core::git::command();
-        bind_git_command_to_worktree(&mut command, repository)?;
-        command.args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"]);
-        for path in batch {
-            command.arg(path_buf_from_git_bytes(path));
+        if std::time::Instant::now() >= deadline {
+            return Err("dirty index inspection exceeded its deadline".into());
         }
-        let output = command
+        let mut command = phoenix_core::git::command();
+        bind_git_command_to_worktree_until(&mut command, repository, deadline)?;
+        command
+            .args(["--literal-pathspecs", "ls-files", "--stage", "-z", "--"])
+            .args(batch.iter().map(|path| path_buf_from_git_bytes(path)))
             .current_dir(repository)
-            .output()
-            .map_err(|error| format!("cannot inspect dirty index: {error}"))?;
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+        let output =
+            execute_worktree_git_leaf_until(command, deadline, "dirty index inspection", git_leaf)?;
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
         }
@@ -7602,6 +10514,8 @@ fn parse_status_losses(status: &[u8]) -> Vec<CloseLossItem> {
         let path = GitPathIdentity::from_bytes(row[3..].to_vec());
         match &row[..2] {
             b"??" => losses.push(CloseLossItem::UntrackedNonIgnoredPath(path)),
+            // Porcelain may collapse an ignored directory; exact files are read
+            // separately with ls-files before any blocker rows are materialized.
             b"!!" => {}
             xy => {
                 let unmerged = matches!(xy, b"DD" | b"AU" | b"UD" | b"UA" | b"DU" | b"AA" | b"UU");
@@ -7771,6 +10685,202 @@ fn require_browser_absent(
 
 #[cfg(test)]
 mod tests {
+    fn opaque_identity(value: &str) -> OpaqueIdentity {
+        OpaqueIdentity::parse(value).expect("test stable identity is non-empty")
+    }
+
+    #[test]
+    fn native_inventory_preparation_preserves_exact_durable_identities() {
+        use phoenix_core::domain::close::{
+            CapturedWorktreeIdentity, GitPathIdentity, RetiredResourceKind as Kind,
+            WorktreeFingerprint, WorktreeId, WorktreeIdentity,
+        };
+        use phoenix_core::work_scope::WorkScopeId;
+
+        let attempt_id =
+            phoenix_core::domain::close::CloseAttemptId::parse("native-inventory-attempt").unwrap();
+        let snapshot = super::snapshot_for(b"native inventory snapshot");
+        let scope = WorkScopeId::parse("native-inventory-scope").unwrap();
+        let worktree = WorktreeIdentity::from_parts(
+            WorktreeId::parse("native-inventory-worktree").unwrap(),
+            WorktreeFingerprint::parse("captured-worktree-incarnation").unwrap(),
+            GitPathIdentity::from_bytes(b"/tmp/native-inventory-worktree".to_vec()),
+        );
+        let tmux = super::opaque_resource(Kind::TmuxServer, "tmux-stable-server-instance".into());
+        let input = super::CloseRetirementInventoryScopeInput {
+            scope: scope.clone(),
+            captured_worktree: Some(CapturedWorktreeIdentity::Resolved(worktree.clone())),
+            acquired_resources: vec![
+                tmux.clone(),
+                super::opaque_resource(Kind::BashProcessGroup, "ephemeral-bash".into()),
+                super::opaque_resource(Kind::PtySession, "ephemeral-pty".into()),
+                super::opaque_resource(Kind::BrowserSession, "ephemeral-browser".into()),
+            ],
+        };
+
+        let request = super::build_close_retirement_inventory_scope_request(
+            attempt_id.clone(),
+            snapshot.clone(),
+            input,
+            super::CloseRetirementInventoryPolicy::NativeInitial,
+        )
+        .unwrap();
+        assert_eq!(request.attempt_id, attempt_id);
+        assert_eq!(request.snapshot, snapshot);
+        assert_eq!(request.scopes.len(), 1);
+        assert_eq!(request.scopes[0].scope, scope);
+        assert_eq!(request.scopes[0].inventory.worktree, Some(worktree));
+        let phoenix_core::domain::close::LossItemIdentity::Opaque(tmux_identity) = tmux.identity()
+        else {
+            unreachable!();
+        };
+        assert_eq!(request.scopes[0].inventory.tmux_servers.len(), 1);
+        assert!(request.scopes[0]
+            .inventory
+            .tmux_servers
+            .contains(tmux_identity));
+        assert_eq!(request.scopes[0].inventory.bash_process_groups.len(), 1);
+        assert_eq!(request.scopes[0].inventory.pty_sessions.len(), 1);
+        assert_eq!(request.scopes[0].inventory.browser_sessions.len(), 1);
+        assert!(request.scopes[0]
+            .inventory
+            .equivalent_live_resources
+            .is_empty());
+        assert!(request.scopes[0]
+            .inventory
+            .bash_process_groups
+            .contains(&opaque_identity("ephemeral-bash")));
+        assert!(request.scopes[0]
+            .inventory
+            .pty_sessions
+            .contains(&opaque_identity("ephemeral-pty")));
+        assert!(request.scopes[0]
+            .inventory
+            .browser_sessions
+            .contains(&opaque_identity("ephemeral-browser")));
+    }
+
+    #[test]
+    fn legacy_inventory_preparation_keeps_tmux_only_filtering() {
+        use phoenix_core::domain::close::RetiredResourceKind as Kind;
+        use phoenix_core::work_scope::WorkScopeId;
+
+        let attempt_id =
+            phoenix_core::domain::close::CloseAttemptId::parse("legacy-inventory-attempt").unwrap();
+        let snapshot = super::snapshot_for(b"legacy inventory snapshot");
+        let request = super::build_close_retirement_inventory_scope_request(
+            attempt_id,
+            snapshot,
+            super::CloseRetirementInventoryScopeInput {
+                scope: WorkScopeId::parse("legacy-inventory-scope").unwrap(),
+                captured_worktree: None,
+                acquired_resources: vec![
+                    super::opaque_resource(Kind::BashProcessGroup, "legacy-bash".into()),
+                    super::opaque_resource(Kind::PtySession, "legacy-pty".into()),
+                    super::opaque_resource(Kind::BrowserSession, "legacy-browser".into()),
+                    super::opaque_resource(Kind::TmuxServer, "legacy-tmux".into()),
+                ],
+            },
+            super::CloseRetirementInventoryPolicy::LegacyDurable,
+        )
+        .unwrap();
+        let inventory = &request.scopes[0].inventory;
+        assert!(inventory.bash_process_groups.is_empty());
+        assert!(inventory.pty_sessions.is_empty());
+        assert!(inventory.browser_sessions.is_empty());
+        assert_eq!(inventory.tmux_servers.len(), 1);
+        assert!(inventory
+            .tmux_servers
+            .contains(&opaque_identity("legacy-tmux")));
+    }
+
+    #[test]
+    fn native_inventory_preparation_keeps_empty_process_inventory_empty() {
+        use phoenix_core::domain::close::CapturedWorktreeIdentity;
+        use phoenix_core::work_scope::WorkScopeId;
+
+        let attempt_id =
+            phoenix_core::domain::close::CloseAttemptId::parse("native-empty-attempt").unwrap();
+        let request = super::build_close_retirement_inventory_scope_request(
+            attempt_id,
+            super::snapshot_for(b"native empty inventory snapshot"),
+            super::CloseRetirementInventoryScopeInput {
+                scope: WorkScopeId::parse("native-empty-scope").unwrap(),
+                captured_worktree: None::<CapturedWorktreeIdentity>,
+                acquired_resources: Vec::new(),
+            },
+            super::CloseRetirementInventoryPolicy::NativeInitial,
+        )
+        .unwrap();
+        let inventory = &request.scopes[0].inventory;
+        assert!(inventory.bash_process_groups.is_empty());
+        assert!(inventory.tmux_servers.is_empty());
+        assert!(inventory.pty_sessions.is_empty());
+        assert!(inventory.browser_sessions.is_empty());
+        assert!(inventory.equivalent_live_resources.is_empty());
+    }
+
+    #[test]
+    fn native_inventory_preparation_rejects_unexpected_registry_identity() {
+        use phoenix_core::domain::close::RetiredResourceKind as Kind;
+        use phoenix_core::work_scope::WorkScopeId;
+
+        let error = super::build_close_retirement_inventory_scope_request(
+            phoenix_core::domain::close::CloseAttemptId::parse("native-unexpected-attempt")
+                .unwrap(),
+            super::snapshot_for(b"native unexpected inventory snapshot"),
+            super::CloseRetirementInventoryScopeInput {
+                scope: WorkScopeId::parse("native-unexpected-scope").unwrap(),
+                captured_worktree: None,
+                acquired_resources: vec![super::opaque_resource(
+                    Kind::EquivalentLiveResource,
+                    "unexpected".into(),
+                )],
+            },
+            super::CloseRetirementInventoryPolicy::NativeInitial,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            super::CloseRetirementInventoryPreparationError::BackendStorageOrUnattributed { .. }
+        ));
+    }
+
+    #[test]
+    fn native_inventory_preparation_rejects_unresolved_captured_scope() {
+        use phoenix_core::domain::close::{
+            CapturedWorktreeIdentity, GitPathIdentity, RetirementFailureReason,
+        };
+        use phoenix_core::work_scope::WorkScopeId;
+
+        let scope = WorkScopeId::parse("native-unresolved-scope").unwrap();
+        let attempt_id =
+            phoenix_core::domain::close::CloseAttemptId::parse("native-unresolved-attempt")
+                .unwrap();
+        let snapshot = super::snapshot_for(b"unresolved inventory snapshot");
+        let error = super::build_close_retirement_inventory_scope_request(
+            attempt_id,
+            snapshot,
+            super::CloseRetirementInventoryScopeInput {
+                scope: scope.clone(),
+                captured_worktree: Some(CapturedWorktreeIdentity::Unresolved {
+                    locator: GitPathIdentity::from_bytes(b"/tmp/unresolved-worktree".to_vec()),
+                }),
+                acquired_resources: Vec::new(),
+            },
+            super::CloseRetirementInventoryPolicy::NativeInitial,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            super::CloseRetirementInventoryPreparationError::CapturedScopeIdentity {
+                scope: error_scope,
+                reason: RetirementFailureReason::IdentityNotProven,
+                ..
+            } if error_scope == scope
+        ));
+    }
+
     #[test]
     fn scope_uncertainty_blocks_close_without_inventing_a_process_failure() {
         use phoenix_tools::bash::registry::{
@@ -7794,16 +10904,16 @@ mod tests {
     }
 
     use super::{
-        both_worktree_paths_absent, canonical_status_observation,
+        append_ignored_paths, both_worktree_paths_absent, canonical_status_observation,
         complete_persisted_worktree_administrative_cleanup, exact_worktree_administrative_dir,
         git_path_from_observation, inspect_and_remove_exact_worktree_with_hook, inspect_worktree,
-        observe_administrative_dir_incarnation, observe_worktree_fingerprint, parse_status_losses,
-        planned_administrative_dir_is_absent, remove_directory_contents_at_with_hook,
-        remove_exact_worktree_administrative_dir_with_hook, remove_identity_bound_directory,
-        remove_quarantine_then_administrative_dir,
+        observe_administrative_dir_incarnation, observe_ignored_paths_with_leaf_until,
+        observe_worktree_fingerprint, parse_status_losses, planned_administrative_dir_is_absent,
+        remove_directory_contents_at_with_hook, remove_exact_worktree_administrative_dir_with_hook,
+        remove_identity_bound_directory, remove_quarantine_then_administrative_dir,
         remove_quarantine_then_administrative_dir_with_hooks, rotate_inspection_generation,
         run_bounded_git_status_until, snapshot_for, staged_index_entries_by_path,
-        staged_index_entries_for_paths, worktree_quarantine_path, CloseLeaseFailure,
+        staged_index_entries_for_paths_until, worktree_quarantine_path, CloseLeaseFailure,
         ExactWorktreeRemoval, FinalTombstoneRecovery,
     };
     use crate::db::{CloseCleanupResourceDisposition, CloseWorktreeFinalTombstone};
@@ -7892,6 +11002,23 @@ mod tests {
         assert_eq!(
             super::close_safe_retry_execution_order(&plan),
             vec![2, 1, 0]
+        );
+        let remaining = plan
+            .iter()
+            .map(|effect| crate::db::CloseCleanupFailureResource {
+                scope: effect.scope.clone(),
+                resource: effect.resource.clone(),
+                disposition: crate::db::CloseCleanupResourceDisposition::Failed,
+            })
+            .collect::<Vec<_>>();
+        let admitted_plan = super::close_safe_retry_effects(&remaining).unwrap();
+        assert_eq!(
+            admitted_plan,
+            vec![plan[2].clone(), plan[1].clone(), plan[0].clone()]
+        );
+        assert_eq!(
+            super::close_safe_retry_execution_order(&admitted_plan),
+            vec![0, 1, 2]
         );
     }
 
@@ -7984,7 +11111,12 @@ mod tests {
                 .archived
         );
         assert_close_admission_fenced(&manager, &scope).await;
-        assert!(manager.close_retirement_leases.lock().await.is_empty());
+        assert!(manager
+            .close_retirement_leases
+            .lock()
+            .await
+            .complete
+            .is_empty());
         assert!(matches!(
             receiver.try_recv().unwrap(),
             crate::runtime::SseEvent::ConversationUpdate {
@@ -8223,7 +11355,10 @@ mod tests {
             assert!(!db.get_conversation(id).await.unwrap().archived);
             assert!(receiver.try_recv().is_err());
         }
-        assert_eq!(manager.close_retirement_leases.lock().await.len(), 1);
+        assert_eq!(
+            manager.close_retirement_leases.lock().await.complete.len(),
+            1
+        );
         assert_close_admission_fenced(&manager, &scope).await;
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures")
@@ -8294,7 +11429,12 @@ mod tests {
                 ));
                 assert!(receiver.try_recv().is_err());
             }
-            assert!(manager.close_retirement_leases.lock().await.is_empty());
+            assert!(manager
+                .close_retirement_leases
+                .lock()
+                .await
+                .complete
+                .is_empty());
             assert_close_admission_fenced(&manager, &scope).await;
         }
         assert_eq!(
@@ -8658,6 +11798,7 @@ mod tests {
                     .close_retirement_leases
                     .lock()
                     .await
+                    .complete
                     .get_mut(&(attempt_id.as_str().to_string(), scope.clone()))
                     .unwrap()
                     .resources = resources;
@@ -8755,7 +11896,12 @@ mod tests {
                     ..
                 }
             ));
-            assert!(manager.close_retirement_leases.lock().await.is_empty());
+            assert!(manager
+                .close_retirement_leases
+                .lock()
+                .await
+                .complete
+                .is_empty());
         }
     }
 
@@ -8964,8 +12110,15 @@ mod tests {
         identity
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn process_step_fixture(two_scopes: bool) -> ProcessStepFixture {
+        process_step_fixture_with_worktree(two_scopes, None).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn process_step_fixture_with_worktree(
+        two_scopes: bool,
+        live_worktree: Option<&Path>,
+    ) -> ProcessStepFixture {
         use phoenix_core::domain::close::{CloseOwnedResourceInventory, TranscriptConversationId};
         use std::collections::BTreeSet;
         use std::sync::Arc;
@@ -8977,6 +12130,16 @@ mod tests {
             .unwrap();
         let mut scopes = vec![source.attached_work_scope_id.clone().unwrap()];
         let mut worktrees = vec![mark_process_step_scope_allocated(&db, &scopes[0], "first").await];
+        if let Some(path) = live_worktree {
+            let identity = inspection_identity(path);
+            sqlx::query("UPDATE work_scopes SET worktree_path=?1, worktree_id=?2, worktree_fingerprint=?3 WHERE id=?4")
+                .bind(path.to_str().unwrap())
+                .bind(identity.id().as_str())
+                .bind(identity.fingerprint().as_str())
+                .bind(scopes[0].as_str())
+                .execute(db.pool()).await.unwrap();
+            worktrees[0] = identity;
+        }
         let mut latest_id = source.id.clone();
         if two_scopes {
             db.update_conversation_state(
@@ -9032,11 +12195,17 @@ mod tests {
             .map(|captured| captured.scope)
             .collect();
         scopes.sort();
-        let snapshot = super::CloseRetirementSnapshot::parse(
-            "process-step-generation",
-            "process-step-fingerprint",
-        )
-        .unwrap();
+        let snapshot = if live_worktree.is_some() {
+            let (snapshot, losses) = super::inspect_worktree(&worktrees[0]).await.unwrap();
+            assert!(losses.is_empty());
+            snapshot
+        } else {
+            super::CloseRetirementSnapshot::parse(
+                "process-step-generation",
+                "process-step-fingerprint",
+            )
+            .unwrap()
+        };
         db.replace_close_inspection(crate::db::ReplaceCloseInspectionRequest {
             attempt_id: run.attempt_id.clone(),
             scopes: scopes
@@ -9136,6 +12305,971 @@ mod tests {
         }
     }
 
+    type NativeRetryFixture = (
+        ProcessStepFixture,
+        super::StoppedCloseOriginalRetirementProof,
+        Vec<(super::CloseRetirementTarget, super::CloseRetirementSnapshot)>,
+    );
+
+    async fn stopped_native_retry_fixture() -> NativeRetryFixture {
+        stopped_native_retry_fixture_with_worktree(None).await
+    }
+
+    async fn stopped_native_retry_fixture_with_worktree(
+        live_worktree: Option<&Path>,
+    ) -> NativeRetryFixture {
+        stopped_native_retry_fixture_with_worktree_at_g2(live_worktree, false).await
+    }
+
+    #[allow(clippy::too_many_lines)] // Keep the supported G1-to-G2 fixture journey together.
+    async fn stopped_native_retry_fixture_with_worktree_at_g2(
+        live_worktree: Option<&Path>,
+        advance_to_successor_inspection: bool,
+    ) -> NativeRetryFixture {
+        use std::collections::BTreeSet;
+
+        // Keep the initial run running while any successor inspection is recorded.
+        let mut fixture = process_step_fixture_with_worktree(false, live_worktree).await;
+        // Isolate this Git identity/drift journey from ambient runner processes.
+        // The same per-manager fixture already controls deletion checkpoints.
+        fixture.manager.clean_close_writer_fixture = advance_to_successor_inspection;
+        let db = fixture.manager.db();
+        let targets = db
+            .list_close_expected_retirement_resources(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        for target in targets {
+            let outcome = if target.resource.kind() == super::RetiredResourceKind::WorkScope
+                || (live_worktree.is_some()
+                    && target.resource.kind() == super::RetiredResourceKind::Worktree)
+            {
+                super::RetirementOutcome::Residual {
+                    residual_reason: super::RetirementFailureReason::RemovalFailed,
+                }
+            } else {
+                super::RetirementOutcome::Retired
+            };
+            db.record_close_retirement_evidence(crate::db::RecordCloseRetirementEvidenceRequest {
+                attempt_id: fixture.run.attempt_id.clone(),
+                snapshot: fixture.snapshot.clone(),
+                scope: target.scope,
+                resource: target.resource,
+                outcome,
+                detail: Some("native retry fixture preserves pending resources".into()),
+            })
+            .await
+            .unwrap();
+        }
+        let g1_inspections = db
+            .list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|inspection| (inspection.target, inspection.snapshot))
+            .collect::<Vec<_>>();
+        if advance_to_successor_inspection {
+            let worktree = live_worktree.expect("G2 native retry fixtures need a live worktree");
+            let captured = db
+                .list_close_attempt_scopes(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap();
+            let Some(super::CapturedWorktreeIdentity::Resolved(identity)) =
+                &captured[0].captured_worktree
+            else {
+                panic!("G2 reinspection requires the captured worktree identity");
+            };
+            assert_eq!(super::worktree_path(identity), worktree);
+            db.retry_close_retirement(&fixture.run.attempt_id)
+                .await
+                .unwrap();
+            let (g2, losses) = super::inspect_worktree(identity).await.unwrap();
+            assert!(losses.is_empty());
+            let g2 = super::rotate_inspection_generation(g2, Some("native-retry-G2")).unwrap();
+            db.replace_close_inspection(crate::db::ReplaceCloseInspectionRequest {
+                attempt_id: fixture.run.attempt_id.clone(),
+                scopes: fixture
+                    .scopes
+                    .iter()
+                    .cloned()
+                    .map(|scope| crate::db::ReplaceCloseInspectionScopeRequest {
+                        scope,
+                        snapshot: g2.clone(),
+                        losses: vec![],
+                    })
+                    .collect(),
+            })
+            .await
+            .unwrap();
+            let inventories = captured
+                .into_iter()
+                .map(|captured| {
+                    crate::db::CaptureCloseRetirementInventoryScopeRequest {
+                        scope: captured.scope,
+                        inventory: super::CloseOwnedResourceInventory {
+                            worktree: match captured.captured_worktree {
+                                Some(super::CapturedWorktreeIdentity::Resolved(identity)) => {
+                                    Some(identity)
+                                }
+                                _ => None,
+                            },
+                            // These process resources were retired under G1; G2 captures
+                            // only the still-live worktree, not already-retired identities.
+                            work_scopes: BTreeSet::default(),
+                            bash_process_groups: BTreeSet::default(),
+                            tmux_servers: BTreeSet::default(),
+                            pty_sessions: BTreeSet::default(),
+                            browser_sessions: BTreeSet::default(),
+                            equivalent_live_resources: BTreeSet::default(),
+                        },
+                    }
+                })
+                .collect();
+            // replace_close_inspection stores per-scope snapshots but updates the
+            // obligation to their aggregate snapshot; inventory authority uses that pair.
+            let aggregate_snapshot = db
+                .get_close_obligation(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .clone();
+            db.capture_close_retirement_inventory(
+                crate::db::CaptureCloseRetirementInventoryRequest {
+                    attempt_id: fixture.run.attempt_id.clone(),
+                    snapshot: aggregate_snapshot,
+                    scopes: inventories,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        db.classify_interrupted_close_run(&fixture.run)
+            .await
+            .unwrap();
+        let original = db
+            .read_stopped_close_original_retirement_proof(&fixture.run)
+            .await
+            .unwrap();
+        if advance_to_successor_inspection {
+            assert!(db
+                .list_close_retirement_inspections_for_snapshot(
+                    fixture.run.attempt_id.as_str(),
+                    &original.snapshot,
+                )
+                .await
+                .is_err());
+        } else {
+            assert_eq!(original.snapshot, fixture.snapshot);
+        }
+        (fixture, original, g1_inspections)
+    }
+
+    #[tokio::test]
+    async fn native_retry_preserves_independent_work_scope_after_worktree_success() {
+        let (fixture, original, inspections) = stopped_native_retry_fixture().await;
+        let effects =
+            super::native_close_retry_remaining_effects(&fixture.run, &original, &inspections)
+                .unwrap();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(
+            effects[0].resource.kind(),
+            super::RetiredResourceKind::WorkScope,
+        );
+        assert_eq!(effects[0].scope, fixture.scopes[0]);
+        assert!(original.outcomes.iter().any(|outcome| {
+            outcome.resource.kind() == super::RetiredResourceKind::Worktree
+                && outcome.outcome == super::RetirementOutcome::Retired
+        }));
+        let mut all_successful = original.clone();
+        for outcome in &mut all_successful.outcomes {
+            outcome.outcome = super::RetirementOutcome::Retired;
+        }
+        assert!(super::native_close_retry_remaining_effects(
+            &fixture.run,
+            &all_successful,
+            &inspections,
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn native_retry_refuses_missing_duplicate_and_mismatched_original_evidence() {
+        let (fixture, original, inspections) = stopped_native_retry_fixture().await;
+        let assess = |proof: &super::StoppedCloseOriginalRetirementProof| {
+            super::native_close_retry_remaining_effects(&fixture.run, proof, &inspections)
+        };
+        let mut missing = original.clone();
+        missing.outcomes.pop();
+        assert!(assess(&missing).is_err());
+        let mut duplicate = original.clone();
+        duplicate.outcomes.push(duplicate.outcomes[0].clone());
+        assert!(assess(&duplicate).is_err());
+        let mut duplicate_target = original.clone();
+        duplicate_target
+            .resources
+            .push(duplicate_target.resources[0].clone());
+        assert!(assess(&duplicate_target).is_err());
+        let mut mismatched = original.clone();
+        mismatched.outcomes[0].snapshot =
+            super::CloseRetirementSnapshot::parse("G2", "G2-fingerprint").unwrap();
+        assert!(assess(&mismatched).is_err());
+        let mut wrong_identity = original.clone();
+        let worktree = wrong_identity
+            .resources
+            .iter_mut()
+            .find(|target| target.resource.kind() == super::RetiredResourceKind::Worktree)
+            .unwrap();
+        let super::LossItemIdentity::Worktree(identity) = worktree.resource.identity() else {
+            panic!("expected worktree identity");
+        };
+        let replacement = super::WorktreeIdentity::from_parts(
+            identity.id().clone(),
+            identity.fingerprint().clone(),
+            super::GitPathIdentity::from_bytes(b"/different/repository".to_vec()),
+        );
+        worktree.resource = super::RetiredResourceIdentity::parse(
+            super::RetiredResourceKind::Worktree,
+            super::LossItemIdentity::Worktree(replacement),
+        )
+        .unwrap();
+        assert!(assess(&wrong_identity).is_err());
+        assert!(super::native_close_retry_remaining_effects(&fixture.run, &original, &[]).is_err());
+        let duplicate_inspections = vec![inspections[0].clone(), inspections[0].clone()];
+        assert!(super::native_close_retry_remaining_effects(
+            &fixture.run,
+            &original,
+            &duplicate_inspections,
+        )
+        .is_err());
+        let mut wrong_run = fixture.run.clone();
+        wrong_run.ordinal = super::CloseRunOrdinal::parse(2).unwrap();
+        assert!(
+            super::native_close_retry_remaining_effects(&wrong_run, &original, &inspections,)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn native_retry_requires_original_scope_even_with_complete_remaining_receipts() {
+        let (fixture, original, inspections) = stopped_native_retry_fixture().await;
+        let assess = |proof: &super::StoppedCloseOriginalRetirementProof| {
+            super::native_close_retry_remaining_effects(&fixture.run, proof, &inspections)
+        };
+        let mut missing_scope = original.clone();
+        missing_scope
+            .resources
+            .retain(|target| target.resource.kind() != super::RetiredResourceKind::WorkScope);
+        missing_scope
+            .outcomes
+            .retain(|outcome| outcome.resource.kind() != super::RetiredResourceKind::WorkScope);
+        assert!(assess(&missing_scope)
+            .unwrap_err()
+            .contains("independent exact WorkScope"));
+
+        let mut wrong_scope_identity = original.clone();
+        let replacement = super::opaque_resource(
+            super::RetiredResourceKind::WorkScope,
+            "unrelated-scope".to_string(),
+        );
+        for target in &mut wrong_scope_identity.resources {
+            if target.resource.kind() == super::RetiredResourceKind::WorkScope {
+                target.resource = replacement.clone();
+            }
+        }
+        for outcome in &mut wrong_scope_identity.outcomes {
+            if outcome.resource.kind() == super::RetiredResourceKind::WorkScope {
+                outcome.resource = replacement.clone();
+            }
+        }
+        assert!(assess(&wrong_scope_identity).is_err());
+
+        let mut duplicate_scope = original.clone();
+        duplicate_scope
+            .scopes
+            .push(duplicate_scope.scopes[0].clone());
+        assert!(assess(&duplicate_scope).is_err());
+        let mut wrong_snapshot = original.clone();
+        wrong_snapshot.resources[0].snapshot =
+            super::CloseRetirementSnapshot::parse("G2", "G2-fingerprint").unwrap();
+        assert!(assess(&wrong_snapshot).is_err());
+        let mut not_stopped = original.clone();
+        not_stopped.run.status = super::CloseRunStatus::Running;
+        assert!(assess(&not_stopped).is_err());
+    }
+
+    #[tokio::test]
+    async fn native_retry_refuses_original_process_local_residuals() {
+        let (fixture, original, inspections) = stopped_native_retry_fixture().await;
+        for kind in [
+            super::RetiredResourceKind::BashProcessGroup,
+            super::RetiredResourceKind::PtySession,
+            super::RetiredResourceKind::BrowserSession,
+        ] {
+            let mut residual = original.clone();
+            residual
+                .outcomes
+                .iter_mut()
+                .find(|outcome| outcome.resource.kind() == kind)
+                .unwrap()
+                .outcome = super::RetirementOutcome::Residual {
+                residual_reason: super::RetirementFailureReason::ManualRepairRequired,
+            };
+            assert!(super::native_close_retry_remaining_effects(
+                &fixture.run,
+                &residual,
+                &inspections,
+            )
+            .unwrap_err()
+            .contains("separate repair authority"));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_retry_assessment_keeps_exact_snapshot_and_does_not_dispatch() {
+        let (fixture, original, _) = stopped_native_retry_fixture().await;
+        let assessment = fixture
+            .manager
+            .assess_native_close_retry(&fixture.run)
+            .await
+            .unwrap();
+        assert_eq!(assessment.original, original);
+        assert_eq!(assessment.remaining_effects.len(), 1);
+        assert_eq!(
+            assessment.remaining_effects[0].resource.kind(),
+            super::RetiredResourceKind::WorkScope,
+        );
+        assert!(!assessment.safety_evidence.is_empty());
+        let g2 = super::CloseRetirementSnapshot::parse(
+            "different-generation",
+            original.snapshot.fingerprint(),
+        )
+        .unwrap();
+        assert!(fixture
+            .manager
+            .db()
+            .list_close_retirement_inspections_for_snapshot(fixture.run.attempt_id.as_str(), &g2)
+            .await
+            .is_err());
+        assert_eq!(
+            fixture
+                .manager
+                .db()
+                .get_close_run(&fixture.run)
+                .await
+                .unwrap(),
+            original.run,
+        );
+        let successor = super::CloseRunRef {
+            attempt_id: fixture.run.attempt_id.clone(),
+            ordinal: super::CloseRunOrdinal::parse(2).unwrap(),
+        };
+        assert!(fixture
+            .manager
+            .db()
+            .get_close_run(&successor)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn anchored_native_retry_assessment_preserves_writer_inspection_gap() {
+        let temp = tempfile::tempdir().unwrap();
+        let linked = linked_close_worktree(&temp);
+        let (mut fixture, original, _) =
+            stopped_native_retry_fixture_with_worktree_at_g2(Some(&linked), true).await;
+        fixture.manager.clean_close_writer_fixture = true;
+        let before_inspections = fixture
+            .manager
+            .db()
+            .list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        let original_run = fixture
+            .manager
+            .db()
+            .get_close_run(&fixture.run)
+            .await
+            .unwrap();
+        let mut observed_target = None;
+
+        let error = fixture
+            .manager
+            .assess_native_close_retry_with_writer_probe(
+                &fixture.run,
+                |path, quarantine, tombstone, _clean_writer_fixture| {
+                    super::probe_retry_worktree_writers_with(
+                        path,
+                        quarantine,
+                        tombstone,
+                        |target| {
+                            observed_target = Some(target.to_path_buf());
+                            Ok(super::RetryTargetObservation::Present(
+                                super::ExternalWriterEvidence::Blocked(
+                                    super::CloseWriterObservation::InspectionGap {
+                                        detector: super::CloseWriterDetector::LinuxDescriptor,
+                                        pid: None,
+                                        reason: super::CloseWriterGap::Unavailable,
+                                    },
+                                ),
+                            ))
+                        },
+                    )
+                },
+            )
+            .await
+            .expect_err("writer inspection gap must block anchored retry assessment");
+        let super::RetryAssessmentError::WriterInspectionGap(gap) = error else {
+            panic!("anchored assessment lost typed writer inspection gap");
+        };
+        assert_eq!(gap.path, linked);
+        assert_eq!(gap.detector, super::CloseWriterDetector::LinuxDescriptor);
+        assert_eq!(gap.reason, super::CloseWriterGap::Unavailable);
+        assert_eq!(gap.pid, None);
+        assert_eq!(observed_target.as_deref(), Some(linked.as_path()));
+
+        assert_eq!(
+            fixture
+                .manager
+                .db()
+                .get_close_run(&fixture.run)
+                .await
+                .unwrap(),
+            original_run
+        );
+        assert_eq!(original.run.run, fixture.run);
+        let successor = super::CloseRunRef {
+            attempt_id: fixture.run.attempt_id.clone(),
+            ordinal: super::CloseRunOrdinal::parse(2).unwrap(),
+        };
+        assert!(fixture
+            .manager
+            .db()
+            .get_close_run(&successor)
+            .await
+            .is_err());
+        assert_eq!(
+            fixture
+                .manager
+                .db()
+                .list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap(),
+            before_inspections
+        );
+        assert!(linked.exists(), "anchored retry target must remain intact");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[allow(clippy::too_many_lines)]
+    async fn native_retry_source_actor_completes_original_worktree_and_scope_under_new_generation()
+    {
+        use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
+        use phoenix_core::domain::close::CloseRunOrdinal;
+        use phoenix_core::domain::db_schema::SourceToolCall;
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::product_conversation::ProductConversationId;
+        use phoenix_db::native_close::{NativeCloseIntent, NativeCloseRetryResult};
+
+        async fn join_actor(mut actor: tokio::task::JoinHandle<bool>) -> bool {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(60), &mut actor).await;
+            if result.is_err() {
+                actor.abort();
+                let _ = actor.await;
+                panic!("bounded native retry actor did not finish");
+            }
+            // Inspect the route's durable diagnostics before asserting this flag.
+            result.unwrap().unwrap()
+        }
+
+        async fn retained_counts(db: &crate::db::Database, attempt: &str) -> Vec<i64> {
+            let mut counts = Vec::new();
+            for query in [
+                "SELECT COUNT(*) FROM close_runs WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_run_retry_effects WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_run_retry_successes WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM native_close_retry_plans WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_writer_observations WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_retirement_inspections WHERE attempt_id=?1",
+                "SELECT COUNT(*) FROM close_retirement_inventories WHERE attempt_id=?1",
+            ] {
+                counts.push(
+                    sqlx::query_scalar(query)
+                        .bind(attempt)
+                        .fetch_one(db.pool())
+                        .await
+                        .unwrap(),
+                );
+            }
+            counts
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let linked = linked_close_worktree(&temp);
+        let (fixture, original, snapshots) =
+            stopped_native_retry_fixture_with_worktree_at_g2(Some(&linked), true).await;
+        let manager = std::sync::Arc::new(fixture.manager);
+        let fatal_local_authority_fence =
+            std::sync::Arc::clone(&manager.fatal_local_authority_fence);
+        let db = manager.db();
+        let obligation = db
+            .get_close_obligation(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        let g2 = obligation.snapshot().unwrap().clone();
+        assert_ne!(g2, original.snapshot);
+        assert!(db
+            .list_close_retirement_inspections_for_snapshot(
+                fixture.run.attempt_id.as_str(),
+                &original.snapshot,
+            )
+            .await
+            .is_err());
+        let current_inspections_before_actor = db
+            .list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(current_inspections_before_actor.len(), snapshots.len());
+        for (current, (original_target, original_snapshot)) in
+            current_inspections_before_actor.iter().zip(&snapshots)
+        {
+            assert_eq!(&current.target, original_target);
+            assert_ne!(&current.snapshot, original_snapshot);
+        }
+
+        let assessment = manager
+            .assess_native_close_retry(&fixture.run)
+            .await
+            .unwrap();
+        assert_eq!(assessment.original, original);
+        assert_eq!(
+            assessment
+                .remaining_effects
+                .iter()
+                .map(|effect| effect.resource.kind())
+                .collect::<Vec<_>>(),
+            vec![
+                super::RetiredResourceKind::Worktree,
+                super::RetiredResourceKind::WorkScope
+            ]
+        );
+        for effect in &assessment.remaining_effects {
+            assert!(original.resources.iter().any(|resource| {
+                resource.scope == effect.scope && resource.resource == effect.resource
+            }));
+        }
+
+        let source_conversation = db
+            .get_or_create_coordinator(None, phoenix_core::llm_language::LlmLanguage::default())
+            .await
+            .unwrap();
+        let target: ProductConversationId = ProductConversationId::parse(
+            sqlx::query_scalar::<_, String>(
+                "SELECT product_conversation_id FROM close_obligations WHERE attempt_id=?1",
+            )
+            .bind(fixture.run.attempt_id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+        )
+        .unwrap();
+        let source = SourceToolCall {
+            message_id: "retry-source-message".into(),
+            tool_use_id: "retry-source-call".into(),
+        };
+        let intent = NativeCloseIntent::ExplicitRetry {
+            target: target.clone(),
+            attempt_id: fixture.run.attempt_id.clone(),
+            failed_run_ordinal: fixture.run.ordinal,
+        };
+        let input = intent.source_input();
+        let state = crate::state_machine::ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                &source.tool_use_id,
+                ToolInput::Unknown {
+                    name: "close_conversation".into(),
+                    input: input.clone(),
+                },
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::new(
+                source.message_id.clone(),
+                vec![ContentBlock::ToolUse {
+                    id: source.tool_use_id.clone(),
+                    name: "close_conversation".into(),
+                    input,
+                }],
+                None,
+                None,
+            ),
+        };
+        db.update_conversation_state(&source_conversation.id, &state)
+            .await
+            .unwrap();
+        // The bounded actor owns a real ConversationRuntime with the persisted
+        // executing source state and exact Database authority; this deliberately
+        // skips run_inner so startup recovery and provider dispatch are not involved.
+        let (sender, actor) =
+            crate::runtime::executor::creation_completion_lifecycle_tests::
+                spawn_bounded_native_close_retry_actor(
+                    db.clone(),
+                    source_conversation.id.clone(),
+                    state.clone(),
+                    std::sync::Arc::clone(&fatal_local_authority_fence),
+                );
+        let _source_events = manager
+            .inject_handle_with_event_capture_for_test(&source_conversation.id, state.clone())
+            .await;
+        manager
+            .runtimes
+            .write()
+            .await
+            .get_mut(&source_conversation.id)
+            .unwrap()
+            .acknowledged_event_tx =
+            crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(sender);
+        // Exercise the production manager route: it owns lock acquisition, backend
+        // selection, envelope construction and response classification.
+        let (result, actor_fatal) = tokio::join!(
+            manager.apply_native_close_explicit_retry(
+                &source_conversation.id,
+                source.clone(),
+                target.clone(),
+                fixture.run.attempt_id.clone(),
+                CloseRunOrdinal::INITIAL,
+            ),
+            join_actor(actor),
+        );
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                // Storage also represents a durably classified execution failure.
+                // Retain its domain detail rather than hiding it behind unwrap.
+                let attempt = fixture.run.attempt_id.as_str();
+                let failures = db.list_close_cleanup_failures(attempt).await;
+                let obligation = db.get_close_obligation(attempt).await;
+                let counts = retained_counts(db, attempt).await;
+                panic!(
+                    "native retry route failed: {error:?}; failures: {failures:#?}; \
+                     obligation: {obligation:#?}; retained counts: {counts:?}"
+                );
+            }
+        };
+        assert!(!actor_fatal, "retry actor must not exit fatally");
+        let NativeCloseRetryResult::NewlyAdmitted(receipt) = result else {
+            panic!("expected fresh explicit retry admission");
+        };
+        assert_eq!(receipt.admitted.run_ordinal.get(), 2);
+
+        let before_replay = retained_counts(db, fixture.run.attempt_id.as_str()).await;
+        let obligation_before_replay = db
+            .get_close_obligation(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        // The same durable source occurrence must replay its exact receipt without
+        // creating another run or dispatching either captured effect again.
+        let (replay_sender, replay_actor) =
+            crate::runtime::executor::creation_completion_lifecycle_tests::
+                spawn_bounded_native_close_retry_actor(
+                    db.clone(),
+                    source_conversation.id.clone(),
+                    state.clone(),
+                    std::sync::Arc::clone(&fatal_local_authority_fence),
+                );
+        let _replay_events = manager
+            .inject_handle_with_event_capture_for_test(&source_conversation.id, state.clone())
+            .await;
+        manager
+            .runtimes
+            .write()
+            .await
+            .get_mut(&source_conversation.id)
+            .unwrap()
+            .acknowledged_event_tx =
+            crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                replay_sender,
+            );
+        let (result, actor_fatal) = tokio::join!(
+            manager.apply_native_close_explicit_retry(
+                &source_conversation.id,
+                source.clone(),
+                target.clone(),
+                fixture.run.attempt_id.clone(),
+                CloseRunOrdinal::INITIAL,
+            ),
+            join_actor(replay_actor),
+        );
+        assert!(!actor_fatal, "retry replay actor must not exit fatally");
+        let NativeCloseRetryResult::Replay(replayed_receipt) = result.unwrap() else {
+            panic!("expected exact retry receipt replay");
+        };
+        assert_eq!(replayed_receipt, receipt);
+        assert_eq!(
+            retained_counts(db, fixture.run.attempt_id.as_str()).await,
+            before_replay,
+            "receipt replay must not append plans, effects, dispatches or writer observations"
+        );
+        assert_eq!(
+            db.get_close_obligation(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap(),
+            obligation_before_replay
+        );
+        // A stale persisted source is insufficient even for a known receipt:
+        // the actual source actor no longer has the executing occurrence.
+        let stopped_state = crate::state_machine::ConvState::Idle;
+        let (stopped_sender, stopped_actor) =
+            crate::runtime::executor::creation_completion_lifecycle_tests::
+                spawn_bounded_native_close_retry_actor(
+                    db.clone(), source_conversation.id.clone(), stopped_state.clone(),
+                    std::sync::Arc::clone(&fatal_local_authority_fence),
+                );
+        let _stopped_events = manager
+            .inject_handle_with_event_capture_for_test(&source_conversation.id, stopped_state)
+            .await;
+        manager
+            .runtimes
+            .write()
+            .await
+            .get_mut(&source_conversation.id)
+            .unwrap()
+            .acknowledged_event_tx =
+            crate::runtime::cancellation_inbox::AcknowledgedEventSender::for_test_receiver(
+                stopped_sender,
+            );
+        let (result, actor_fatal) = tokio::join!(
+            manager.apply_native_close_explicit_retry(
+                &source_conversation.id,
+                source.clone(),
+                target.clone(),
+                fixture.run.attempt_id.clone(),
+                CloseRunOrdinal::INITIAL,
+            ),
+            join_actor(stopped_actor),
+        );
+        assert!(!actor_fatal, "stopped-source actor must not exit fatally");
+        assert_eq!(
+            result,
+            Err(crate::runtime::NativeCloseApplicationError::SourceRefused)
+        );
+        assert_eq!(
+            retained_counts(db, fixture.run.attempt_id.as_str()).await,
+            before_replay
+        );
+
+        let run_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM close_runs WHERE attempt_id=?1")
+                .bind(fixture.run.attempt_id.as_str())
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(run_count, 2);
+
+        assert!(
+            !linked.exists(),
+            "the exact clean captured worktree should be retired"
+        );
+        let completed = db
+            .get_close_obligation(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_ne!(completed, obligation);
+        assert_eq!(db.get_close_run(&fixture.run).await.unwrap(), original.run);
+        let retry_run = super::CloseRunRef {
+            attempt_id: fixture.run.attempt_id.clone(),
+            ordinal: receipt.admitted.run_ordinal,
+        };
+        assert_eq!(
+            db.get_close_run(&retry_run).await.unwrap().status,
+            super::CloseRunStatus::Completed
+        );
+        let worktree_success: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_run_retry_successes success
+             JOIN close_run_retry_effects effect ON effect.attempt_id=success.attempt_id
+               AND effect.run_ordinal=success.run_ordinal AND effect.ordinal=success.ordinal
+             JOIN native_close_retry_plans plan ON plan.attempt_id=effect.attempt_id
+               AND plan.run_ordinal=effect.run_ordinal
+             WHERE success.attempt_id=?1 AND success.run_ordinal=?2
+               AND effect.resource_kind='worktree'
+               AND plan.inspection_generation=?3 AND plan.inspection_fingerprint=?4",
+        )
+        .bind(fixture.run.attempt_id.as_str())
+        .bind(receipt.admitted.run_ordinal.get())
+        .bind(original.snapshot.generation())
+        .bind(original.snapshot.fingerprint())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let scope_success: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_run_retry_successes success
+             JOIN close_run_retry_effects effect ON effect.attempt_id=success.attempt_id
+               AND effect.run_ordinal=success.run_ordinal AND effect.ordinal=success.ordinal
+             JOIN native_close_retry_plans plan ON plan.attempt_id=effect.attempt_id
+               AND plan.run_ordinal=effect.run_ordinal
+             WHERE success.attempt_id=?1 AND success.run_ordinal=?2
+               AND effect.resource_kind='work_scope'
+               AND plan.inspection_generation=?3 AND plan.inspection_fingerprint=?4",
+        )
+        .bind(fixture.run.attempt_id.as_str())
+        .bind(receipt.admitted.run_ordinal.get())
+        .bind(original.snapshot.generation())
+        .bind(original.snapshot.fingerprint())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!((worktree_success, scope_success), (1, 1));
+        assert_eq!(
+            db.get_close_obligation(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap()
+                .snapshot(),
+            Some(&g2),
+        );
+        let current_inspections_after_actor = db
+            .list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            current_inspections_after_actor,
+            current_inspections_before_actor
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn native_retry_pending_worktree_uses_g1_under_g2_and_refuses_live_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let linked = linked_close_worktree(&temp);
+        let (fixture, original, snapshots) =
+            stopped_native_retry_fixture_with_worktree_at_g2(Some(&linked), true).await;
+        let db = fixture.manager.db();
+        let effects =
+            super::native_close_retry_remaining_effects(&fixture.run, &original, &snapshots)
+                .unwrap();
+        let worktree = effects
+            .iter()
+            .find(|effect| effect.resource.kind() == super::RetiredResourceKind::Worktree)
+            .unwrap();
+        assert_eq!(effects.len(), 2);
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|(target, _)| target.scope.clone())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from([fixture.scopes[0].clone()])
+        );
+        assert!(!original.outcomes.iter().any(|outcome| {
+            outcome.resource == worktree.resource
+                && matches!(
+                    outcome.outcome,
+                    super::RetirementOutcome::Retired
+                        | super::RetirementOutcome::AbsenceAdopted { .. }
+                )
+        }));
+        assert!(original.outcomes.iter().any(|outcome| {
+            outcome.resource == worktree.resource
+                && matches!(outcome.outcome, super::RetirementOutcome::Residual { .. })
+        }));
+        let work_scope = effects
+            .iter()
+            .find(|effect| effect.resource.kind() == super::RetiredResourceKind::WorkScope)
+            .unwrap();
+        assert!(original.outcomes.iter().any(|outcome| {
+            outcome.resource == work_scope.resource
+                && matches!(outcome.outcome, super::RetirementOutcome::Residual { .. })
+        }));
+
+        // The retained G2 inspection is fresh; drift below is a separate live change.
+        let g2 = db
+            .get_close_obligation(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .clone();
+        let obligation = db
+            .get_close_obligation(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        let inspections = db
+            .list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(obligation.snapshot(), Some(&g2));
+        assert_ne!(g2, original.snapshot);
+        assert!(db
+            .list_close_retirement_inspections_for_snapshot(
+                fixture.run.attempt_id.as_str(),
+                &original.snapshot,
+            )
+            .await
+            .is_err());
+
+        let assessment = fixture
+            .manager
+            .assess_native_close_retry(&fixture.run)
+            .await
+            .unwrap();
+        assert_eq!(assessment.original, original);
+        assert_eq!(assessment.remaining_effects, effects);
+        std::fs::write(linked.join("new-unique-data"), "must survive\n").unwrap();
+        let error = fixture
+            .manager
+            .assess_native_close_retry(&fixture.run)
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not unchanged and reconstructible"),
+            "{error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(linked.join("new-unique-data")).unwrap(),
+            "must survive\n"
+        );
+
+        assert_eq!(
+            db.get_close_obligation(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap(),
+            obligation
+        );
+        assert_eq!(
+            db.list_close_retirement_inspections(fixture.run.attempt_id.as_str())
+                .await
+                .unwrap(),
+            inspections
+        );
+        assert_eq!(
+            db.read_stopped_close_original_retirement_proof(&fixture.run)
+                .await
+                .unwrap(),
+            original
+        );
+        assert_eq!(db.get_close_run(&fixture.run).await.unwrap(), original.run);
+        let successor = super::CloseRunRef {
+            attempt_id: fixture.run.attempt_id.clone(),
+            ordinal: super::CloseRunOrdinal::parse(2).unwrap(),
+        };
+        assert!(db.get_close_run(&successor).await.is_err());
+        for effect in &effects {
+            assert!(!db
+                .close_retirement_resource_was_dispatched(
+                    &fixture.run.attempt_id,
+                    &effect.scope,
+                    &original.snapshot,
+                    &effect.resource,
+                )
+                .await
+                .unwrap());
+        }
+    }
+
     async fn run_scope(
         fixture: &ProcessStepFixture,
         index: usize,
@@ -9212,6 +13346,132 @@ mod tests {
             failures[0].occurrence.failure_occurrence_id,
             fixture.run.failure_occurrence_id()
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn dropped_live_completion_retains_original_lease_without_dispatch() {
+        use super::lease_custody::{AcquisitionHook, CompletionHook};
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        // The fixture seals inert identities, but owns no live processes. Only
+        // acquire an empty live scope, with tmux explicitly unable to spawn.
+        let mut fixture = process_step_fixture(false).await;
+        fixture.manager.tmux_registry =
+            Arc::new(phoenix_tools::tmux::registry::TmuxRegistry::with_backend(
+                PathBuf::from("/inert/completion-cancellation-tmux"),
+                phoenix_tools::tmux::fake_backend::FakeTmuxBackend::unavailable(),
+                None,
+            ));
+        let manager = &fixture.manager;
+        let scope = &fixture.scopes[0];
+        let key = (fixture.run.attempt_id.as_str().to_string(), scope.clone());
+        let registries = manager.close_lease_registries();
+        let hook = CompletionHook {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        };
+        let generations = |lease: &super::CloseResourceLease| {
+            (
+                lease.bash.generation(),
+                lease.tmux.generation(),
+                lease.terminal.generation(),
+                lease.browser.generation(),
+            )
+        };
+        let original = {
+            let mut store = manager.close_retirement_leases.lock().await;
+            assert!(store
+                .acquire(key.clone(), registries.clone(), None, None)
+                .await
+                .unwrap()
+                .is_empty());
+            store.completion_hook = Some(hook.clone());
+            generations(store.complete.get(&key).unwrap())
+        };
+
+        {
+            // Poll the actual manager wrapper, not the process-step helper or a
+            // spawned task. Leaving this block drops the borrowed future while
+            // it holds the original lease at its first post-lookup await.
+            let completion =
+                manager.complete_close_resource_lease(&fixture.run, &fixture.snapshot, scope, &[]);
+            tokio::pin!(completion);
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                tokio::select! {
+                    () = hook.entered.notified() => {},
+                    result = &mut completion => panic!("completion escaped pause: {result:?}"),
+                }
+            })
+            .await
+            .expect("live completion did not reach its pause within the watchdog");
+            assert!(
+                manager.close_retirement_leases.try_lock().is_err(),
+                "live completion must retain the store guard across its await"
+            );
+        }
+
+        {
+            let mut store = manager.close_retirement_leases.try_lock().unwrap();
+            assert_eq!(store.complete.len(), 1);
+            let lease = store.complete.get(&key).expect("original lease retained");
+            assert_eq!(generations(lease), original);
+            assert!(lease.resources.is_empty());
+            assert!(!store.has_acquisition(&key));
+
+            // Reusing the lease must not start a replacement acquisition. If it
+            // does, this pre-released hook fails rather than hanging the test.
+            let unused_hook = AcquisitionHook {
+                entered: Arc::new(Notify::new()),
+                release: Arc::new(Notify::new()),
+                fail: true,
+            };
+            unused_hook.release.notify_one();
+            store.acquisition_hook = Some(unused_hook);
+            assert!(store
+                .acquire(key.clone(), registries, None, None)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(
+                store.acquisition_hook.is_some(),
+                "no replacement acquisition"
+            );
+            assert!(!store.has_acquisition(&key));
+            assert_eq!(generations(store.complete.get(&key).unwrap()), original);
+        }
+
+        let db = manager.db();
+        assert!(db
+            .list_close_process_step_successes(&fixture.run)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .list_close_retirement_evidence(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap()
+            .is_empty());
+        let targets = db
+            .list_close_expected_retirement_resources(fixture.run.attempt_id.as_str())
+            .await
+            .unwrap();
+        assert!(
+            !targets.is_empty(),
+            "sealed following effects exercise dispatch checks"
+        );
+        for target in targets {
+            assert!(!db
+                .close_retirement_resource_was_dispatched(
+                    &fixture.run.attempt_id,
+                    &target.scope,
+                    &target.snapshot,
+                    &target.resource,
+                )
+                .await
+                .unwrap());
+        }
     }
 
     #[tokio::test]
@@ -9787,7 +14047,6 @@ mod tests {
         assert!(!super::descriptor_inventory_may_be_truncated(4080, 4096));
     }
 
-    #[cfg(target_os = "macos")]
     #[test]
     fn macos_process_inventory_failures_are_absent_evidence() {
         assert_eq!(super::macos_all_pids_with(|_, _| 0), None);
@@ -9795,7 +14054,22 @@ mod tests {
         assert_eq!(super::macos_all_pids_with(|_, _| 3), None);
     }
 
-    #[cfg(target_os = "macos")]
+    #[test]
+    fn expired_macos_process_inventory_stops_before_listing() {
+        let listed = std::cell::Cell::new(false);
+        let result = super::macos_all_pids_with_until(
+            |_, _| {
+                listed.set(true);
+                0
+            },
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
+        assert!(matches!(result, Err(super::WriterScanError::Stopped(_))));
+        assert!(!listed.get());
+    }
+
     #[test]
     fn macos_process_inventory_retries_full_buffer_and_accepts_complete_list() {
         use std::mem::size_of;
@@ -10112,6 +14386,275 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn common_directory_registry_listing_does_not_resolve_a_nested_dot_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        assert!(!common.join(".git").exists());
+        let output = super::list_registered_worktrees_in_common_directory_until(
+            &common,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        let canonical_target = target.canonicalize().unwrap();
+        assert!(output.stdout.split(|byte| *byte == 0).any(|field| {
+            field
+                .strip_prefix(b"worktree ")
+                .map(super::path_buf_from_git_bytes)
+                .and_then(|path| path.canonicalize().ok())
+                .as_ref()
+                == Some(&canonical_target)
+        }));
+    }
+
+    #[test]
+    fn expired_common_directory_registry_listing_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("unaccessed-common-directory");
+        let error = super::list_registered_worktrees_in_common_directory_until(
+            &nonexistent,
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(!nonexistent.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn expired_prepared_worktree_refuses_before_first_teardown_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let identity = inspection_identity(&target);
+        let snapshot = inspect_worktree(&identity).await.unwrap().0;
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let admin = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&admin).unwrap();
+        let mut prepared = super::prepare_physical_worktree_removal_until(
+            &identity,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap()
+        .unwrap();
+        prepared.deadline = std::time::Instant::now();
+        let effects = injected_close_worktree_effects(|_| {
+            panic!("expired preparation must refuse before the first teardown effect")
+        });
+
+        let result = tokio::task::spawn_blocking(move || {
+            super::inspect_and_remove_prepared_worktree_with_hook_and_plan_until(
+                &tokio::runtime::Handle::current(),
+                prepared,
+                &snapshot,
+                &admin,
+                &incarnation,
+                None,
+                |_, _, _| Ok(()),
+                |_| {},
+                effects,
+            )
+        })
+        .await
+        .unwrap();
+        let Err(error) = result else {
+            panic!("expired preparation unexpectedly reached a retirement outcome");
+        };
+        assert!(error.contains("deadline"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepared_worktree_core_holds_existing_repository_lock_through_effect_hook() {
+        use fs2::FileExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let identity = inspection_identity(&target);
+        let snapshot = inspect_worktree(&identity).await.unwrap().0;
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let admin = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&admin).unwrap();
+        let prepared = super::prepare_physical_worktree_removal_until(
+            &identity,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap()
+        .unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(common.join("phoenix-creation.lock"))
+            .unwrap();
+        let effect_contender = contender.try_clone().unwrap();
+        let effects = injected_close_worktree_effects(move |_| {
+            assert!(effect_contender.try_lock_exclusive().is_err());
+            Err("fixture stopped at first teardown effect".to_string())
+        });
+
+        let result = tokio::task::spawn_blocking(move || {
+            super::inspect_and_remove_prepared_worktree_with_hook_and_plan_until(
+                &tokio::runtime::Handle::current(),
+                prepared,
+                &snapshot,
+                &admin,
+                &incarnation,
+                None,
+                |_, _, _| Ok(()),
+                |_| {},
+                effects,
+            )
+        })
+        .await
+        .unwrap();
+        let super::ExactWorktreeRemoval::StopFailed { detail } = result.unwrap() else {
+            panic!("expected the injected first teardown effect refusal");
+        };
+        assert!(detail.contains("fixture stopped at first teardown effect"));
+        contender.try_lock_exclusive().unwrap();
+        contender.unlock().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn aborting_close_waiter_keeps_original_repository_lock_until_inner_effect_returns() {
+        use fs2::FileExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let identity = inspection_identity(&target);
+        let snapshot = inspect_worktree(&identity).await.unwrap().0;
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let admin = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&admin).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let prepared = super::prepare_physical_worktree_removal_until(&identity, deadline)
+            .unwrap()
+            .unwrap();
+        let repository_lock = prepared.repository_lock;
+        let contender_path = common.join("phoenix-creation.lock");
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&contender_path)
+            .unwrap();
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let effects = injected_close_worktree_effects(move |_| {
+            let _ = reached_tx.send(());
+            if release_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .is_err()
+            {
+                return Err("fixture release signal was dropped".to_string());
+            }
+            Err("fixture stopped at first teardown effect".to_string())
+        });
+
+        let waiter = tokio::spawn(async move {
+            super::quarantine_and_remove_exact_worktree_with_repository_lock_until(
+                &identity,
+                &snapshot,
+                admin,
+                incarnation,
+                None,
+                |_, _, _| panic!("must not bind a deletion tombstone"),
+                |_| panic!("must not quarantine after failed fsmonitor stop"),
+                effects,
+                deadline,
+                Some(repository_lock),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), reached_rx)
+            .await
+            .expect("first teardown effect was not reached")
+            .expect("effect reach signal was dropped");
+
+        waiter.abort();
+        let joined = waiter.await;
+        assert!(matches!(joined, Err(error) if error.is_cancelled()));
+        assert!(contender.try_lock_exclusive().is_err());
+
+        release_tx
+            .send(())
+            .expect("inner effect should still be waiting for release");
+        drop(release_tx);
+        let lock_path = contender_path;
+        tokio::task::spawn_blocking(move || {
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(lock_path)
+                .unwrap();
+            lock.lock_exclusive().unwrap();
+            lock.unlock().unwrap();
+        })
+        .await
+        .expect("competing repository lock worker panicked");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepared_worktree_refuses_replaced_common_directory_before_teardown() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let identity = inspection_identity(&target);
+        let snapshot = inspect_worktree(&identity).await.unwrap().0;
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let admin = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&admin).unwrap();
+        let prepared = super::prepare_physical_worktree_removal_until(
+            &identity,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap()
+        .unwrap();
+
+        // Retain every child inode, including the held lock, but replace the
+        // common directory itself so Git still resolves the same path.
+        let original_common = temp.path().join("original-common-directory");
+        std::fs::rename(&common, &original_common).unwrap();
+        std::fs::create_dir(&common).unwrap();
+        for entry in std::fs::read_dir(&original_common).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::rename(entry.path(), common.join(entry.file_name())).unwrap();
+        }
+        assert_eq!(
+            super::exact_worktree_common_git_dir(&target).unwrap(),
+            common
+        );
+        assert_ne!(
+            observe_administrative_dir_incarnation(&common).unwrap(),
+            prepared.common_git_dir_incarnation,
+        );
+        let effects = injected_close_worktree_effects(|_| {
+            panic!("replaced repository must refuse before the first teardown effect")
+        });
+        let result = tokio::task::spawn_blocking(move || {
+            super::inspect_and_remove_prepared_worktree_with_hook_and_plan_until(
+                &tokio::runtime::Handle::current(),
+                prepared,
+                &snapshot,
+                &admin,
+                &incarnation,
+                None,
+                |_, _, _| Ok(()),
+                |_| {},
+                effects,
+            )
+        })
+        .await
+        .unwrap();
+        let Err(error) = result else {
+            panic!("replaced common directory unexpectedly reached a retirement outcome");
+        };
+        assert!(error.contains("repository binding changed"), "{error}");
+        assert!(target.exists());
+    }
+
+    #[cfg(unix)]
     fn open_directory(path: &Path) -> std::os::fd::OwnedFd {
         std::fs::File::open(path).unwrap().into()
     }
@@ -10129,6 +14672,938 @@ mod tests {
                 })
             })
             .expect("replacement must remain in an identity-bound private slot")
+    }
+
+    #[test]
+    fn expired_repository_lock_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let identity = WorktreeIdentity::from_parts(
+            WorktreeId::parse("unaccessed-worktree").unwrap(),
+            WorktreeFingerprint::parse("unaccessed-incarnation").unwrap(),
+            GitPathIdentity::from_bytes(
+                temp.path()
+                    .join("not-a-repository")
+                    .to_string_lossy()
+                    .as_bytes()
+                    .to_vec(),
+            ),
+        );
+        let result =
+            super::prepare_physical_worktree_removal_until(&identity, std::time::Instant::now());
+        let Err(error) = result else {
+            panic!("expired repository lock unexpectedly acquired");
+        };
+        assert!(error.contains("deadline"), "{error}");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_repository_lock_uses_shared_common_directory_until_released() {
+        use fs2::FileExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let repository = temp.path().join("repository");
+        let guard = super::prepare_physical_worktree_removal_until(
+            &inspection_identity(&target),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        )
+        .unwrap()
+        .unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(repository.join(".git/phoenix-creation.lock"))
+            .unwrap();
+        assert!(contender.try_lock_exclusive().is_err());
+        drop(guard);
+        contender.try_lock_exclusive().unwrap();
+        contender.unlock().unwrap();
+        assert!(!target.join("phoenix-creation.lock").exists());
+    }
+
+    #[test]
+    fn expired_common_git_directory_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = super::exact_worktree_common_git_dir_until(
+            &temp.path().join("not-a-repository"),
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn expired_git_directory_resolver_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = super::git_directory_for_worktree_until(
+            &temp.path().join("not-a-repository"),
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn expired_git_directory_capture_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = super::capture_git_directory_bindings_until(
+            &temp.path().join("not-a-repository"),
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn expired_git_directory_verification_deadline_rejects_even_empty_bindings() {
+        let error = super::verify_git_directory_bindings_until(
+            Path::new("not-a-repository"),
+            &std::collections::BTreeMap::new(),
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+    }
+
+    #[test]
+    fn expired_administrative_deletion_deadline_preserves_live_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let registration = temp.path().join("registration");
+        std::fs::create_dir(&registration).unwrap();
+        std::fs::write(registration.join("sentinel"), b"preserve").unwrap();
+        let incarnation = super::observe_administrative_dir_incarnation(&registration).unwrap();
+        let error = super::remove_exact_worktree_administrative_dir_until(
+            &registration,
+            &incarnation,
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read(registration.join("sentinel")).unwrap(),
+            b"preserve"
+        );
+    }
+
+    #[test]
+    fn administrative_final_tombstone_prevents_false_absence_completion() {
+        let temp = tempfile::tempdir().unwrap();
+        let registration = temp.path().join("registration");
+        std::fs::create_dir(&registration).unwrap();
+        std::fs::write(registration.join("sentinel"), b"preserve").unwrap();
+        let incarnation = super::observe_administrative_dir_incarnation(&registration).unwrap();
+        let quarantine =
+            super::administrative_dir_quarantine_path(&registration, &incarnation).unwrap();
+        let root = super::administrative_dir_final_tombstone_path(&quarantine);
+        std::fs::create_dir(&root).unwrap();
+        std::fs::rename(&registration, root.join("object")).unwrap();
+
+        let error = super::remove_exact_worktree_administrative_dir(&registration, &incarnation)
+            .unwrap_err();
+
+        assert!(error.contains("unresolved final tombstone"), "{error}");
+        assert!(!registration.exists());
+        assert!(!quarantine.exists());
+        assert_eq!(
+            std::fs::read(root.join("object/sentinel")).unwrap(),
+            b"preserve"
+        );
+        // Even an empty reserved root is uncertainty, not proof of completion.
+        std::fs::remove_file(root.join("object/sentinel")).unwrap();
+        std::fs::remove_dir(root.join("object")).unwrap();
+        let error = super::remove_exact_worktree_administrative_dir(&registration, &incarnation)
+            .unwrap_err();
+        assert!(error.contains("unresolved final tombstone"), "{error}");
+        assert!(root.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn administrative_remover_reserves_distinct_random_private_final_roots() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let registration = temp.path().join("registration");
+        let mut observed_roots = Vec::new();
+        for _ in 0..2 {
+            std::fs::create_dir(&registration).unwrap();
+            std::fs::write(registration.join("owned"), b"remove").unwrap();
+            let incarnation = observe_administrative_dir_incarnation(&registration).unwrap();
+            let quarantine =
+                super::administrative_dir_quarantine_path(&registration, &incarnation).unwrap();
+            let legacy = super::administrative_dir_final_tombstone_path(&quarantine);
+            let mut prefix = legacy.file_name().unwrap().to_os_string();
+            prefix.push("-");
+            super::remove_exact_worktree_administrative_dir_with_hook(
+                &registration,
+                &incarnation,
+                |target| {
+                    assert_eq!(target, quarantine);
+                    let roots: Vec<_> = std::fs::read_dir(temp.path())
+                        .unwrap()
+                        .map(Result::unwrap)
+                        .filter(|entry| {
+                            entry
+                                .file_name()
+                                .as_encoded_bytes()
+                                .starts_with(prefix.as_encoded_bytes())
+                        })
+                        .map(|entry| entry.path())
+                        .collect();
+                    assert_eq!(roots.len(), 1);
+                    let root = roots.into_iter().next().unwrap();
+                    assert_ne!(root, legacy);
+                    assert_eq!(root.parent(), quarantine.parent());
+                    let metadata = std::fs::symlink_metadata(&root).unwrap();
+                    assert!(metadata.is_dir());
+                    assert_eq!(metadata.mode() & 0o077, 0);
+                    let suffix = root.file_name().unwrap().as_encoded_bytes()
+                        [prefix.as_encoded_bytes().len()..]
+                        .to_vec();
+                    assert!(uuid::Uuid::parse_str(std::str::from_utf8(&suffix).unwrap()).is_ok());
+                    assert!(!observed_roots.contains(&root));
+                    observed_roots.push(root);
+                },
+            )
+            .unwrap();
+            assert!(!registration.exists());
+            assert!(!quarantine.exists());
+            assert!(!observed_roots.last().unwrap().exists());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn randomized_administrative_final_residues_are_preserved_by_exact_remover() {
+        let temp = tempfile::tempdir().unwrap();
+        let registration = temp.path().join("absent-registration");
+        let incarnation = "captured-incarnation";
+        let quarantine =
+            super::administrative_dir_quarantine_path(&registration, incarnation).unwrap();
+        let mut roots = Vec::new();
+        for kind in 0..4 {
+            let root = super::fresh_administrative_dir_final_tombstone_path(&quarantine);
+            assert!(!roots.contains(&root));
+            assert_eq!(root.parent(), quarantine.parent());
+            match kind {
+                0 => {
+                    super::reserve_private_tombstone(&root, "test administrative directory")
+                        .unwrap();
+                    std::fs::write(root.join("sentinel"), b"preserve").unwrap();
+                }
+                1 => super::reserve_private_tombstone(&root, "test administrative directory")
+                    .unwrap(),
+                2 => std::os::unix::fs::symlink(temp.path().join("absent-target"), &root).unwrap(),
+                _ => std::fs::write(&root, b"preserve file").unwrap(),
+            }
+            let error = super::remove_exact_worktree_administrative_dir(&registration, incarnation)
+                .unwrap_err();
+            assert!(error.contains("unresolved final tombstone"), "{error}");
+            assert!(std::fs::symlink_metadata(&root).is_ok());
+            match kind {
+                0 => {
+                    assert_eq!(std::fs::read(root.join("sentinel")).unwrap(), b"preserve");
+                    std::fs::remove_dir_all(&root).unwrap();
+                }
+                1 => std::fs::remove_dir(&root).unwrap(),
+                2 => {
+                    assert_eq!(
+                        std::fs::read_link(&root).unwrap(),
+                        temp.path().join("absent-target")
+                    );
+                    std::fs::remove_file(&root).unwrap();
+                }
+                _ => {
+                    assert_eq!(std::fs::read(&root).unwrap(), b"preserve file");
+                    std::fs::remove_file(&root).unwrap();
+                }
+            }
+            roots.push(root);
+        }
+        super::remove_exact_worktree_administrative_dir(&registration, incarnation).unwrap();
+    }
+
+    #[test]
+    fn administrative_cleanup_with_missing_parent_is_truly_absent() {
+        let temp = tempfile::tempdir().unwrap();
+        let registration = temp.path().join("absent-parent/registration");
+        super::remove_exact_worktree_administrative_dir(&registration, "captured-incarnation")
+            .unwrap();
+        assert!(!registration.parent().unwrap().exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_administrative_parent_is_not_proof_of_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = temp.path().join("parent");
+        std::os::unix::fs::symlink(temp.path().join("missing"), &parent).unwrap();
+        let error = super::remove_exact_worktree_administrative_dir(
+            &parent.join("registration"),
+            "captured-incarnation",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("cannot enumerate administrative final tombstones"),
+            "{error}"
+        );
+        assert!(std::fs::symlink_metadata(parent)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_final_tombstone_is_rejected_before_target_move() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let root = temp.path().join("tombstone");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("sentinel"), b"preserve").unwrap();
+        super::reserve_private_tombstone(&root, "test directory").unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let error = remove_identity_bound_directory(
+            &target,
+            Some(&root),
+            "unused-identity",
+            |_| panic!("must reject root before observing moved target"),
+            |_| {},
+            |_, _, _| panic!("must reject root before binding custody"),
+            |_, _| panic!("must reject root before deletion"),
+            "test directory",
+        )
+        .unwrap_err();
+        assert!(error.contains("owner-only permissions"), "{error}");
+        assert_eq!(std::fs::read(target.join("sentinel")).unwrap(), b"preserve");
+        assert_eq!(
+            std::fs::symlink_metadata(&root).unwrap().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct RecordingWorktreeMutationExecutor {
+        attempts: usize,
+        executed: usize,
+        refuse_at: Option<usize>,
+        in_effect: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[cfg(unix)]
+    impl super::WorktreeMutationExecutor for RecordingWorktreeMutationExecutor {
+        fn execute<T, F>(&mut self, effect: F) -> Result<T, String>
+        where
+            T: Send + 'static,
+            F: FnOnce() -> Result<T, String> + Send + 'static,
+        {
+            use std::sync::atomic::Ordering::SeqCst;
+
+            self.attempts += 1;
+            // Refuse only this admission, deliberately not latching: an erroneous
+            // later admission would run and be observable in the assertions.
+            if self.refuse_at == Some(self.attempts) {
+                return Err("test mutation admission refused".to_string());
+            }
+            assert!(!self.in_effect.swap(true, SeqCst));
+            self.executed += 1;
+            // Exercise the owned Send + 'static seam, including fd/name custody
+            // and errno handling, on a thread different from the descriptor walk.
+            let result = std::thread::spawn(effect)
+                .join()
+                .expect("mutation panicked");
+            assert!(self.in_effect.swap(false, SeqCst));
+            result
+        }
+    }
+
+    // Synthetic admission wait: mutate a name AFTER the caller has prepared
+    // its owned effect and BEFORE invoking that effect. No DB/native fixture.
+    #[cfg(unix)]
+    struct BoundaryReplacingExecutor {
+        attempts: usize,
+        before_effect: Box<dyn FnMut(usize)>,
+    }
+
+    #[cfg(unix)]
+    impl super::WorktreeMutationExecutor for BoundaryReplacingExecutor {
+        fn execute<T, F>(&mut self, effect: F) -> Result<T, String>
+        where
+            T: Send + 'static,
+            F: FnOnce() -> Result<T, String> + Send + 'static,
+        {
+            self.attempts += 1;
+            (self.before_effect)(self.attempts);
+            effect()
+        }
+    }
+
+    #[cfg(unix)]
+    struct BoundaryDeletionDriver(BoundaryReplacingExecutor);
+
+    #[cfg(unix)]
+    impl super::WorktreeMutationExecutor for BoundaryDeletionDriver {
+        fn execute<T, F>(&mut self, effect: F) -> Result<T, String>
+        where
+            T: Send + 'static,
+            F: FnOnce() -> Result<T, String> + Send + 'static,
+        {
+            super::WorktreeMutationExecutor::execute(&mut self.0, effect)
+        }
+    }
+
+    #[cfg(unix)]
+    impl super::WorktreeDeletionDriver for BoundaryDeletionDriver {
+        fn allows_existing_root(&self) -> bool {
+            false
+        }
+        fn cleanup_after_failure(&self) -> bool {
+            false
+        }
+        fn before_move(&mut self, _: &std::path::Path) -> Result<(), String> {
+            Ok(())
+        }
+        fn bind_root(
+            &mut self,
+            _: &std::path::Path,
+            _: (u64, u64),
+            _: Option<(u64, u64)>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+        fn observe_identity(&mut self, object: &std::path::Path) -> Result<String, String> {
+            observe_administrative_dir_incarnation(object)
+        }
+        fn after_move(
+            &mut self,
+            _: &std::path::Path,
+            _: &std::path::Path,
+            _: Option<&super::SelfDeletionDescriptorBorrow<'_>>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_unlink_revalidates_file_directory_and_symlink_private_slots() {
+        for kind in ["file", "directory", "symlink"] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            let displaced = temp.path().join("original");
+            let external = temp.path().join("external");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(&external, b"external sentinel").unwrap();
+            match kind {
+                "file" => std::fs::write(root.join("entry"), b"original").unwrap(),
+                "directory" => std::fs::create_dir(root.join("entry")).unwrap(),
+                _ => std::os::unix::fs::symlink(&external, root.join("entry")).unwrap(),
+            }
+            let effect_root = root.clone();
+            let effect_displaced = displaced.clone();
+            let effect_external = external.clone();
+            let mut executor = BoundaryReplacingExecutor {
+                attempts: 0,
+                before_effect: Box::new(move |attempt| {
+                    if attempt != 2 {
+                        return;
+                    }
+                    let slot = preserved_private_slot(&effect_root);
+                    std::fs::rename(&slot, &effect_displaced).unwrap();
+                    match kind {
+                        "file" => std::fs::write(&slot, b"replacement").unwrap(),
+                        "directory" => std::fs::create_dir(&slot).unwrap(),
+                        _ => std::os::unix::fs::symlink(&effect_external, &slot).unwrap(),
+                    }
+                }),
+            };
+            let error = super::remove_directory_contents_at_with_hook_and_deadline_with_executor(
+                &std::sync::Arc::new(open_directory(&root)),
+                &mut |_, _| {},
+                None,
+                &mut executor,
+            )
+            .unwrap_err();
+            assert!(error.contains("slot was replaced"), "{kind}: {error}");
+            assert_eq!(executor.attempts, 2, "no later leaf or compensation");
+            let slot = preserved_private_slot(&root);
+            assert!(std::fs::symlink_metadata(&displaced).is_ok());
+            assert!(
+                std::fs::symlink_metadata(&slot).is_ok(),
+                "replacement survives"
+            );
+            if kind == "file" {
+                assert_eq!(std::fs::read(slot).unwrap(), b"replacement");
+                assert_eq!(std::fs::read(displaced).unwrap(), b"original");
+            }
+            assert_eq!(std::fs::read(&external).unwrap(), b"external sentinel");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_object_and_final_root_unlinks_preserve_empty_replacements() {
+        // Empty replacements make an unchecked rmdir succeed, not merely fail
+        // because a sentinel happens to make the substituted directory nonempty.
+        for replace_at in [3, 4] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let root = temp.path().join("root");
+            let displaced = temp.path().join("displaced");
+            std::fs::create_dir(&source).unwrap();
+            let identity = observe_administrative_dir_incarnation(&source).unwrap();
+            let effect_root = root.clone();
+            let effect_displaced = displaced.clone();
+            let mut driver = BoundaryDeletionDriver(BoundaryReplacingExecutor {
+                attempts: 0,
+                before_effect: Box::new(move |attempt| {
+                    if attempt != replace_at {
+                        return;
+                    }
+                    let slot = if replace_at == 3 {
+                        effect_root.join("object")
+                    } else {
+                        effect_root.clone()
+                    };
+                    std::fs::rename(&slot, &effect_displaced).unwrap();
+                    std::fs::create_dir(&slot).unwrap();
+                }),
+            });
+            let error = super::remove_identity_bound_directory_with_driver(
+                &source,
+                Some(&root),
+                &identity,
+                "test",
+                None,
+                &mut driver,
+            )
+            .unwrap_err();
+            assert!(error.contains("slot was replaced"), "{error}");
+            assert_eq!(driver.0.attempts, replace_at);
+            assert!(displaced.is_dir());
+            assert!(root.is_dir());
+            assert_eq!(root.join("object").is_dir(), replace_at == 3);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn admitted_final_rename_rejects_replaced_source_root_and_occupied_object() {
+        for replacement in [
+            "source-directory",
+            "source-symlink",
+            "root-directory",
+            "root-symlink",
+            "occupied-object",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("source");
+            let root = temp.path().join("root");
+            let displaced = temp.path().join("displaced");
+            let external = temp.path().join("external");
+            std::fs::create_dir(&source).unwrap();
+            std::fs::create_dir(&external).unwrap();
+            std::fs::write(source.join("owned"), b"original").unwrap();
+            std::fs::write(external.join("sentinel"), b"external").unwrap();
+            let identity = observe_administrative_dir_incarnation(&source).unwrap();
+            let effect_source = source.clone();
+            let effect_root = root.clone();
+            let effect_external = external.clone();
+            let effect_displaced = displaced.clone();
+            let mut driver = BoundaryDeletionDriver(BoundaryReplacingExecutor {
+                attempts: 0,
+                before_effect: Box::new(move |attempt| {
+                    if attempt != 2 {
+                        return;
+                    }
+                    if replacement == "occupied-object" {
+                        // Empty directory would be overwritten by ordinary rename.
+                        std::fs::create_dir(effect_root.join("object")).unwrap();
+                        return;
+                    }
+                    let slot = if replacement.starts_with("source") {
+                        &effect_source
+                    } else {
+                        &effect_root
+                    };
+                    std::fs::rename(slot, &effect_displaced).unwrap();
+                    if replacement.ends_with("symlink") {
+                        std::os::unix::fs::symlink(&effect_external, slot).unwrap();
+                    } else {
+                        std::fs::create_dir(slot).unwrap();
+                    }
+                }),
+            });
+            assert!(
+                super::remove_identity_bound_directory_with_driver(
+                    &source,
+                    Some(&root),
+                    &identity,
+                    "test",
+                    None,
+                    &mut driver,
+                )
+                .is_err(),
+                "{replacement}"
+            );
+            assert_eq!(driver.0.attempts, 2, "no compensation or later deletion");
+            assert_eq!(
+                std::fs::read(external.join("sentinel")).unwrap(),
+                b"external"
+            );
+            assert!(
+                !external.join("object").exists(),
+                "root symlink must not redirect rename"
+            );
+            let original = if replacement.starts_with("source") {
+                &displaced
+            } else {
+                &source
+            };
+            assert_eq!(std::fs::read(original.join("owned")).unwrap(), b"original");
+            assert!(std::fs::symlink_metadata(&root).is_ok());
+            if replacement == "occupied-object" {
+                assert!(root.join("object").is_dir());
+                assert_eq!(std::fs::read_dir(root.join("object")).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_executor_refusal_stops_private_rename_and_later_unlink() {
+        for refuse_at in [1, 2] {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("sentinel"), b"preserve").unwrap();
+            let descriptor = std::sync::Arc::new(open_directory(&root));
+            let mut executor = RecordingWorktreeMutationExecutor {
+                refuse_at: Some(refuse_at),
+                ..Default::default()
+            };
+
+            let error = super::remove_directory_contents_at_with_hook_and_deadline_with_executor(
+                &descriptor,
+                &mut |_, _| {},
+                None,
+                &mut executor,
+            )
+            .unwrap_err();
+
+            assert_eq!(error, "test mutation admission refused");
+            assert_eq!(executor.attempts, refuse_at);
+            assert_eq!(executor.executed, refuse_at - 1);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+            let preserved = if refuse_at == 1 {
+                root.join("sentinel")
+            } else {
+                preserved_private_slot(&root)
+            };
+            assert_eq!(std::fs::read(preserved).unwrap(), b"preserve");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_mutation_walk_uses_same_executor_for_every_rename_and_unlink() {
+        // A single-child chain makes mutation ordering deterministic: three
+        // private renames followed by three unlinks from the leaf outward.
+        for refuse_at in (1..=6).map(Some).chain(std::iter::once(None)) {
+            let temp = tempfile::tempdir().unwrap();
+            let root = temp.path().join("root");
+            std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+            std::fs::write(root.join("nested/deeper/owned"), b"preserve").unwrap();
+            let descriptor = std::sync::Arc::new(open_directory(&root));
+            let mut executor = RecordingWorktreeMutationExecutor {
+                refuse_at,
+                ..Default::default()
+            };
+
+            let result = super::remove_directory_contents_at_with_hook_and_deadline_with_executor(
+                &descriptor,
+                &mut |_, _| {},
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+                &mut executor,
+            );
+
+            if let Some(refused) = refuse_at {
+                assert_eq!(result.unwrap_err(), "test mutation admission refused");
+                assert_eq!(executor.attempts, refused);
+                assert_eq!(executor.executed, refused - 1);
+                assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+                if refused <= 4 {
+                    let nested = if refused == 1 {
+                        root.join("nested")
+                    } else {
+                        preserved_private_slot(&root)
+                    };
+                    let deeper = if refused <= 2 {
+                        nested.join("deeper")
+                    } else {
+                        preserved_private_slot(&nested)
+                    };
+                    let leaf = if refused <= 3 {
+                        deeper.join("owned")
+                    } else {
+                        preserved_private_slot(&deeper)
+                    };
+                    assert_eq!(std::fs::read(leaf).unwrap(), b"preserve");
+                }
+            } else {
+                result.unwrap();
+                assert_eq!(executor.attempts, 6);
+                assert_eq!(executor.executed, 6);
+                assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn root_object_mutations_are_admitted_separately_from_durable_bind_callbacks() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        // Reserve, move object, bind entry, unlink entry, unlink object, remove
+        // root. Refusal at any leaf must stop the graph without compensating
+        // cleanup or any later mutation. In particular, move refusal leaves root.
+        for refuse_at in (1..=6).map(Some).chain(std::iter::once(None)) {
+            let temp = tempfile::tempdir().unwrap();
+            let target = temp.path().join("target");
+            let root = temp.path().join("tombstone");
+            std::fs::create_dir(&target).unwrap();
+            std::fs::write(target.join("sentinel"), b"preserve").unwrap();
+            let identity = observe_administrative_dir_incarnation(&target).unwrap();
+            let mut executor = RecordingWorktreeMutationExecutor {
+                refuse_at,
+                ..Default::default()
+            };
+            let in_effect = std::sync::Arc::clone(&executor.in_effect);
+            let mut bound_objects = Vec::new();
+
+            let result = super::remove_identity_bound_directory_with_deadline_with_executor(
+                &target,
+                Some(&root),
+                &identity,
+                observe_administrative_dir_incarnation,
+                |_| assert!(!in_effect.load(SeqCst)),
+                |_, _, object| {
+                    assert!(!in_effect.load(SeqCst), "nested durable writer admission");
+                    bound_objects.push(object.is_some());
+                    Ok(())
+                },
+                |_, _| {
+                    assert!(!in_effect.load(SeqCst));
+                    Ok(())
+                },
+                "test directory",
+                None,
+                &mut executor,
+            );
+
+            if let Some(refused) = refuse_at {
+                assert_eq!(result.unwrap_err(), "test mutation admission refused");
+                assert_eq!(executor.attempts, refused);
+                assert_eq!(executor.executed, refused - 1);
+                assert_eq!(target.exists(), refused <= 2);
+                assert_eq!(root.exists(), refused >= 2);
+                assert_eq!(root.join("object").exists(), (3..=5).contains(&refused));
+                if refused <= 4 {
+                    let preserved = match refused {
+                        1 | 2 => target.join("sentinel"),
+                        3 => root.join("object/sentinel"),
+                        _ => preserved_private_slot(&root.join("object")),
+                    };
+                    assert_eq!(std::fs::read(preserved).unwrap(), b"preserve");
+                }
+                let expected_bindings = match refused {
+                    1 => vec![],
+                    2 => vec![false],
+                    _ => vec![false, true],
+                };
+                assert_eq!(bound_objects, expected_bindings);
+            } else {
+                result.unwrap();
+                assert_eq!(executor.attempts, 6);
+                assert_eq!(executor.executed, 6);
+                assert_eq!(bound_objects, vec![false, true]);
+                assert!(!target.exists());
+                assert!(!root.exists());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn compensating_tombstone_cleanup_requires_its_own_mutation_admission() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let root = temp.path().join("tombstone");
+        std::fs::create_dir(&target).unwrap();
+        let mut executor = RecordingWorktreeMutationExecutor {
+            refuse_at: Some(2),
+            ..Default::default()
+        };
+
+        let error = super::remove_identity_bound_directory_with_deadline_with_executor(
+            &target,
+            Some(&root),
+            "unused",
+            |_| panic!("failed custody bind must not move or inspect object"),
+            |_| {},
+            |_, _, _| Err("test durable bind failed".to_string()),
+            |_, _| panic!("failed custody bind must not delete object"),
+            "test directory",
+            None,
+            &mut executor,
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "test mutation admission refused");
+        assert_eq!(executor.attempts, 2);
+        assert_eq!(executor.executed, 1);
+        assert!(target.is_dir());
+        assert!(root.is_dir());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_final_source_is_refused_before_reservation_or_any_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("missing-target");
+        let root = temp.path().join("tombstone");
+        let mut executor = RecordingWorktreeMutationExecutor::default();
+        let error = super::remove_identity_bound_directory_with_deadline_with_executor(
+            &target,
+            Some(&root),
+            "unused",
+            |_| panic!("missing source must not inspect an object"),
+            |_| {},
+            |_, _, _| panic!("missing source must not bind a reservation"),
+            |_, _| panic!("missing source must not delete an object"),
+            "test directory",
+            None,
+            &mut executor,
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot revalidate deletion slot"));
+        assert_eq!(executor.attempts, 0);
+        assert_eq!(executor.executed, 0);
+        assert!(!root.exists());
+        assert!(!target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_admin_deletion_threads_executor_through_quarantine_and_final_deletion() {
+        // Admin quarantine adds one mutation before the six root/object leaves.
+        for refuse_at in (1..=7).map(Some).chain(std::iter::once(None)) {
+            let temp = tempfile::tempdir().unwrap();
+            let registration = temp.path().join("registration");
+            std::fs::create_dir(&registration).unwrap();
+            std::fs::write(registration.join("sentinel"), b"preserve").unwrap();
+            let identity = observe_administrative_dir_incarnation(&registration).unwrap();
+            let quarantine =
+                super::administrative_dir_quarantine_path(&registration, &identity).unwrap();
+            let mut executor = RecordingWorktreeMutationExecutor {
+                refuse_at,
+                ..Default::default()
+            };
+
+            let result =
+                super::remove_exact_worktree_administrative_dir_with_hook_and_deadline_with_executor(
+                    &registration,
+                    &identity,
+                    |_| {},
+                    None,
+                    &mut executor,
+                );
+
+            if let Some(refused) = refuse_at {
+                assert_eq!(result.unwrap_err(), "test mutation admission refused");
+                assert_eq!(executor.attempts, refused);
+                assert_eq!(executor.executed, refused - 1);
+                assert_eq!(registration.exists(), refused == 1);
+                assert_eq!(quarantine.exists(), (2..=3).contains(&refused));
+                if refused <= 3 {
+                    let preserved = if refused == 1 {
+                        &registration
+                    } else {
+                        &quarantine
+                    };
+                    assert_eq!(
+                        std::fs::read(preserved.join("sentinel")).unwrap(),
+                        b"preserve"
+                    );
+                }
+            } else {
+                result.unwrap();
+                assert_eq!(executor.attempts, 7);
+                assert_eq!(executor.executed, 7);
+                assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_directory_deletion_deadline_preserves_entries_before_inspection() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("sentinel"), "preserve\n").unwrap();
+        let descriptor = open_directory(&root);
+
+        let error = super::remove_directory_contents_at_with_hook_and_deadline(
+            &descriptor,
+            &mut |_, _| panic!("expired deletion must not inspect an entry"),
+            Some(std::time::Instant::now()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("deadline"));
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        assert_eq!(std::fs::read(root.join("sentinel")).unwrap(), b"preserve\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deadline_directory_deletion_recurses_without_following_symlinks() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(root.join("nested/deeper")).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(external.join("sentinel"), "preserve\n").unwrap();
+        std::fs::write(root.join("nested/deeper/owned"), "remove\n").unwrap();
+        std::os::unix::fs::symlink(&external, root.join("nested/external-link")).unwrap();
+        let descriptor = open_directory(&root);
+
+        super::remove_directory_contents_at_with_hook_and_deadline(
+            &descriptor,
+            &mut |_, _| {},
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        assert_eq!(
+            std::fs::read(external.join("sentinel")).unwrap(),
+            b"preserve\n"
+        );
     }
 
     #[cfg(unix)]
@@ -10193,6 +15668,172 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn native_driver_preserves_bound_root_after_failed_final_move() {
+        struct Driver {
+            source: std::path::PathBuf,
+            displaced: std::path::PathBuf,
+            effects: usize,
+        }
+        impl super::WorktreeMutationExecutor for Driver {
+            fn execute<T, F>(&mut self, effect: F) -> Result<T, String>
+            where
+                T: Send + 'static,
+                F: FnOnce() -> Result<T, String> + Send + 'static,
+            {
+                self.effects += 1;
+                effect()
+            }
+        }
+        impl super::WorktreeDeletionDriver for Driver {
+            fn allows_existing_root(&self) -> bool {
+                false
+            }
+            fn cleanup_after_failure(&self) -> bool {
+                false
+            }
+            fn before_move(&mut self, _: &std::path::Path) -> Result<(), String> {
+                Ok(())
+            }
+            fn bind_root(
+                &mut self,
+                _: &std::path::Path,
+                _: (u64, u64),
+                object: Option<(u64, u64)>,
+            ) -> Result<(), String> {
+                assert!(object.is_none());
+                // Model an external change after the reservation is bound but
+                // before the native driver's one direct final rename.
+                std::fs::rename(&self.source, &self.displaced).unwrap();
+                Ok(())
+            }
+            fn observe_identity(&mut self, _: &std::path::Path) -> Result<String, String> {
+                panic!("failed final move must not observe or delete an object")
+            }
+            fn after_move(
+                &mut self,
+                _: &std::path::Path,
+                _: &std::path::Path,
+                _: Option<&super::SelfDeletionDescriptorBorrow<'_>>,
+            ) -> Result<(), String> {
+                panic!("failed final move must not continue the deletion graph")
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("target");
+        let displaced = temp.path().join("externally-displaced");
+        let root = temp.path().join("final-root");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::write(source.join("sentinel"), b"preserve\n").unwrap();
+        let mut driver = Driver {
+            source: source.clone(),
+            displaced: displaced.clone(),
+            effects: 0,
+        };
+        let error = super::remove_identity_bound_directory_with_driver(
+            &source,
+            Some(&root),
+            "test-identity",
+            "test directory",
+            None,
+            &mut driver,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("cannot revalidate deletion slot"));
+        assert_eq!(driver.effects, 2, "no compensating rmdir may be admitted");
+        assert!(
+            root.is_dir(),
+            "bound empty final root remains recovery evidence"
+        );
+        assert_eq!(
+            std::fs::read(displaced.join("sentinel")).unwrap(),
+            b"preserve\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_identity_bound_deletion_refuses_before_hook_or_tombstone_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let tombstone_root = temp.path().join("tombstone");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("sentinel"), "preserve\\n").unwrap();
+
+        let error = super::remove_identity_bound_directory_with_deadline(
+            &target,
+            Some(&tombstone_root),
+            "synthetic-identity",
+            |_| panic!("expired deletion must not observe repository identity"),
+            |_| panic!("expired deletion must not run pre-move hook"),
+            |_, _, _| panic!("expired deletion must not bind tombstone"),
+            |_, _| panic!("expired deletion must not run identity callback"),
+            "test directory",
+            Some(std::time::Instant::now()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("deadline"));
+        assert!(!tombstone_root.exists());
+        assert_eq!(
+            std::fs::read(target.join("sentinel")).unwrap(),
+            b"preserve\\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_error_cleanup_preserves_reserved_tombstone() {
+        let temp = tempfile::tempdir().unwrap();
+        let tombstone = temp.path().join("tombstone");
+        std::fs::create_dir(&tombstone).unwrap();
+        super::remove_empty_tombstone_before_deadline(&tombstone, Some(std::time::Instant::now()));
+        assert!(tombstone.is_dir());
+        assert_eq!(std::fs::read_dir(&tombstone).unwrap().count(), 0);
+        super::remove_empty_tombstone_before_deadline(&tombstone, None);
+        assert!(!tombstone.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn future_deadline_removes_exact_identity_bound_directory_without_following_symlink() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let tombstone_root = temp.path().join("tombstone");
+        let external = temp.path().join("external");
+        std::fs::create_dir_all(target.join("nested/deeper")).unwrap();
+        std::fs::create_dir(&external).unwrap();
+        std::fs::write(target.join("nested/deeper/owned"), "remove\\n").unwrap();
+        std::fs::write(external.join("sentinel"), "preserve\\n").unwrap();
+        std::os::unix::fs::symlink(&external, target.join("nested/external-link")).unwrap();
+
+        super::remove_identity_bound_directory_with_deadline(
+            &target,
+            Some(&tombstone_root),
+            "synthetic-identity",
+            |path| {
+                assert_eq!(path, tombstone_root.join("object"));
+                Ok("synthetic-identity".to_string())
+            },
+            |_| {},
+            |_, _, _| Ok(()),
+            |_, _| Ok(()),
+            "test directory",
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(30)),
+        )
+        .unwrap();
+
+        assert!(!target.exists());
+        assert!(!tombstone_root.exists());
+        assert_eq!(
+            std::fs::read(external.join("sentinel")).unwrap(),
+            b"preserve\\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn tombstone_object_swap_after_observation_preserves_replacement_for_needs_repair() {
         let temp = tempfile::tempdir().unwrap();
         let target = temp.path().join("target");
@@ -10218,7 +15859,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("object was replaced before descriptor binding"));
+        assert!(error.contains("slot was replaced"));
         assert!(displaced.join("original").is_file());
         let replacement = std::fs::read_dir(temp.path())
             .unwrap()
@@ -10261,7 +15902,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("root was replaced before descriptor binding"));
+        assert!(error.contains("slot was replaced"));
         assert!(displaced_root.join("object/original").is_file());
         assert_eq!(
             std::fs::read_to_string(
@@ -10296,9 +15937,44 @@ mod tests {
         target
     }
 
+    #[test]
+    fn common_directory_registry_query_lists_linked_worktree_without_nested_git() {
+        let temp = tempfile::tempdir().unwrap();
+        let linked = linked_close_worktree(&temp);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let common = super::exact_worktree_common_git_dir_until(&linked, deadline).unwrap();
+        assert!(!common.join(".git").exists());
+        let listed =
+            super::list_registered_worktrees_in_common_directory_until(&common, deadline).unwrap();
+        assert!(listed.status.success(), "{listed:?}");
+        let target = std::fs::canonicalize(&linked).unwrap();
+        assert!(listed.stdout.split(|byte| *byte == 0).any(|field| {
+            field
+                .strip_prefix(b"worktree ")
+                .map(super::path_buf_from_git_bytes)
+                .and_then(|path| std::fs::canonicalize(path).ok())
+                .as_ref()
+                == Some(&target)
+        }));
+        assert!(linked.exists());
+    }
+
+    #[test]
+    fn expired_common_directory_registry_query_refuses_before_directory_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let absent = temp.path().join("not-a-git-directory");
+        let error = super::list_registered_worktrees_in_common_directory_until(
+            &absent,
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert!(error.contains("deadline"), "{error}");
+        assert!(!absent.exists());
+    }
+
     #[cfg(unix)]
     #[test]
-    fn ignored_content_preserves_linked_worktree_without_a_loss_item() {
+    fn ignored_content_changes_fingerprint_and_is_an_exact_linked_worktree_blocker() {
         let temp = tempfile::tempdir().unwrap();
         let target = linked_close_worktree(&temp);
         std::fs::write(target.join(".gitignore"), "cache/\n").unwrap();
@@ -10308,17 +15984,29 @@ mod tests {
         let confirmed = test_worktree_snapshot(&identity, &target);
         std::fs::create_dir(target.join("cache")).unwrap();
         std::fs::write(target.join("cache/unique"), "preserve").unwrap();
+        std::fs::write(target.join("cache/another"), "also preserve").unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let (fresh, losses) = runtime.block_on(inspect_worktree(&identity)).unwrap();
-        assert_eq!(fresh.fingerprint(), confirmed.fingerprint());
-        assert!(losses.is_empty());
+        assert_ne!(fresh.fingerprint(), confirmed.fingerprint());
+        let ignored_paths = losses
+            .iter()
+            .filter_map(|loss| match loss {
+                CloseLossItem::IgnoredPath(path) => Some(path.as_bytes()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ignored_paths,
+            [b"cache/another".as_slice(), b"cache/unique".as_slice()]
+        );
+        assert_eq!(losses.len(), 2);
         let common = super::exact_worktree_common_git_dir(&target).unwrap();
         let administrative = super::exact_worktree_administrative_dir(&target, &common).unwrap();
         let incarnation = observe_administrative_dir_incarnation(&administrative).unwrap();
-        let error = super::inspect_and_remove_exact_worktree(
+        let result = super::inspect_and_remove_exact_worktree(
             runtime.handle(),
             &identity,
             &confirmed,
@@ -10330,16 +16018,22 @@ mod tests {
             }),
             |_, _, _| Ok(()),
         )
-        .err()
-        .expect("ignored data must prevent deletion");
-        assert!(error.contains("ignored content"), "{error}");
+        .unwrap();
+        let super::ExactWorktreeRemoval::ReinspectionRequired { detail: error } = result else {
+            panic!("ignored data must require fresh confirmation before deletion");
+        };
+        assert!(
+            error.contains("fresh confirmation is required"),
+            "changed ignored inventory must refuse deletion: {error}"
+        );
         assert!(target.join("cache/unique").exists());
+        assert!(target.join("cache/another").exists());
         assert!(!worktree_quarantine_path(&identity).unwrap().exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn named_nested_submodule_preserves_ignored_content_under_identical_fingerprint() {
+    fn named_nested_submodule_reports_exact_ignored_blocker_and_changes_fingerprint() {
         let temp = tempfile::tempdir().unwrap();
         let subrepo = temp.path().join("subrepo");
         initialize_repository(&subrepo);
@@ -10414,9 +16108,704 @@ mod tests {
         assert!(super::ensure_no_ignored_content(&target)
             .unwrap_err()
             .contains("ignored content"));
-        let fresh = test_worktree_snapshot(&identity, &target);
-        assert_eq!(fresh.fingerprint(), confirmed.fingerprint());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (fresh, losses) = runtime.block_on(inspect_worktree(&identity)).unwrap();
+        assert_ne!(fresh.fingerprint(), confirmed.fingerprint());
+        assert!(losses.iter().any(|loss| matches!(
+            loss,
+            CloseLossItem::IgnoredPath(path) if path.as_bytes() == b"deps/child/build/unique"
+        )));
         assert!(target.join("deps/child/build/unique").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_original_deadline_does_not_spawn_git_or_a_sentinel_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("must-not-be-created");
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args(["-c", "printf invoked > \"$1\"", "deadline-sentinel"]);
+        command.arg(&marker);
+        let error = super::run_bounded_spawned_git(
+            command,
+            std::time::Instant::now(),
+            "expired initial Close probe",
+        )
+        .unwrap_err();
+        assert_eq!(error, "expired initial Close probe exceeded its deadline");
+        assert!(
+            !marker.exists(),
+            "expired budget cannot admit a subprocess effect"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_child_waits_for_pipe_eof_until_deadline_after_direct_child_exits() {
+        use std::os::unix::process::CommandExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("descendant-started");
+        let mut command = std::process::Command::new("/bin/sh");
+        command
+            .args([
+                "-c",
+                "(/bin/sleep 60) & printf ready > \"$1\"; exit 0",
+                "pipe-retention-fixture",
+            ])
+            .arg(&marker)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        // Direct-child exit is the causal boundary under test, not a scheduling
+        // assumption within the deadline. Its descendant still owns the pipes.
+        let status = child.wait().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+
+        let error =
+            super::wait_bounded_child_output(child, deadline, "pipe retention probe").unwrap_err();
+
+        assert_eq!(error, "pipe retention probe exceeded its deadline");
+        assert!(status.success());
+        assert!(
+            marker.exists(),
+            "fixture handshake confirms descendant launch"
+        );
+    }
+
+    // These fixtures author only filesystem metadata and synthetic Git outputs;
+    // no Git process, SQLite admission or native executor is involved.
+    #[cfg(unix)]
+    fn synthetic_inspection_repository() -> (tempfile::TempDir, WorktreeIdentity) {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        std::fs::write(temp.path().join(".git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        std::fs::write(temp.path().join(".git/index"), b"synthetic-index").unwrap();
+        let identity = WorktreeIdentity::from_parts(
+            WorktreeId::parse("supplied-leaf-inspection").unwrap(),
+            WorktreeFingerprint::parse(observe_worktree_fingerprint(temp.path()).unwrap()).unwrap(),
+            GitPathIdentity::from_bytes(b"synthetic-inspection-path".to_vec()),
+        );
+        (temp, identity)
+    }
+
+    #[cfg(unix)]
+    fn synthetic_inspection_output(stdout: Vec<u8>, success: bool) -> std::process::Output {
+        use std::os::unix::process::ExitStatusExt as _;
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+            stdout,
+            stderr: Vec::new(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supplied_leaf_full_inspection_matches_legacy_canonical_clean_snapshot() {
+        let (temp, identity) = synthetic_inspection_repository();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut snapshots = Vec::new();
+        for oid in [
+            "1111111111111111111111111111111111111111",
+            "2222222222222222222222222222222222222222",
+        ] {
+            let index = format!("100644 {oid} 0\ttracked\0").into_bytes();
+            let mut results = Vec::new();
+            for native in [false, true] {
+                let mut calls = Vec::new();
+                let mut leaf = |command: std::process::Command, leaf_deadline, operation: &str| {
+                    assert_eq!(leaf_deadline, deadline);
+                    assert_eq!(command.get_current_dir(), Some(temp.path()));
+                    if native {
+                        assert!(!command
+                            .get_envs()
+                            .any(|(key, value)| { key == "GIT_INDEX_FILE" && value.is_some() }));
+                        assert!(!command.get_args().any(|arg| arg == "update-index"));
+                    }
+                    calls.push(operation.to_string());
+                    let stdout = match operation {
+                        "Git status inspection"
+                        | "exact ignored-path inspection"
+                        | "hidden-index inspection" => Vec::new(),
+                        "Git index path inspection" => b".git/index\n".to_vec(),
+                        "detached head inspection" => b"refs/heads/main\n".to_vec(),
+                        "gitlink inspection" => index.clone(),
+                        unexpected => panic!("unexpected Git leaf: {unexpected}"),
+                    };
+                    Ok(synthetic_inspection_output(stdout, true))
+                };
+                let result = if native {
+                    super::inspect_worktree_at_with_git_leaf_until(
+                        &identity,
+                        temp.path(),
+                        deadline,
+                        &mut leaf,
+                    )
+                } else {
+                    super::inspect_worktree_at_with_policy_until(
+                        &identity,
+                        temp.path(),
+                        deadline,
+                        super::WorktreeInspectionPolicy::Legacy,
+                        &mut leaf,
+                    )
+                }
+                .unwrap();
+                assert!(result.1.is_empty());
+                let mut expected_calls =
+                    vec!["Git status inspection", "exact ignored-path inspection"];
+                if !native {
+                    expected_calls.push("Git index path inspection");
+                }
+                expected_calls.extend([
+                    "hidden-index inspection",
+                    "detached head inspection",
+                    "gitlink inspection",
+                ]);
+                assert_eq!(calls, expected_calls);
+                results.push(result.0);
+            }
+            // Independent byte fixture pins the pre-existing framing, including
+            // the root gitlink-index record even when there are no gitlinks.
+            let mut canonical =
+                b"HEAD_SYMBOLIC\0refs/heads/main\0SUBMODULE_GITLINK_INDEX\0\0".to_vec();
+            canonical.extend_from_slice(&index);
+            canonical.push(0);
+            assert_eq!(results[0], snapshot_for(&canonical));
+            let mut native_canonical =
+                b"HEAD_SYMBOLIC\0refs/heads/main\0SUBMODULE_GITLINK_INDEX\0\0".to_vec();
+            native_canonical.extend_from_slice(&index);
+            native_canonical.push(0);
+            assert_eq!(results[1], snapshot_for(&native_canonical));
+            snapshots.push(results.pop().unwrap());
+        }
+        assert_ne!(
+            snapshots[0], snapshots[1],
+            "clean status alone is not a snapshot"
+        );
+        assert_eq!(
+            std::fs::read(temp.path().join(".git/index")).unwrap(),
+            b"synthetic-index"
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path().join(".git")).unwrap().count(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supplied_leaf_inspection_refuses_unsupported_state_without_scratch_mutation() {
+        let (temp, identity) = synthetic_inspection_repository();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        for (stop, stdout, success, reason) in [
+            (
+                "Git status inspection",
+                b" M tracked\0".as_slice(),
+                true,
+                "dirty status",
+            ),
+            (
+                "Git status inspection",
+                b"?? untracked\0".as_slice(),
+                true,
+                "dirty status",
+            ),
+            (
+                "hidden-index inspection",
+                b"h tracked\0".as_slice(),
+                true,
+                "hidden index suppression",
+            ),
+            (
+                "hidden-index inspection",
+                b"S tracked\0".as_slice(),
+                true,
+                "hidden index suppression",
+            ),
+            (
+                "hidden-index inspection",
+                b"s tracked\0".as_slice(),
+                true,
+                "hidden index suppression",
+            ),
+            (
+                "hidden-index inspection",
+                b"m tracked\0".as_slice(),
+                true,
+                "hidden index suppression",
+            ),
+            (
+                "detached head inspection",
+                b"".as_slice(),
+                false,
+                "detached HEAD",
+            ),
+            (
+                "gitlink inspection",
+                b"160000 1111111111111111111111111111111111111111 0\tmissing-module\0".as_slice(),
+                true,
+                "gitlinks",
+            ),
+            (
+                "gitlink inspection",
+                b"160000 1111111111111111111111111111111111111111 2\tconflicted-module\0"
+                    .as_slice(),
+                true,
+                "gitlinks",
+            ),
+        ] {
+            let refusal_stage = if stop == "Git status inspection" {
+                "exact ignored-path inspection"
+            } else {
+                stop
+            };
+            let mut stopped = false;
+            let error = super::inspect_worktree_at_with_git_leaf_until(
+                &identity,
+                temp.path(),
+                deadline,
+                &mut |command: std::process::Command, leaf_deadline, operation: &str| {
+                    assert_eq!(leaf_deadline, deadline);
+                    assert!(!stopped, "inspection continued after unsupported state");
+                    assert!(!command
+                        .get_envs()
+                        .any(|(key, value)| key == "GIT_INDEX_FILE" && value.is_some()));
+                    assert!(!command.get_args().any(|arg| arg == "update-index"));
+                    stopped = operation == refusal_stage;
+                    if operation == stop {
+                        return Ok(synthetic_inspection_output(stdout.to_vec(), success));
+                    }
+                    let stdout = match operation {
+                        "Git status inspection"
+                        | "exact ignored-path inspection"
+                        | "gitlink inspection" => Vec::new(),
+                        "hidden-index inspection" => b"H tracked\0".to_vec(),
+                        "detached head inspection" => b"refs/heads/main\n".to_vec(),
+                        unexpected => panic!("unexpected Git leaf: {unexpected}"),
+                    };
+                    Ok(synthetic_inspection_output(stdout, true))
+                },
+            )
+            .unwrap_err();
+            assert!(stopped);
+            assert!(error.contains(reason), "{error}");
+            assert_synthetic_index_unchanged(temp.path());
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_synthetic_index_unchanged(repository: &Path) {
+        assert_eq!(
+            std::fs::read(repository.join(".git/index")).unwrap(),
+            b"synthetic-index"
+        );
+        assert_eq!(
+            std::fs::read_dir(repository.join(".git")).unwrap().count(),
+            2
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_inspection_keeps_legacy_dirty_content_observation() {
+        let (temp, identity) = synthetic_inspection_repository();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let index = b"100644 1111111111111111111111111111111111111111 0\ttracked\0";
+        let mut snapshots = Vec::new();
+        for contents in [b"first".as_slice(), b"second".as_slice()] {
+            std::fs::write(temp.path().join("tracked"), contents).unwrap();
+            let mut dirty_index_observed = false;
+            let (snapshot, losses) = super::inspect_worktree_at_with_policy_until(
+                &identity,
+                temp.path(),
+                deadline,
+                super::WorktreeInspectionPolicy::Legacy,
+                &mut |_: std::process::Command, leaf_deadline, operation: &str| {
+                    assert_eq!(leaf_deadline, deadline);
+                    let stdout = match operation {
+                        "Git status inspection" => b" M tracked\0".to_vec(),
+                        "exact ignored-path inspection" => Vec::new(),
+                        "Git index path inspection" => b".git/index\n".to_vec(),
+                        "hidden-index inspection" => b"H tracked\0".to_vec(),
+                        "detached head inspection" => b"refs/heads/main\n".to_vec(),
+                        "gitlink inspection" => index.to_vec(),
+                        "dirty index inspection" => {
+                            dirty_index_observed = true;
+                            index.to_vec()
+                        }
+                        unexpected => panic!("unexpected Git leaf: {unexpected}"),
+                    };
+                    Ok(synthetic_inspection_output(stdout, true))
+                },
+            )
+            .unwrap();
+            assert!(dirty_index_observed);
+            assert_eq!(
+                losses,
+                vec![CloseLossItem::UnstagedTrackedPath(
+                    GitPathIdentity::from_bytes(b"tracked".to_vec()),
+                )],
+            );
+            snapshots.push(snapshot);
+        }
+        assert_ne!(snapshots[0], snapshots[1]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supplied_leaf_inspection_checks_administrative_incarnation_before_git() {
+        let (temp, identity) = synthetic_inspection_repository();
+        std::fs::write(temp.path().join(".git/HEAD"), b"ref: refs/heads/replaced\n").unwrap();
+        let error = super::inspect_worktree_at_with_git_leaf_until(
+            &identity,
+            temp.path(),
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            &mut |_, _, _| panic!("changed incarnation entered the Git leaf"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "captured worktree administrative incarnation changed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn supplied_leaf_inspection_propagates_refusal_at_every_git_leaf() {
+        let (temp, identity) = synthetic_inspection_repository();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        for stop in [
+            "Git status inspection",
+            "exact ignored-path inspection",
+            "hidden-index inspection",
+            "detached head inspection",
+            "gitlink inspection",
+        ] {
+            let mut stopped = false;
+            let error = super::inspect_worktree_at_with_git_leaf_until(
+                &identity,
+                temp.path(),
+                deadline,
+                &mut |_: std::process::Command, leaf_deadline, operation: &str| {
+                    assert_eq!(leaf_deadline, deadline);
+                    assert!(!stopped);
+                    if operation == stop {
+                        stopped = true;
+                        return Err("supplied leaf refused".to_string());
+                    }
+                    let stdout = match operation {
+                        "Git status inspection" | "exact ignored-path inspection" => Vec::new(),
+                        "hidden-index inspection" => b"H tracked\0".to_vec(),
+                        "detached head inspection" => b"refs/heads/main\n".to_vec(),
+                        unexpected => panic!("unexpected Git leaf: {unexpected}"),
+                    };
+                    Ok(synthetic_inspection_output(stdout, true))
+                },
+            )
+            .unwrap_err();
+            assert!(stopped);
+            assert_eq!(error, "supplied leaf refused");
+        }
+    }
+
+    #[test]
+    fn supplied_leaf_inspection_rejects_expired_deadline_before_repository_access() {
+        let identity = WorktreeIdentity::from_parts(
+            WorktreeId::parse("expired-supplied-inspection").unwrap(),
+            WorktreeFingerprint::parse("captured-incarnation").unwrap(),
+            GitPathIdentity::from_bytes(b"unopened-repository".to_vec()),
+        );
+        let error = super::inspect_worktree_at_with_git_leaf_until(
+            &identity,
+            Path::new("must-not-access-a-repository"),
+            std::time::Instant::now(),
+            &mut |_, _, _| panic!("expired inspection entered the Git leaf"),
+        )
+        .unwrap_err();
+        assert_eq!(error, "worktree inspection exceeded its deadline");
+    }
+
+    #[test]
+    fn expired_git_leaf_does_not_enter_the_caller() {
+        let deadline = std::time::Instant::now();
+        let mut calls = 0;
+        let error = super::execute_worktree_git_leaf_until(
+            std::process::Command::new("must-not-spawn"),
+            deadline,
+            "supervised probe",
+            &mut |_, _, _| {
+                calls += 1;
+                Err("must not enter the callback".to_string())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "supervised probe exceeded its deadline");
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn expired_legacy_git_wrappers_do_not_access_a_repository() {
+        let repository = Path::new("must-not-access-a-repository");
+        let deadline = std::time::Instant::now();
+        assert!(super::index_gitlinks(repository, deadline).is_err());
+        assert!(super::git_index_path(repository, deadline).is_err());
+        assert!(super::git_sparse_checkout_cone_mode(repository, deadline).is_err());
+        assert!(super::run_bounded_git_paths_until(
+            repository,
+            &["update-index"],
+            &[],
+            true,
+            Path::new("must-not-access-an-index"),
+            deadline,
+            "expired path probe",
+        )
+        .is_err());
+        assert!(super::sparse_checkout_absent_paths(
+            repository,
+            &[super::HiddenIndexCandidate {
+                flag: super::HiddenIndexFlag::SkipWorktree,
+                path: b"absent".to_vec(),
+            }],
+            deadline,
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recursive_worktree_inspections_share_each_git_leaf_and_deadline() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let module = root.join("module");
+        let nested = module.join("nested");
+        for repository in [root, module.as_path(), nested.as_path()] {
+            std::fs::create_dir_all(repository.join(".git")).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let oid = "1111111111111111111111111111111111111111";
+        let mut calls = Vec::new();
+        // No Git process is needed: every output comes from this one leaf.
+        let mut git_leaf = |command: std::process::Command, leaf_deadline, operation: &str| {
+            assert_eq!(leaf_deadline, deadline);
+            let repository = command.get_current_dir().unwrap().to_path_buf();
+            calls.push((repository.clone(), operation.to_string()));
+            let stdout = match operation {
+                "gitlink inspection" if repository == root => {
+                    format!("160000 {oid} 0\tmodule\0").into_bytes()
+                }
+                "gitlink inspection" if repository == module => {
+                    format!("160000 {oid} 0\tnested\0").into_bytes()
+                }
+                "gitlink inspection"
+                | "dirty index inspection"
+                | "exact ignored-path inspection" => Vec::new(),
+                "Git status inspection" => b"?? untracked\0".to_vec(),
+                "Git index path inspection" => b".git/missing-index\n".to_vec(),
+                "Git submodule HEAD inspection" => {
+                    if command
+                        .get_args()
+                        .any(|argument| argument == "symbolic-ref")
+                    {
+                        b"refs/heads/main\n".to_vec()
+                    } else {
+                        format!("{oid}\n").into_bytes()
+                    }
+                }
+                "detached head inspection" => b"refs/heads/main\n".to_vec(),
+                unexpected => panic!("unexpected Git leaf: {unexpected}"),
+            };
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout,
+                stderr: Vec::new(),
+            })
+        };
+        let mut observation = Vec::new();
+        super::observe_initialized_submodules_with_leaf_until(
+            root,
+            &[],
+            &mut observation,
+            deadline,
+            &mut std::collections::HashSet::new(),
+            &mut git_leaf,
+        )
+        .unwrap();
+        super::ensure_no_ignored_content_with_git_leaf_until(root, deadline, &mut git_leaf)
+            .unwrap();
+        let bindings =
+            super::capture_git_directory_bindings_with_leaf_until(root, deadline, &mut git_leaf)
+                .unwrap();
+        assert_eq!(bindings.len(), 3);
+        assert!(bindings.contains_key(Path::new("module/nested")));
+        assert_eq!(calls.len(), 26);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, operation)| operation == "exact ignored-path inspection")
+                .count(),
+            2
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|(_, operation)| operation == "gitlink inspection")
+                .count(),
+            9
+        );
+        assert!(observation
+            .iter()
+            .any(|(key, _)| { key == b"SUBMODULE_LOSS\0untracked\0module/nested/untracked" }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_inspection_stops_at_a_refused_git_leaf() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut calls = Vec::new();
+        let error = super::ensure_no_ignored_content_with_git_leaf_until(
+            temp.path(),
+            deadline,
+            &mut |_, leaf_deadline, operation| {
+                assert_eq!(leaf_deadline, deadline);
+                calls.push(operation.to_string());
+                if operation == "gitlink inspection" {
+                    return Err("original worker admission refused".to_string());
+                }
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                })
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "original worker admission refused");
+        assert_eq!(calls, ["Git status inspection", "gitlink inspection"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_common_directory_and_fsmonitor_use_individual_git_leaves() {
+        use std::os::unix::process::ExitStatusExt as _;
+
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(temp.path().join(".git")).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let expected_common = temp.path().join(".git").canonicalize().unwrap();
+        let mut common_output = expected_common.as_os_str().as_encoded_bytes().to_vec();
+        common_output.push(b'\n');
+        let mut calls = Vec::new();
+        let mut git_leaf = |command: std::process::Command, leaf_deadline, operation: &str| {
+            assert_eq!(leaf_deadline, deadline);
+            assert!(!command.get_args().any(|argument| argument == "foreach"));
+            calls.push(operation.to_string());
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: if operation == "Git common-directory inspection" {
+                    common_output.clone()
+                } else {
+                    Vec::new()
+                },
+                stderr: Vec::new(),
+            })
+        };
+        let common = super::exact_worktree_common_git_dir_with_leaf_until(
+            temp.path(),
+            deadline,
+            &mut git_leaf,
+        )
+        .unwrap();
+        assert_eq!(common, expected_common);
+        super::list_registered_worktrees_in_common_directory_with_leaf_until(
+            &common,
+            deadline,
+            &mut git_leaf,
+        )
+        .unwrap();
+        assert_eq!(
+            super::stop_bound_fsmonitor_with_leaf_until(temp.path(), deadline, &mut git_leaf)
+                .unwrap(),
+            super::FsmonitorStop::Stopped,
+        );
+        assert_eq!(
+            calls,
+            [
+                "Git common-directory inspection",
+                "exact Worktree registration inspection",
+                "worktree fsmonitor shutdown",
+            ]
+        );
+    }
+
+    #[test]
+    fn expired_original_fsmonitor_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("not-a-repository");
+        let error =
+            super::stop_bound_fsmonitor_daemons_until(&nonexistent, std::time::Instant::now())
+                .unwrap_err();
+        assert_eq!(error, "submodule fsmonitor shutdown exceeded its deadline");
+        assert!(!nonexistent.exists());
+    }
+
+    #[test]
+    fn expired_hidden_worktree_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("not-a-repository");
+        let error =
+            super::observe_hidden_worktree_changes_until(&nonexistent, std::time::Instant::now())
+                .unwrap_err();
+        assert_eq!(error, "hidden worktree inspection exceeded its deadline");
+        assert!(!nonexistent.exists());
+    }
+
+    #[test]
+    fn expired_dirty_index_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("not-a-repository");
+        let error = super::staged_index_entries_for_paths_until(
+            &nonexistent,
+            &[b"tracked".to_vec()],
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+        assert_eq!(error, "dirty index inspection exceeded its deadline");
+        assert!(!nonexistent.exists());
+    }
+
+    #[test]
+    fn expired_dirty_content_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("not-a-repository");
+        let losses = [CloseLossItem::UnstagedTrackedPath(
+            GitPathIdentity::from_bytes(b"tracked".to_vec()),
+        )];
+        let error =
+            super::observe_dirty_content_until(&nonexistent, &losses, std::time::Instant::now())
+                .unwrap_err();
+        assert_eq!(error, "dirty content inspection exceeded its deadline");
+        assert!(!nonexistent.exists());
+    }
+
+    #[test]
+    fn expired_ignored_content_deadline_refuses_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("not-a-repository");
+        let error = super::ensure_no_ignored_content_until(&nonexistent, std::time::Instant::now())
+            .unwrap_err();
+        assert_eq!(error, "ignored-content inspection exceeded its deadline");
+        assert!(!nonexistent.exists());
     }
 
     #[cfg(unix)]
@@ -10450,6 +16839,38 @@ mod tests {
         .is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fsmonitor_unsupported_platform_requires_the_exact_git_source_diagnostic() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let output = |code, stdout: &[u8], stderr: &[u8]| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+        };
+        // Git v2.47.0 builtin/fsmonitor--daemon.c's unsupported-backend die().
+        let unsupported = b"fatal: fsmonitor--daemon not supported on this platform\n";
+        assert_eq!(
+            super::classify_fsmonitor_stop(&output(128, b"", unsupported)).unwrap(),
+            super::FsmonitorStop::NotRunning,
+        );
+        for stderr in [
+            b"fatal: fsmonitor--daemon is not supported on this platform\n".as_slice(),
+            b"fatal: fsmonitor--daemon not supported\n".as_slice(),
+            b"fatal: permission denied\n".as_slice(),
+            b"fatal: fsmonitor--daemon not supported on this platform\nwarning: unknown failure\n"
+                .as_slice(),
+            b" fatal: fsmonitor--daemon not supported on this platform\n".as_slice(),
+            b"fatal: fsmonitor--daemon not supported on this platform\n\n".as_slice(),
+        ] {
+            assert!(super::classify_fsmonitor_stop(&output(128, b"", stderr)).is_err());
+        }
+        for code in [1, 127, 129] {
+            assert!(super::classify_fsmonitor_stop(&output(code, b"", unsupported)).is_err());
+        }
+        assert!(super::classify_fsmonitor_stop(&output(128, b"unexpected", unsupported)).is_err());
+    }
+
     /// Deterministic quarantine/removal effects for tests: the supplied
     /// `stop_fsmonitor` observation replaces the real fsmonitor shutdown, while
     fn injected_writer_evidence() -> super::ExternalWriterEvidence {
@@ -10471,11 +16892,12 @@ mod tests {
         stop_fsmonitor: impl FnOnce(&Path) -> Result<super::FsmonitorStop, String> + Send + 'static,
     ) -> super::CloseWorktreeEffects {
         super::CloseWorktreeEffects {
-            stop_fsmonitor: Box::new(stop_fsmonitor),
-            observe_open_descriptors: Box::new(|_| {
+            stop_fsmonitor: Box::new(move |path, _deadline, _admission| stop_fsmonitor(path)),
+            first_submodule_spawn_admission: None,
+            observe_open_descriptors: Box::new(|_, _| {
                 Ok(super::ExternalWriterEvidence::NoPositiveEvidence)
             }),
-            observe_external_writer: Box::new(|_| Ok(false)),
+            observe_external_writer: Box::new(|_, _| Ok(false)),
         }
     }
 
@@ -10485,14 +16907,122 @@ mod tests {
         stop_fsmonitor: impl FnOnce(&Path) -> Result<super::FsmonitorStop, String> + Send + 'static,
     ) -> super::CloseWorktreeEffects {
         super::CloseWorktreeEffects {
-            stop_fsmonitor: Box::new(stop_fsmonitor),
-            observe_open_descriptors: Box::new(|_| {
+            stop_fsmonitor: Box::new(move |path, _deadline, _admission| stop_fsmonitor(path)),
+            first_submodule_spawn_admission: None,
+            observe_open_descriptors: Box::new(|_, _| {
                 panic!("must not scan for open descriptors before quarantine commits")
             }),
-            observe_external_writer: Box::new(|_| {
+            observe_external_writer: Box::new(|_, _| {
                 panic!("must not scan for an external writer before quarantine commits")
             }),
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn worktree_effect_receives_the_original_absolute_deadline() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let identity = inspection_identity(&target);
+        let snapshot = inspect_worktree(&identity).await.unwrap().0;
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let admin = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&admin).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut effects = injected_close_worktree_effects_rejecting_scans(|_| {
+            panic!("replaced by deadline-aware effect")
+        });
+        effects.stop_fsmonitor = Box::new(move |_, received, _admission| {
+            assert_eq!(received, deadline);
+            Err("fixture stopped before fsmonitor effect".to_string())
+        });
+
+        let result = super::quarantine_and_remove_exact_worktree_with_effects_until(
+            &identity,
+            &snapshot,
+            admin,
+            incarnation,
+            None,
+            |_, _, _| panic!("must not bind a deletion tombstone"),
+            |_| panic!("must not quarantine after failed fsmonitor stop"),
+            effects,
+            deadline,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, ExactWorktreeRemoval::StopFailed { detail }
+            if detail == "fixture stopped before fsmonitor effect"));
+        assert!(target.exists());
+        assert!(!worktree_quarantine_path(&identity).unwrap().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn quarantine_rejects_live_linux_descriptor_writer_before_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = linked_close_worktree(&temp);
+        let identity = inspection_identity(&target);
+        let snapshot = inspect_worktree(&identity).await.unwrap().0;
+        let common = super::exact_worktree_common_git_dir(&target).unwrap();
+        let admin = super::exact_worktree_administrative_dir(&target, &common).unwrap();
+        let incarnation = observe_administrative_dir_incarnation(&admin).unwrap();
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .open(target.join("tracked"))
+            .unwrap();
+        let writer_pid = std::process::id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut effects = injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning));
+        effects.observe_open_descriptors = Box::new(move |quarantine, deadline| {
+            let evidence = super::quarantine_has_open_descriptors_until(quarantine, deadline)?;
+            assert!(
+                matches!(
+                    &evidence,
+                    super::ExternalWriterEvidence::Blocked(
+                        super::CloseWriterObservation::Authority {
+                            detector: super::CloseWriterDetector::LinuxDescriptor,
+                            process,
+                            matched_path,
+                            authority: super::CloseWriterAuthority::WritableFile(
+                                super::CloseFileWriteAccess::WriteOnly
+                                    | super::CloseFileWriteAccess::ReadWrite
+                            ),
+                        }
+                    ) if process.pid == writer_pid
+                        && matched_path == &quarantine.join("tracked")
+                ),
+                "expected real /proc descriptor attribution to the held writer: {evidence:?}"
+            );
+            Ok(evidence)
+        });
+        effects.observe_external_writer = Box::new(|_, _| {
+            panic!("descriptor evidence must refuse retirement before the next writer scan")
+        });
+
+        let outcome = super::quarantine_and_remove_exact_worktree_with_effects_until(
+            &identity,
+            &snapshot,
+            admin.clone(),
+            incarnation,
+            None,
+            |_, _, _| panic!("must not bind deletion after live writer evidence"),
+            |_| {},
+            effects,
+            deadline,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, ExactWorktreeRemoval::Residual { .. }));
+        let retained = worktree_quarantine_path(&identity).unwrap();
+        assert!(!target.exists());
+        assert_eq!(
+            std::fs::read_to_string(retained.join("tracked")).unwrap(),
+            "initial\n"
+        );
+        assert!(admin.exists());
+        drop(writer);
     }
 
     #[cfg(unix)]
@@ -10508,12 +17038,12 @@ mod tests {
             let incarnation = observe_administrative_dir_incarnation(&admin).unwrap();
             let mut effects =
                 injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning));
-            effects.observe_open_descriptors = Box::new(move |_| match observation {
+            effects.observe_open_descriptors = Box::new(move |_, _| match observation {
                 0 => Ok(injected_writer_evidence()),
                 1 => Err("injected descriptor observation failure".into()),
                 _ => Ok(super::ExternalWriterEvidence::NoPositiveEvidence),
             });
-            effects.observe_external_writer = Box::new(move |_| match observation {
+            effects.observe_external_writer = Box::new(move |_, _| match observation {
                 2 => Ok(true),
                 3 => Err("injected writer observation failure".into()),
                 _ => panic!("later writer observation must not run after descriptor rejection"),
@@ -10638,14 +17168,43 @@ mod tests {
             })
         })
         .expect_err("a positive external writer must reject the retry");
+        let message = error.to_string();
         assert!(
-            error.contains("external writer") && error.contains("no new run admitted"),
-            "rejection must name the external writer: {error}"
+            message.contains("external writer") && message.contains("no new run admitted"),
+            "rejection must name the external writer: {message}"
         );
         assert!(
-            error.contains(&quarantine.display().to_string()),
-            "rejection must name the holding target: {error}"
+            message.contains(&quarantine.display().to_string()),
+            "rejection must name the holding target: {message}"
         );
+    }
+
+    #[test]
+    fn retry_writer_inspection_gap_keeps_exact_target_and_typed_details() {
+        let original = Path::new("/captured/worktree");
+        let quarantine = Path::new("/captured/quarantine");
+        let mut observed = Vec::new();
+        let error = super::probe_retry_worktree_writers_with(original, quarantine, None, |path| {
+            observed.push(path.to_path_buf());
+            Ok(super::RetryTargetObservation::Present(
+                super::ExternalWriterEvidence::Blocked(
+                    super::CloseWriterObservation::InspectionGap {
+                        detector: super::CloseWriterDetector::LinuxDescriptor,
+                        pid: None,
+                        reason: super::CloseWriterGap::Unavailable,
+                    },
+                ),
+            ))
+        })
+        .expect_err("an inspection gap must block before later retry targets");
+        let super::RetryAssessmentError::WriterInspectionGap(gap) = error else {
+            panic!("inspection gap lost its typed classification");
+        };
+        assert_eq!(gap.path, original);
+        assert_eq!(gap.detector, super::CloseWriterDetector::LinuxDescriptor);
+        assert_eq!(gap.reason, super::CloseWriterGap::Unavailable);
+        assert_eq!(gap.pid, None);
+        assert_eq!(observed, [original.to_path_buf()]);
     }
 
     #[test]
@@ -10661,7 +17220,9 @@ mod tests {
         })
         .expect_err("a probe failure must be fail-closed, not proof of absence");
         assert!(
-            error.contains("cannot probe retry writer target"),
+            error
+                .to_string()
+                .contains("cannot probe retry writer target"),
             "probe error must propagate as the rejection: {error}"
         );
     }
@@ -10890,7 +17451,7 @@ mod tests {
         let identity = inspection_identity(&target);
         let confirmed = test_worktree_snapshot(&identity, &target);
         let root = temp.path().join("private-tombstone");
-        std::fs::create_dir(&root).unwrap();
+        super::reserve_private_tombstone(&root, "test worktree").unwrap();
         let metadata = std::fs::symlink_metadata(&root).unwrap();
         let recorded = CloseWorktreeFinalTombstone {
             root,
@@ -10920,7 +17481,7 @@ mod tests {
         let identity = inspection_identity(&target);
         let confirmed = test_worktree_snapshot(&identity, &target);
         let root = temp.path().join("private-tombstone");
-        std::fs::create_dir(&root).unwrap();
+        super::reserve_private_tombstone(&root, "test worktree").unwrap();
         let metadata = std::fs::symlink_metadata(&root).unwrap();
         let recorded = CloseWorktreeFinalTombstone {
             root,
@@ -11051,6 +17612,26 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn administrative_final_tombstone_symlink_is_not_absence_or_adopted_custody() {
+        let temp = tempfile::tempdir().unwrap();
+        let registration = temp.path().join("absent-registration");
+        let incarnation = "captured-incarnation";
+        let quarantine =
+            super::administrative_dir_quarantine_path(&registration, incarnation).unwrap();
+        let root = super::administrative_dir_final_tombstone_path(&quarantine);
+        let absent = temp.path().join("absent-target");
+        std::os::unix::fs::symlink(&absent, &root).unwrap();
+
+        let error = super::remove_exact_worktree_administrative_dir(&registration, incarnation)
+            .unwrap_err();
+
+        assert!(error.contains("unresolved final tombstone"), "{error}");
+        assert_eq!(std::fs::read_link(root).unwrap(), absent);
+        assert!(!registration.exists());
+    }
+
     #[test]
     fn restart_completes_only_exact_persisted_admin_cleanup_after_quarantine_removal() {
         let temp = tempfile::tempdir().unwrap();
@@ -11101,6 +17682,72 @@ mod tests {
         assert!(!linked.exists());
         assert!(!quarantine.exists());
         assert!(repository.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_refuses_unresolved_administrative_final_tombstone() {
+        for fresh_root in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let linked = linked_close_worktree(&temp);
+            let identity = inspection_identity(&linked);
+            let common = super::exact_worktree_common_git_dir(&linked).unwrap();
+            let administrative = exact_worktree_administrative_dir(&linked, &common).unwrap();
+            let incarnation = observe_administrative_dir_incarnation(&administrative).unwrap();
+            let quarantine =
+                super::administrative_dir_quarantine_path(&administrative, &incarnation).unwrap();
+            let root = if fresh_root {
+                super::fresh_administrative_dir_final_tombstone_path(&quarantine)
+            } else {
+                super::administrative_dir_final_tombstone_path(&quarantine)
+            };
+            std::fs::create_dir(&root).unwrap();
+            std::fs::rename(&administrative, root.join("object")).unwrap();
+            std::fs::remove_dir_all(&linked).unwrap();
+
+            for phase in 0..4 {
+                let error = complete_persisted_worktree_administrative_cleanup(
+                    &identity,
+                    &administrative,
+                    &incarnation,
+                )
+                .unwrap_err();
+                assert!(error.contains("unresolved final tombstone"), "{error}");
+                assert!(!administrative.exists());
+                assert!(!quarantine.exists());
+                match phase {
+                    0 => {
+                        assert!(root.join("object/gitdir").exists());
+                        std::fs::remove_dir_all(root.join("object")).unwrap();
+                    }
+                    1 => {
+                        assert!(root.is_dir());
+                        std::fs::remove_dir(&root).unwrap();
+                        std::os::unix::fs::symlink(temp.path().join("absent-target"), &root)
+                            .unwrap();
+                    }
+                    2 => {
+                        assert!(std::fs::symlink_metadata(&root)
+                            .unwrap()
+                            .file_type()
+                            .is_symlink());
+                        assert_eq!(
+                            std::fs::read_link(&root).unwrap(),
+                            temp.path().join("absent-target")
+                        );
+                        std::fs::remove_file(&root).unwrap();
+                        std::fs::write(&root, b"preserve final tombstone file").unwrap();
+                    }
+                    _ => {
+                        assert!(root.is_file());
+                        assert_eq!(
+                            std::fs::read(&root).unwrap(),
+                            b"preserve final tombstone file"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -11398,6 +18045,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worktree_inspection_rejects_expired_deadline_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent_repository = temp.path().join("does-not-exist");
+        let identity = WorktreeIdentity::from_parts(
+            WorktreeId::parse("expired-inspection-worktree").unwrap(),
+            WorktreeFingerprint::parse("captured-incarnation").unwrap(),
+            GitPathIdentity::from_bytes(b"unopened-repository".to_vec()),
+        );
+        let deadline = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap();
+
+        let error = super::inspect_worktree_at_until(&identity, nonexistent_repository, deadline)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "worktree inspection exceeded its deadline");
+    }
+
+    #[test]
+    fn sparse_checkout_rule_inspection_rejects_expired_deadline_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent_repository = temp.path().join("does-not-exist");
+        let deadline = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap();
+
+        let error = super::git_sparse_checkout_selected_paths(
+            &nonexistent_repository,
+            &[b"tracked/path".to_vec()],
+            false,
+            deadline,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "sparse-checkout rule inspection exceeded its deadline"
+        );
+    }
+
+    #[tokio::test]
     async fn sparse_checkout_absent_skip_worktree_path_is_not_loss_but_present_modified_one_is() {
         let temp = tempfile::tempdir().unwrap();
         initialize_repository(temp.path());
@@ -11563,6 +18252,54 @@ mod tests {
         assert!(head.status.success());
 
         assert!(super::detached_unreachable_commits(temp.path(), head.stdout.trim_ascii()).is_ok());
+    }
+
+    #[test]
+    fn detached_unreachable_commits_until_rejects_expired_deadline_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("does-not-exist");
+
+        let error = super::detached_unreachable_commits_until(
+            &nonexistent,
+            b"invalid head is not parsed before expiration",
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exceeded its deadline"));
+    }
+
+    #[test]
+    fn detached_head_is_unreachable_rejects_expired_deadline_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("does-not-exist");
+        let mut observation = Vec::new();
+
+        let error = super::detached_head_is_unreachable(
+            &nonexistent,
+            &mut observation,
+            b"submodule",
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exceeded its deadline"));
+        assert!(observation.is_empty());
+    }
+
+    #[test]
+    fn detached_reachability_evidence_until_rejects_expired_deadline_before_repository_access() {
+        let temp = tempfile::tempdir().unwrap();
+        let nonexistent = temp.path().join("does-not-exist");
+
+        let error = super::detached_reachability_evidence_until(
+            &nonexistent,
+            b"invalid head is not parsed before expiration",
+            std::time::Instant::now(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("exceeded its deadline"));
     }
 
     #[tokio::test]
@@ -11910,6 +18647,77 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_writer_process_expired_deadline_precedes_missing_or_malformed_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        for name in ["17", "not-a-pid"] {
+            let result = super::linux_writer_process_until(
+                &temp.path().join(name),
+                "test-boot",
+                std::time::Instant::now(),
+            );
+            assert!(matches!(result, Err(super::WriterScanError::Stopped(_))));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_owner_expired_deadline_precedes_missing_or_malformed_status() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("17");
+        std::fs::create_dir(&path).unwrap();
+        let process = std::fs::read_dir(temp.path())
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        for status in [None, Some("malformed status")] {
+            if let Some(status) = status {
+                std::fs::write(path.join("status"), status).unwrap();
+            }
+            let result =
+                super::linux_process_owner_until(&process, 1, "test", std::time::Instant::now());
+            assert!(matches!(result, Err(super::WriterScanError::Stopped(_))));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_zombie_expired_deadline_precedes_missing_tasks_or_malformed_status() {
+        let temp = tempfile::tempdir().unwrap();
+        for status in [
+            "malformed status",
+            "State:\tZ (zombie)\nThreads:\t1\nUid:\t1\t1\t1\t1\n",
+        ] {
+            let result = super::linux_zombie_has_no_sibling_threads_until(
+                &temp.path().join("17"),
+                status,
+                std::time::Instant::now(),
+            );
+            assert!(matches!(result, Err(super::WriterScanError::Stopped(_))));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_writer_scan_expired_deadline_stops_without_persisting_a_gap() {
+        let called = std::cell::Cell::new(false);
+        let result = super::linux_writer_scan_until(
+            Path::new("/not-accessed"),
+            Path::new("/not-accessed"),
+            0,
+            super::CloseWriterDetector::LinuxMapping,
+            std::time::Instant::now(),
+            |_, _| {
+                called.set(true);
+                Ok(None)
+            },
+        );
+        assert!(matches!(result, Err(message) if message.contains("deadline")));
+        assert!(!called.get());
+    }
+
+    #[cfg(target_os = "linux")]
     fn fake_linux_process(proc_root: &Path, pid: u32, uid: u32, start: u64) -> PathBuf {
         let process = proc_root.join(pid.to_string());
         std::fs::create_dir_all(process.join("fd")).unwrap();
@@ -11933,6 +18741,77 @@ mod tests {
         std::os::unix::fs::symlink("/outside", process.join("cwd")).unwrap();
         std::fs::write(process.join("maps"), "").unwrap();
         process
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_writer_scan_propagates_detector_stop_without_gap_evidence() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&target).unwrap();
+        fake_linux_process(&proc_root, 17, 1, 42);
+        let inspected = std::cell::Cell::new(false);
+        let result = super::linux_writer_scan_until(
+            &target,
+            &proc_root,
+            1,
+            super::CloseWriterDetector::LinuxMapping,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+            |_, _| {
+                inspected.set(true);
+                Err(super::WriterScanError::Stopped("fixture stop".to_owned()))
+            },
+        );
+        assert!(inspected.get());
+        assert!(matches!(result, Err(message) if message == "fixture stop"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_writer_scan_missing_pre_owner_status_is_attributed_gap_for_each_detector() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&target).unwrap();
+        let process = fake_linux_process(&proc_root, 17, 1, 42);
+        std::fs::remove_file(process.join("status")).unwrap();
+
+        for detector in [
+            super::CloseWriterDetector::LinuxDescriptor,
+            super::CloseWriterDetector::LinuxCwd,
+            super::CloseWriterDetector::LinuxMapping,
+        ] {
+            let inspected = std::cell::Cell::new(false);
+            let result = super::linux_writer_scan_until(
+                &target,
+                &proc_root,
+                1,
+                detector,
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+                |_, _| {
+                    inspected.set(true);
+                    Ok(None)
+                },
+            )
+            .unwrap();
+
+            assert!(
+                !inspected.get(),
+                "inspected process with missing owner status"
+            );
+            assert!(matches!(
+                result,
+                super::ExternalWriterEvidence::Blocked(
+                    super::CloseWriterObservation::InspectionGap {
+                        detector: observed_detector,
+                        pid: Some(17),
+                        reason: super::CloseWriterGap::Unavailable,
+                        ..
+                    }
+                ) if observed_detector == detector
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -12120,6 +18999,222 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn linux_descriptor_scan_exempts_only_the_exact_live_self_borrow() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let other = temp.path().join("other");
+        std::fs::create_dir(&quarantine).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let witness = capture_linux_descriptor_test_slot(&quarantine, "quarantine");
+        let borrow = witness.self_descriptor_borrow().unwrap();
+        // SAFETY: geteuid and getpid have no preconditions.
+        let uid = unsafe { libc::geteuid() };
+        let pid = unsafe { libc::getpid() };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+
+        let make_proc = |root: &Path, process_pid: u32, fd: i32, target: &Path| {
+            fake_linux_readonly_descriptor(root, process_pid, uid, fd, target);
+        };
+
+        let ordinary_proc = temp.path().join("ordinary-proc");
+        make_proc(&ordinary_proc, pid.cast_unsigned(), borrow.fd, &quarantine);
+        assert_linux_unscoped_directory_authority(&quarantine, &ordinary_proc, deadline);
+
+        let exact_proc = temp.path().join("exact-proc");
+        make_proc(&exact_proc, pid.cast_unsigned(), borrow.fd, &quarantine);
+        assert_linux_scoped_descriptor_repeatedly_exempt(
+            &quarantine,
+            &exact_proc,
+            deadline,
+            &borrow,
+        );
+        // An exempt slot must not stop inventory inspection before other authority.
+        let mixed_process = exact_proc.join(pid.to_string());
+        let extra_fd = borrow.fd + 100;
+        std::os::unix::fs::symlink(&quarantine, mixed_process.join(format!("fd/{extra_fd}")))
+            .unwrap();
+        std::fs::write(
+            mixed_process.join(format!("fdinfo/{extra_fd}")),
+            "flags:\t0100000\n",
+        )
+        .unwrap();
+        assert_linux_scoped_descriptor_authority(&quarantine, &exact_proc, deadline, &borrow);
+
+        let duplicate_proc = temp.path().join("duplicate-proc");
+        make_proc(
+            &duplicate_proc,
+            pid.cast_unsigned(),
+            borrow.fd + 1,
+            &quarantine,
+        );
+        assert_linux_scoped_descriptor_authority(&quarantine, &duplicate_proc, deadline, &borrow);
+
+        let other_pid_proc = temp.path().join("other-pid-proc");
+        make_proc(
+            &other_pid_proc,
+            pid.cast_unsigned() + 1,
+            borrow.fd,
+            &quarantine,
+        );
+        assert_linux_scoped_descriptor_authority(&quarantine, &other_pid_proc, deadline, &borrow);
+
+        let other_witness = capture_linux_descriptor_test_slot(&other, "other");
+        let other_borrow = other_witness.self_descriptor_borrow().unwrap();
+        let mismatched_borrow = super::SelfDeletionDescriptorBorrow {
+            witness: &other_witness,
+            pid: borrow.pid,
+            fd: borrow.fd,
+            device: other_borrow.device,
+            inode: other_borrow.inode,
+            kind: other_borrow.kind,
+        };
+        let mismatch_proc = temp.path().join("mismatch-proc");
+        make_proc(&mismatch_proc, pid.cast_unsigned(), borrow.fd, &quarantine);
+        assert_linux_scoped_descriptor_authority(
+            &quarantine,
+            &mismatch_proc,
+            deadline,
+            &mismatched_borrow,
+        );
+
+        // Keeping the FD alive must not excuse replacement of its witnessed slot.
+        let retained_path = temp.path().join("retained-quarantine");
+        std::fs::rename(&quarantine, &retained_path).unwrap();
+        std::fs::create_dir(&quarantine).unwrap();
+        let replaced_proc = temp.path().join("replaced-proc");
+        make_proc(
+            &replaced_proc,
+            pid.cast_unsigned(),
+            borrow.fd,
+            &retained_path,
+        );
+        assert_linux_scoped_descriptor_authority(&retained_path, &replaced_proc, deadline, &borrow);
+
+        let uncertain_proc = temp.path().join("uncertain-proc");
+        let uncertain = fake_linux_process(&uncertain_proc, pid.cast_unsigned(), uid, 44);
+        std::os::unix::fs::symlink(&quarantine, uncertain.join(format!("fd/{}", borrow.fd)))
+            .unwrap();
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_with_info_reader_until_scoped(
+                &quarantine,
+                &uncertain_proc,
+                deadline,
+                |path| std::fs::read_to_string(path),
+                Some(&borrow),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::InspectionGap {
+                reason: super::CloseWriterGap::DescriptorChanged,
+                ..
+            })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn fake_linux_readonly_descriptor(
+        root: &Path,
+        process_pid: u32,
+        uid: libc::uid_t,
+        fd: i32,
+        target: &Path,
+    ) {
+        let process = fake_linux_process(root, process_pid, uid, 44);
+        std::os::unix::fs::symlink(target, process.join(format!("fd/{fd}"))).unwrap();
+        std::fs::write(
+            process.join(format!("fdinfo/{fd}")),
+            "pos:\t0\nflags:\t0100000\n",
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_linux_descriptor_test_slot(
+        path: &Path,
+        slot_name: &str,
+    ) -> super::OwnedDeletionSlot {
+        let parent = super::open_deletion_parent(path.parent().unwrap()).unwrap();
+        let name = std::ffi::CString::new(slot_name).unwrap();
+        let identity = super::DeletionEntryIdentity::from_stat(
+            &super::deletion_slot_stat(&parent, &name).unwrap(),
+        );
+        super::OwnedDeletionSlot::capture(&parent, &name, identity).unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_linux_unscoped_directory_authority(
+        quarantine: &Path,
+        proc_root: &Path,
+        deadline: std::time::Instant,
+    ) {
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_with_info_reader_until(
+                quarantine,
+                proc_root,
+                deadline,
+                |path| std::fs::read_to_string(path),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority {
+                authority: super::CloseWriterAuthority::DirectoryDescriptor(_),
+                ..
+            })
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_linux_scoped_descriptor_repeatedly_exempt(
+        quarantine: &Path,
+        proc_root: &Path,
+        deadline: std::time::Instant,
+        borrow: &super::SelfDeletionDescriptorBorrow<'_>,
+    ) {
+        // Check the initial scan and two repeats against the same live witness.
+        for _ in 0..3 {
+            assert_eq!(
+                super::quarantine_has_open_descriptors_with_info_reader_until_scoped(
+                    quarantine,
+                    proc_root,
+                    deadline,
+                    |path| std::fs::read_to_string(path),
+                    Some(borrow),
+                )
+                .unwrap(),
+                super::ExternalWriterEvidence::NoPositiveEvidence
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_linux_scoped_descriptor_authority(
+        quarantine: &Path,
+        proc_root: &Path,
+        deadline: std::time::Instant,
+        borrow: &super::SelfDeletionDescriptorBorrow<'_>,
+    ) {
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_with_info_reader_until_scoped(
+                quarantine,
+                proc_root,
+                deadline,
+                |path| std::fs::read_to_string(path),
+                Some(borrow),
+            )
+            .unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::Authority { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mac_self_descriptor_device_preserves_unsigned_libproc_bits() {
+        // SAFETY: libc::stat is plain integer storage, initialized before use.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        stat.st_dev = 0x80000001_u32 as i32;
+        assert_eq!(super::deletion_descriptor_device(&stat), 0x80000001_u64);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn linux_readonly_descriptor_position_changes_are_not_writer_gaps() {
         let temp = tempfile::tempdir().unwrap();
         let quarantine = temp.path().join("quarantine");
@@ -12188,6 +19283,27 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descriptor_scan_retains_attributed_unavailable_inventory() {
+        let temp = tempfile::tempdir().unwrap();
+        let quarantine = temp.path().join("quarantine");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&quarantine).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let process = fake_linux_process(&proc_root, 1274, unsafe { libc::geteuid() }, 44);
+        std::fs::remove_dir(process.join("fd")).unwrap();
+        assert!(matches!(
+            super::quarantine_has_open_descriptors_in(&quarantine, &proc_root).unwrap(),
+            super::ExternalWriterEvidence::Blocked(super::CloseWriterObservation::InspectionGap {
+                detector: super::CloseWriterDetector::LinuxDescriptor,
+                pid: Some(1274),
+                reason: super::CloseWriterGap::Unavailable,
+            })
+        ));
+        assert!(quarantine.is_dir());
     }
 
     #[cfg(target_os = "linux")]
@@ -12443,9 +19559,10 @@ mod tests {
     }
 
     #[test]
-    fn porcelain_loss_parser_distinguishes_loss_categories_and_ignores_ignored_paths() {
+    fn porcelain_loss_parser_distinguishes_loss_categories_and_leaves_collapsed_ignored_paths_for_enumeration(
+    ) {
         let losses =
-            parse_status_losses(b"M  staged\0 M unstaged\0MM both\0?? untracked\0!! ignored\0");
+            parse_status_losses(b"M  staged\0 M unstaged\0MM both\0?? untracked\0!! ignored/\0");
         assert_eq!(losses.len(), 5);
         assert!(losses.iter().any(|loss| matches!(loss, CloseLossItem::StagedTrackedPath(path) if path.as_bytes() == b"staged")));
         assert!(losses.iter().any(|loss| matches!(loss, CloseLossItem::UnstagedTrackedPath(path) if path.as_bytes() == b"unstaged")));
@@ -12454,18 +19571,64 @@ mod tests {
         assert!(losses.iter().any(|loss| matches!(loss, CloseLossItem::UntrackedNonIgnoredPath(path) if path.as_bytes() == b"untracked")));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn ignored_paths_do_not_change_canonical_snapshot() {
+    fn ignored_directory_inventory_preserves_each_leaf_identity() {
+        let (temp, _) = synthetic_inspection_repository();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut leaf = |command: std::process::Command, _, operation: &str| {
+            assert_eq!(operation, "exact ignored-path inspection");
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            assert!(args.ends_with(
+                &[
+                    "ls-files",
+                    "--others",
+                    "--ignored",
+                    "--exclude-standard",
+                    "-z",
+                    "--"
+                ]
+                .map(str::to_owned)
+            ));
+            Ok(synthetic_inspection_output(
+                b"out/cache/a\0out/cache/b\0".to_vec(),
+                true,
+            ))
+        };
+        let paths =
+            observe_ignored_paths_with_leaf_until(temp.path(), deadline, &mut leaf).unwrap();
+        assert_eq!(
+            paths
+                .iter()
+                .map(GitPathIdentity::as_bytes)
+                .collect::<Vec<_>>(),
+            [b"out/cache/a".as_slice(), b"out/cache/b".as_slice()]
+        );
+    }
+
+    #[test]
+    fn ignored_status_and_exact_paths_change_canonical_snapshot() {
         let clean = snapshot_for(&canonical_status_observation(b""));
-        let ignored = snapshot_for(&canonical_status_observation(b"!! target/log.txt\0"));
-        assert_eq!(clean, ignored);
+        let collapsed = canonical_status_observation(b"!! target/\0");
+        assert_ne!(clean, snapshot_for(&collapsed));
+
+        let exact = vec![GitPathIdentity::from_bytes(b"target/a.log".to_vec())];
+        let mut with_exact = collapsed;
+        append_ignored_paths(&mut with_exact, &exact);
+        assert_ne!(clean, snapshot_for(&with_exact));
+        assert!(with_exact
+            .windows(b"IGNORED_PATH\0target/a.log\0".len())
+            .any(|window| window == b"IGNORED_PATH\0target/a.log\0"));
     }
 
     #[test]
     fn canonical_status_preserves_rename_source_record() {
         assert_eq!(
             canonical_status_observation(b"R  new-name.txt\0old-name.txt\0!! ignored\0"),
-            b"R  new-name.txt\0old-name.txt\0"
+            b"R  new-name.txt\0old-name.txt\0!! ignored\0"
         );
     }
 
@@ -12489,7 +19652,13 @@ mod tests {
         run_git(temp.path(), &["add", "unrelated"]);
         run_git(temp.path(), &["commit", "--quiet", "-m", "unrelated"]);
 
-        let entries = staged_index_entries_for_paths(temp.path(), &[b"tracked".to_vec()]).unwrap();
+        let paths = [b"tracked".to_vec()];
+        let entries = staged_index_entries_for_paths_until(
+            temp.path(),
+            &paths,
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(entries.len(), 1);
         assert!(entries.contains_key(b"tracked".as_slice()));
         assert!(!entries.contains_key(b"unrelated".as_slice()));

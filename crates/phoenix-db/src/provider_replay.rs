@@ -14,6 +14,81 @@ use sqlx::Row;
 mod canonical_receipt;
 pub(crate) use canonical_receipt::CanonicalReceipt;
 
+pub(crate) fn validate_task_proposal(
+    conversation_id: &str,
+    assistant: &Message,
+    state: &phoenix_core::domain::sm_state::ConvState,
+) -> DbResult<()> {
+    use phoenix_core::domain::{
+        db_schema::MessageContent,
+        llm_types::ContentBlock,
+        sm_state::{ConvState, ProposeTaskInput},
+        task_approval::ReviewedProposal,
+    };
+    let ConvState::AwaitingTaskApproval {
+        task_file,
+        plan,
+        reviewed_proposal: Some(reviewed),
+        ..
+    } = state
+    else {
+        return Ok(());
+    };
+    let occurrence = &reviewed.occurrence;
+    let matching_call = match &assistant.content {
+        MessageContent::Agent(blocks) => {
+            let mut calls = blocks.iter().filter_map(|block| match block {
+                ContentBlock::ToolUse { id, name, input } if id == &occurrence.tool_use_id => {
+                    Some((name, input))
+                }
+                ContentBlock::Text { .. }
+                | ContentBlock::Image { .. }
+                | ContentBlock::ToolUse { .. }
+                | ContentBlock::ToolResult { .. }
+                | ContentBlock::ServerToolUse { .. }
+                | ContentBlock::ToolSearchToolResult { .. }
+                | ContentBlock::WebSearchToolResult { .. }
+                | ContentBlock::WebFetchToolResult { .. }
+                | ContentBlock::CodeExecutionToolResult { .. }
+                | ContentBlock::BashCodeExecutionToolResult { .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
+                | ContentBlock::McpToolUse { .. }
+                | ContentBlock::McpToolResult { .. } => None,
+            });
+            match (calls.next(), calls.next()) {
+                (Some((name, input)), None) if name == "propose_task" => {
+                    serde_json::from_value::<ProposeTaskInput>(input.clone())
+                        .is_ok_and(|call| call.task_file.replace('\\', "/") == task_file.as_str())
+                }
+                _ => false,
+            }
+        }
+        MessageContent::User(_)
+        | MessageContent::Tool(_)
+        | MessageContent::System(_)
+        | MessageContent::Error(_)
+        | MessageContent::Continuation(_)
+        | MessageContent::Skill(_) => false,
+    };
+    let valid_source = assistant.conversation_id == conversation_id
+        && assistant.message_id == occurrence.assistant_message_id
+        && assistant.message_type == phoenix_core::domain::db_schema::MessageType::Agent
+        && !occurrence.assistant_message_id.trim().is_empty()
+        && !occurrence.tool_use_id.trim().is_empty()
+        && matching_call;
+    let source = std::path::Path::new(task_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(phoenix_core::task_source::TaskSource::detect)
+        .ok_or_else(|| DbError::Serialization("task proposal path is not markdown".into()))?;
+    if !valid_source || reviewed != &ReviewedProposal::capture(occurrence.clone(), &source, plan) {
+        return Err(DbError::Serialization(
+            "task proposal source or reviewed bytes differ".into(),
+        ));
+    }
+    Ok(())
+}
+
 async fn record_exact_agent_ending_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conversation_id: &str,
@@ -176,6 +251,7 @@ impl Database {
             }
         }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        validate_task_proposal(conversation_id, assistant, state)?;
         let mut receipt =
             canonical_receipt::CanonicalReceipt::new(state, state_updated_at, update)?;
         let round::RoundWriteOutcome {
@@ -190,6 +266,13 @@ impl Database {
             state,
             state_updated_at,
             self.goal_write_policies(),
+        )
+        .await?;
+        crate::native_close::acknowledge_initial_result_tx(
+            &mut tx,
+            conversation_id,
+            assistant,
+            &results,
         )
         .await?;
         receipt.bind_self_goal_evidence(input, &results)?;
@@ -350,21 +433,8 @@ impl Database {
                 .fetch_one(&mut *tx)
                 .await?;
         crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
-        let state_json = serde_json::to_string(state)
-            .map_err(|error| DbError::Serialization(error.to_string()))?;
-        let result = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
-        )
-        .bind(state_json)
-        .bind(crate::conv_state_kind(state))
-        .bind(state_updated_at.to_rfc3339())
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(conversation_id)
-        .execute(&mut *tx)
-        .await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(conversation_id.to_string()));
-        }
+        crate::write_conversation_state_tx(&mut tx, conversation_id, state, state_updated_at)
+            .await?;
         if previous_kind != crate::conv_state_kind(state) {
             crate::record_initial_execution_outcome_tx(&mut tx, conversation_id, state).await?;
         }
@@ -497,13 +567,17 @@ impl Database {
         crate::coordinator_watches::record_wait_entry_tx(&mut tx, conversation_id, state).await?;
         let state_json = serde_json::to_string(state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
-        sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")
+        let updated = sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")
             .bind(state_json)
             .bind(crate::conv_state_kind(state))
             .bind(state_updated_at.to_rfc3339())
             .bind(conversation_id)
             .execute(&mut *tx)
             .await?;
+        if updated.rows_affected() > 0 {
+            crate::native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, state)
+                .await?;
+        }
         record_exact_agent_ending_tx(&mut tx, conversation_id, message_id, content, state).await?;
         sqlx::query("DELETE FROM active_responses_replay_sets WHERE conversation_id = ?1")
             .bind(conversation_id)

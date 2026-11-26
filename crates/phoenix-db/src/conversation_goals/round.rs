@@ -542,23 +542,7 @@ pub(crate) async fn selected_state_tx(
 ) -> Result<(ConvState, DateTime<Utc>)> {
     if !replayed {
         crate::coordinator_watches::record_wait_entry_tx(tx, conversation_id, state).await?;
-        let state_json = serde_json::to_string(state)
-            .map_err(|_| GoalDbError::Integrity("selected round state serialization"))?;
-        let updated = sqlx::query(
-            "UPDATE conversations SET state=?1,state_kind=?2,state_updated_at=?3,updated_at=?4 WHERE id=?5",
-        )
-        .bind(state_json)
-        .bind(crate::conv_state_kind(state))
-        .bind(state_updated_at.to_rfc3339())
-        .bind(Utc::now().to_rfc3339())
-        .bind(conversation_id)
-        .execute(&mut **tx)
-        .await?;
-        if updated.rows_affected() == 0 {
-            return Err(GoalDbError::Integrity(
-                "selected round conversation missing",
-            ));
-        }
+        crate::write_conversation_state_tx(tx, conversation_id, state, state_updated_at).await?;
         crate::record_initial_execution_outcome_tx(tx, conversation_id, state).await?;
         return Ok((state.clone(), state_updated_at));
     }

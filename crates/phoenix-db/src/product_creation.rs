@@ -4738,6 +4738,7 @@ mod product_creation_tests {
                     title: "test".into(),
                     priority: phoenix_core::task_source::Priority::P2,
                     plan: "test".into(),
+                    reviewed_proposal: None,
                 },
                 ProductCreationInitialExecution::AwaitingTaskApproval,
             ),

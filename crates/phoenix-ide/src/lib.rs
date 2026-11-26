@@ -12,6 +12,7 @@ mod api;
 mod automatic_continuation_settings;
 mod chain_qa;
 mod chain_runtime;
+mod close_service;
 mod continuation_service;
 mod conversation_action_tools;
 mod conversation_actions;

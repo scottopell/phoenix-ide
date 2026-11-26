@@ -298,6 +298,36 @@ pub(crate) struct AcknowledgedEventRequest {
     pub retirement: tokio::sync::oneshot::Receiver<()>,
 }
 
+pub(crate) enum AcknowledgedRuntimeRequest {
+    Event(Box<AcknowledgedEventRequest>),
+    ExecuteNativeCloseInitial(Box<native_close_application::NativeCloseInitialRequest>),
+    ExecuteNativeCloseObserve(Box<native_close_application::NativeCloseObserveRequest>),
+    ExecuteNativeCloseRetry(Box<native_close_application::NativeCloseRetryRequest>),
+}
+
+mod native_close_application;
+pub(crate) use native_close_application::{
+    NativeCloseApplicationError, NativeCloseApplicationResult,
+};
+
+impl From<AcknowledgedEventRequest> for AcknowledgedRuntimeRequest {
+    fn from(request: AcknowledgedEventRequest) -> Self {
+        Self::Event(Box::new(request))
+    }
+}
+
+#[cfg(test)]
+impl AcknowledgedRuntimeRequest {
+    fn into_event(self) -> AcknowledgedEventRequest {
+        match self {
+            Self::Event(event) => *event,
+            Self::ExecuteNativeCloseInitial(_)
+            | Self::ExecuteNativeCloseObserve(_)
+            | Self::ExecuteNativeCloseRetry(_) => panic!("expected event request"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum HandoffCapacityStatus {
@@ -754,8 +784,7 @@ pub struct RuntimeManager {
     mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
     /// Active PTY terminal sessions — threaded into `ToolContext` for `read_terminal`.
     pub terminals: crate::terminal::ActiveTerminals,
-    pub(crate) close_retirement_leases:
-        AsyncMutex<HashMap<(String, WorkScopeId), close_retirement::CloseResourceLease>>,
+    pub(crate) close_retirement_leases: AsyncMutex<close_retirement::CloseResourceLeaseStore>,
     /// Isolates fake-tmux lifecycle fixtures from ambient host processes.
     #[cfg(test)]
     clean_close_writer_fixture: bool,
@@ -770,6 +799,10 @@ pub struct RuntimeManager {
     subagent_dispatch: ConversationMutexGates,
     #[cfg(test)]
     runtime_materialization_panics: AsyncMutex<HashSet<String>>,
+    #[cfg(test)]
+    #[cfg(test)]
+    #[cfg(test)]
+    #[cfg(test)]
     #[cfg(test)]
     runtime_materialization_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
@@ -2013,6 +2046,19 @@ pub struct CachedPrSummary {
 /// the extra display fields.
 pub(crate) fn public_conversation_state(state: &ConvState) -> serde_json::Value {
     match state {
+        ConvState::AwaitingTaskApproval {
+            task_file,
+            title,
+            priority,
+            plan,
+            ..
+        } => serde_json::json!({
+            "type": "awaiting_task_approval",
+            "task_file": task_file,
+            "title": title,
+            "priority": priority,
+            "plan": plan,
+        }),
         ConvState::ServerOverloadRetrying { retry } => serde_json::json!({
             "type": "server_overload_retrying",
             "attempt": retry.attempt,
@@ -2700,7 +2746,9 @@ impl RuntimeManager {
             tmux_registry: Arc::new(TmuxRegistry::with_lifecycle_sink(Some(tmux_lifecycle_tx))),
             mcp_manager,
             terminals,
-            close_retirement_leases: AsyncMutex::new(HashMap::new()),
+            close_retirement_leases: AsyncMutex::new(
+                close_retirement::CloseResourceLeaseStore::default(),
+            ),
             #[cfg(test)]
             clean_close_writer_fixture: false,
             close_retirement_execution: ConversationMutexGates::default(),
@@ -2710,6 +2758,10 @@ impl RuntimeManager {
             subagent_dispatch: ConversationMutexGates::default(),
             #[cfg(test)]
             runtime_materialization_panics: AsyncMutex::new(HashSet::new()),
+            #[cfg(test)]
+            #[cfg(test)]
+            #[cfg(test)]
+            #[cfg(test)]
             #[cfg(test)]
             runtime_materialization_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
@@ -3747,60 +3799,72 @@ impl RuntimeManager {
     pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {
         let obligations = self
             .db
-            .list_pending_close_obligations()
+            .list_pending_generic_close_settlements()
             .await
             .map_err(|error| error.to_string())?;
         let manager = Arc::clone(self);
         self.run_authority_units(obligations, move |obligation| {
             let manager = Arc::clone(&manager);
-            async move {
-                if !matches!(
-                    obligation.phase(),
-                    phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-                        | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
-                ) {
-                    return Ok(false);
-                }
-                let conversation_ids = manager
-                    .db
-                    .list_close_settlement_conversation_ids(obligation.attempt_id().as_str())
-                    .await
-                    .map_err(|error| error.to_string())?;
-                for conversation_id in &conversation_ids {
-                    match manager
-                        .db
-                        .cancel_conversation_creation(conversation_id, Utc::now())
-                        .await
-                    {
-                        Ok(()) | Err(crate::db::DbError::Sqlx(sqlx::Error::RowNotFound)) => {}
-                        Err(error) => return Err(error.to_string()),
-                    }
-                }
-                manager.kick_creation_worker();
-                manager
-                    .settle_close_direct_turn_targets(obligation.attempt_id().as_str())
-                    .await?;
-                match manager
-                    .db
-                    .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
-                    .await
-                {
-                    Ok(advanced) => {
-                        if advanced.phase()
-                            == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                        {
-                            manager
-                                .inspect_close_retirement(advanced.attempt_id().clone())
-                                .await?;
-                        }
-                        Ok(true)
-                    }
-                    Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
-                    Err(error) => Err(error.to_string()),
-                }
-            }
+            async move { manager.settle_close_obligation(obligation).await }
         })
         .await
+    }
+
+    async fn settle_close_obligation(
+        self: &Arc<Self>,
+        settlement: crate::db::GenericCloseSettlement,
+    ) -> Result<bool, String> {
+        let obligation = settlement.obligation();
+        if !matches!(
+            obligation.phase(),
+            phoenix_core::domain::close::ClosePhase::SettlingActiveWork
+                | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
+        ) {
+            return Ok(false);
+        }
+        if !self
+            .db
+            .validate_generic_close_settlement(&settlement)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(false);
+        }
+        let conversation_ids = self
+            .db
+            .list_close_settlement_conversation_ids(obligation.attempt_id().as_str())
+            .await
+            .map_err(|error| error.to_string())?;
+        for conversation_id in &conversation_ids {
+            match self
+                .db
+                .cancel_conversation_creation(conversation_id, Utc::now())
+                .await
+            {
+                Ok(()) | Err(crate::db::DbError::Sqlx(sqlx::Error::RowNotFound)) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        self.kick_creation_worker();
+        self.settle_close_direct_turn_targets(obligation.attempt_id().as_str())
+            .await?;
+        match self
+            .db
+            .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
+            .await
+        {
+            Ok(advanced) => {
+                if advanced.phase()
+                    == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
+                {
+                    self.inspect_close_retirement(advanced.attempt_id().clone())
+                        .await?;
+                }
+                Ok(true)
+            }
+            Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     /// Materialize persisted continuation operations so restart recovery does
@@ -6741,8 +6805,8 @@ impl RuntimeManager {
         let runtime = runtime
             .with_cancellation_input_receiver(cancellation_input_rx)
             .with_acknowledged_event_receiver(acknowledged_event_rx)
+            .with_actor_database(self.db.clone())
             .with_handoff_review_receiver(handoff_review_rx);
-
         let runtime = runtime
             .with_model_route_switch(model_upgrade.unwrap_or(false))
             .with_exhausted_maintenance(exhausted_maintenance)
@@ -7214,6 +7278,8 @@ impl RuntimeManager {
             .map(|_| ())
     }
 
+    /// Internal command only; no tool registration or HTTP route is installed.
+    #[allow(dead_code)]
     async fn send_acknowledged_event(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -7235,11 +7301,13 @@ impl RuntimeManager {
         let (retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event,
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
+            .send(AcknowledgedRuntimeRequest::Event(Box::new(
+                AcknowledgedEventRequest {
+                    event,
+                    acknowledgement: ack_tx,
+                    retirement: retirement_rx,
+                },
+            )))
             .await
             .map_err(|error| error.to_string())?;
         let outcome = ack_rx
@@ -7471,11 +7539,13 @@ impl RuntimeManager {
         let (_retirement_tx, retirement_rx) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event: Event::UserTriggerContinuation { operation_id },
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
+            .send(AcknowledgedRuntimeRequest::Event(Box::new(
+                AcknowledgedEventRequest {
+                    event: Event::UserTriggerContinuation { operation_id },
+                    acknowledgement: ack_tx,
+                    retirement: retirement_rx,
+                },
+            )))
             .await
             .map_err(|error| format!("Failed to send continuation admission: {error}"))?;
         ack_rx
@@ -8224,7 +8294,6 @@ impl RuntimeManager {
             })
     }
 
-    /// Get the database handle
     pub(crate) async fn mutation_admission(
         &self,
         conversation_id: &str,
@@ -10132,6 +10201,7 @@ mod scope_liveness_tests {
             .close_retirement_leases
             .lock()
             .await
+            .complete
             .retain(|(lease_attempt, _), _| lease_attempt != attempt_id.as_str());
         manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
 
@@ -11258,7 +11328,7 @@ mod scope_liveness_tests {
         conversation_id: &str,
     ) -> (
         mpsc::Receiver<Event>,
-        mpsc::Receiver<AcknowledgedEventRequest>,
+        mpsc::Receiver<AcknowledgedRuntimeRequest>,
     ) {
         let (event_tx, event_rx) = mpsc::channel(4);
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(4);
@@ -11485,6 +11555,7 @@ mod scope_liveness_tests {
             .await
             .unwrap()
             .unwrap();
+        let request = request.into_event();
         assert!(matches!(request.event, Event::UserCancel { .. }));
         assert_controller_fenced(&manager, &owner, child_id).await;
         assert!(!cancel.is_finished(), "runtime settlement remains required");
@@ -11639,6 +11710,7 @@ mod scope_liveness_tests {
             .await
             .expect("ordinary child cancellation reaches acknowledged dispatch")
             .unwrap();
+        let request = request.into_event();
         assert!(manager
             .bash_handles()
             .reserve_spawn_for_controller(
@@ -12681,7 +12753,7 @@ mod scope_liveness_tests {
     async fn insert_acknowledged_idle_handle(
         manager: &RuntimeManager,
         conversation_id: &str,
-    ) -> mpsc::Receiver<AcknowledgedEventRequest> {
+    ) -> mpsc::Receiver<AcknowledgedRuntimeRequest> {
         let (event_tx, _event_rx) = mpsc::channel(1);
         let (acknowledged_event_tx, acknowledged_event_rx) = mpsc::channel(1);
         let (_state_tx, state_rx) = watch::channel(ConvState::Idle);
@@ -12719,15 +12791,16 @@ mod scope_liveness_tests {
                     .await
             })
         };
-        let AcknowledgedEventRequest {
-            acknowledgement, ..
-        } = tokio::time::timeout(
+        let request = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             acknowledged_event_rx.recv(),
         )
         .await
         .expect("runtime event delivery must not hang")
         .expect("event must reach the runtime settlement channel");
+        let AcknowledgedEventRequest {
+            acknowledgement, ..
+        } = request.into_event();
         assert!(!sender.is_finished(), "channel admission is not success");
         drop(acknowledgement);
         assert_eq!(
@@ -16519,6 +16592,7 @@ mod scope_liveness_tests {
             title: "Example".into(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Review".into(),
+            reviewed_proposal: None,
         };
         manager
             .db()

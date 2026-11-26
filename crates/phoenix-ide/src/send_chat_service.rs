@@ -3,7 +3,6 @@ use crate::api::{FileAttachment, ImageAttachment};
 use crate::db::ConvState;
 use crate::runtime::RuntimeManager;
 use crate::state_machine::{check_user_message_acceptable, Event, TransitionError};
-use phoenix_core::domain::close::{CloseAttemptId, CloseRunOrdinal, CloseRunRef};
 use phoenix_core::domain::db_schema::ImageData;
 use phoenix_core::domain::skill_invocation::SkillInvocation;
 use phoenix_core::domain::sm_event::{
@@ -231,46 +230,58 @@ impl SendChatApplicationService {
         &self.db
     }
 
-    pub(crate) async fn retry_close_as_current_global(
+    /// Detached tool ingress; the source actor owns live authority and settlement.
+    pub(crate) async fn close_conversation(
         &self,
-        authorizer_conversation_id: &str,
-        target_conversation_id: &str,
-        attempt_id: &str,
-        failed_run_ordinal: i64,
-    ) -> Result<(), String> {
-        let current_global = self
-            .db
-            .coordinator_conversation_id()
-            .await
-            .map_err(|error| error.to_string())?;
-        if current_global.as_deref() != Some(authorizer_conversation_id) {
-            return Err("Fresh Close retry requires the current Global Coordinator".into());
-        }
-        let target = self
-            .db
-            .get_conversation(target_conversation_id)
-            .await
-            .map_err(|error| error.to_string())?;
-        let attempt_id = CloseAttemptId::parse(attempt_id).map_err(|error| error.to_string())?;
-        let obligation = self
-            .db
-            .get_close_obligation(attempt_id.as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        if target.product_conversation_id.as_str() != obligation.product_conversation_id().as_str()
-        {
-            return Err(
-                "Close retry target does not belong to the exact retained Close authority".into(),
-            );
-        }
-        let ordinal =
-            CloseRunOrdinal::parse(failed_run_ordinal).map_err(|error| error.to_string())?;
-        self.runtime
-            .retry_close_runtime_resources(CloseRunRef {
+        source_transcript_id: &str,
+        source: phoenix_core::domain::db_schema::SourceToolCall,
+        intent: phoenix_db::native_close::NativeCloseIntent,
+    ) -> Result<
+        crate::runtime::NativeCloseApplicationResult,
+        crate::runtime::NativeCloseApplicationError,
+    > {
+        use crate::runtime::NativeCloseApplicationResult;
+        use phoenix_db::native_close::{NativeCloseIntent, NativeCloseRunRef};
+
+        match intent {
+            NativeCloseIntent::Initial { target } => self
+                .runtime
+                .apply_native_close_initial(source_transcript_id, source, target)
+                .await
+                .map(NativeCloseApplicationResult::Initial),
+            NativeCloseIntent::Observe {
+                target,
                 attempt_id,
-                ordinal,
-            })
-            .await
+                run_ordinal,
+            } => self
+                .runtime
+                .apply_native_close_observe(
+                    source_transcript_id,
+                    source,
+                    NativeCloseRunRef {
+                        target,
+                        attempt_id,
+                        run_ordinal,
+                    },
+                )
+                .await
+                .map(NativeCloseApplicationResult::Observe),
+            NativeCloseIntent::ExplicitRetry {
+                target,
+                attempt_id,
+                failed_run_ordinal,
+            } => self
+                .runtime
+                .apply_native_close_explicit_retry(
+                    source_transcript_id,
+                    source,
+                    target,
+                    attempt_id,
+                    failed_run_ordinal,
+                )
+                .await
+                .map(NativeCloseApplicationResult::ExplicitRetry),
+        }
     }
 
     pub(crate) async fn source_conversation(

@@ -4,6 +4,7 @@ import { useLocation, useParams } from 'react-router-dom';
 import { decodedRouteReference } from '../transcriptReference';
 import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
+import { displayLossIdentity } from '../components/closeLossIdentity';
 import { AutomaticContinuationControl } from '../components/AutomaticContinuationControl';
 import { PendingContinuationOpening } from '../components/PendingContinuationOpening';
 import { MessageListSkeleton } from '../components/Skeleton';
@@ -1684,9 +1685,37 @@ function ProductConversationPageInner({ productId, globalShell, journey: inherit
       {ordinarySnapshot?.close && (ordinarySnapshot.close.outcome === 'archived_cleanup_attention' || closeIncomplete) && (
         <section className="product-conversation-page__close-status" role="alert" aria-label="Close status">
           <strong>{closeIncomplete
-            ? 'Close incomplete — shutdown could not be confirmed'
+            ? ordinarySnapshot.close.failure?.stop_certainty.kind === 'conversation_and_processes_stopped'
+              ? 'Close incomplete — cleanup not confirmed'
+              : 'Close incomplete — shutdown could not be confirmed'
             : 'Closed — cleanup needs attention'}</strong>
           <div>Run {ordinarySnapshot.close.run_ordinal} · {ordinarySnapshot.close.run_status}. No automatic retry.</div>
+          {ordinarySnapshot.close.losses.length > 0 && (
+            <details>
+              <summary>Exact work items ({ordinarySnapshot.close.losses.length})</summary>
+              <ul>
+                {ordinarySnapshot.close.losses.map((loss) => (
+                  <li key={`${loss.scope}:${loss.generation}:${loss.category}:${loss.identity}`}>
+                    <code>{loss.scope}: {displayLossIdentity(loss.identity)}</code> · {loss.category.replaceAll('_', ' ')}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+          {ordinarySnapshot.close.residuals.length > 0 && (
+            <details>
+              <summary>Residual resources ({ordinarySnapshot.close.residuals.length})</summary>
+              <ul>
+                {ordinarySnapshot.close.residuals.map((residual) => (
+                  <li key={`${residual.scope}:${residual.resource_kind}:${residual.identity}`}>
+                    <code>{residual.scope}: {residual.resource_kind.replaceAll('_', ' ')} · {residual.identity}</code>
+                    {' · '}{residual.reason.replaceAll('_', ' ')}
+                    {residual.detail ? ` — ${residual.detail}` : ''}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
           {ordinarySnapshot.close.failure && (
             <>
               <div>{ordinarySnapshot.close.failure.reason.replaceAll('_', ' ')} — {ordinarySnapshot.close.failure.detail}</div>

@@ -762,8 +762,12 @@ class CheckPlanTests(unittest.TestCase):
         self.assertEqual({old_path, new_path}, paths)
         self.assertIn("DEVTOOLS", self.dev._categorize_changed_paths(paths))
 
-    def test_rust_checker_changes_run_structural_and_devpy_tests(self):
-        for path in ("scripts/check_rust_test_timing.py", "scripts/check_manual_sql_transactions.py"):
+    def test_rust_checker_and_rule_changes_run_structural_and_devpy_tests(self):
+        for path in (
+            "scripts/check_rust_test_timing.py",
+            "scripts/check_manual_sql_transactions.py",
+            "ast-grep-rules/rust-no-direct-git-command.yml",
+        ):
             with self.subTest(path=path):
                 cats = self.dev._categorize_changed_paths({path})
                 self.assertIn("ASTGREP", cats)

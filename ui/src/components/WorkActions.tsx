@@ -192,7 +192,7 @@ function ResolveLink({
 }
 
 function closeHintText(): string {
-  return 'Closes this conversation and retires Phoenix-owned resources. Exact tracked, untracked, submodule, or detached work loss requires confirmation. Phoenix does not create recovery artifacts or move/delete branches or PRs.';
+  return 'Closes this conversation and retires Phoenix-owned resources. Exact work blockers remain visible until resolved separately and Close is explicitly retried. Phoenix does not create recovery artifacts or move/delete branches or PRs.';
 }
 
 type CompactFallbackStatus = {
@@ -600,27 +600,6 @@ export function WorkControlBar({
     }
   };
 
-  const confirmCloseLosses = async () => {
-    const close = closeSnapshot?.close;
-    const inspection = close?.confirmation_snapshot;
-    if (!close || !inspection) return;
-    setError(null);
-    setAbandoning(true);
-    try {
-      await api.confirmCloseLossRetirement(conversationId, {
-        attempt_id: close.attempt_id,
-        inspection_generation: inspection.generation,
-        inspection_fingerprint: inspection.fingerprint,
-      });
-      setCloseSnapshot(null);
-      onCloseCompleted?.();
-    } catch (err) {
-      await surfaceCloseConflict(err, 'Failed to confirm Close losses');
-    } finally {
-      setAbandoning(false);
-    }
-  };
-
   const cancelClose = async () => {
     setError(null);
     setAbandoning(true);
@@ -707,7 +686,6 @@ export function WorkControlBar({
     <CloseStatusPanel
       snapshot={closeSnapshot}
       busy={closeResolutionBusy}
-      onConfirmLosses={() => { void confirmCloseLosses(); }}
       onConfirmStopWork={() => { void confirmCloseStopWork(); }}
       onCancel={() => { void cancelClose(); }}
       onRetry={() => { void retryClose(); }}

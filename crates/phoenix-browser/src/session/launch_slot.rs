@@ -1,10 +1,11 @@
 use super::{
     console, delete_profile_if_owned_and_stopped, prepare_profile_dir_for_launch,
     profile_marker_path, user_data_dir_for_key, write_profile_marker_atomic, BrowserError,
-    BrowserLaunchIdentity, BrowserProfileMarker, BrowserRetainedLaunch, BrowserRetirementFenceKey,
-    BrowserSession, BrowserSessionLifecycleEvent, BrowserSessionLifecycleKind,
-    BrowserSessionLifecycleSink, BrowserSessionLookup, BrowserSessionManager,
-    BrowserSessionRegistryState, ProfileDeletionProof, ProfilingState, MAX_CONSOLE_LOGS,
+    BrowserLaunchIdentity, BrowserProfileMarker, BrowserRetainedLaunch, BrowserRetirementCustody,
+    BrowserRetirementFenceKey, BrowserSession, BrowserSessionLifecycleEvent,
+    BrowserSessionLifecycleKind, BrowserSessionLifecycleSink, BrowserSessionLookup,
+    BrowserSessionManager, BrowserSessionRegistryState, ProfileDeletionProof, ProfilingState,
+    MAX_CONSOLE_LOGS,
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::process_group::OwnedChromeGroup;
@@ -43,13 +44,50 @@ impl ProfilePolicy {
 pub(super) struct LaunchSlot {
     pub(super) identity: BrowserLaunchIdentity,
     pub(super) profile: PathBuf,
+    // Published when the original process identity is established; no session lock required.
+    observed_identity: StdMutex<BrowserLaunchIdentity>,
     scenario_owner: Arc<crate::scenario::ScenarioOwner>,
     key: String,
-    state: RwLock<LaunchState>,
+    pub(super) retirement_gate: Arc<tokio::sync::Mutex<()>>,
+    state: Arc<RwLock<LaunchState>>,
     changed: Notify,
     driver: StdMutex<Option<JoinHandle<()>>>,
     #[cfg(test)]
     fault: StdMutex<Option<Arc<tests::LaunchFault>>>,
+}
+
+pub(super) struct LaunchStateGuard(tokio::sync::OwnedRwLockWriteGuard<LaunchState>);
+pub(super) struct PreparedLaunchGuards {
+    pub(super) state: LaunchStateGuard,
+    pub(super) ready_session: Option<tokio::sync::OwnedRwLockWriteGuard<BrowserSession>>,
+}
+
+impl LaunchStateGuard {
+    pub(super) fn identity_snapshot(
+        &self,
+        ready_session: Option<&BrowserSession>,
+    ) -> Option<BrowserLaunchIdentity> {
+        match (&*self.0, ready_session) {
+            (LaunchState::Ready(_), Some(session)) => Some(session.launch_identity().clone()),
+            (LaunchState::Ready(_), None) => None,
+            (LaunchState::Pending(pending), _) => Some(pending.identity.clone()),
+            (
+                LaunchState::Reserved
+                | LaunchState::PreSpawnFailed(_)
+                | LaunchState::UnobservableAttempt(_)
+                | LaunchState::Stopped,
+                _,
+            ) => None,
+            #[cfg(test)]
+            (LaunchState::InjectedPending(pending), _) => Some(pending.identity.clone()),
+        }
+    }
+}
+
+impl PreparedLaunchGuards {
+    pub(super) fn identity_snapshot(&self) -> Option<BrowserLaunchIdentity> {
+        self.state.identity_snapshot(self.ready_session.as_deref())
+    }
 }
 
 enum LaunchState {
@@ -87,10 +125,12 @@ impl LaunchSlot {
         };
         Arc::new(Self {
             profile: policy.path(root, key, &identity.launch_uuid),
+            observed_identity: StdMutex::new(identity.clone()),
             identity,
             scenario_owner: Arc::new(crate::scenario::ScenarioOwner::default()),
             key: key.to_owned(),
-            state: RwLock::new(LaunchState::Reserved),
+            retirement_gate: Arc::new(tokio::sync::Mutex::new(())),
+            state: Arc::new(RwLock::new(LaunchState::Reserved)),
             changed: Notify::new(),
             driver: StdMutex::new(None),
             #[cfg(test)]
@@ -186,22 +226,10 @@ impl LaunchSlot {
     }
 
     pub(super) fn observed_identity(&self) -> BrowserLaunchIdentity {
-        self.state.try_read().ok().map_or_else(
-            || self.identity.clone(),
-            |state| match &*state {
-                #[cfg(test)]
-                LaunchState::InjectedPending(_) => self.identity.clone(),
-                LaunchState::Pending(pending) => pending.identity.clone(),
-                LaunchState::Ready(session) => session.try_read().map_or_else(
-                    |_| self.identity.clone(),
-                    |session| session.launch_identity.clone(),
-                ),
-                LaunchState::Reserved
-                | LaunchState::PreSpawnFailed(_)
-                | LaunchState::UnobservableAttempt(_)
-                | LaunchState::Stopped => self.identity.clone(),
-            },
-        )
+        self.observed_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     pub(super) fn scenario_owner(&self) -> Arc<crate::scenario::ScenarioOwner> {
@@ -328,6 +356,7 @@ impl LaunchSlot {
                 .initialize(
                     &self.profile,
                     &self.key,
+                    &self.observed_identity,
                     #[cfg(test)]
                     fault,
                 )
@@ -400,7 +429,7 @@ impl LaunchSlot {
                     "injected partial cleanup failure".into(),
                 ))
             }
-            LaunchState::Pending(pending) => pending.stop().await,
+            LaunchState::Pending(pending) => pending.stop(&self.observed_identity).await,
             LaunchState::PreSpawnFailed(_) => {
                 Err(BrowserError::LaunchFailed("no process was spawned".into()))
             }
@@ -416,14 +445,71 @@ impl LaunchSlot {
         }
     }
 
-    pub(super) async fn stop_and_delete(&self) -> Result<(), BrowserError> {
+    pub(super) async fn lock_for_teardown(
+        &self,
+    ) -> (
+        LaunchStateGuard,
+        Option<tokio::sync::OwnedRwLockWriteGuard<BrowserSession>>,
+    ) {
+        let state = self.state.clone().write_owned().await;
+        let ready_session = match &*state {
+            LaunchState::Ready(session) => Some(session.clone().write_owned().await),
+            #[cfg(test)]
+            LaunchState::InjectedPending(_) => None,
+            LaunchState::Reserved
+            | LaunchState::PreSpawnFailed(_)
+            | LaunchState::UnobservableAttempt(_)
+            | LaunchState::Pending(_)
+            | LaunchState::Stopped => None,
+        };
+        (LaunchStateGuard(state), ready_session)
+    }
+
+    pub(super) async fn stop_and_delete(
+        &self,
+        custody: BrowserRetirementCustody,
+    ) -> Result<(), BrowserError> {
+        // Legacy teardown cancels scenarios before waiting for the slot lock.
+        // Staged preparation remains non-destructive; its close occurs only in
+        // stop_and_delete_prepared after physical entry has been authorized.
         self.scenario_owner.close();
-        let mut state = self.state.write().await;
+        let (state, ready_session) = self.lock_for_teardown().await;
+        self.stop_and_delete_prepared(state, ready_session, custody)
+            .await
+    }
+
+    pub(super) async fn stop_and_delete_prepared(
+        &self,
+        state: LaunchStateGuard,
+        mut ready_session: Option<tokio::sync::OwnedRwLockWriteGuard<BrowserSession>>,
+        custody: BrowserRetirementCustody,
+    ) -> Result<(), BrowserError> {
+        let mut state = state.0;
+        self.scenario_owner.close();
         if matches!(&*state, LaunchState::PreSpawnFailed(_)) {
             *state = LaunchState::Stopped;
             return Ok(());
         }
-        let proof = self.stop_state(&mut state).await?;
+        let proof = match (&mut *state, ready_session.as_deref_mut()) {
+            (LaunchState::Ready(_), Some(session)) => {
+                session
+                    .terminate()
+                    .await
+                    .map_err(|error| BrowserError::OperationFailed(error.to_string()))?;
+                session.profile_deletion_proof()?
+            }
+            (LaunchState::Ready(_), None) => {
+                return Err(BrowserError::LaunchFailed(
+                    "ready browser teardown requires its prelocked session".into(),
+                ));
+            }
+            (_, None) => self.stop_state(&mut state).await?,
+            (_, Some(_)) => {
+                return Err(BrowserError::LaunchFailed(
+                    "prelocked session does not match launch state".into(),
+                ));
+            }
+        };
         #[cfg(test)]
         if matches!(&*state, LaunchState::InjectedPending(_)) {
             *state = LaunchState::Stopped;
@@ -435,7 +521,11 @@ impl LaunchSlot {
         let identity = match &*state {
             #[cfg(test)]
             LaunchState::InjectedPending(_) => unreachable!("injected stop handled above"),
-            LaunchState::Ready(session) => session.read().await.launch_identity().clone(),
+            LaunchState::Ready(_) => ready_session
+                .as_deref()
+                .expect("ready session guard checked above")
+                .launch_identity()
+                .clone(),
             LaunchState::Pending(pending) => pending.identity.clone(),
             LaunchState::Reserved
             | LaunchState::PreSpawnFailed(_)
@@ -449,26 +539,16 @@ impl LaunchSlot {
         let unmarked = matches!(&*state, LaunchState::Pending(pending) if !pending.marker);
         let profile = self.profile.clone();
         let key = self.key.clone();
-        tokio::task::spawn_blocking(move || {
-            if unmarked {
-                if profile_marker_path(&profile).exists() {
-                    return Err(BrowserError::OperationFailed(
-                        "unmarked launch path now has a marker; preserving foreign profile".into(),
-                    ));
-                }
-                std::fs::remove_dir_all(&profile)
-                    .or_else(|error| {
-                        if error.kind() == std::io::ErrorKind::NotFound {
-                            Ok(())
-                        } else {
-                            Err(error)
-                        }
-                    })
-                    .map_err(|error| BrowserError::OperationFailed(error.to_string()))
-            } else {
-                delete_profile_if_owned_and_stopped(&profile, &key, &identity, proof)
-            }
-        })
+        spawn_profile_cleanup(
+            profile,
+            key,
+            identity,
+            proof,
+            unmarked,
+            custody,
+            #[cfg(test)]
+            None,
+        )
         .await
         .map_err(|error| {
             BrowserError::OperationFailed(format!("profile cleanup task failed: {error}"))
@@ -476,6 +556,46 @@ impl LaunchSlot {
         *state = LaunchState::Stopped;
         Ok(())
     }
+}
+
+fn spawn_profile_cleanup(
+    profile: PathBuf,
+    key: String,
+    identity: BrowserLaunchIdentity,
+    proof: ProfileDeletionProof,
+    unmarked: bool,
+    custody: BrowserRetirementCustody,
+    #[cfg(test)] gate: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+) -> JoinHandle<Result<(), BrowserError>> {
+    tokio::task::spawn_blocking(move || {
+        let custody_guard = custody;
+        let _ = &custody_guard.0;
+        #[cfg(test)]
+        if let Some((entered, release)) = gate {
+            entered.send(()).expect("cleanup test waits for entry");
+            release
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("cleanup test releases blocking work");
+        }
+        if unmarked {
+            if profile_marker_path(&profile).exists() {
+                return Err(BrowserError::OperationFailed(
+                    "unmarked launch path now has a marker; preserving foreign profile".into(),
+                ));
+            }
+            std::fs::remove_dir_all(&profile)
+                .or_else(|error| {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        Ok(())
+                    } else {
+                        Err(error)
+                    }
+                })
+                .map_err(|error| BrowserError::OperationFailed(error.to_string()))
+        } else {
+            delete_profile_if_owned_and_stopped(&profile, &key, &identity, proof)
+        }
+    })
 }
 
 async fn apply_initial_device(
@@ -496,9 +616,10 @@ impl PendingBrowser {
         &mut self,
         profile: &Path,
         key: &str,
+        observed_identity: &StdMutex<BrowserLaunchIdentity>,
         #[cfg(test)] fault: Option<Arc<tests::LaunchFault>>,
     ) -> Result<Page, BrowserError> {
-        self.establish_authority()?;
+        self.establish_authority(observed_identity)?;
         let marker = BrowserProfileMarker::from_launch(key, &self.identity)
             .expect("identity contains proven process");
         write_profile_marker_atomic(profile, &marker)?;
@@ -512,7 +633,10 @@ impl PendingBrowser {
         BrowserSession::first_page(&mut self.browser, &self.handler).await
     }
 
-    fn establish_authority(&mut self) -> Result<(), BrowserError> {
+    fn establish_authority(
+        &mut self,
+        observed_identity: &StdMutex<BrowserLaunchIdentity>,
+    ) -> Result<(), BrowserError> {
         let pid = self
             .browser
             .get_mut_child()
@@ -521,6 +645,9 @@ impl PendingBrowser {
             BrowserError::LaunchFailed("could not capture Chrome process identity".into())
         })?;
         self.identity.chrome_process = Some(identity);
+        *observed_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = self.identity.clone();
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         if crate::process_group::ChromeExecShim::registered().is_some() {
             let child = self
@@ -541,9 +668,12 @@ impl PendingBrowser {
         Ok(())
     }
 
-    async fn stop(&mut self) -> Result<ProfileDeletionProof, BrowserError> {
+    async fn stop(
+        &mut self,
+        observed_identity: &StdMutex<BrowserLaunchIdentity>,
+    ) -> Result<ProfileDeletionProof, BrowserError> {
         if matches!(self.authority, InitialAuthority::Unadopted) {
-            self.establish_authority()?;
+            self.establish_authority(observed_identity)?;
         }
         match &mut self.authority {
             InitialAuthority::Unadopted => Err(BrowserError::LaunchFailed(
@@ -637,6 +767,149 @@ pub(super) mod tests {
     use crate::session::{session_key, BrowserRetirementOutcome, ScopedSession};
     use phoenix_core::work_scope::{EffectiveResourceAccess, ResourceAuthority, ResourceScopeKey};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    struct CustodyDropWitness {
+        dropped: Arc<AtomicBool>,
+        changed: Arc<Notify>,
+    }
+
+    impl Drop for CustodyDropWitness {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+            self.changed.notify_one();
+        }
+    }
+
+    fn witnessed_custody() -> (BrowserRetirementCustody, Arc<AtomicBool>, Arc<Notify>) {
+        let dropped = Arc::new(AtomicBool::new(false));
+        let changed = Arc::new(Notify::new());
+        let custody = BrowserRetirementCustody::new(Arc::new(CustodyDropWitness {
+            dropped: dropped.clone(),
+            changed: changed.clone(),
+        }));
+        (custody, dropped, changed)
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Keep the physical cleanup, cancelled waiter, late custody, and retry assertions in one lifecycle test"
+    )]
+    async fn aborted_waiter_keeps_custody_inside_actual_blocking_profile_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("owned-unmarked-profile");
+        std::fs::create_dir(&profile).unwrap();
+        let attempt = crate::session::KillAttempt::new();
+        let (initial, initially_dropped, _) = witnessed_custody();
+        attempt.retain_until_complete(initial);
+        let group = attempt.custody_group();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let waiter = tokio::spawn(async move {
+            spawn_profile_cleanup(
+                profile,
+                "test-key".into(),
+                BrowserLaunchIdentity {
+                    launch_uuid: "test".into(),
+                    chrome_process: None,
+                },
+                ProfileDeletionProof::RootOnly,
+                true,
+                BrowserRetirementCustody::new(group),
+                Some((entered_tx, release_rx)),
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || entered_rx.recv()),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let (late, late_dropped, changed) = witnessed_custody();
+        attempt.retain_until_complete(late);
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(attempt.complete(Err("abnormal kill".into())));
+        assert!(
+            !initially_dropped.load(Ordering::SeqCst) && !late_dropped.load(Ordering::SeqCst),
+            "blocking closure must own both caller custodies after completion and waiter abort"
+        );
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        *slot.state.write().await = LaunchState::PreSpawnFailed("safe retry".into());
+        let key = session_key(
+            &scope,
+            &EffectiveResourceAccess::new("owner", ResourceAuthority::Work),
+        );
+        *manager
+            .state
+            .read()
+            .await
+            .sessions
+            .get(&key)
+            .unwrap()
+            .current_kill
+            .lock()
+            .unwrap() = Some(attempt.clone());
+        // Attach a genuinely new caller payload after the attempt has already
+        // completed abnormally. Only the physical cleanup owns the weak group's
+        // remaining lifetime; joining must not discard this late custody.
+        let (after_completion, after_completion_dropped, after_completion_changed) =
+            witnessed_custody();
+        let held = manager
+            .spawn_kill_session_by_key(
+                key.clone(),
+                scope.clone(),
+                None,
+                None,
+                Some(after_completion),
+            )
+            .await;
+        let crate::session::KillSessionOutcome::AlreadyRequested { attempt: joined } = held else {
+            panic!("physical cleanup still holds group: no second kill task");
+        };
+        assert!(Arc::ptr_eq(&joined, &attempt));
+        assert!(manager.wait_for_kill_completion(joined).await.is_err());
+        assert!(
+            !after_completion_dropped.load(Ordering::SeqCst),
+            "completed result does not release custody while physical cleanup is live"
+        );
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), changed.notified())
+            .await
+            .expect("blocking closure releases custody after cleanup");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            after_completion_changed.notified(),
+        )
+        .await
+        .expect("physical cleanup releases the post-completion joiner's custody");
+        assert!(after_completion_dropped.load(Ordering::SeqCst));
+        assert!(initially_dropped.load(Ordering::SeqCst));
+        assert!(late_dropped.load(Ordering::SeqCst));
+        assert!(!root.path().join("owned-unmarked-profile").exists());
+        assert!(
+            attempt.join_group().is_none(),
+            "completed attempt cannot keep group alive"
+        );
+        let retry = manager
+            .spawn_kill_session_by_key(
+                key,
+                scope,
+                None,
+                None,
+                Some(BrowserRetirementCustody::no_op()),
+            )
+            .await;
+        let crate::session::KillSessionOutcome::Started { handle, .. } = retry else {
+            panic!("quiescent group permits a new kill attempt");
+        };
+        assert!(handle.await.unwrap().is_ok());
+    }
 
     pub(in crate::session) struct LaunchFault {
         pub(super) opaque: bool,
@@ -812,6 +1085,7 @@ pub(super) mod tests {
     }
 
     pub(super) struct InjectedPending {
+        pub(super) identity: BrowserLaunchIdentity,
         failures_remaining: usize,
         stop_attempts: Arc<AtomicUsize>,
         dropped: Arc<AtomicBool>,
@@ -858,7 +1132,7 @@ pub(super) mod tests {
                 session: slot.clone(),
                 user_data_key: key,
                 destination_retirement_generation: generation,
-                current_kill: StdMutex::new(None),
+                current_kill: Arc::new(StdMutex::new(None)),
                 teardown_failed: Arc::new(AtomicBool::new(false)),
             },
         );
@@ -875,6 +1149,7 @@ pub(super) mod tests {
         let mut device = crate::device::DeviceState::default();
         let mut state = slot.state.write().await;
         *state = LaunchState::InjectedPending(InjectedPending {
+            identity: slot.identity.clone(),
             failures_remaining: 1,
             stop_attempts: stop_attempts.clone(),
             dropped: dropped.clone(),
@@ -925,6 +1200,313 @@ pub(super) mod tests {
         assert!(!manager.is_active(&scope).await);
     }
 
+    #[test]
+    fn joining_an_existing_kill_retains_late_custody_until_completion() {
+        let attempt = crate::session::KillAttempt::new();
+        let (custody, dropped, _) = witnessed_custody();
+        attempt.retain_until_complete(custody);
+        assert!(!dropped.load(Ordering::SeqCst));
+        assert!(attempt.complete(Ok(())));
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    struct LockCheckDrop {
+        attempt: Arc<crate::session::KillAttempt>,
+        manager: Arc<BrowserSessionManager>,
+        unlocked: Arc<AtomicBool>,
+    }
+
+    impl Drop for LockCheckDrop {
+        fn drop(&mut self) {
+            let registry = self.manager.state.try_read();
+            let unlocked = registry.as_ref().is_ok_and(|registry| {
+                registry
+                    .sessions
+                    .values()
+                    .all(|entry| entry.current_kill.try_lock().is_ok())
+            }) && self.attempt.progress.try_lock().is_ok();
+            self.unlocked.store(unlocked, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn custody_destructors_never_run_under_kill_or_registry_locks() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope();
+        reserve_in_manager(&manager, &scope).await;
+        let attempt = crate::session::KillAttempt::new();
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let custody = BrowserRetirementCustody::new(Arc::new(LockCheckDrop {
+            attempt: attempt.clone(),
+            manager: manager.clone(),
+            unlocked: unlocked.clone(),
+        }));
+        attempt.retain_until_complete(custody);
+        assert!(attempt.complete(Ok(())));
+        assert!(unlocked.load(Ordering::SeqCst));
+
+        let unlocked = Arc::new(AtomicBool::new(false));
+        let custody = BrowserRetirementCustody::new(Arc::new(LockCheckDrop {
+            attempt: attempt.clone(),
+            manager: manager.clone(),
+            unlocked: unlocked.clone(),
+        }));
+        attempt.retain_until_complete(custody);
+        assert!(unlocked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn dropped_kill_task_guard_settles_abnormal_exit() {
+        let attempt = crate::session::KillAttempt::new();
+        let guard = crate::session::KillTaskCompletion {
+            attempt: attempt.clone(),
+            teardown_failed: Arc::new(AtomicBool::new(false)),
+            scope: scope(),
+            audience: crate::session::BrowserSessionAudience::Scope,
+            sink: None,
+        };
+        drop(guard);
+        assert!(attempt.result().unwrap().is_err());
+        assert!(!attempt.complete(Ok(())));
+    }
+
+    #[tokio::test]
+    async fn tampered_nonempty_permit_never_enters_teardown_or_reopens_fence() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = Arc::new(BrowserSessionManager {
+            tmp_root: temp.path().to_path_buf(),
+            ..BrowserSessionManager::default()
+        });
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        tokio::fs::create_dir_all(&slot.profile).await.unwrap();
+        let sentinel = slot.profile.join("untouched");
+        tokio::fs::write(&sentinel, b"original").await.unwrap();
+        *slot.state.write().await = LaunchState::PreSpawnFailed("never launched".into());
+
+        for mutation in 0..4 {
+            let mut permit = manager.begin_retirement(&scope).await;
+            assert_eq!(permit.instances.len(), 1);
+            match mutation {
+                0 => permit.actor_session_key = Some("another-actor".into()),
+                1 => permit.instances.clear(),
+                2 => permit.instances[0].session_key = "another-session".into(),
+                3 => permit.had_entries = false,
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                manager.verify_exact_absence(&permit).await,
+                BrowserRetirementOutcome::Residual { .. }
+            ));
+            assert!(matches!(
+                manager.complete_retirement(&permit).await,
+                BrowserRetirementOutcome::Residual { .. }
+            ));
+            manager.reopen_after_permit(permit).await;
+            assert!(manager.is_retirement_fenced(&scope).await);
+            let registry = manager.state.read().await;
+            assert_eq!(registry.sessions.len(), 1);
+            let entry = registry.sessions.values().next().unwrap();
+            assert!(Arc::ptr_eq(&entry.session, &slot));
+            assert!(entry.current_kill.lock().unwrap().is_none());
+            assert!(!entry.teardown_failed.load(Ordering::SeqCst));
+            drop(registry);
+            assert!(matches!(
+                *slot.state.read().await,
+                LaunchState::PreSpawnFailed(_)
+            ));
+            assert_eq!(tokio::fs::read(&sentinel).await.unwrap(), b"original");
+        }
+    }
+
+    #[tokio::test]
+    async fn aborted_retirement_parent_keeps_custody_in_spawned_kill_task() {
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let manager = BrowserSessionManager::with_lifecycle_sink(Some(tx));
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        *slot.state.write().await = LaunchState::InjectedPending(InjectedPending {
+            identity: slot.identity.clone(),
+            failures_remaining: 0,
+            stop_attempts: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicBool::new(false)),
+        });
+        let permit = manager.begin_retirement(&scope).await;
+        let expected = permit.instances[0].clone();
+        let state_guard = slot.state.write().await;
+        let (custody, dropped, changed) = witnessed_custody();
+        let parent = {
+            let manager = manager.clone();
+            tokio::spawn(async move {
+                manager
+                    .complete_retirement_with_custody(&permit, custody)
+                    .await
+            })
+        };
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.kind, BrowserSessionLifecycleKind::TeardownPending);
+        let attempt = {
+            let registry = manager.state.read().await;
+            let attempt = registry
+                .sessions
+                .values()
+                .next()
+                .unwrap()
+                .current_kill
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .clone();
+            attempt
+        };
+        let (late, late_dropped, late_changed) = witnessed_custody();
+        let key = session_key(
+            &scope,
+            &EffectiveResourceAccess::new("owner", ResourceAuthority::Work),
+        );
+        let joined = manager
+            .spawn_kill_session_by_key(key, scope.clone(), Some(expected), None, Some(late))
+            .await;
+        let crate::session::KillSessionOutcome::AlreadyRequested {
+            attempt: joined_attempt,
+        } = joined
+        else {
+            panic!("late caller must join the active kill");
+        };
+        assert!(Arc::ptr_eq(&attempt, &joined_attempt));
+        let cancelled_wait_handle = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.wait_for_kill_completion(joined_attempt).await })
+        };
+        cancelled_wait_handle.abort();
+        assert!(cancelled_wait_handle.await.unwrap_err().is_cancelled());
+        parent.abort();
+        assert!(parent.await.unwrap_err().is_cancelled());
+        assert!(
+            !dropped.load(Ordering::SeqCst) && !late_dropped.load(Ordering::SeqCst),
+            "spawned kill retains both caller custodies while blocked on slot"
+        );
+        drop(state_guard);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.wait_for_kill_completion(attempt),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), changed.notified())
+            .await
+            .expect("kill task releases initial custody after bookkeeping");
+        tokio::time::timeout(std::time::Duration::from_secs(5), late_changed.notified())
+            .await
+            .expect("kill task releases late custody after bookkeeping");
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(late_dropped.load(Ordering::SeqCst));
+    }
+
+    async fn assert_aborted_kill_task(before_first_poll: bool) {
+        let (tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let manager = BrowserSessionManager::with_lifecycle_sink(Some(tx));
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        let closed = if before_first_poll {
+            None
+        } else {
+            let (closed, observed) = tokio::sync::oneshot::channel();
+            slot.scenario_owner
+                .start(move |mut cancelled| async move {
+                    if !*cancelled.borrow() {
+                        cancelled.changed().await.unwrap();
+                    }
+                    assert!(*cancelled.borrow());
+                    let _ = closed.send(());
+                })
+                .unwrap();
+            Some(observed)
+        };
+        *slot.state.write().await = LaunchState::InjectedPending(InjectedPending {
+            identity: slot.identity.clone(),
+            failures_remaining: 0,
+            stop_attempts: Arc::new(AtomicUsize::new(0)),
+            dropped: Arc::new(AtomicBool::new(false)),
+        });
+        let state_guard = slot.state.write().await;
+        let key = session_key(
+            &scope,
+            &EffectiveResourceAccess::new("owner", ResourceAuthority::Work),
+        );
+        let started = manager
+            .spawn_kill_session_by_key(
+                key,
+                scope.clone(),
+                None,
+                None,
+                Some(BrowserRetirementCustody::no_op()),
+            )
+            .await;
+        let crate::session::KillSessionOutcome::Started {
+            handle, attempt, ..
+        } = started
+        else {
+            panic!("kill must start");
+        };
+        // The pending event is synchronous; consuming it must not yield before
+        // the before-first-poll abort on the current-thread test runtime.
+        assert_eq!(
+            events.try_recv().unwrap().kind,
+            BrowserSessionLifecycleKind::TeardownPending
+        );
+        if let Some(closed) = closed {
+            tokio::time::timeout(std::time::Duration::from_secs(5), closed)
+                .await
+                .expect("kill enters stop_and_delete before abort")
+                .unwrap();
+        }
+        handle.abort();
+        assert!(handle.await.unwrap_err().is_cancelled());
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.wait_for_kill_completion(attempt)
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert_eq!(
+            events.recv().await.unwrap().kind,
+            BrowserSessionLifecycleKind::TeardownFailed
+        );
+        assert_eq!(
+            manager.inventory_metadata(&scope).await.unwrap().state,
+            crate::session::BrowserInventoryState::TeardownFailed
+        );
+        assert!(manager.get_session(&scope).await.is_err());
+        assert!(manager
+            .state
+            .read()
+            .await
+            .sessions
+            .values()
+            .next()
+            .unwrap()
+            .teardown_failed
+            .load(Ordering::SeqCst));
+        drop(state_guard);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborted_kill_task_before_first_poll_marks_failure() {
+        assert_aborted_kill_task(true).await;
+    }
+
+    #[tokio::test]
+    async fn aborted_kill_task_while_slot_held_marks_failure() {
+        assert_aborted_kill_task(false).await;
+    }
+
     #[tokio::test]
     async fn default_device_first_command_error_attempts_cleanup_and_retains_authority() {
         assert_default_device_failure_retains_cleanup(1, false).await;
@@ -961,6 +1543,194 @@ pub(super) mod tests {
             ProfilePolicy::CliTransient.path(root, key, "one"),
             ProfilePolicy::CliTransient.path(root, key, "two")
         );
+    }
+
+    #[tokio::test]
+    async fn full_process_identity_capture_does_not_wait_for_launch_state() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        let full = BrowserLaunchIdentity {
+            launch_uuid: slot.identity.launch_uuid.clone(),
+            chrome_process: Some(phoenix_core::process_identity::ProcessIdentity {
+                pid: 4242,
+                start_time: 9,
+            }),
+        };
+        *slot.observed_identity.lock().unwrap() = full.clone();
+        let state_guard = slot.state.write().await;
+        let permit = manager.begin_retirement(&scope).await;
+        assert_eq!(permit.instances[0].process_identity(), full.chrome_process);
+        assert_eq!(permit.instances[0].durable, full);
+        drop(state_guard);
+    }
+
+    #[tokio::test]
+    async fn dead_retirement_detaches_synthetic_cleanup_and_revalidates_the_captured_slot() {
+        let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let manager = BrowserSessionManager::with_lifecycle_sink(Some(events_tx));
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        let key = slot.key.clone();
+        let stop_attempts = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_task = cancelled.clone();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel();
+        slot.scenario_owner
+            .start(move |mut cancellation| async move {
+                if !*cancellation.borrow() {
+                    let _ = cancellation.changed().await;
+                }
+                if *cancellation.borrow() {
+                    cancelled_task.store(true, Ordering::SeqCst);
+                    let _ = cancelled_tx.send(());
+                }
+            })
+            .unwrap();
+        *slot.state.write().await = LaunchState::InjectedPending(InjectedPending {
+            identity: slot.identity.clone(),
+            failures_remaining: 0,
+            stop_attempts: stop_attempts.clone(),
+            dropped,
+        });
+        std::fs::create_dir_all(&slot.profile).unwrap();
+
+        let gate = slot.retirement_gate.clone().lock_owned().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let worker_manager = manager.clone();
+        let worker_scope = scope.clone();
+        let worker_slot = slot.clone();
+        let worker = tokio::spawn(async move {
+            let mut retirement =
+                Box::pin(worker_manager.retire_dead_session(key, worker_scope, worker_slot));
+            let first_poll = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(retirement.as_mut(), cx))
+            })
+            .await;
+            assert!(
+                first_poll.is_pending(),
+                "retirement must block on the held gate"
+            );
+            let _ = started_tx.send(());
+            let result = retirement.await;
+            let _ = done_tx.send(result);
+        });
+        started_rx.await.unwrap();
+        let waiter = tokio::spawn(worker);
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 0);
+        assert!(!cancelled.load(Ordering::SeqCst));
+        assert!(slot.profile.exists());
+        assert!(events.try_recv().is_err());
+        let state = manager.state.read().await;
+        assert!(state.sessions[&slot.key]
+            .current_kill
+            .lock()
+            .unwrap()
+            .is_none());
+        drop(state);
+
+        drop(gate);
+        done_rx.await.unwrap().unwrap();
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), cancelled_rx)
+            .await
+            .expect("scenario cancellation must be observed")
+            .expect("scenario cancellation observer remains connected");
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(!manager.state.read().await.sessions.contains_key(&slot.key));
+        assert!(events.try_recv().is_ok());
+        // InjectedPending tests detached retirement coordination, not physical deletion.
+        std::fs::remove_dir_all(&slot.profile).expect("remove synthetic profile directory");
+    }
+
+    #[tokio::test]
+    async fn dead_retirement_preserves_replacement_installed_while_waiting_for_gate() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope();
+        let captured = reserve_in_manager(&manager, &scope).await;
+        let key = captured.key.clone();
+        let gate = captured.retirement_gate.clone().lock_owned().await;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let worker_manager = manager.clone();
+        let worker_scope = scope.clone();
+        let worker_slot = captured.clone();
+        let worker = tokio::spawn(async move {
+            let mut retirement =
+                Box::pin(worker_manager.retire_dead_session(key, worker_scope, worker_slot));
+            let first_poll = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(retirement.as_mut(), cx))
+            })
+            .await;
+            assert!(
+                first_poll.is_pending(),
+                "retirement must block on the held gate"
+            );
+            let _ = started_tx.send(());
+            let result = retirement.await;
+            let _ = done_tx.send(result);
+        });
+        started_rx.await.unwrap();
+        drop(tokio::spawn(worker));
+
+        let replacement = reserve_in_manager(&manager, &scope).await;
+        assert_eq!(captured.key, replacement.key);
+        assert!(!Arc::ptr_eq(&captured, &replacement));
+        drop(gate);
+        done_rx.await.unwrap().unwrap();
+        let current = manager.state.read().await.sessions[&replacement.key]
+            .session
+            .clone();
+        assert!(Arc::ptr_eq(&current, &replacement));
+    }
+
+    #[tokio::test]
+    async fn prepared_pre_spawn_retirement_is_inert_until_executed_and_drop_releases_gate() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        let stop_attempts = Arc::new(AtomicUsize::new(0));
+        *slot.state.write().await = LaunchState::InjectedPending(InjectedPending {
+            identity: slot.identity.clone(),
+            failures_remaining: 0,
+            stop_attempts: stop_attempts.clone(),
+            dropped: Arc::new(AtomicBool::new(false)),
+        });
+        let original_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let permit = manager
+            .begin_retirement_with_deadline(&scope, original_deadline)
+            .await;
+        let prepared = manager
+            .prepare_retirement_resource(&permit, &permit.instances[0], permit.original.deadline)
+            .await
+            .unwrap();
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 0);
+        assert!(slot.retirement_gate.try_lock().is_err());
+        drop(prepared);
+        assert!(slot.retirement_gate.try_lock().is_ok());
+        assert_eq!(stop_attempts.load(Ordering::SeqCst), 0);
+        assert!(manager.is_retirement_fenced(&scope).await);
+    }
+
+    #[tokio::test]
+    async fn prepare_wait_on_slot_lock_obeys_deadline_and_releases_gate() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope();
+        let slot = reserve_in_manager(&manager, &scope).await;
+        let permit = manager.begin_retirement(&scope).await;
+        let held = slot.state.write().await;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(20);
+        let result = manager
+            .prepare_retirement_resource(&permit, &permit.instances[0], deadline)
+            .await;
+        assert!(result.unwrap_err().contains("wait timed out"));
+        assert!(slot.retirement_gate.try_lock().is_ok());
+        drop(held);
     }
 
     #[tokio::test]
@@ -1027,6 +1797,7 @@ pub(super) mod tests {
         let stop_attempts = Arc::new(AtomicUsize::new(0));
         let dropped = Arc::new(AtomicBool::new(false));
         *slot.state.write().await = LaunchState::InjectedPending(InjectedPending {
+            identity: slot.identity.clone(),
             failures_remaining: 1,
             stop_attempts: stop_attempts.clone(),
             dropped: dropped.clone(),

@@ -5,6 +5,7 @@ use crate::api::global_read::{
 
 mod answer_question;
 mod authority;
+mod close_conversation;
 mod goals;
 pub(crate) mod instance;
 mod tracking;
@@ -457,7 +458,9 @@ pub(crate) fn tools(
         db: watch_db,
         peer_db: db.clone(),
     }));
-    tools.push(Arc::new(SafeRetryClose(close_retry.clone())));
+    tools.push(Arc::new(close_conversation::CloseConversation(Arc::clone(
+        &close_retry,
+    ))));
     tools.push(Arc::new(answer_question::AnswerConversationQuestion(
         close_retry,
     )));
@@ -544,7 +547,6 @@ struct ListWatchedConversations {
     db: crate::db::Database,
     peer_db: crate::db::Database,
 }
-struct SafeRetryClose(Arc<SendChatApplicationService>);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -823,70 +825,6 @@ impl Tool for ListWatchedConversations {
                     Err(error) => ToolOutput::error(error.to_string()),
                 }
             }
-        }
-    }
-}
-
-#[async_trait]
-impl Tool for SafeRetryClose {
-    fn foreground_execution(&self) -> phoenix_tools::ForegroundExecution {
-        phoenix_tools::ForegroundExecution::Serial
-    }
-
-    fn name(&self) -> &'static str {
-        "retry_close_safely"
-    }
-
-    fn description(&self) -> String {
-        "Explicitly authorize one fresh, server-validated retry of an exact stopped Close run. Available only to the current Global Coordinator. The server allocates ordinal N+1, revalidates retained authority and current risk, never expands the original Close target set, and never treats notification delivery as approval. Input identifies the target transcript and exact failed attempt/run; safety evidence is server-produced, not accepted from this input."
-            .into()
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "target_conversation_id": {"type": "string", "minLength": 1},
-                "attempt_id": {"type": "string", "minLength": 1},
-                "failed_run_ordinal": {"type": "integer", "minimum": 1}
-            },
-            "required": ["target_conversation_id", "attempt_id", "failed_run_ordinal"],
-            "additionalProperties": false
-        })
-    }
-
-    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
-        let Some(target_conversation_id) =
-            input.get("target_conversation_id").and_then(Value::as_str)
-        else {
-            return ToolOutput::error("target_conversation_id is required");
-        };
-        let Some(attempt_id) = input.get("attempt_id").and_then(Value::as_str) else {
-            return ToolOutput::error("attempt_id is required");
-        };
-        let Some(failed_run_ordinal) = input.get("failed_run_ordinal").and_then(Value::as_i64)
-        else {
-            return ToolOutput::error("failed_run_ordinal must be an integer");
-        };
-        match self
-            .0
-            .retry_close_as_current_global(
-                &ctx.conversation_id,
-                target_conversation_id,
-                attempt_id,
-                failed_run_ordinal,
-            )
-            .await
-        {
-            Ok(()) => ToolOutput::success(
-                json!({
-                    "attempt_id": attempt_id,
-                    "failed_run_ordinal": failed_run_ordinal,
-                    "status": "retry_completed"
-                })
-                .to_string(),
-            ),
-            Err(error) => ToolOutput::error(error),
         }
     }
 }
@@ -3325,7 +3263,7 @@ mod tests {
                 "watch_conversation",
                 "unwatch_conversation",
                 "list_watched_conversations",
-                "retry_close_safely",
+                "close_conversation",
                 "answer_conversation_question",
                 "post_user_question",
                 "withdraw_user_question",
@@ -3389,16 +3327,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn safe_retry_tool_rejects_non_current_global_before_target_lookup() {
+    async fn native_close_tool_requires_trusted_source_before_target_lookup() {
         let (_, coordinator) = application_tools().await;
+        assert_eq!(
+            coordinator
+                .iter()
+                .filter(|tool| tool.name() == "close_conversation")
+                .count(),
+            1
+        );
         let tool = coordinator
             .into_iter()
-            .find(|tool| tool.name() == "retry_close_safely")
+            .find(|tool| tool.name() == "close_conversation")
+            .unwrap();
+        assert_eq!(
+            tool.foreground_execution(),
+            phoenix_tools::ForegroundExecution::Serial
+        );
+        let output = tool
+            .run(
+                json!({"action":"initial", "product_conversation_id":"missing-target"}),
+                context("missing-source"),
+            )
+            .await;
+        assert!(!output.is_success());
+        assert!(output.output().contains("source_refused"));
+        let schema = tool.input_schema();
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["required"],
+            json!(["action", "product_conversation_id"])
+        );
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(["initial", "observe", "explicit_retry"])
+        );
+        for rejected in ["oneOf", "allOf", "anyOf"] {
+            assert!(
+                schema.get(rejected).is_none(),
+                "provider rejects {rejected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_close_explicit_retry_rejects_untrusted_source_without_legacy_surface() {
+        let (_, coordinator) = application_tools().await;
+        assert!(coordinator
+            .iter()
+            .all(|tool| tool.name() != "retry_close_safely"));
+        let tool = coordinator
+            .into_iter()
+            .find(|tool| tool.name() == "close_conversation")
             .unwrap();
         let output = tool
             .run(
                 json!({
-                    "target_conversation_id": "missing-target",
+                    "action": "explicit_retry",
+                    "product_conversation_id": "missing-target",
                     "attempt_id": "missing-attempt",
                     "failed_run_ordinal": 1
                 }),
@@ -3406,7 +3393,7 @@ mod tests {
             )
             .await;
         assert!(!output.is_success());
-        assert!(output.output().contains("current Global Coordinator"));
+        assert!(output.output().contains("source_refused"));
     }
 
     #[tokio::test]
@@ -3434,7 +3421,7 @@ mod tests {
                 "watch_conversation",
                 "unwatch_conversation",
                 "list_watched_conversations",
-                "retry_close_safely",
+                "close_conversation",
                 "answer_conversation_question",
                 "post_user_question",
                 "withdraw_user_question",

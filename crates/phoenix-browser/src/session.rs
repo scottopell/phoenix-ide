@@ -1505,6 +1505,44 @@ impl BrowserSessionInstanceIdentity {
 type BrowserRetirementSession = (String, Arc<LaunchSlot>, String, BrowserSessionAudience);
 type BrowserActorRetirementSession = (Arc<LaunchSlot>, String, BrowserSessionAudience);
 
+#[derive(Clone)]
+struct CapturedLaunchSlot(Arc<LaunchSlot>);
+
+impl std::fmt::Debug for CapturedLaunchSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CapturedLaunchSlot")
+            .field(&(Arc::as_ptr(&self.0) as usize))
+            .finish()
+    }
+}
+impl PartialEq for CapturedLaunchSlot {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for CapturedLaunchSlot {}
+
+#[derive(Debug, PartialEq, Eq)]
+struct CapturedRetirementInstance {
+    identity: BrowserSessionInstanceIdentity,
+    slot: CapturedLaunchSlot,
+}
+
+// Private capture is the authority seal. Public permit fields are reporting
+// projections only; changing them must never redirect cleanup or rollback.
+#[derive(Debug, PartialEq, Eq)]
+struct BrowserRetirementOriginalIdentity {
+    issuer: uuid::Uuid,
+    work_scope: ResourceScopeKey,
+    actor_session_key: Option<String>,
+    instances: Vec<BrowserSessionInstanceIdentity>,
+    captured_slots: Vec<CapturedRetirementInstance>,
+    generation: BrowserRetirementGeneration,
+    had_entries: bool,
+    deadline: tokio::time::Instant,
+}
+
+#[must_use = "retirement remains fenced until exact completion or explicit rollback"]
 #[derive(Debug, PartialEq, Eq)]
 pub struct BrowserRetirementPermit {
     pub work_scope: ResourceScopeKey,
@@ -1512,12 +1550,46 @@ pub struct BrowserRetirementPermit {
     pub instances: Vec<BrowserSessionInstanceIdentity>,
     generation: BrowserRetirementGeneration,
     had_entries: bool,
+    original: BrowserRetirementOriginalIdentity,
+}
+
+impl BrowserRetirementPermit {
+    #[must_use]
+    pub fn deadline(&self) -> tokio::time::Instant {
+        self.original.deadline
+    }
+}
+
+impl BrowserRetirementPermit {
+    fn projections_match_original(&self) -> bool {
+        self.work_scope == self.original.work_scope
+            && self.actor_session_key == self.original.actor_session_key
+            && self.instances == self.original.instances
+            && self.generation == self.original.generation
+            && self.had_entries == self.original.had_entries
+    }
 }
 
 impl BrowserRetirementPermit {
     #[must_use]
     pub fn generation(&self) -> BrowserRetirementGeneration {
         self.generation
+    }
+}
+
+/// Caller-owned lifetime guard for retirement work. This is only a keepalive:
+/// it grants no source, launch, process, or profile cleanup authority.
+#[derive(Clone)]
+pub struct BrowserRetirementCustody(Arc<dyn Send + Sync + 'static>);
+
+impl BrowserRetirementCustody {
+    #[must_use]
+    pub fn new<T: Send + Sync + 'static>(payload: Arc<T>) -> Self {
+        Self(payload)
+    }
+
+    fn no_op() -> Self {
+        Self::new(Arc::new(()))
     }
 }
 
@@ -1566,35 +1638,120 @@ struct BrowserSessionRegistryState {
 /// plus the live session arc.
 struct KillAttempt {
     done: Notify,
-    result: std::sync::Mutex<Option<Result<(), String>>>,
+    progress: std::sync::Mutex<KillAttemptProgress>,
+}
+
+#[derive(Default)]
+struct KillAttemptProgress {
+    result: Option<Result<(), String>>,
+    custody: Option<Arc<CustodyGroup>>,
+    live_custody: std::sync::Weak<CustodyGroup>,
+}
+
+#[derive(Default)]
+struct CustodyGroup {
+    payloads: std::sync::Mutex<Vec<BrowserRetirementCustody>>,
+}
+
+impl CustodyGroup {
+    fn retain(&self, custody: BrowserRetirementCustody) {
+        self.payloads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(custody);
+    }
+}
+
+// Owned by the spawned task itself, not by a caller awaiting its JoinHandle.
+// A cancelled or panicking task must settle joiners even if its first caller vanished.
+struct KillTaskCompletion {
+    attempt: Arc<KillAttempt>,
+    teardown_failed: Arc<AtomicBool>,
+    scope: ResourceScopeKey,
+    audience: BrowserSessionAudience,
+    sink: Option<BrowserSessionLifecycleSink>,
+}
+
+impl Drop for KillTaskCompletion {
+    fn drop(&mut self) {
+        if self.attempt.result().is_some() {
+            return;
+        }
+        self.teardown_failed.store(true, Ordering::SeqCst);
+        if let Some(sink) = &self.sink {
+            if let Err(error) = sink.send(BrowserSessionLifecycleEvent {
+                work_scope: self.scope.clone(),
+                audience: self.audience.clone(),
+                kind: BrowserSessionLifecycleKind::TeardownFailed,
+            }) {
+                tracing::debug!(%error, "browser lifecycle sink closed");
+            }
+        }
+        self.attempt
+            .complete(Err("browser kill task cancelled or panicked".into()));
+    }
 }
 
 impl KillAttempt {
     fn new() -> Arc<Self> {
+        let custody = Arc::new(CustodyGroup::default());
         Arc::new(Self {
             done: Notify::new(),
-            result: std::sync::Mutex::new(None),
+            progress: std::sync::Mutex::new(KillAttemptProgress {
+                live_custody: Arc::downgrade(&custody),
+                custody: Some(custody),
+                ..KillAttemptProgress::default()
+            }),
         })
     }
 
     fn complete(&self, result: Result<(), String>) -> bool {
-        let mut slot = self
-            .result
+        let mut progress = self
+            .progress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if slot.is_some() {
+        if progress.result.is_some() {
             return false;
         }
-        *slot = Some(result);
-        drop(slot);
+        progress.result = Some(result);
+        let custody = progress.custody.take();
+        drop(progress);
         self.done.notify_waiters();
+        drop(custody);
         true
     }
 
-    fn result(&self) -> Option<Result<(), String>> {
-        self.result
+    fn custody_group(&self) -> Arc<CustodyGroup> {
+        self.progress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .custody
+            .as_ref()
+            .expect("new kill attempt has custody until completion")
+            .clone()
+    }
+
+    fn join_group(&self) -> Option<Arc<CustodyGroup>> {
+        let progress = self
+            .progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        progress.live_custody.upgrade()
+    }
+
+    #[cfg(test)]
+    fn retain_until_complete(&self, custody: BrowserRetirementCustody) {
+        if let Some(group) = self.join_group() {
+            group.retain(custody);
+        }
+        // On an already completed attempt, custody is released outside all locks.
+    }
+
+    fn result(&self) -> Option<Result<(), String>> {
+        self.progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .result
             .clone()
     }
 }
@@ -1606,7 +1763,7 @@ struct ScopedSession {
     session: Arc<LaunchSlot>,
     user_data_key: String,
     destination_retirement_generation: u64,
-    current_kill: std::sync::Mutex<Option<Arc<KillAttempt>>>,
+    current_kill: Arc<StdMutex<Option<Arc<KillAttempt>>>>,
     teardown_failed: Arc<AtomicBool>,
 }
 
@@ -1659,12 +1816,148 @@ pub enum BrowserSessionLookup {
     Retained(BrowserRetainedLaunch),
 }
 
+struct PreparedExistingAttempt {
+    attempt: Arc<KillAttempt>,
+    custody_group: Arc<CustodyGroup>,
+}
+
+enum PreparedRetirementSelection {
+    Existing(PreparedExistingAttempt),
+    New {
+        gate: tokio::sync::OwnedMutexGuard<()>,
+        launch: launch_slot::PreparedLaunchGuards,
+    },
+}
+
+#[must_use = "prepared browser retirement retains physical exclusion until consumed or dropped"]
+pub struct BrowserPreparedRetirement {
+    manager: Arc<BrowserSessionManager>,
+    identity: BrowserSessionInstanceIdentity,
+    slot: CapturedLaunchSlot,
+    scope: ResourceScopeKey,
+    current_kill: Arc<StdMutex<Option<Arc<KillAttempt>>>>,
+    teardown_failed: Arc<AtomicBool>,
+    audience: BrowserSessionAudience,
+    deadline: tokio::time::Instant,
+    selection: PreparedRetirementSelection,
+}
+
+impl std::fmt::Debug for BrowserPreparedRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserPreparedRetirement")
+            .field("identity", &self.identity)
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BrowserPreparedRetirement {
+    /// Consume the admission-time locks and retire exactly the captured slot.
+    pub async fn execute(self, custody: BrowserRetirementCustody) -> BrowserRetirementOutcome {
+        let (gate, guards) = match self.selection {
+            PreparedRetirementSelection::Existing(existing) => {
+                existing.custody_group.retain(custody);
+                return match tokio::time::timeout_at(
+                    self.deadline,
+                    self.manager.wait_for_kill_completion(existing.attempt),
+                )
+                .await
+                {
+                    Ok(Ok(())) => BrowserRetirementOutcome::Retired,
+                    Ok(Err(error)) => BrowserRetirementOutcome::Residual {
+                        reason: error.to_string(),
+                    },
+                    Err(_) => BrowserRetirementOutcome::Residual {
+                        reason: "browser retirement deadline elapsed while joining attempt".into(),
+                    },
+                };
+            }
+            PreparedRetirementSelection::New { gate, launch } => (gate, launch),
+        };
+        if tokio::time::Instant::now() >= self.deadline {
+            drop((gate, guards));
+            return BrowserRetirementOutcome::Residual {
+                reason: "browser retirement deadline elapsed".into(),
+            };
+        }
+        let scope = self.scope.clone();
+        let slot = self.slot.0.clone();
+        let attempt = {
+            let mut current = self
+                .current_kill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let attempt = KillAttempt::new();
+            *current = Some(attempt.clone());
+            attempt
+        };
+        let teardown_failed = self.teardown_failed.clone();
+        let audience = self.audience.clone();
+        self.manager.emit_lifecycle(
+            &scope,
+            audience.clone(),
+            BrowserSessionLifecycleKind::TeardownPending,
+        );
+        let group = attempt.custody_group();
+        group.retain(custody);
+        group.retain(BrowserRetirementCustody::new(Arc::new(gate)));
+        let manager = self.manager.clone();
+        let key = self.identity.session_key.clone();
+        let attempt_task = attempt.clone();
+        let completion = KillTaskCompletion {
+            attempt: attempt_task.clone(),
+            teardown_failed,
+            scope: scope.clone(),
+            audience: audience.clone(),
+            sink: manager.lifecycle_sink.clone(),
+        };
+        let task = tokio::spawn(async move {
+            let _completion = completion;
+            let task_custody = BrowserRetirementCustody::new(group.clone());
+            if let Err(error) = slot
+                .stop_and_delete_prepared(guards.state, guards.ready_session, task_custody)
+                .await
+            {
+                manager
+                    .complete_kill_failure(&key, &attempt_task, error.to_string())
+                    .await;
+                return Err(error);
+            }
+            if let Some(entry) = manager.remove_session_if_current(&key, &slot).await {
+                let removed_scope = entry.scope.clone();
+                let removed_audience = entry.audience();
+                drop(entry);
+                manager.emit_lifecycle(
+                    &removed_scope,
+                    removed_audience,
+                    BrowserSessionLifecycleKind::Inactive,
+                );
+            }
+            attempt_task.complete(Ok(()));
+            Ok::<(), BrowserError>(())
+        });
+        match tokio::time::timeout_at(self.deadline, task).await {
+            Ok(Ok(Ok(()))) => BrowserRetirementOutcome::Retired,
+            Ok(Ok(Err(error))) => BrowserRetirementOutcome::Residual {
+                reason: error.to_string(),
+            },
+            Ok(Err(error)) => BrowserRetirementOutcome::Residual {
+                reason: format!("browser kill task failed: {error}"),
+            },
+            Err(_) => BrowserRetirementOutcome::Residual {
+                reason: "browser retirement deadline elapsed while awaiting cleanup".into(),
+            },
+        }
+    }
+}
+
 /// Global manager for all browser launch reservations and ready sessions.
 pub struct BrowserSessionManager {
     /// Keyed by browser session identity, with per-scope / per-actor retirement
     /// fences in the same lock so exact retirement can close admission without a
     /// check-then-insert race.
     state: Arc<RwLock<BrowserSessionRegistryState>>,
+    retirement_issuer: uuid::Uuid,
     /// Optional lifecycle event sink. Populated by [`RuntimeManager::new`]
     /// so session create/destroy edges flow into per-conversation SSE
     /// streams. Stays `None` for tool-level tests.
@@ -1722,6 +2015,7 @@ impl BrowserSessionManager {
     ) -> Arc<Self> {
         let manager = Arc::new(Self {
             state: Arc::new(RwLock::new(BrowserSessionRegistryState::default())),
+            retirement_issuer: uuid::Uuid::new_v4(),
             lifecycle_sink: sink,
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
@@ -1997,10 +2291,34 @@ impl BrowserSessionManager {
     }
 
     fn permit_fence_key(permit: &BrowserRetirementPermit) -> BrowserRetirementFenceKey {
-        permit.actor_session_key.as_ref().map_or_else(
-            || BrowserRetirementFenceKey::Scope(permit.work_scope.clone()),
+        permit.original.actor_session_key.as_ref().map_or_else(
+            || BrowserRetirementFenceKey::Scope(permit.original.work_scope.clone()),
             |key| BrowserRetirementFenceKey::Session(key.clone()),
         )
+    }
+
+    fn permit_is_authentic(&self, permit: &BrowserRetirementPermit) -> bool {
+        self.retirement_issuer == permit.original.issuer && permit.projections_match_original()
+    }
+
+    fn invalid_permit_outcome() -> BrowserRetirementOutcome {
+        BrowserRetirementOutcome::Residual {
+            reason: "browser retirement permit issuer or identity projection is invalid"
+                .to_string(),
+        }
+    }
+
+    fn current_entry_metadata_matches_identity(
+        entry: &ScopedSession,
+        key: &str,
+        scope: &ResourceScopeKey,
+        expected: &BrowserSessionInstanceIdentity,
+    ) -> bool {
+        entry.scope == *scope
+            && entry.user_data_key == expected.user_data_key
+            && expected.session_key == key
+            && expected.audience == entry.audience()
+            && expected.slot_addr == Arc::as_ptr(&entry.session) as usize
     }
 
     fn current_entry_matches_identity(
@@ -2046,7 +2364,7 @@ impl BrowserSessionManager {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .as_ref()
                     .is_some_and(|current| Arc::ptr_eq(current, attempt));
-                if !is_current {
+                if !is_current || attempt.result().is_some() {
                     return None;
                 }
                 entry.teardown_failed.store(true, Ordering::SeqCst);
@@ -2085,7 +2403,7 @@ impl BrowserSessionManager {
     /// Returns [`BrowserError::AccessDenied`] when the actor cannot control an
     /// existing session, or a browser launch/initialization error when creating one.
     pub async fn get_session_for_actor(
-        &self,
+        self: &Arc<Self>,
         work_scope: &ResourceScopeKey,
         actor: &EffectiveResourceAccess,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
@@ -2148,7 +2466,7 @@ impl BrowserSessionManager {
     /// Returns [`BrowserError`] when Chrome cannot be launched for a
     /// not-yet-existing session.
     pub async fn get_session(
-        &self,
+        self: &Arc<Self>,
         work_scope: &ResourceScopeKey,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
         let system = EffectiveResourceAccess::new("browser-manager", ResourceAuthority::Work);
@@ -2190,80 +2508,8 @@ impl BrowserSessionManager {
         }
     }
 
-    fn spawn_dead_session_teardown(
-        &self,
-        key: String,
-        entry_scope: &ResourceScopeKey,
-        audience: BrowserSessionAudience,
-        dead_slot: Arc<LaunchSlot>,
-        attempt: Arc<KillAttempt>,
-    ) {
-        tracing::warn!(
-            work_scope = %entry_scope,
-            "browser session is dead; tearing down before relaunch"
-        );
-        self.emit_lifecycle(
-            entry_scope,
-            audience,
-            BrowserSessionLifecycleKind::TeardownPending,
-        );
-        let state_handle = self.state.clone();
-        let sink = self.lifecycle_sink.clone();
-        tokio::spawn(async move {
-            if let Err(error) = dead_slot.stop_and_delete().await {
-                let lifecycle = {
-                    let state = state_handle.read().await;
-                    state.sessions.get(&key).and_then(|entry| {
-                        let is_current = entry
-                            .current_kill
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .as_ref()
-                            .is_some_and(|current| Arc::ptr_eq(current, &attempt));
-                        if !is_current {
-                            return None;
-                        }
-                        entry.teardown_failed.store(true, Ordering::SeqCst);
-                        Some((entry.scope.clone(), entry.audience()))
-                    })
-                };
-                if let Some((scope, audience)) = lifecycle {
-                    Self::emit_lifecycle_to(
-                        sink.as_ref(),
-                        &scope,
-                        audience,
-                        BrowserSessionLifecycleKind::TeardownFailed,
-                    );
-                }
-                attempt.complete(Err(error.to_string()));
-                return;
-            }
-            let removed = {
-                let mut state = state_handle.write().await;
-                state
-                    .sessions
-                    .get(&key)
-                    .is_some_and(|entry| Arc::ptr_eq(&entry.session, &dead_slot))
-                    .then(|| state.sessions.remove(&key))
-                    .flatten()
-            };
-            if let Some(removed_entry) = removed {
-                let removed_scope = removed_entry.scope.clone();
-                let removed_audience = removed_entry.audience();
-                drop(removed_entry);
-                Self::emit_lifecycle_to(
-                    sink.as_ref(),
-                    &removed_scope,
-                    removed_audience,
-                    BrowserSessionLifecycleKind::Inactive,
-                );
-            }
-            attempt.complete(Ok(()));
-        });
-    }
-
     async fn get_session_with_creator(
-        &self,
+        self: &Arc<Self>,
         work_scope: &ResourceScopeKey,
         actor: &EffectiveResourceAccess,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
@@ -2303,24 +2549,26 @@ impl BrowserSessionManager {
                         .try_write()
                         .is_ok_and(|mut guard| guard.is_dead());
                     if dead {
-                        let attempt = KillAttempt::new();
-                        *entry
-                            .current_kill
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(attempt.clone());
                         let dead_slot = entry.session.clone();
                         let entry_scope = entry.scope.clone();
-                        let audience = entry.audience();
-                        drop(state);
-                        self.spawn_dead_session_teardown(
-                            key.clone(),
-                            &entry_scope,
-                            audience,
-                            dead_slot,
-                            attempt.clone(),
+                        tracing::warn!(
+                            work_scope = %entry_scope,
+                            "browser session is dead; tearing down before relaunch"
                         );
-                        self.wait_for_kill_completion(attempt).await?;
+                        drop(state);
+                        let manager = Arc::clone(self);
+                        let retirement_key = key.clone();
+                        tokio::spawn(async move {
+                            manager
+                                .retire_dead_session(retirement_key, entry_scope, dead_slot)
+                                .await
+                        })
+                        .await
+                        .map_err(|error| {
+                            BrowserError::OperationFailed(format!(
+                                "dead browser session teardown task failed: {error}"
+                            ))
+                        })??;
                         continue;
                     }
                 }
@@ -2338,7 +2586,7 @@ impl BrowserSessionManager {
                     session: slot.clone(),
                     user_data_key: key.clone(),
                     destination_retirement_generation,
-                    current_kill: StdMutex::new(None),
+                    current_kill: Arc::new(StdMutex::new(None)),
                     teardown_failed: Arc::new(AtomicBool::new(false)),
                 },
             );
@@ -2569,7 +2817,186 @@ impl BrowserSessionManager {
         hit
     }
 
+    /// Prepare retirement of the exact browser instance captured by the permit.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the permit is invalid, the deadline is extended or
+    /// expires, the fence is stale, the captured session or durable launch
+    /// identity changes, or a retirement attempt appears during preparation.
+    pub async fn prepare_retirement_resource(
+        self: &Arc<Self>,
+        permit: &BrowserRetirementPermit,
+        expected: &BrowserSessionInstanceIdentity,
+        deadline: tokio::time::Instant,
+    ) -> Result<BrowserPreparedRetirement, String> {
+        if !self.permit_is_authentic(permit) || deadline > permit.original.deadline {
+            return Err("browser retirement permit is invalid or deadline was extended".into());
+        }
+        let captured = permit
+            .original
+            .captured_slots
+            .iter()
+            .find(|capture| capture.identity == *expected)
+            .ok_or_else(|| {
+                "browser identity is not captured by this retirement permit".to_string()
+            })?;
+        let effective_deadline = deadline.min(permit.original.deadline);
+        let slot = captured.slot.clone();
+        let (scope, current_kill, teardown_failed, audience, existing_attempt) = {
+            let state = tokio::time::timeout_at(effective_deadline, self.state.read())
+                .await
+                .map_err(|_| "browser retirement deadline elapsed".to_string())?;
+            let key = Self::permit_fence_key(permit);
+            if !state.retirements.get(&key).is_some_and(|fence| {
+                fence.fenced && fence.generation == permit.original.generation.get()
+            }) {
+                return Err("browser retirement fence is stale".into());
+            }
+            let entry = state
+                .sessions
+                .get(&expected.session_key)
+                .ok_or_else(|| "captured browser session is absent".to_string())?;
+            if !Arc::ptr_eq(&entry.session, &slot.0)
+                || !Self::current_entry_metadata_matches_identity(
+                    entry,
+                    &expected.session_key,
+                    &permit.original.work_scope,
+                    expected,
+                )
+            {
+                return Err("captured browser session was replaced".into());
+            }
+            let current = entry
+                .current_kill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let existing = current
+                .as_ref()
+                .filter(|attempt| attempt.result().is_none())
+                .and_then(|attempt| {
+                    attempt
+                        .join_group()
+                        .map(|custody_group| PreparedExistingAttempt {
+                            attempt: attempt.clone(),
+                            custody_group,
+                        })
+                });
+            (
+                entry.scope.clone(),
+                entry.current_kill.clone(),
+                entry.teardown_failed.clone(),
+                entry.audience(),
+                existing,
+            )
+        };
+        if let Some(existing) = existing_attempt {
+            return Ok(BrowserPreparedRetirement {
+                manager: self.clone(),
+                identity: expected.clone(),
+                slot,
+                scope,
+                current_kill,
+                teardown_failed,
+                audience,
+                deadline: effective_deadline,
+                selection: PreparedRetirementSelection::Existing(existing),
+            });
+        }
+        let selection = self
+            .prepare_new_retirement_selection(permit, expected, &slot, effective_deadline)
+            .await?;
+        Ok(BrowserPreparedRetirement {
+            manager: self.clone(),
+            identity: expected.clone(),
+            slot,
+            scope,
+            current_kill,
+            teardown_failed,
+            audience,
+            deadline: effective_deadline,
+            selection,
+        })
+    }
+
+    async fn prepare_new_retirement_selection(
+        &self,
+        permit: &BrowserRetirementPermit,
+        expected: &BrowserSessionInstanceIdentity,
+        slot: &CapturedLaunchSlot,
+        effective_deadline: tokio::time::Instant,
+    ) -> Result<PreparedRetirementSelection, String> {
+        // Acquire the exact captured launch and revalidate after waiting for the gate.
+        let gate = tokio::time::timeout_at(
+            effective_deadline,
+            slot.0.retirement_gate.clone().lock_owned(),
+        )
+        .await
+        .map_err(|_| "browser retirement gate wait timed out".to_string())?;
+        let launch_result = tokio::time::timeout_at(effective_deadline, slot.0.lock_for_teardown())
+            .await
+            .map_err(|_| "browser launch slot wait timed out".to_string())?;
+        let launch = launch_slot::PreparedLaunchGuards {
+            state: launch_result.0,
+            ready_session: launch_result.1,
+        };
+        let observed = launch
+            .identity_snapshot()
+            .ok_or_else(|| "captured launch identity is no longer available".to_string())?;
+        if observed != expected.durable {
+            return Err("captured durable launch identity changed".into());
+        }
+        {
+            let state = tokio::time::timeout_at(effective_deadline, self.state.read())
+                .await
+                .map_err(|_| "browser registry validation timed out".to_string())?;
+            let key = Self::permit_fence_key(permit);
+            if !state.retirements.get(&key).is_some_and(|fence| {
+                fence.fenced && fence.generation == permit.original.generation.get()
+            }) {
+                return Err("browser retirement fence is stale".into());
+            }
+            let entry = state
+                .sessions
+                .get(&expected.session_key)
+                .ok_or_else(|| "captured browser session is absent".to_string())?;
+            if !Arc::ptr_eq(&entry.session, &slot.0)
+                || !Self::current_entry_metadata_matches_identity(
+                    entry,
+                    &expected.session_key,
+                    &permit.original.work_scope,
+                    expected,
+                )
+                || observed != expected.durable
+            {
+                return Err("captured browser session or durable identity was replaced".into());
+            }
+            if entry
+                .current_kill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .is_some_and(|attempt| attempt.result().is_none())
+            {
+                return Err("browser retirement attempt appeared while preparing".into());
+            }
+        }
+        Ok(PreparedRetirementSelection::New { gate, launch })
+    }
+
     pub async fn begin_retirement(&self, work_scope: &ResourceScopeKey) -> BrowserRetirementPermit {
+        self.begin_retirement_with_deadline(
+            work_scope,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await
+    }
+
+    pub async fn begin_retirement_with_deadline(
+        &self,
+        work_scope: &ResourceScopeKey,
+        deadline: tokio::time::Instant,
+    ) -> BrowserRetirementPermit {
         let (generation, current): (BrowserRetirementGeneration, Vec<BrowserRetirementSession>) = {
             let mut state = self.state.write().await;
             let generation = Self::mark_retirement_fenced(
@@ -2592,24 +3019,41 @@ impl BrowserSessionManager {
             (generation, current)
         };
         let mut instances = Vec::with_capacity(current.len());
+        let mut captured_slots = Vec::with_capacity(current.len());
         for (session_key, session, user_data_key, audience) in current {
             let durable = session.observed_identity();
             let chrome_pid = durable.chrome_process.map(|process| process.pid);
-            instances.push(BrowserSessionInstanceIdentity {
+            let identity = BrowserSessionInstanceIdentity {
                 session_key,
                 audience,
                 chrome_pid,
                 durable,
                 slot_addr: Arc::as_ptr(&session) as usize,
                 user_data_key,
+            };
+            captured_slots.push(CapturedRetirementInstance {
+                identity: identity.clone(),
+                slot: CapturedLaunchSlot(session),
             });
+            instances.push(identity);
         }
+        let had_entries = !instances.is_empty();
         BrowserRetirementPermit {
             work_scope: work_scope.clone(),
             actor_session_key: None,
-            had_entries: !instances.is_empty(),
-            instances,
+            instances: instances.clone(),
             generation,
+            had_entries,
+            original: BrowserRetirementOriginalIdentity {
+                issuer: self.retirement_issuer,
+                work_scope: work_scope.clone(),
+                actor_session_key: None,
+                instances,
+                captured_slots,
+                generation,
+                had_entries,
+                deadline,
+            },
         }
     }
 
@@ -2617,6 +3061,20 @@ impl BrowserSessionManager {
         &self,
         work_scope: &ResourceScopeKey,
         actor: &EffectiveResourceAccess,
+    ) -> BrowserRetirementPermit {
+        self.begin_retirement_for_actor_with_deadline(
+            work_scope,
+            actor,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+        )
+        .await
+    }
+
+    pub async fn begin_retirement_for_actor_with_deadline(
+        &self,
+        work_scope: &ResourceScopeKey,
+        actor: &EffectiveResourceAccess,
+        deadline: tokio::time::Instant,
     ) -> BrowserRetirementPermit {
         let actor_key = session_key(work_scope, actor);
         let (generation, current): (
@@ -2637,27 +3095,48 @@ impl BrowserSessionManager {
             });
             (generation, current)
         };
-        let instances = match current {
+        let instances = match current.as_ref() {
             Some((session, user_data_key, audience)) => {
                 let durable = session.observed_identity();
                 let chrome_pid = durable.chrome_process.map(|process| process.pid);
                 vec![BrowserSessionInstanceIdentity {
                     session_key: actor_key.clone(),
-                    audience,
+                    audience: audience.clone(),
                     chrome_pid,
                     durable,
-                    slot_addr: Arc::as_ptr(&session) as usize,
-                    user_data_key,
+                    slot_addr: Arc::as_ptr(session) as usize,
+                    user_data_key: user_data_key.clone(),
                 }]
             }
             None => Vec::new(),
         };
+        let captured_slots = current
+            .as_ref()
+            .zip(instances.first())
+            .map(|((slot, _, _), identity)| {
+                vec![CapturedRetirementInstance {
+                    identity: identity.clone(),
+                    slot: CapturedLaunchSlot(slot.clone()),
+                }]
+            })
+            .unwrap_or_default();
+        let had_entries = !instances.is_empty();
         BrowserRetirementPermit {
             work_scope: work_scope.clone(),
-            actor_session_key: Some(actor_key),
-            had_entries: !instances.is_empty(),
-            instances,
+            actor_session_key: Some(actor_key.clone()),
+            instances: instances.clone(),
             generation,
+            had_entries,
+            original: BrowserRetirementOriginalIdentity {
+                issuer: self.retirement_issuer,
+                work_scope: work_scope.clone(),
+                actor_session_key: Some(actor_key),
+                instances,
+                captured_slots,
+                generation,
+                had_entries,
+                deadline,
+            },
         }
     }
 
@@ -2665,6 +3144,9 @@ impl BrowserSessionManager {
         &self,
         permit: &BrowserRetirementPermit,
     ) -> BrowserRetirementOutcome {
+        if !self.permit_is_authentic(permit) {
+            return Self::invalid_permit_outcome();
+        }
         let state = self.state.read().await;
         if !state
             .retirements
@@ -2731,20 +3213,41 @@ impl BrowserSessionManager {
             .flatten()
     }
 
+    async fn retire_dead_session(
+        self: &Arc<Self>,
+        key: String,
+        scope: ResourceScopeKey,
+        slot: Arc<LaunchSlot>,
+    ) -> Result<(), BrowserError> {
+        match self
+            .spawn_kill_session_by_key(key, scope, None, Some(slot), None)
+            .await
+        {
+            KillSessionOutcome::Absent => Ok(()),
+            KillSessionOutcome::AlreadyRequested { attempt } => {
+                self.wait_for_kill_completion(attempt).await
+            }
+            KillSessionOutcome::Started {
+                attempt, handle, ..
+            } => {
+                if let Err(error) = handle.await {
+                    tracing::warn!(%error, "browser dead-session teardown task failed");
+                }
+                self.wait_for_kill_completion(attempt).await
+            }
+        }
+    }
+
     /// Kill the session belonging to `work_scope` (called from the cleanup
     /// cascade on archive/abandon/mark-merged/delete of the chain leaf).
     ///
     /// Force-closes the underlying Chrome process via
-    /// [`BrowserSession::terminate`] BEFORE dropping the map's `Arc`.
+    /// [`BrowserSession::terminate`] before dropping the map's `Arc`.
     /// Other holders of the session `Arc` (notably the `browser-view`
-    /// WebSocket viewer, which keeps an `Arc` for the duration of its
-    /// connection) would otherwise prevent `Drop for BrowserSession`
-    /// from running, leaving the OS chromium process alive after the
-    /// cascade claimed to have killed it.
+    /// WebSocket viewer) would otherwise keep the OS process alive.
     ///
-    /// The sessions write lock is released as soon as the entry is
-    /// removed; `terminate` and the awaited `remove_dir_all` run
-    /// lock-free so concurrent `get_session` / `get_existing` /
+    /// The sessions write lock is released before teardown and profile cleanup
+    /// so concurrent lookups and unrelated scopes remain responsive.
     /// `is_active` calls on unrelated scopes are not blocked for the
     /// duration of fs deletion + Chrome shutdown.
     #[allow(clippy::too_many_lines)]
@@ -2753,15 +3256,57 @@ impl BrowserSessionManager {
         key: String,
         work_scope: ResourceScopeKey,
         expected: Option<BrowserSessionInstanceIdentity>,
+        expected_slot: Option<Arc<LaunchSlot>>,
+        mut custody: Option<BrowserRetirementCustody>,
     ) -> KillSessionOutcome {
-        let (session, attempt, audience, lifecycle_kind) = {
-            let state = self.state.write().await;
+        // Existing attempts must remain joinable without waiting for the
+        // physical retirement gate: the active task may itself be waiting on
+        // slot/session custody held by this caller.
+        let slot = {
+            let state = self.state.read().await;
             let Some(entry) = state.sessions.get(&key) else {
                 return KillSessionOutcome::Absent;
             };
             if expected
                 .as_ref()
                 .is_some_and(|expected| !Self::current_entry_matches_identity(entry, expected))
+                || expected_slot
+                    .as_ref()
+                    .is_some_and(|expected| !Arc::ptr_eq(&entry.session, expected))
+            {
+                return KillSessionOutcome::Absent;
+            }
+            let current = entry
+                .current_kill
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some((attempt, group)) = current
+                .as_ref()
+                .and_then(|attempt| attempt.join_group().map(|group| (attempt.clone(), group)))
+            {
+                drop(current);
+                drop(state);
+                tracing::debug!(work_scope = %work_scope, "browser kill already requested");
+                if let Some(custody) = custody.take() {
+                    group.retain(custody);
+                }
+                return KillSessionOutcome::AlreadyRequested { attempt };
+            }
+            entry.session.clone()
+        };
+        let retirement_gate = slot.retirement_gate.clone().lock_owned().await;
+        let (session, attempt, audience, lifecycle_kind, teardown_failed) = {
+            let state = self.state.write().await;
+            let Some(entry) = state.sessions.get(&key) else {
+                return KillSessionOutcome::Absent;
+            };
+            if !Arc::ptr_eq(&entry.session, &slot)
+                || expected
+                    .as_ref()
+                    .is_some_and(|expected| !Self::current_entry_matches_identity(entry, expected))
+                || expected_slot
+                    .as_ref()
+                    .is_some_and(|expected| !Arc::ptr_eq(&entry.session, expected))
             {
                 return KillSessionOutcome::Absent;
             }
@@ -2769,14 +3314,17 @@ impl BrowserSessionManager {
                 .current_kill
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(attempt) = current
+            if let Some((attempt, group)) = current
                 .as_ref()
-                .filter(|attempt| attempt.result().is_none())
+                .and_then(|attempt| attempt.join_group().map(|group| (attempt.clone(), group)))
             {
+                drop(current);
+                drop(state);
                 tracing::debug!(work_scope = %work_scope, "browser kill already requested");
-                return KillSessionOutcome::AlreadyRequested {
-                    attempt: attempt.clone(),
-                };
+                if let Some(custody) = custody.take() {
+                    group.retain(custody);
+                }
+                return KillSessionOutcome::AlreadyRequested { attempt };
             }
             let attempt = KillAttempt::new();
             *current = Some(attempt.clone());
@@ -2791,20 +3339,42 @@ impl BrowserSessionManager {
                     BrowserSessionAudience::Conversation(entry.creator_conversation_id.clone())
                 }
             };
-            (entry.session.clone(), attempt, audience, lifecycle_kind)
+            (
+                entry.session.clone(),
+                attempt,
+                audience,
+                lifecycle_kind,
+                entry.teardown_failed.clone(),
+            )
         };
-        self.emit_lifecycle(&work_scope, audience, lifecycle_kind);
+        let group = attempt.custody_group();
+        if let Some(custody) = custody {
+            group.retain(custody);
+        }
+        // Blocking profile cleanup can outlive the async task. Physical
+        // exclusion must follow that actual cleanup, not just its waiter.
+        group.retain(BrowserRetirementCustody::new(Arc::new(retirement_gate)));
+        self.emit_lifecycle(&work_scope, audience.clone(), lifecycle_kind);
 
         let requested_scope = work_scope;
         let manager = Arc::clone(self);
         let task_attempt = attempt.clone();
+        let completion = KillTaskCompletion {
+            attempt: attempt.clone(),
+            teardown_failed,
+            scope: requested_scope.clone(),
+            audience,
+            sink: self.lifecycle_sink.clone(),
+        };
         KillSessionOutcome::Started {
             key: key.clone(),
             attempt,
             handle: tokio::spawn(async move {
+                let _completion = completion;
+                let task_custody = BrowserRetirementCustody::new(group.clone());
                 tracing::info!(work_scope = %requested_scope, "Killing browser session");
 
-                if let Err(error) = session.stop_and_delete().await {
+                if let Err(error) = session.stop_and_delete(task_custody).await {
                     manager
                         .complete_kill_failure(&key, &task_attempt, error.to_string())
                         .await;
@@ -2840,6 +3410,25 @@ impl BrowserSessionManager {
         self: &Arc<Self>,
         permit: &BrowserRetirementPermit,
     ) -> BrowserRetirementOutcome {
+        self.complete_retirement_with_custody(permit, BrowserRetirementCustody::no_op())
+            .await
+    }
+
+    /// Retire under a caller-owned keepalive, carried through actual kill and
+    /// blocking profile cleanup (including late callers joining an active kill).
+    /// Success means browser cleanup and registry bookkeeping finished, not that
+    /// arbitrary custody destructors have run. After an abnormal kill-task exit,
+    /// a surviving blocking cleanup may still hold the custody group. Custody
+    /// does not authorize a launch or deletion, and does not cancel or revoke
+    /// any in-flight browser work.
+    pub async fn complete_retirement_with_custody(
+        self: &Arc<Self>,
+        permit: &BrowserRetirementPermit,
+        custody: BrowserRetirementCustody,
+    ) -> BrowserRetirementOutcome {
+        if !self.permit_is_authentic(permit) {
+            return Self::invalid_permit_outcome();
+        }
         let matches_current_generation = {
             let state = self.state.read().await;
             state
@@ -2858,6 +3447,8 @@ impl BrowserSessionManager {
                         expected.session_key.clone(),
                         permit.work_scope.clone(),
                         Some(expected.clone()),
+                        None,
+                        Some(custody.clone()),
                     )
                     .await
                 {
@@ -2890,6 +3481,7 @@ impl BrowserSessionManager {
         }
 
         let verified = self.verify_exact_absence(permit).await;
+        let _ = &custody.0;
         if !failures.is_empty() {
             return BrowserRetirementOutcome::Residual {
                 reason: failures.join("; "),
@@ -2923,9 +3515,12 @@ impl BrowserSessionManager {
             hook.release.notified().await;
         }
         let mut state = self.state.write().await;
+        if !self.permit_is_authentic(&permit) {
+            return;
+        }
         let key = Self::permit_fence_key(&permit);
         if state.retirements.get(&key).is_some_and(|retirement| {
-            retirement.fenced && retirement.generation == permit.generation.get()
+            retirement.fenced && retirement.generation == permit.original.generation.get()
         }) {
             Self::reopen_retirement(&mut state, &key);
         }
@@ -3151,7 +3746,10 @@ impl BrowserSessionManager {
             };
             if let Some(scope) = scope {
                 tracing::info!(scope_key = %key, "Cleaning up idle browser session");
-                match self.spawn_kill_session_by_key(key, scope, None).await {
+                match self
+                    .spawn_kill_session_by_key(key, scope, None, None, None)
+                    .await
+                {
                     KillSessionOutcome::Absent => {}
                     KillSessionOutcome::Started {
                         key,
@@ -3310,6 +3908,7 @@ impl Default for BrowserSessionManager {
     fn default() -> Self {
         Self {
             state: Arc::new(RwLock::new(BrowserSessionRegistryState::default())),
+            retirement_issuer: uuid::Uuid::new_v4(),
             lifecycle_sink: None,
             scope_liveness_hook: std::sync::OnceLock::new(),
             shutting_down: AtomicBool::new(false),
@@ -3595,7 +4194,7 @@ mod lifecycle_hook_tests {
 
     #[tokio::test]
     async fn begin_retirement_fences_scope_admission_until_reopened() {
-        let manager = BrowserSessionManager::default();
+        let manager = Arc::new(BrowserSessionManager::default());
         let scope = scope("browser-retirement-fence");
 
         let permit = manager.begin_retirement(&scope).await;
@@ -3615,7 +4214,7 @@ mod lifecycle_hook_tests {
 
     #[tokio::test]
     async fn begin_retirement_fences_actor_admission_until_reopened() {
-        let manager = BrowserSessionManager::default();
+        let manager = Arc::new(BrowserSessionManager::default());
         let scope = scope("browser-actor-retirement-fence");
         let actor = EffectiveResourceAccess::new("restricted-child", ResourceAuthority::Restricted);
 
@@ -3665,6 +4264,74 @@ mod lifecycle_hook_tests {
 
         assert_eq!(scope_permit.work_scope, scope);
         assert_eq!(actor_permit.work_scope, scope);
+    }
+
+    #[tokio::test]
+    async fn retirement_permit_from_matching_foreign_fence_has_no_authority() {
+        let issuer = Arc::new(BrowserSessionManager::default());
+        let foreign = Arc::new(BrowserSessionManager::default());
+        let scope = scope("browser-foreign-retirement-permit");
+        let permit = issuer.begin_retirement(&scope).await;
+        let matching_foreign_fence = foreign.begin_retirement(&scope).await;
+
+        assert_eq!(permit.generation().get(), 1);
+        assert_eq!(permit.generation(), matching_foreign_fence.generation());
+        assert_ne!(permit, matching_foreign_fence);
+        assert_eq!(
+            foreign.verify_exact_absence(&permit).await,
+            BrowserSessionManager::invalid_permit_outcome()
+        );
+        assert_eq!(
+            foreign.complete_retirement(&permit).await,
+            super::BrowserRetirementOutcome::Residual {
+                reason: "browser retirement permit issuer or identity projection is invalid"
+                    .to_string()
+            }
+        );
+        foreign.reopen_after_permit(permit).await;
+        assert!(issuer.is_retirement_fenced(&scope).await);
+        assert!(foreign.is_retirement_fenced(&scope).await);
+    }
+
+    #[tokio::test]
+    async fn mutated_retirement_projection_cannot_redirect_completion_or_reopen() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let original_scope = scope("browser-original-retirement-projection");
+        let redirected_scope = scope("browser-redirected-retirement-projection");
+        let mut permit = manager.begin_retirement(&original_scope).await;
+        let _redirected_fence = manager.begin_retirement(&redirected_scope).await;
+        permit.work_scope = redirected_scope.clone();
+
+        assert_eq!(
+            manager.complete_retirement(&permit).await,
+            super::BrowserRetirementOutcome::Residual {
+                reason: "browser retirement permit issuer or identity projection is invalid"
+                    .to_string()
+            }
+        );
+        manager.reopen_after_permit(permit).await;
+        assert!(manager.is_retirement_fenced(&original_scope).await);
+        assert!(manager.is_retirement_fenced(&redirected_scope).await);
+    }
+
+    #[tokio::test]
+    async fn stale_retirement_generation_spoof_cannot_complete_or_reopen_newer_fence() {
+        let manager = Arc::new(BrowserSessionManager::default());
+        let scope = scope("browser-spoofed-retirement-generation");
+        let mut stale = manager.begin_retirement(&scope).await;
+        let current = manager.begin_retirement(&scope).await;
+        assert_ne!(stale.generation, current.generation);
+        stale.generation = current.generation;
+
+        assert_eq!(
+            manager.complete_retirement(&stale).await,
+            super::BrowserRetirementOutcome::Residual {
+                reason: "browser retirement permit issuer or identity projection is invalid"
+                    .to_string()
+            }
+        );
+        manager.reopen_after_permit(stale).await;
+        assert!(manager.is_retirement_fenced(&scope).await);
     }
 
     #[tokio::test]
@@ -3822,9 +4489,25 @@ mod lifecycle_hook_tests {
         assert!(!manager.is_active(&scope).await);
     }
 
+    fn real_chrome_lifecycle_tests_configured() -> bool {
+        static INSTALL_SHIM: std::sync::Once = std::sync::Once::new();
+        if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
+            return false;
+        }
+        INSTALL_SHIM.call_once(|| {
+            let executable = std::env::var_os("PHOENIX_TEST_CHROME_SHIM_EXECUTABLE")
+                .expect("real Chrome lifecycle tests require a matched Chrome exec shim");
+            crate::process_group::ChromeExecShim::install_external_qualification_executable(
+                std::path::Path::new(&executable),
+            )
+            .expect("install real Chrome lifecycle test shim");
+        });
+        true
+    }
+
     #[tokio::test]
     async fn shutdown_all_waits_for_process_exit_and_profile_removal() {
-        if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
+        if !real_chrome_lifecycle_tests_configured() {
             return;
         }
 
@@ -3836,6 +4519,8 @@ mod lifecycle_hook_tests {
         let _ = std::fs::remove_dir_all(&profile);
         let manager = BrowserSessionManager::new();
         let session = manager.get_session(&scope).await.expect("launch browser");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(session.read().await.owned_group.is_some());
 
         manager.shutdown_all().await.expect("browser shutdown");
 
@@ -3855,13 +4540,15 @@ mod lifecycle_hook_tests {
 
     #[tokio::test]
     async fn get_session_evicts_and_relaunches_after_chrome_process_exits() {
-        if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
+        if !real_chrome_lifecycle_tests_configured() {
             return;
         }
 
         let scope = ResourceScopeKey::Work(WorkScopeId::new());
         let manager = BrowserSessionManager::new();
         let first = manager.get_session(&scope).await.expect("launch first");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(first.read().await.owned_group.is_some());
         let first_pid = first
             .read()
             .await
@@ -3869,18 +4556,25 @@ mod lifecycle_hook_tests {
             .expect("chrome process identity")
             .pid;
 
-        // Kill the Chrome process externally so the cached session becomes dead.
-        #[cfg(unix)]
-        unsafe {
-            libc::kill(i32::try_from(first_pid).unwrap(), libc::SIGKILL);
-        }
-        let _ = first
-            .write()
-            .await
-            .browser
-            .wait()
-            .await
-            .expect("await killed Chrome exit");
+        // Kill only the root; retirement must drain the owned group before reaping it.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert_eq!(
+            unsafe { libc::kill(i32::try_from(first_pid).unwrap(), libc::SIGKILL) },
+            0,
+            "kill Chrome root"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while first
+                .write()
+                .await
+                .is_running()
+                .expect("observe Chrome root")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("observe killed Chrome root exit without reaping");
         assert!(
             first.write().await.is_dead(),
             "killed Chrome process must be detected as dead"
@@ -3890,6 +4584,8 @@ mod lifecycle_hook_tests {
             .get_session(&scope)
             .await
             .expect("relaunch after Chrome exit");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(second.read().await.owned_group.is_some());
         assert!(
             !Arc::ptr_eq(&first, &second),
             "dead session must be replaced with a fresh session"
@@ -3910,13 +4606,15 @@ mod lifecycle_hook_tests {
 
     #[tokio::test]
     async fn get_session_evicts_and_relaunches_when_cdp_handler_exits() {
-        if std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none() {
+        if !real_chrome_lifecycle_tests_configured() {
             return;
         }
 
         let scope = ResourceScopeKey::Work(WorkScopeId::new());
         let manager = BrowserSessionManager::new();
         let first = manager.get_session(&scope).await.expect("launch first");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(first.read().await.owned_group.is_some());
 
         first.read().await.handler_task.abort();
         let deadline = Instant::now() + std::time::Duration::from_secs(2);
@@ -3935,6 +4633,8 @@ mod lifecycle_hook_tests {
             .get_session(&scope)
             .await
             .expect("relaunch after CDP handler exit");
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        assert!(second.read().await.owned_group.is_some());
         assert!(
             !Arc::ptr_eq(&first, &second),
             "session with exited CDP handler must be replaced"

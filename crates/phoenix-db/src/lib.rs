@@ -38,6 +38,7 @@ pub use coordinator_watches::{
 };
 pub use federation_peers::FederationPeerConnection;
 mod ddl;
+mod executing_source;
 mod in_memory_template;
 mod reminders;
 mod request_capacity;
@@ -71,6 +72,7 @@ pub use automatic_continuation_settings::{
     AutomaticContinuationSettings, AutomaticContinuationTarget,
     ResolvedAutomaticContinuationAggregate,
 };
+pub mod native_close;
 mod native_continuation;
 pub use native_continuation::{
     CoordinatorContinuationOpening, CurrentCoordinatorContinuationRequest,
@@ -605,6 +607,7 @@ pub(crate) async fn persist_continuation_start_tx(
     if updated.rows_affected() == 0 {
         return Ok(ContinuationCommitOutcome::Stale);
     }
+    native_close::fence_native_retry_sources_tx(tx, conversation_id, target_state).await?;
     Ok(ContinuationCommitOutcome::Applied)
 }
 
@@ -688,6 +691,7 @@ pub(crate) async fn commit_continuation_tx(
     if updated.rows_affected() == 0 {
         return Ok(ContinuationCommitOutcome::Stale);
     }
+    native_close::fence_native_retry_sources_tx(tx, conversation_id, completed_state).await?;
     sqlx::query("UPDATE coordinator_watch_events SET delivery_state = 'suppressed', continuation_state = 'suppressed' WHERE source_transcript_id = ?1 AND delivery_state = 'pending' AND terminal_kind = 'failed' AND terminal_reason = 'continuation summary failed'")
         .bind(conversation_id).execute(&mut **tx).await?;
     admit_automatic_continuation_tx(
@@ -807,6 +811,9 @@ pub(crate) async fn reconcile_legacy_half_committed_continuation_tx(
     .bind(persisted_json)
     .execute(&mut **tx)
     .await?;
+    if updated.rows_affected() == 1 {
+        native_close::fence_native_retry_sources_tx(tx, conversation_id, &target).await?;
+    }
     Ok((updated.rows_affected() == 1).then_some(summary))
 }
 
@@ -1763,6 +1770,7 @@ impl SteeringCapacityTestControl {
 }
 
 pub struct Database {
+    authority_identity: std::sync::Arc<()>,
     pool: SqlitePool,
     slack_gateway_wakeup: std::sync::Arc<tokio::sync::Notify>,
     goal_version_committed:
@@ -1800,6 +1808,7 @@ pub struct Database {
 impl Clone for Database {
     fn clone(&self) -> Self {
         Self {
+            authority_identity: self.authority_identity.clone(),
             pool: self.pool.clone(),
             slack_gateway_wakeup: self.slack_gateway_wakeup.clone(),
             goal_version_committed: self.goal_version_committed.clone(),
@@ -1986,6 +1995,16 @@ const PROMPT_TAIL_AFTER_SQL: &str =
      ORDER BY sequence_id ASC";
 
 impl Database {
+    /// Returns whether these handles share the same database authority identity.
+    ///
+    /// A clone shares its original handle's identity. Separately constructed
+    /// handles have distinct identities even when they point to the same path;
+    /// path equality does not establish shared authority.
+    #[must_use]
+    pub fn shares_authority_with(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.authority_identity, &other.authority_identity)
+    }
+
     /// Access the underlying connection pool (for migrations and testing).
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
@@ -2084,6 +2103,7 @@ impl Database {
         sqlite_workload_collector: SqliteWorkloadCollector,
     ) -> Self {
         Self {
+            authority_identity: std::sync::Arc::new(()),
             pool,
             slack_gateway_wakeup: std::sync::Arc::new(tokio::sync::Notify::new()),
             goal_version_committed: tokio::sync::broadcast::channel(128).0,
@@ -2557,6 +2577,7 @@ impl Database {
                      WHERE obligation.attempt_id = ?1
                        AND obligation.topology_sealed = 1
                        AND captured.scope = ?2
+                       AND (obligation.native_managed = 0 OR obligation.phase <> 'completed')
                        AND (obligation.phase <> 'completed' OR (
                            obligation.close_outcome IN ('close_incomplete', 'archived_cleanup_attention')
                            AND EXISTS (SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
@@ -2624,14 +2645,32 @@ impl Database {
                 )));
             }
         }
+        let outcome =
+            Self::retire_work_scope_lifecycle_tx(&mut tx, precondition, reason, close_attempt_id)
+                .await?;
+        if matches!(outcome, WorkScopeRetirementOutcome::Retired) {
+            tx.commit().await?;
+        } else {
+            tx.rollback().await?;
+        }
+        Ok(outcome)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn retire_work_scope_lifecycle_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        precondition: WorkScopeRetirementPrecondition,
+        reason: &str,
+        close_attempt_id: Option<&CloseAttemptId>,
+    ) -> DbResult<WorkScopeRetirementOutcome> {
+        let scope_id = precondition.scope_id();
         let lifecycle =
             sqlx::query_scalar::<_, String>("SELECT lifecycle FROM work_scopes WHERE id = ?1")
                 .bind(scope_id.as_str())
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?
                 .ok_or_else(|| DbError::Serialization(format!("unknown work scope {scope_id}")))?;
         if lifecycle == "retired" {
-            tx.rollback().await?;
             return Ok(WorkScopeRetirementOutcome::AlreadyRetired);
         }
 
@@ -2645,19 +2684,17 @@ impl Database {
              )",
         )
         .bind(scope_id.as_str())
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if unresolved_product_ownership {
-            tx.rollback().await?;
             return Ok(WorkScopeRetirementOutcome::Blocked(
                 WorkScopeRetirementBlocker::UnresolvedProductConversationOwnership,
             ));
         }
 
         if let Some(blocker) =
-            Self::conversation_retirement_blocker(&mut tx, scope_id, close_attempt_id).await?
+            Self::conversation_retirement_blocker(tx, scope_id, close_attempt_id).await?
         {
-            tx.rollback().await?;
             return Ok(WorkScopeRetirementOutcome::Blocked(blocker));
         }
 
@@ -2681,11 +2718,10 @@ impl Database {
             if sqlx::query_scalar::<_, i64>(query)
                 .bind(scope_id.as_str())
                 .bind(close_attempt_id.map(CloseAttemptId::as_str))
-                .fetch_one(&mut *tx)
+                .fetch_one(&mut **tx)
                 .await?
                 != 0
             {
-                tx.rollback().await?;
                 return Ok(WorkScopeRetirementOutcome::Blocked(blocker));
             }
         }
@@ -2699,13 +2735,11 @@ impl Database {
         .bind(&now)
         .bind(reason)
         .bind(scope_id.as_str())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if result.rows_affected() != 1 {
-            tx.rollback().await?;
             return Ok(WorkScopeRetirementOutcome::AlreadyRetired);
         }
-        tx.commit().await?;
         Ok(WorkScopeRetirementOutcome::Retired)
     }
 
@@ -6039,6 +6073,14 @@ impl Database {
             tx.rollback().await?;
             return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
         }
+        native_close::fence_native_retry_sources_tx(
+            &mut tx,
+            conversation_id,
+            &ConvState::CreationCancelled {
+                job_id: job_id.clone(),
+            },
+        )
+        .await?;
         let state = serde_json::to_string(&ConvState::CreationCancelled {
             job_id: job_id.clone(),
         })
@@ -6194,6 +6236,8 @@ impl Database {
             tx.rollback().await?;
             return Ok(CreationCasOutcome::ClaimLost);
         }
+        native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, &ConvState::Idle)
+            .await?;
         let state_updated = sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
              WHERE id = ?4",
@@ -6794,6 +6838,16 @@ impl Database {
             )
             .bind(job_id)
             .fetch_one(&mut *tx)
+            .await?;
+            native_close::fence_native_retry_sources_tx(
+                &mut tx,
+                &source,
+                &ConvState::CreationFailed {
+                    job_id: job_id.to_string(),
+                    error: error.to_string(),
+                    error_kind: error_kind.clone(),
+                },
+            )
             .await?;
             crate::coordinator_watches::record_creation_event_tx(
                 &mut tx,
@@ -7819,7 +7873,6 @@ impl Database {
         state: &ConvState,
         state_updated_at: DateTime<Utc>,
     ) -> DbResult<()> {
-        let state_json = serde_json::to_string(state).unwrap();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let previous_kind: String =
             sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
@@ -7829,20 +7882,7 @@ impl Database {
 
         coordinator_watches::record_wait_entry_tx(&mut tx, id, state).await?;
 
-        let result = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
-        )
-        .bind(&state_json)
-        .bind(conv_state_kind(state))
-        .bind(state_updated_at.to_rfc3339())
-        .bind(Utc::now().to_rfc3339())
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(id.to_string()));
-        }
+        write_conversation_state_tx(&mut tx, id, state, state_updated_at).await?;
         if previous_kind != conv_state_kind(state) {
             record_initial_execution_outcome_tx(&mut tx, id, state).await?;
         }
@@ -8308,6 +8348,7 @@ impl Database {
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
+        native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, state).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -8384,6 +8425,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         if projection_changed == 1 {
+            native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, state).await?;
             crate::coordinator_watches::record_steering_event_tx(
                 &mut tx,
                 source_kind,
@@ -8444,6 +8486,7 @@ impl Database {
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
+        native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, state).await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -8607,6 +8650,7 @@ impl Database {
                 .bind(id).bind(&messages[0].message_id).execute(&mut *tx).await?;
         }
 
+        native_close::fence_native_retry_sources_tx(&mut tx, id, state).await?;
         let updated = sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4
@@ -9340,6 +9384,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         if let Some((approval_message, state, state_updated_at)) = settlement {
+            native_close::fence_native_retry_sources_tx(&mut tx, conversation_id, state).await?;
             insert_message_tx(&mut tx, approval_message).await?;
             sqlx::query(
                 "INSERT INTO approval_request_obligations
@@ -9588,6 +9633,7 @@ impl Database {
         .execute(&mut *tx)
         .await?;
         let source_state = ConvState::Idle;
+        native_close::fence_native_retry_sources_tx(&mut tx, parent_id, &source_state).await?;
         sqlx::query(
             "UPDATE conversations
              SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
@@ -11413,6 +11459,7 @@ impl Database {
                     "Model replan does not match the retained capacity operation".to_string(),
                 ));
             }
+            native_close::fence_native_retry_sources_tx(&mut tx, id, &next_state).await?;
             sqlx::query("UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3 WHERE id = ?4")
                 .bind(serde_json::to_string(&next_state).map_err(|error| DbError::Serialization(error.to_string()))?).bind(conv_state_kind(&next_state)).bind(now.to_rfc3339()).bind(id).execute(&mut *tx).await?;
             record_initial_execution_outcome_tx(&mut tx, id, &next_state).await?;
@@ -12545,8 +12592,7 @@ impl Database {
                     ..
                 }
             ) {
-                self.update_conversation_state_at(&id, &ConvState::Idle, now)
-                    .await?;
+                self.update_startup_recovered_state(&id, &ConvState::Idle, now).await?;
             }
         }
 
@@ -12564,13 +12610,48 @@ impl Database {
         Ok(())
     }
 
+    async fn update_startup_recovered_state(
+        &self,
+        id: &str,
+        state: &ConvState,
+        now: DateTime<Utc>,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let previous_kind: String =
+            sqlx::query_scalar("SELECT state_kind FROM conversations WHERE id = ?1")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
+        coordinator_watches::record_wait_entry_tx(&mut tx, id, state).await?;
+        native_close::recover_native_retry_sources_tx(&mut tx, id, state).await?;
+        sqlx::query(
+            "UPDATE conversations SET state = ?1, state_kind = ?2,
+             state_updated_at = ?3, updated_at = ?3 WHERE id = ?4",
+        )
+        .bind(
+            serde_json::to_string(state)
+                .map_err(|error| DbError::Serialization(error.to_string()))?,
+        )
+        .bind(conv_state_kind(state))
+        .bind(now.to_rfc3339())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if previous_kind != conv_state_kind(state) {
+            record_initial_execution_outcome_tx(&mut tx, id, state).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn reset_restartable_conversations(
         &self,
         idle_state: &str,
         now: DateTime<Utc>,
     ) -> DbResult<()> {
-        sqlx::query(
-            "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let reset_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM conversations
              WHERE state_kind NOT IN ('idle', 'provisioning', 'completed', 'failed', 'creation_failed', 'creation_cancelled', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'server_overload_retrying', 'awaiting_continuation', 'recoverable_continuation_failure', 'awaiting_recovery', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')
                AND NOT EXISTS (
                    SELECT 1
@@ -12634,11 +12715,31 @@ impl Database {
                    )
                )",
         )
-        .bind(idle_state)
-        .bind(conv_state_kind(&ConvState::Idle))
-        .bind(now.to_rfc3339())
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        for id in &reset_ids {
+            native_close::recover_native_retry_sources_tx(&mut tx, id, &ConvState::Idle).await?;
+        }
+        let now = now.to_rfc3339();
+        for ids in reset_ids.chunks(500) {
+            let mut update = sqlx::QueryBuilder::<Sqlite>::new("UPDATE conversations SET state = ");
+            update
+                .push_bind(idle_state)
+                .push(", state_kind = ")
+                .push_bind(conv_state_kind(&ConvState::Idle))
+                .push(", state_updated_at = ")
+                .push_bind(&now)
+                .push(", updated_at = ")
+                .push_bind(&now)
+                .push(" WHERE id IN (");
+            let mut separated = update.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            separated.push_unseparated(")");
+            update.build().execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -12877,7 +12978,7 @@ impl Database {
                             },
                         });
                 if !sub_agent_outcomes.contains_key(&agent.agent_id) {
-                    sqlx::query(
+                    let updated = sqlx::query(
                         "UPDATE conversations
                          SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
                          WHERE id = ?4
@@ -12891,6 +12992,14 @@ impl Database {
                     .bind(&agent.agent_id)
                     .execute(&mut *tx)
                     .await?;
+                    if updated.rows_affected() == 1 {
+                        native_close::recover_native_retry_sources_tx(
+                            &mut tx,
+                            &agent.agent_id,
+                            &interrupted,
+                        )
+                        .await?;
+                    }
                 }
                 let lifecycle = sqlx::query(
                     "UPDATE sub_agent_runs
@@ -13092,6 +13201,8 @@ impl Database {
                 "parent {conversation_id} changed during recovered fan-in"
             )));
         }
+        native_close::recover_native_retry_sources_tx(&mut tx, conversation_id, destination)
+            .await?;
         for result in results {
             use phoenix_core::domain::sm_state::SubAgentOutcome;
             let cause = match &result.outcome {
@@ -13383,7 +13494,7 @@ impl Database {
                             error: "Sub-agent interrupted by server restart".to_string(),
                             error_kind: phoenix_core::domain::db_schema::ErrorKind::SubAgentError,
                         };
-                        self.update_conversation_state(&agent.agent_id, &interrupted)
+                        self.update_startup_recovered_state(&agent.agent_id, &interrupted, now)
                             .await?;
                         phoenix_core::domain::sm_state::SubAgentOutcome::Failure {
                             error: "Sub-agent interrupted by server restart".to_string(),
@@ -13493,6 +13604,12 @@ impl Database {
             .execute(&mut *tx)
             .await?;
             if updated.rows_affected() == 1 {
+                native_close::recover_native_retry_sources_tx(
+                    &mut tx,
+                    conversation_id,
+                    &ConvState::Idle,
+                )
+                .await?;
                 sqlx::query(
                     "INSERT OR REPLACE INTO startup_parent_actions
                          (conversation_id, action, transcript_generation, turn_id, turn_generation, created_at)
@@ -16655,6 +16772,32 @@ fn initial_steering_execution_outcome(state: &ConvState) -> Option<phoenix_workf
     }
 }
 
+pub(crate) async fn write_conversation_state_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    id: &str,
+    state: &ConvState,
+    state_updated_at: DateTime<Utc>,
+) -> DbResult<()> {
+    native_close::fence_native_retry_sources_tx(tx, id, state).await?;
+    let state_json =
+        serde_json::to_string(state).map_err(|error| DbError::Serialization(error.to_string()))?;
+    let result = sqlx::query(
+        "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4 WHERE id = ?5",
+    )
+    .bind(&state_json)
+    .bind(conv_state_kind(state))
+    .bind(state_updated_at.to_rfc3339())
+    .bind(Utc::now().to_rfc3339())
+    .bind(id)
+    .execute(&mut **tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(DbError::ConversationNotFound(id.to_string()));
+    }
+    Ok(())
+}
+
 pub(crate) async fn record_initial_execution_outcome_tx(
     tx: &mut Transaction<'_, Sqlite>,
     conversation_id: &str,
@@ -16850,6 +16993,7 @@ async fn update_creation_runtime_state(
     state_updated_at: &str,
     now: &str,
 ) -> DbResult<()> {
+    native_close::fence_native_retry_sources_tx(tx, conversation_id, state).await?;
     let result = sqlx::query(
         "UPDATE conversations
          SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?4,
@@ -17154,6 +17298,18 @@ mod tests {
                 .sum::<u64>(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn database_authority_identity_is_stable_across_clones_only() {
+        let original = Database::open_in_memory().await.unwrap();
+        let clone = original.clone();
+        let separate = Database::open_in_memory().await.unwrap();
+
+        assert_eq!(original.path, "");
+        assert_eq!(separate.path, "");
+        assert!(original.shares_authority_with(&clone));
+        assert!(!original.shares_authority_with(&separate));
     }
 
     #[tokio::test]
@@ -26075,6 +26231,7 @@ mod tests {
             title: "Fix the widget".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Step 1: read code\nStep 2: fix bug".to_string(),
+            reviewed_proposal: None,
         };
         db.update_conversation_state("conv-1", &approval_state)
             .await
@@ -26093,6 +26250,7 @@ mod tests {
             title,
             priority,
             plan,
+            ..
         } = conv_after.state
         {
             assert_eq!(task_file, "tasks/12345-p1-ready--fix-the-widget.md");
@@ -30055,6 +30213,7 @@ mod tests {
             title: "Rollback".to_string(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "reviewed".to_string(),
+            reviewed_proposal: None,
         };
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2 WHERE id = 'handoff-parent'",

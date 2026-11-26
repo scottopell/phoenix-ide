@@ -349,6 +349,7 @@ pub fn spawn_pty(
                 // reclaimer must wait for the sitting relay to drop the permit
                 // before proceeding. See `TerminalHandle::attach_permit`.
                 attach_permit: Arc::new(tokio::sync::Semaphore::new(1)),
+                retirement_requested: crate::session::TerminalRetirementRequest::default(),
             })
         }
     }

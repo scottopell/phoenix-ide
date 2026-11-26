@@ -1,8 +1,8 @@
 use super::*;
 use crate::runtime::traits::MessageStore;
 use crate::runtime::{
-    AddressedConversationEventDispatcher, ConversationEventDispatcher, ConversationHandle,
-    RuntimeManager,
+    AcknowledgedEventRequest, AddressedConversationEventDispatcher, ConversationEventDispatcher,
+    ConversationHandle, RuntimeManager,
 };
 
 #[derive(Clone, Copy)]
@@ -201,6 +201,166 @@ async fn cancellation_interrupts_held_sibling_commit(route: Route) {
 #[tokio::test]
 async fn acknowledged_cancel_interrupts_running_siblings_during_held_commit() {
     cancellation_interrupts_held_sibling_commit(Route::Acknowledged).await;
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // Keep the held-write/custody Stop interleaving in one test.
+async fn stop_keeps_batch_commit_and_cutoff_live_while_close_holds_source_custody() {
+    use native_close::source_entry::{ActorEntryResult, SourceEntryController, WorkerEntryResult};
+    use phoenix_core::domain::{
+        db_schema::SourceToolCall, product_conversation::ProductConversationId,
+    };
+    use phoenix_db::native_close::{NativeCloseCommand, NativeCloseIntent};
+
+    let mut content = calls(2, "stubborn-command");
+    content[1] = ContentBlock::tool_use(
+        "call-1",
+        "bash",
+        serde_json::json!({"op":"run","cmd":"fast-command"}),
+    );
+    let (mut runtime, mut starts, _directory) = prepared_batch(content).await;
+    let tools = Arc::clone(&runtime.tool_executor);
+    let release_fast = Arc::new(Semaphore::new(0));
+    *tools.fast_release.lock().unwrap() = Some(release_fast.clone());
+    let (write_entered, release_write) = runtime.storage.gate_state_update();
+
+    // Retain an entered Close leaf at the custody seam, but stage its controller
+    // until the actor reaches its ordinary batch commit. The real lease, not an
+    // artificial wait in Stop, must exclude semantic cancellation until released.
+    let command = NativeCloseCommand::new(
+        "ordinary-batch".into(),
+        SourceToolCall {
+            message_id: "close-source".into(),
+            tool_use_id: "close-call".into(),
+        },
+        NativeCloseIntent::Initial {
+            target: ProductConversationId::parse("target").unwrap(),
+        },
+    )
+    .unwrap();
+    let input = command.intent().source_input();
+    let close_state = ConvState::ToolExecuting {
+        current_tool: ToolCall::new(
+            "close-call",
+            ToolInput::Unknown {
+                name: "close_conversation".into(),
+                input: input.clone(),
+            },
+        ),
+        remaining_tools: vec![],
+        completed_results: vec![],
+        pending_sub_agents: vec![],
+        assistant_message: crate::state_machine::AssistantMessage::new(
+            "close-source".into(),
+            vec![ContentBlock::tool_use(
+                "close-call",
+                "close_conversation",
+                input,
+            )],
+            None,
+            None,
+        ),
+    };
+    let mut controller = SourceEntryController::new(
+        command.clone(),
+        tokio::time::Instant::now() + Duration::from_secs(60),
+    );
+    assert_eq!(
+        controller.revalidate(&close_state, &command),
+        ActorEntryResult::Updated
+    );
+    let worker = controller.worker();
+    let WorkerEntryResult::Ran(lease) = worker.try_acquire_first_effect(&command) else {
+        panic!("Close leaf must hold source custody before Stop");
+    };
+    runtime.staged_native_close_source_entry = Some(controller);
+
+    let (_manager, handle, actor, mut states) = register_actor(runtime).await;
+    for _ in 0..2 {
+        next_started(&mut starts).await;
+    }
+    release_fast.add_permits(1);
+    let limit = Duration::from_secs(10);
+    tokio::time::timeout(limit, write_entered)
+        .await
+        .unwrap()
+        .unwrap();
+    let sibling_token = tools
+        .tokens
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(command, _)| command == "stubborn-command")
+        .unwrap()
+        .1
+        .clone();
+    let (acknowledgement, mut stop_ack) = oneshot::channel();
+    let (_retirement, retirement) = oneshot::channel();
+    tokio::time::pause();
+    handle
+        .acknowledged_event_tx
+        .send(AcknowledgedEventRequest {
+            event: user_cancel(),
+            acknowledgement,
+            retirement,
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(limit, sibling_token.cancelled())
+        .await
+        .unwrap();
+    assert!(
+        worker.is_revoked_for_test(),
+        "receipt closes Close admission even while Busy"
+    );
+
+    // The sibling cancellation token is the causal witness that Stop has been
+    // applied and its original resource cutoff armed. Keep time virtual so a
+    // late/rearmed cutoff cannot be hidden by waiting on wall-clock time.
+    tokio::time::advance(CANCELLATION_DEADLINE + Duration::from_millis(1)).await;
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        wait_for_finished(&tools, "stubborn-command", 1),
+    )
+    .await
+    .expect("original resource cutoff must fire with both custody barriers held");
+    tokio::time::resume();
+    assert_eq!(
+        stop_ack.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    );
+
+    release_write.send(()).unwrap();
+    tokio::time::timeout(
+        limit,
+        states.wait_for(|state| {
+            matches!(state, ConvState::ToolExecuting { completed_results, .. }
+                if completed_results.iter().any(|result| result.tool_use_id() == "call-1"))
+        }),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        stop_ack.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    );
+
+    drop(lease);
+    assert_eq!(
+        tokio::time::timeout(limit, stop_ack)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+        AcknowledgedEventOutcome::Settled,
+    );
+    assert!(matches!(*states.borrow(), ConvState::Idle));
+    handle.event_tx.send(Event::Shutdown).await.unwrap();
+    assert_eq!(
+        actor.await.unwrap(),
+        RuntimeExitDisposition::CoordinatedShutdown
+    );
 }
 
 #[tokio::test]

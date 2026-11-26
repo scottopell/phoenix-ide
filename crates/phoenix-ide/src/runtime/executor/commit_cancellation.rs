@@ -13,6 +13,18 @@ pub(super) struct ObservedCancellation {
     cutoff: Option<CancellationCutoff>,
 }
 
+pub(super) fn refuse_during_exit(input: CancellationInput) {
+    if let (
+        _,
+        CancellationReceipt::Acknowledged {
+            acknowledgement, ..
+        },
+    ) = input.into_parts()
+    {
+        let _ = acknowledgement.send(Err("runtime is exiting".into()));
+    }
+}
+
 pub(super) struct CancellationCutoff {
     origin: Arc<AssistantMessage>,
     at: tokio::time::Instant,
@@ -69,7 +81,7 @@ impl CancellationCustody {
         Some(cutoff)
     }
 
-    pub(super) fn take_pending(&mut self) -> Option<ObservedCancellation> {
+    fn take_pending(&mut self) -> Option<ObservedCancellation> {
         if !matches!(self, Self::Pending(_)) {
             return None;
         }
@@ -77,6 +89,12 @@ impl CancellationCustody {
             unreachable!()
         };
         Some(observed)
+    }
+
+    pub(super) fn refuse_pending_during_exit(&mut self) {
+        if let Some(observed) = self.take_pending() {
+            refuse_during_exit(observed.input);
+        }
     }
 }
 
@@ -91,10 +109,11 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         self
     }
 
-    pub(super) fn observe_cancellation_input(
-        &mut self,
-        input: CancellationInput,
-    ) -> ObservedCancellation {
+    pub(super) fn retain_cancellation_input(&mut self, input: CancellationInput) {
+        debug_assert!(!self.has_pending_cancellation());
+        // Revoke closes admission even when an already-entered Close leaf holds
+        // the guard. Do not wait for that leaf while a batch write owns the actor.
+        self.try_revoke_native_close_source_entry();
         let retained = self.cancellation_custody.take_closing().filter(|cutoff| {
             let current = self.foreground_dispatch.owns_batch_origin(&cutoff.origin);
             if !current {
@@ -112,7 +131,8 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 phase: CutoffPhase::Pending,
             })
         });
-        ObservedCancellation { input, cutoff }
+        self.cancellation_custody =
+            CancellationCustody::Pending(ObservedCancellation { input, cutoff });
     }
 
     pub(super) fn service_cancellation_resource_cutoff(&mut self) {
@@ -134,6 +154,10 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         &mut self,
         write: impl Future<Output = Result<(), String>> + Send,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(controller) = self.staged_native_close_source_entry.take() {
+            self.native_close_source_entry = Some(controller);
+        }
         tokio::pin!(write);
         loop {
             let observe = self.foreground_dispatch.has_open_batch_controls()
@@ -149,7 +173,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 biased;
                 input = async { self.cancellation_input_rx.as_mut().expect("open cancellation inbox").recv().await }, if observe => {
                     match input {
-                        Some(input) => self.cancellation_custody = CancellationCustody::Pending(self.observe_cancellation_input(input)),
+                        Some(input) => self.retain_cancellation_input(input),
                         None => self.cancellation_input_rx = None,
                     }
                 }
@@ -175,14 +199,39 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         }
     }
 
-    pub(super) async fn settle_cancellation_input(
-        &mut self,
-        observed: ObservedCancellation,
-    ) -> Option<RuntimeExitDisposition> {
-        let ObservedCancellation { input, cutoff } = observed;
+    pub(super) async fn settle_cancellation_input(&mut self) -> Option<RuntimeExitDisposition> {
+        let ObservedCancellation { input, cutoff } = self
+            .cancellation_custody
+            .take_pending()
+            .expect("retained cancellation receipt");
         let (event, receipt) = input.into_parts();
         self.cancellation_custody = CancellationCustody::Applying(cutoff);
-        let mut result = if matches!(&receipt, CancellationReceipt::Acknowledged { .. }) {
+        // The commit has returned, but a Close leaf may still hold source custody.
+        // Keep the original cutoff serviceable until the leaf drains; only then
+        // can semantic Stop apply or publish its durable source fence.
+        loop {
+            if self
+                .cancellation_custody
+                .pending_cutoff()
+                .is_some_and(|cutoff| cutoff <= tokio::time::Instant::now())
+            {
+                self.service_cancellation_resource_cutoff();
+            }
+            if self
+                .fatal_local_authority_fence
+                .fatal_authority_loss_is_latched()
+                || self.try_revoke_native_close_source_entry()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let mut result = if self
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched()
+        {
+            Err("runtime processing closed after fatal local authority loss".into())
+        } else if matches!(&receipt, CancellationReceipt::Acknowledged { .. }) {
             self.process_acknowledged_event(event).await
         } else {
             self.process_event(event)
@@ -221,6 +270,8 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         if terminal && !fatal {
             self.emit_terminal_lifecycle_event().await;
         }
+        let interrupted =
+            self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority;
         match receipt {
             CancellationReceipt::Addressed => {
                 if let Err(error) = result {
@@ -232,16 +283,16 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 retirement,
             } => {
                 let _ = acknowledgement.send(result);
-                if self.creation_settlement_disposition
-                    == CreationSettlementDisposition::StaleAuthority
-                {
+                if interrupted && !fatal {
                     let _ = retirement.await;
-                    return Some(RuntimeExitDisposition::Interrupted);
                 }
             }
         }
         if fatal {
-            return Some(self.fatal_local_authority_exit());
+            return Some(RuntimeExitDisposition::FatalLocalAuthorityLoss);
+        }
+        if interrupted {
+            return Some(RuntimeExitDisposition::Interrupted);
         }
         terminal.then_some(RuntimeExitDisposition::Terminal)
     }

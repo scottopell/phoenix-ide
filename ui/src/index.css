@@ -258,7 +258,7 @@ body.app-viewport-active #root {
     padding-left: calc(10px + env(safe-area-inset-left, 0));
   }
 
-  
+
 
   .chain-page {
     padding-bottom: env(safe-area-inset-bottom, 0);
@@ -270,7 +270,7 @@ body.app-viewport-active #root {
       padding-left: calc(12px + env(safe-area-inset-left, 0));
     }
 
-    
+
 
     #conversation-nav {
       min-height: var(--breadcrumb-height);
@@ -5650,7 +5650,7 @@ html * {
     width: 100%;
   }
 
-  
+
 
   .new-conv-bottom-input {
     display: block;

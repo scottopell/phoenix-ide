@@ -15,11 +15,31 @@ mod federated_conversation_actions;
 mod federated_subscriptions;
 mod goal_execution;
 mod local_goal_watch;
+mod native_close_captured_loss_retry;
+mod native_close_retry_dispatch;
+mod native_close_retry_failure;
+mod native_close_retry_origin_gate;
+mod native_close_retry_tmux_dispatch;
+mod native_close_retry_worktree_metadata;
+mod native_close_source_fence;
+mod native_initial_completed_interruption;
+#[path = "migrations/native_initial_completion_retry_admission.rs"]
+mod native_initial_completion_retry_admission;
+mod native_initial_source_fence;
 mod retire_commission_review;
 mod settle_historical_continuation;
 
 #[cfg(test)]
+mod captured_loss_retry_tests;
+
+#[cfg(test)]
+mod native_close_origin_owner_cleanup_tests;
+
+#[cfg(test)]
 mod conversation_tools_tests;
+
+#[cfg(test)]
+mod retry_tmux_dispatch_tests;
 
 struct Migration {
     version: u32,
@@ -888,7 +908,242 @@ const MIGRATIONS: &[Migration] = &[
         name: "coordinator_scan_origin_labels",
         sql: include_str!("migrations/coordinator_scan_origin_labels.sql"),
     },
+    Migration {
+        version: 173,
+        name: "native_task_approval_receipts",
+        sql: include_str!("migrations/native_task_approval_receipts.sql"),
+    },
+    Migration {
+        version: 174,
+        name: "close_completion_allowances_and_native_retry_fence",
+        sql: MIGRATION_174,
+    },
+    Migration {
+        version: 175,
+        name: "native_close_initial_receipts",
+        sql: MIGRATION_175,
+    },
+    Migration {
+        version: 176,
+        name: "close_original_retirement_anchors",
+        sql: include_str!("migrations/close_original_retirement_anchor.sql"),
+    },
+    Migration {
+        version: 177,
+        name: "native_close_exact_observation_receipts",
+        sql: include_str!("migrations/native_close_exact_observation_receipts.sql"),
+    },
+    Migration {
+        version: 178,
+        name: "native_close_explicit_retry_admission",
+        sql: include_str!("migrations/native_close_explicit_retry_admission.sql"),
+    },
+    Migration {
+        version: 179,
+        name: "native_close_source_fence",
+        sql: include_str!("migrations/native_close_source_fence.sql"),
+    },
+    Migration {
+        version: 180,
+        name: "native_close_retry_failure",
+        sql: include_str!("migrations/native_close_retry_failure.sql"),
+    },
+    Migration {
+        version: 181,
+        name: "native_close_retry_dispatch",
+        sql: include_str!("migrations/native_close_retry_dispatch.sql"),
+    },
+    Migration {
+        version: 182,
+        name: "native_close_retry_worktree_metadata",
+        sql: include_str!("migrations/native_close_retry_worktree_metadata.sql"),
+    },
+    Migration {
+        version: 183,
+        name: "native_initial_source_fence",
+        sql: include_str!("migrations/native_initial_source_fence.sql"),
+    },
+    Migration {
+        version: 184,
+        name: "native_initial_completed_interruption",
+        sql: include_str!("migrations/native_initial_completed_interruption.sql"),
+    },
+    Migration {
+        version: 185,
+        name: "native_initial_completion_retry_admission",
+        sql: include_str!("migrations/native_initial_completion_retry_admission.sql"),
+    },
+    Migration {
+        version: 186,
+        name: "close_ignored_loss_category",
+        sql: include_str!("migrations/close_ignored_loss_category.sql"),
+    },
+    Migration {
+        version: 187,
+        name: "native_close_initial_result_acknowledgement",
+        sql: include_str!("migrations/native_close_initial_result_acknowledgement.sql"),
+    },
+    Migration {
+        version: 188,
+        name: "native_close_captured_loss_retry",
+        sql: include_str!("migrations/native_close_captured_loss_retry.sql"),
+    },
+    Migration {
+        version: 189,
+        name: "native_close_retry_tmux_dispatch",
+        sql: include_str!("migrations/native_close_retry_tmux_dispatch.sql"),
+    },
+    Migration {
+        version: 190,
+        name: "native_close_retry_origin_gate",
+        sql: "SELECT 1;",
+    },
+    Migration {
+        version: 191,
+        name: "native_close_origin_owner_cleanup",
+        sql: include_str!("migrations/native_close_origin_owner_cleanup.sql"),
+    },
 ];
+
+const MIGRATION_175: &str = r"
+CREATE UNIQUE INDEX close_obligations_attempt_product_unique
+    ON close_obligations(attempt_id, product_conversation_id);
+
+CREATE TABLE native_close_initial_receipts (
+    request_id TEXT NOT NULL PRIMARY KEY
+        CHECK (typeof(request_id) = 'text' AND length(trim(request_id)) > 0),
+    source_transcript_id TEXT NOT NULL
+        CHECK (typeof(source_transcript_id) = 'text' AND length(trim(source_transcript_id)) > 0),
+    source_message_id TEXT NOT NULL
+        CHECK (typeof(source_message_id) = 'text' AND length(trim(source_message_id)) > 0),
+    source_tool_use_id TEXT NOT NULL
+        CHECK (typeof(source_tool_use_id) = 'text' AND length(trim(source_tool_use_id)) > 0),
+    request_fingerprint TEXT NOT NULL
+        CHECK (typeof(request_fingerprint) = 'text' AND length(trim(request_fingerprint)) > 0),
+    product_conversation_id TEXT NOT NULL
+        CHECK (typeof(product_conversation_id) = 'text' AND length(trim(product_conversation_id)) > 0),
+    attempt_id TEXT NOT NULL
+        CHECK (typeof(attempt_id) = 'text' AND length(trim(attempt_id)) > 0),
+    run_ordinal INTEGER NOT NULL CHECK (typeof(run_ordinal) = 'integer' AND run_ordinal = 1),
+    UNIQUE (source_transcript_id, source_message_id, source_tool_use_id),
+    FOREIGN KEY (attempt_id, product_conversation_id)
+        REFERENCES close_obligations(attempt_id, product_conversation_id) ON DELETE CASCADE,
+    FOREIGN KEY (attempt_id, run_ordinal)
+        REFERENCES close_runs(attempt_id, run_ordinal) ON DELETE CASCADE
+);
+
+CREATE TRIGGER native_close_initial_receipts_require_native_parent
+BEFORE INSERT ON native_close_initial_receipts
+WHEN NOT EXISTS (
+    SELECT 1 FROM close_obligations
+    WHERE attempt_id = NEW.attempt_id
+      AND product_conversation_id = NEW.product_conversation_id
+      AND native_managed = 1
+)
+BEGIN
+    SELECT RAISE(ABORT, 'native Close initial receipt requires native-managed obligation');
+END;
+
+CREATE TRIGGER native_close_initial_receipts_immutable
+BEFORE UPDATE ON native_close_initial_receipts
+BEGIN
+    SELECT RAISE(ABORT, 'native Close initial receipt is immutable');
+END;
+
+CREATE TRIGGER native_close_initial_receipts_no_replacement
+BEFORE INSERT ON native_close_initial_receipts
+WHEN EXISTS (SELECT 1 FROM native_close_initial_receipts WHERE request_id = NEW.request_id)
+  OR EXISTS (SELECT 1 FROM native_close_initial_receipts
+             WHERE source_transcript_id = NEW.source_transcript_id
+               AND source_message_id = NEW.source_message_id
+               AND source_tool_use_id = NEW.source_tool_use_id)
+BEGIN
+    SELECT RAISE(ABORT, 'native Close initial receipt cannot be replaced');
+END;
+
+CREATE TRIGGER native_close_initial_receipts_no_direct_delete
+BEFORE DELETE ON native_close_initial_receipts
+WHEN EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = OLD.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'native Close initial receipt must be retained with its obligation');
+END;
+";
+
+const MIGRATION_174: &str = r"
+ALTER TABLE close_obligations
+ADD COLUMN native_managed INTEGER NOT NULL DEFAULT 0
+    CHECK (typeof(native_managed) = 'integer' AND native_managed IN (0, 1));
+
+-- Dormant storage only: no caller may consume this allowance until the exact
+-- completion-only admission and live source/Stop fences are implemented.
+-- Consumption and suppression are independent: suppression after admission
+-- must retain the fact that the original allowance was already consumed.
+CREATE TABLE close_completion_retry_allowances (
+    attempt_id TEXT NOT NULL PRIMARY KEY
+        REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
+    consumed INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(consumed) = 'integer' AND consumed IN (0, 1)),
+    suppressed INTEGER NOT NULL DEFAULT 0
+        CHECK (typeof(suppressed) = 'integer' AND suppressed IN (0, 1))
+);
+
+CREATE TRIGGER close_obligations_create_completion_retry_allowance
+AFTER INSERT ON close_obligations
+BEGIN
+    INSERT INTO close_completion_retry_allowances (attempt_id)
+    VALUES (NEW.attempt_id);
+END;
+
+CREATE TRIGGER close_completion_retry_allowances_immutable_identity
+BEFORE UPDATE OF attempt_id ON close_completion_retry_allowances
+WHEN OLD.attempt_id <> NEW.attempt_id
+BEGIN
+    SELECT RAISE(ABORT, 'completion retry allowance identity is immutable');
+END;
+
+CREATE TRIGGER close_completion_retry_allowances_no_replacement
+BEFORE INSERT ON close_completion_retry_allowances
+WHEN EXISTS (SELECT 1 FROM close_completion_retry_allowances WHERE attempt_id = NEW.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'completion retry allowance cannot be replaced');
+END;
+
+CREATE TRIGGER close_completion_retry_allowances_monotonic_state
+BEFORE UPDATE OF consumed, suppressed ON close_completion_retry_allowances
+WHEN NEW.consumed < OLD.consumed OR NEW.suppressed < OLD.suppressed
+BEGIN
+    SELECT RAISE(ABORT, 'completion retry allowance state is monotonic');
+END;
+
+CREATE TRIGGER close_completion_retry_allowances_no_direct_delete
+BEFORE DELETE ON close_completion_retry_allowances
+WHEN EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = OLD.attempt_id)
+BEGIN
+    SELECT RAISE(ABORT, 'completion retry allowance cannot be removed');
+END;
+
+-- REPLACE deletes a conflicting parent before inserting defaults, bypassing
+-- DELETE triggers when recursive_triggers is OFF. Reject it before that deletion.
+CREATE TRIGGER close_obligations_reject_replacement
+BEFORE INSERT ON close_obligations
+WHEN EXISTS (
+    SELECT 1 FROM close_obligations
+    WHERE attempt_id = NEW.attempt_id
+       OR (product_conversation_id = NEW.product_conversation_id
+           AND (phase <> 'completed' OR close_outcome = 'close_incomplete')
+           AND (NEW.phase <> 'completed' OR NEW.close_outcome = 'close_incomplete'))
+)
+BEGIN
+    SELECT RAISE(ABORT, 'close obligation cannot be replaced');
+END;
+
+CREATE TRIGGER close_obligations_native_managed_monotonic
+BEFORE UPDATE OF native_managed ON close_obligations
+WHEN OLD.native_managed = 1 AND NEW.native_managed = 0
+BEGIN
+    SELECT RAISE(ABORT, 'native Close management cannot be cleared');
+END;
+";
 
 async fn run_migration_171(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;
@@ -12478,6 +12733,12 @@ pub(crate) async fn run_through_for_test(pool: &SqlitePool, version: u32) -> DbR
     run_migration_list(pool, &MIGRATIONS[..end]).await
 }
 
+#[cfg(test)]
+pub(crate) async fn setup_real_179_for_test(pool: &SqlitePool) {
+    tests::setup_real_pre_176_schema(pool).await;
+    run_through_for_test(pool, 179).await.unwrap();
+}
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -12550,6 +12811,67 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
 
         if migration.version == 121 {
             run_migration_121(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 181 {
+            native_close_retry_dispatch::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+        if migration.version == 182 {
+            native_close_retry_worktree_metadata::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 180 {
+            native_close_retry_failure::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 184 {
+            native_initial_completed_interruption::run(pool, migration).await?;
+            applied += 1;
+            tracing::info!(version = migration.version, "Migration complete");
+            continue;
+        }
+
+        if migration.version == 188 {
+            native_close_captured_loss_retry::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 189 {
+            native_close_retry_tmux_dispatch::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 190 {
+            native_close_retry_origin_gate::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 185 {
+            native_initial_completion_retry_admission::run(pool, migration).await?;
+            applied += 1;
+            tracing::info!(version = migration.version, "Migration complete");
+            continue;
+        }
+
+        if migration.version == 183 {
+            native_initial_source_fence::run(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 179 {
+            native_close_source_fence::run(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -13455,6 +13777,7 @@ END;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
 
     fn registered_after(prefix: u32) -> u32 {
         u32::try_from(
@@ -13946,7 +14269,7 @@ mod tests {
         .unwrap();
         assert_eq!(ledger, vec![119, 122]);
     }
-    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
     use sqlx::Row;
     use std::str::FromStr;
 
@@ -16388,11 +16711,648 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Compares predecessor rows and guards with fresh successor authority and rejection cases in the same migrated database"
+    )]
+    async fn migration_185_adds_unbackfilled_initial_completion_successor_authority() {
+        let pool = test_pool().await;
+        setup_real_pre_176_schema(&pool).await;
+        run_through_for_test(&pool, 184).await.unwrap();
+        let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
+        let legacy = db
+            .create_conversation("completion-legacy", "legacy", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.begin_close_foundation(
+            &legacy.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-legacy")
+                .unwrap(),
+            "completion-legacy-attempt",
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = 'completion-legacy-attempt'")
+            .execute(&pool).await.unwrap();
+        let receipt_sql = "INSERT INTO native_close_initial_receipts
+            (request_id, request_fingerprint, source_transcript_id, source_message_id, source_tool_use_id,
+             product_conversation_id, intent, attempt_id, run_ordinal)
+            VALUES (?1, 'fingerprint', ?2, 'message', 'tool', ?3, 'initial', ?4, 1)";
+        sqlx::query(receipt_sql)
+            .bind("legacy-request")
+            .bind("completion-legacy")
+            .bind(legacy.product_conversation_id.as_str())
+            .bind("completion-legacy-attempt")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unreceipted = db
+            .create_conversation(
+                "completion-unreceipted",
+                "retained",
+                "/tmp",
+                true,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.begin_close_foundation(
+            &unreceipted.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-unreceipted")
+                .unwrap(),
+            "completion-unreceipted-attempt",
+        )
+        .await
+        .unwrap();
+        let original_guards: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql FROM sqlite_schema WHERE type = 'trigger' AND name IN
+             ('close_runs_require_next_ordinal', 'close_obligations_completed_outcome_is_immutable',
+              'close_cleanup_failures_require_initial_authority', 'native_close_source_fence_requires_exact_plan',
+              'close_cleanup_failure_completion_requires_disposition') ORDER BY name",
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(original_guards.len(), 5);
+        assert_eq!(run_through_for_test(&pool, 185).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 185).await.unwrap(), 0);
+        for name in [
+            "native_close_completion_retry_origins",
+            "native_close_completion_retry_admissions",
+            "native_close_completion_retry_source_revocations",
+            "native_close_completion_retry_initial_failures",
+            "native_close_completion_retry_successors",
+            "native_close_completion_retry_finalizable",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM sqlite_schema WHERE name = ?1")
+                    .bind(name)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                1,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM native_close_completion_retry_origins"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0,
+            "historical/adopted receipts are not granted an automatic allowance"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM native_close_completion_retry_successors"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        let origin_sql = "INSERT INTO native_close_completion_retry_origins
+            (attempt_id, origin_request_id, origin_request_fingerprint, source_transcript_id,
+             source_message_id, source_tool_use_id, product_conversation_id, initial_run_ordinal)
+            VALUES (?1, ?2, 'fingerprint', ?3, 'message', 'tool', ?4, 1)";
+        assert!(
+            sqlx::query(origin_sql)
+                .bind("completion-legacy-attempt")
+                .bind("legacy-request")
+                .bind("completion-legacy")
+                .bind(legacy.product_conversation_id.as_str())
+                .execute(&pool)
+                .await
+                .is_err(),
+            "historical receipt cannot be adopted as a fresh origin"
+        );
+        assert!(
+            sqlx::query(origin_sql)
+                .bind("completion-unreceipted-attempt")
+                .bind("late-request")
+                .bind("completion-unreceipted")
+                .bind(unreceipted.product_conversation_id.as_str())
+                .execute(&pool)
+                .await
+                .is_err(),
+            "retained unreceipted operation cannot acquire origin"
+        );
+        assert!(
+            sqlx::query(receipt_sql)
+                .bind("late-request")
+                .bind("completion-unreceipted")
+                .bind(unreceipted.product_conversation_id.as_str())
+                .bind("completion-unreceipted-attempt")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "receipt cannot late-bind an original source"
+        );
+        let fresh = db
+            .create_conversation("completion-fresh", "fresh", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut fresh_tx = pool.begin().await.unwrap();
+        sqlx::query(origin_sql)
+            .bind("completion-fresh-attempt")
+            .bind("fresh-request")
+            .bind("completion-fresh")
+            .bind(fresh.product_conversation_id.as_str())
+            .execute(&mut *fresh_tx)
+            .await
+            .unwrap();
+        crate::Database::begin_close_foundation_inner(
+            &mut fresh_tx,
+            &fresh.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-fresh")
+                .unwrap(),
+            "completion-fresh-attempt",
+            false,
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = 'completion-fresh-attempt'")
+            .execute(&mut *fresh_tx).await.unwrap();
+        sqlx::query(receipt_sql)
+            .bind("fresh-request")
+            .bind("completion-fresh")
+            .bind(fresh.product_conversation_id.as_str())
+            .bind("completion-fresh-attempt")
+            .execute(&mut *fresh_tx)
+            .await
+            .unwrap();
+        fresh_tx.commit().await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM native_close_completion_retry_origins"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        assert!(sqlx::query(
+            "INSERT OR REPLACE INTO native_close_completion_retry_origins
+            (attempt_id, origin_request_id, origin_request_fingerprint, source_transcript_id,
+             source_message_id, source_tool_use_id, product_conversation_id, initial_run_ordinal)
+            VALUES (?1, ?2, 'fingerprint', ?3, 'message', 'tool', ?4, 1)"
+        )
+        .bind("completion-fresh-attempt")
+        .bind("fresh-request")
+        .bind("completion-fresh")
+        .bind(fresh.product_conversation_id.as_str())
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE native_close_completion_retry_origins SET source_tool_use_id = 'forged'"
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(
+            sqlx::query("DELETE FROM native_close_completion_retry_origins")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        // The existing parent run is real, but it has no interrupted all-success proof.
+        assert!(sqlx::query("INSERT INTO native_close_completion_retry_admissions
+            (attempt_id, origin_request_id, origin_request_fingerprint, product_conversation_id,
+             failed_run_ordinal, successor_run_ordinal, admitted_at_us)
+            VALUES ('completion-fresh-attempt', 'fresh-request', 'fingerprint', ?1, 1, 2, 9000000000000000)")
+            .bind(fresh.product_conversation_id.as_str()).execute(&pool).await.is_err());
+        assert_eq!(sqlx::query_as::<_, (i64, i64)>("SELECT consumed, suppressed FROM close_completion_retry_allowances WHERE attempt_id = 'completion-fresh-attempt'")
+            .fetch_one(&pool).await.unwrap(), (0, 0));
+        sqlx::query("INSERT INTO native_close_completion_retry_source_revocations VALUES ('completion-fresh-attempt', 1)")
+            .execute(&pool).await.unwrap();
+        for query in [
+            "INSERT OR REPLACE INTO native_close_completion_retry_source_revocations VALUES ('completion-fresh-attempt', 2)",
+            "UPDATE native_close_completion_retry_source_revocations SET revoked_at_us = 2",
+            "DELETE FROM native_close_completion_retry_source_revocations",
+        ] {
+            assert!(sqlx::query(query).execute(&pool).await.is_err(), "{query}");
+        }
+        // A naked origin is deferred only until commit; it can never acquire receipt authority.
+        let orphan = db
+            .create_conversation("completion-orphan", "orphan", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(origin_sql)
+            .bind("completion-orphan-attempt")
+            .bind("missing-request")
+            .bind("completion-orphan")
+            .bind(orphan.product_conversation_id.as_str())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        crate::Database::begin_close_foundation_inner(
+            &mut tx,
+            &orphan.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("completion-orphan")
+                .unwrap(),
+            "completion-orphan-attempt",
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(
+            tx.commit().await.is_err(),
+            "origin requires exact receipt FK at commit"
+        );
+        for (name, original) in original_guards {
+            let installed: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+            )
+            .bind(&name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(installed.starts_with(&format!("CREATE TRIGGER {name}\n")));
+            assert!(installed.ends_with("\nEND"));
+            assert!(
+                installed.contains(original.split("\nBEGIN\n").last().unwrap()),
+                "{name} abort body retained"
+            );
+            assert!(
+                installed.contains("native_close_completion_retry_"),
+                "{name} narrow automatic provenance"
+            );
+        }
+        // Force preparation of every changed trigger after schema-version reload, not just sqlite_schema reads.
+        for query in [
+            "EXPLAIN UPDATE close_obligations SET phase = phase, close_outcome = close_outcome",
+            "EXPLAIN INSERT INTO close_runs (attempt_id, run_ordinal, status, created_at_us) SELECT 'missing', 2, 'running', 1 WHERE 0",
+            "EXPLAIN INSERT INTO close_cleanup_failures (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id, authority_kind, occurred_at_us, reason, detail, stop_certainty) SELECT 'missing', 'missing', 2, 'missing', 'attempt_interrupted', 1, 'interrupted', 'missing', 'shutdown_uncertain' WHERE 0",
+        ] {
+            sqlx::query(query).fetch_all(&pool).await.unwrap();
+        }
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA writable_schema")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Verifies retained loss rows and unchanged triggers before exercising the new ignored category on the same migrated attempt"
+    )]
+    async fn migration_186_preserves_existing_losses_and_adds_ignored_category() {
+        let pool = test_pool().await;
+        setup_real_pre_176_schema(&pool).await;
+        run_through_for_test(&pool, 185).await.unwrap();
+        let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
+        let conversation = db
+            .create_conversation("ignored-migration", "ignored", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let scope = db
+            .get_conversation("ignored-migration")
+            .await
+            .unwrap()
+            .attached_work_scope_id
+            .unwrap();
+        sqlx::query(
+            "UPDATE work_scopes
+             SET environment_kind = 'allocated_worktree', cwd = '/tmp',
+                 worktree_path = '/tmp/ignored-migration-worktree',
+                 worktree_id = 'ignored-migration-worktree-id',
+                 worktree_fingerprint = 'ignored-migration-worktree-fingerprint',
+                 branch_name = 'ignored-migration-branch', base_branch = 'main'
+             WHERE id = ?1",
+        )
+        .bind(scope.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("ignored-migration")
+                .unwrap(),
+            "ignored-migration-attempt",
+        )
+        .await
+        .unwrap();
+        for phase in [
+            "awaiting_stop_work_confirmation",
+            "settling_active_work",
+            "awaiting_retirement_inspection",
+        ] {
+            sqlx::query("UPDATE close_obligations SET phase = ?1 WHERE attempt_id = 'ignored-migration-attempt'")
+                .bind(phase)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO close_retirement_inspections (attempt_id, scope, generation, fingerprint, inspected_at)
+             VALUES ('ignored-migration-attempt', ?1, 'g1', 'fp1', '2026-01-01T00:00:00Z')",
+        )
+        .bind(scope.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_retirement_losses
+                (attempt_id, scope, generation, category, identity_kind, identity_codec, identity_value)
+             VALUES ('ignored-migration-attempt', ?1, 'g1', 'untracked_non_ignored_paths',
+                     'git_path', 'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:6f6c64')",
+        )
+        .bind(scope.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let external_trigger_names = [
+            "close_obligations_require_loss_consistent_branch_from_inspection",
+            "close_cleanup_failure_completion_requires_disposition",
+            "native_close_source_fence_requires_exact_plan",
+            "close_cleanup_failures_require_initial_authority",
+        ];
+        let external_triggers_before: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name IN (?1, ?2, ?3, ?4) ORDER BY name",
+        )
+        .bind(external_trigger_names[0])
+        .bind(external_trigger_names[1])
+        .bind(external_trigger_names[2])
+        .bind(external_trigger_names[3])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(external_triggers_before.len(), external_trigger_names.len());
+        assert_eq!(run_through_for_test(&pool, 186).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 186).await.unwrap(), 0);
+        let existing: (String, String) = sqlx::query_as(
+            "SELECT category, identity_value FROM close_retirement_losses WHERE attempt_id = 'ignored-migration-attempt'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            existing,
+            (
+                "untracked_non_ignored_paths".into(),
+                "git_path_bytes_hex_v1:6f6c64".into()
+            )
+        );
+        sqlx::query(
+            "INSERT INTO close_retirement_losses
+                (attempt_id, scope, generation, category, identity_kind, identity_codec, identity_value)
+             VALUES ('ignored-migration-attempt', ?1, 'g1', 'ignored',
+                     'git_path', 'git_path_bytes_hex_v1', 'git_path_bytes_hex_v1:69676e6f726564')",
+        )
+        .bind(scope.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM close_retirement_losses WHERE category = 'ignored'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        let trigger: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = 'close_obligations_invalidate_inspection_on_reentry'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(trigger.contains("DELETE FROM close_retirement_inspections"));
+        for name in [
+            "close_obligations_require_loss_consistent_branch_from_inspection",
+            "close_cleanup_failures_require_initial_authority",
+        ] {
+            let definition: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(definition.contains("close_retirement_losses"), "{name}");
+        }
+        let external_triggers_after: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, sql FROM sqlite_schema
+             WHERE type = 'trigger' AND name IN (?1, ?2, ?3, ?4) ORDER BY name",
+        )
+        .bind(external_trigger_names[0])
+        .bind(external_trigger_names[1])
+        .bind(external_trigger_names[2])
+        .bind(external_trigger_names[3])
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(external_triggers_after, external_triggers_before);
+        sqlx::query(
+            "UPDATE close_obligations
+             SET phase = 'awaiting_loss_confirmation', inspection_generation = ?1,
+                 inspection_fingerprint = ?2
+             WHERE attempt_id = 'ignored-migration-attempt'",
+        )
+        .bind(format!("v1{}:{}2:g1", scope.as_str().len(), scope.as_str()))
+        .bind(format!(
+            "v1{}:{}3:fp1",
+            scope.as_str().len(),
+            scope.as_str()
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "DELETE FROM close_retirement_losses
+             WHERE attempt_id = 'ignored-migration-attempt' AND category = 'ignored'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM close_retirement_losses WHERE category = 'ignored'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            1
+        );
+        for query in [
+            "EXPLAIN UPDATE close_obligations SET phase = phase WHERE attempt_id = 'ignored-migration-attempt'",
+            "EXPLAIN INSERT INTO close_cleanup_failures (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id, authority_kind, occurred_at_us, reason, detail, stop_certainty) SELECT 'missing', 'missing', 2, 'missing', 'attempt_interrupted', 1, 'interrupted', 'missing', 'shutdown_uncertain' WHERE 0",
+        ] {
+            sqlx::query(query).fetch_all(&pool).await.unwrap();
+        }
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_187_adds_unbackfilled_initial_result_acknowledgements() {
+        let pool = test_pool().await;
+        setup_real_pre_176_schema(&pool).await;
+        run_through_for_test(&pool, 186).await.unwrap();
+        let receipts: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(run_through_for_test(&pool, 187).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 187).await.unwrap(), 0);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM native_close_initial_result_acknowledgements"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_receipts")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            receipts
+        );
+        assert!(sqlx::query("INSERT INTO native_close_initial_result_acknowledgements
+            (request_id, request_fingerprint, attempt_id, run_ordinal, assistant_message_id, result_message_id)
+            VALUES ('missing', 'missing', 'missing', 1, 'assistant', 'result')")
+            .execute(&pool).await.is_err());
+        for name in [
+            "native_close_initial_result_acknowledgements_no_update",
+            "native_close_initial_result_acknowledgements_exact_initial",
+            "native_close_initial_result_acknowledgements_no_replacement",
+            "native_close_initial_result_acknowledgements_no_direct_delete",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1"
+                )
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                1
+            );
+        }
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn migration_184_upgrades_authentic_183_initial_source_fence_schema() {
+        let pool = test_pool().await;
+        setup_real_pre_176_schema(&pool).await;
+        run_through_for_test(&pool, 183).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _migrations")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            183
+        );
+        assert_eq!(run_through_for_test(&pool, 184).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 184).await.unwrap(), 0);
+        for name in [
+            "close_cleanup_failures_require_initial_authority",
+            "native_close_source_fence_requires_exact_plan",
+            "close_cleanup_failure_completion_requires_disposition",
+        ] {
+            let definition: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+            )
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert!(
+                definition.contains("native_close_initial_complete_retirement_proofs"),
+                "{name}"
+            );
+        }
+        // Preparing the query resolves the view's full schema, not only its ledger row.
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM native_close_initial_complete_retirement_proofs"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA writable_schema")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (191, "native_close_origin_owner_cleanup"),
+            (190, "native_close_retry_origin_gate"),
+            (189, "native_close_retry_tmux_dispatch"),
+            (188, "native_close_captured_loss_retry"),
+            (187, "native_close_initial_result_acknowledgement"),
+            (186, "close_ignored_loss_category"),
+            (185, "native_initial_completion_retry_admission"),
+            (184, "native_initial_completed_interruption"),
+            (183, "native_initial_source_fence"),
+            (182, "native_close_retry_worktree_metadata"),
+            (181, "native_close_retry_dispatch"),
+            (180, "native_close_retry_failure"),
+            (179, "native_close_source_fence"),
+            (178, "native_close_explicit_retry_admission"),
+            (177, "native_close_exact_observation_receipts"),
+            (176, "close_original_retirement_anchors"),
+            (175, "native_close_initial_receipts"),
+            (174, "close_completion_allowances_and_native_retry_fence"),
+            (173, "native_task_approval_receipts"),
+            (172, "coordinator_scan_origin_labels"),
+            (171, "adhd_llm_language"),
+            (170, "tool_discovery"),
+            (169, "chat_completions_signature_replay"),
+            (168, "coordinator_user_questions"),
+            (167, "slack_channel_submissions"),
+            (166, "coordinator_transcript_scanner"),
+            (165, "watch_ending_evidence"),
+            (164, "coordinator_durable_tracking"),
             (163, "product_conversation_read_state"),
             (162, "slack_saved_capture"),
             (161, "slack_single_trigger_emoji"),
@@ -16446,7 +17406,6 @@ mod tests {
         assert_eq!(
             ledger
                 .iter()
-                .filter(|(version, _)| *version <= 163)
                 .rev()
                 .take(expected_tail.len())
                 .copied()
@@ -16684,6 +17643,62 @@ mod tests {
             assert_eq!(kind, "unknown_historical");
             assert_eq!((product_id, transcript_id), (None, None));
             assert!(sqlx::query(invalid_update).execute(&pool).await.is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn close_tail_upgrades_base_171_and_main_172_to_cached_schema_idempotently() {
+        let ledger_query = "SELECT version, name, applied_at FROM _migrations ORDER BY version";
+        let schema_query =
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name";
+        let cached = crate::Database::open_in_memory().await.unwrap();
+        let cached_schema: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as(schema_query)
+                .fetch_all(cached.pool())
+                .await
+                .unwrap();
+        let cached_ledger: Vec<(u32, String)> =
+            sqlx::query_as("SELECT version, name FROM _migrations ORDER BY version")
+                .fetch_all(cached.pool())
+                .await
+                .unwrap();
+        assert!(cached_ledger
+            .iter()
+            .cloned()
+            .eq(migration_identities().map(|(version, name)| (version, name.to_owned()))));
+        assert_eq!(run_pending_migrations(cached.pool()).await.unwrap(), 0);
+
+        let dir = tempfile::tempdir().unwrap();
+        for (prefix, pending) in [(171, 20), (172, 19)] {
+            let path = dir.path().join(format!("prefix-{prefix}.db"));
+            let path = path.to_str().unwrap();
+            let db = crate::Database::open(path).await.unwrap();
+            let pool = db.pool();
+            run_through_for_test(pool, prefix).await.unwrap();
+            let before: Vec<(u32, String, String)> =
+                sqlx::query_as(ledger_query).fetch_all(pool).await.unwrap();
+            assert_eq!(before.last().unwrap().0, prefix);
+
+            assert_eq!(run_pending_migrations(pool).await.unwrap(), pending);
+            let installed: Vec<(u32, String, String)> =
+                sqlx::query_as(ledger_query).fetch_all(pool).await.unwrap();
+            assert!(installed.starts_with(&before));
+            assert!(installed
+                .iter()
+                .map(|(version, name, _)| (version, name))
+                .eq(cached_ledger.iter().map(|(version, name)| (version, name))));
+            let schema: Vec<(String, String, String, Option<String>)> =
+                sqlx::query_as(schema_query).fetch_all(pool).await.unwrap();
+            assert_eq!(schema, cached_schema);
+            assert!(sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(pool)
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(run_pending_migrations(pool).await.unwrap(), 0);
+            let again: Vec<(u32, String, String)> =
+                sqlx::query_as(ledger_query).fetch_all(pool).await.unwrap();
+            assert_eq!(again, installed);
         }
     }
 
@@ -17318,6 +18333,12 @@ mod tests {
         {
             sqlx::raw_sql(migration.sql).execute(pool).await.unwrap();
         }
+    }
+
+    pub(super) async fn setup_real_pre_176_schema(pool: &SqlitePool) {
+        setup_legacy_conversations_table(pool).await;
+        let end = MIGRATIONS.partition_point(|migration| migration.version <= 175);
+        run_migration_list(pool, &MIGRATIONS[..end]).await.unwrap();
     }
 
     #[allow(dead_code)]
@@ -23586,5 +24607,914 @@ mod tests {
             Some("claude-sonnet-4-6"),
             "non-Opus rows must not be touched"
         );
+    }
+}
+
+#[cfg(test)]
+mod close_completion_allowance_tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::{
+        run_pending_migrations, tests::setup_real_pre_176_schema, MIGRATIONS, MIGRATION_174,
+    };
+
+    #[tokio::test]
+    // Keep the migration's before/after, failed-write, cascade and rollback
+    // assertions together so each observes the same retained fixture state.
+    #[allow(clippy::too_many_lines)]
+    async fn migration_174_seeds_only_future_operations_and_enforces_monotonicity() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY,
+                 product_conversation_id TEXT NOT NULL DEFAULT 'new-product',
+                 phase TEXT NOT NULL DEFAULT 'awaiting_blocker_resolution',
+                 close_outcome TEXT
+             );
+             CREATE UNIQUE INDEX close_obligations_one_active_per_product
+                 ON close_obligations(product_conversation_id)
+                 WHERE phase <> 'completed' OR close_outcome = 'close_incomplete';
+             INSERT INTO close_obligations (attempt_id, product_conversation_id)
+                 VALUES ('preexisting', 'old-product');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_174).execute(&pool).await.unwrap();
+
+        let old_marker: i64 = sqlx::query_scalar(
+            "SELECT native_managed FROM close_obligations WHERE attempt_id = 'preexisting'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(old_marker, 0);
+        let old_allowance: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = 'preexisting'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(old_allowance, 0);
+
+        sqlx::query("INSERT INTO close_obligations (attempt_id) VALUES ('new-operation')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let initial: (i64, i64) = sqlx::query_as(
+            "SELECT consumed, suppressed FROM close_completion_retry_allowances WHERE attempt_id = 'new-operation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(initial, (0, 0));
+
+        assert!(
+            sqlx::query("INSERT INTO close_obligations (attempt_id) VALUES ('new-operation')")
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+        assert!(sqlx::query(
+            "INSERT INTO close_completion_retry_allowances (attempt_id) VALUES ('new-operation')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT OR REPLACE INTO close_completion_retry_allowances (attempt_id) VALUES ('new-operation')",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "INSERT INTO close_completion_retry_allowances (attempt_id) VALUES ('missing-operation')",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET attempt_id = 'preexisting' WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "DELETE FROM close_completion_retry_allowances WHERE attempt_id = 'new-operation'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET consumed = 2 WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET consumed = NULL WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET consumed = 'bad' WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET suppressed = NULL WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+
+        sqlx::query(
+            "UPDATE close_completion_retry_allowances SET consumed = 1 WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.unwrap();
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET consumed = 0 WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        assert!(sqlx::query(
+            "UPDATE close_completion_retry_allowances SET suppressed = 0 WHERE attempt_id = 'new-operation'",
+        ).execute(&pool).await.is_err());
+        let final_state: (i64, i64) = sqlx::query_as(
+            "SELECT consumed, suppressed FROM close_completion_retry_allowances WHERE attempt_id = 'new-operation'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(final_state, (1, 1));
+
+        sqlx::query(
+            "UPDATE close_obligations SET native_managed = 1 WHERE attempt_id = 'new-operation'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "UPDATE close_obligations SET native_managed = 0 WHERE attempt_id = 'new-operation'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE close_obligations SET native_managed = 2 WHERE attempt_id = 'preexisting'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "UPDATE close_obligations SET native_managed = NULL WHERE attempt_id = 'preexisting'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query("PRAGMA recursive_triggers = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (attempt_id, product_id) in [
+            ("new-operation", "new-product"),
+            ("preexisting", "old-product"),
+            ("different-operation", "new-product"),
+        ] {
+            let error =
+                sqlx::query("INSERT OR REPLACE INTO close_obligations (attempt_id, product_conversation_id) VALUES (?1, ?2)")
+                    .bind(attempt_id)
+                    .bind(product_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap_err();
+            assert_eq!(
+                error.as_database_error().unwrap().message(),
+                "close obligation cannot be replaced"
+            );
+        }
+        let retained: (i64, i64, i64) = sqlx::query_as(
+            "SELECT o.native_managed, a.consumed, a.suppressed
+             FROM close_obligations o JOIN close_completion_retry_allowances a USING (attempt_id)
+             WHERE o.attempt_id = 'new-operation'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained, (1, 1, 1));
+        let old_retained: (i64, i64) = sqlx::query_as(
+            "SELECT native_managed,
+                (SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = 'preexisting')
+             FROM close_obligations WHERE attempt_id = 'preexisting'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(old_retained, (0, 0));
+
+        // Isolate both sides of the partial-index predicate: nonparticipating
+        // historical rows must not turn a nonconflicting insert into replacement.
+        sqlx::raw_sql(
+            "INSERT INTO close_obligations (attempt_id, product_conversation_id, phase, close_outcome)
+                 VALUES ('incoming-history', 'new-product', 'completed', 'cancelled');
+             INSERT INTO close_obligations (attempt_id, product_conversation_id, phase, close_outcome)
+                 VALUES ('retained-history', 'history-product', 'completed', 'cancelled');
+             INSERT INTO close_obligations (attempt_id, product_conversation_id)
+                 VALUES ('after-history', 'history-product');
+             DELETE FROM close_obligations
+                 WHERE attempt_id IN ('incoming-history', 'retained-history', 'after-history');",
+        ).execute(&pool).await.unwrap();
+
+        sqlx::query("DELETE FROM close_obligations WHERE attempt_id = 'new-operation'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let cascaded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = 'new-operation'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(cascaded, 0);
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO close_obligations (attempt_id) VALUES ('rolled-back')")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.rollback().await.unwrap();
+        let rolled_back_allowances: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_completion_retry_allowances WHERE attempt_id = 'rolled-back'",
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(rolled_back_allowances, 0);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Exercise the real 175 -> 176 boundary and shared G1 -> G2 path.
+    async fn migration_176_excludes_legacy_sealed_inventory_and_preserves_shared_g2_capture() {
+        use crate::{
+            CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
+            ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
+            RouteCloseAttemptToRepairRequest,
+        };
+        use phoenix_core::domain::close::{
+            CloseAttemptId, CloseOwnedResourceInventory, ClosePhase, CloseRetirementSnapshot,
+            GitPathIdentity, RetiredResourceKind, RetirementFailureReason,
+            TranscriptConversationId, WorktreeFingerprint, WorktreeId, WorktreeIdentity,
+        };
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        setup_real_pre_176_schema(&pool).await;
+        let missing_tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name IN ('close_original_retirement_anchors', 'close_retirement_anchor_exclusions')"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(missing_tables, 0);
+
+        let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
+        let conversation = db
+            .create_conversation("legacy-sealed", "legacy-sealed", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let scope = conversation.attached_work_scope_id.unwrap();
+        sqlx::query(
+            "UPDATE work_scopes SET environment_kind = 'allocated_worktree', cwd = '/tmp',
+                worktree_path = '/tmp/worktree', worktree_id = lower(hex(randomblob(16))),
+                worktree_fingerprint = lower(hex(randomblob(32))), branch_name = 'branch',
+                base_branch = 'main' WHERE id = ?1",
+        )
+        .bind(scope.as_str())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let attempt = CloseAttemptId::parse("legacy-sealed-attempt").unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &TranscriptConversationId::parse("legacy-sealed").unwrap(),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        for phase in ["settling_active_work", "awaiting_retirement_inspection"] {
+            sqlx::query("UPDATE close_obligations SET phase = ?2 WHERE attempt_id = ?1")
+                .bind(attempt.as_str())
+                .bind(phase)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: attempt.clone(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("g1", "g1-fingerprint").unwrap(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let g1 = db
+            .get_close_obligation(attempt.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .clone();
+
+        // Author the genuine pre-176 capture using only tables and constraints
+        // available at 158. In particular, no modern capture API can run here.
+        sqlx::query(
+            "INSERT INTO close_retirement_inventories
+                 (attempt_id, scope, inspection_generation, inspection_fingerprint, captured_at)
+             VALUES (?1, ?2, ?3, ?4, '2026-01-01T00:00:00Z')",
+        )
+        .bind(attempt.as_str())
+        .bind(scope.as_str())
+        .bind(g1.generation())
+        .bind(g1.fingerprint())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_expected_retirement_resources
+                 (attempt_id, scope, inspection_generation, inspection_fingerprint,
+                  resource_kind, identity_kind, identity_codec, identity_value)
+             SELECT ?1, ?2, ?3, ?4, 'worktree', 'worktree', 'worktree_id_v1',
+                    captured_worktree_identity
+             FROM close_attempt_scopes WHERE attempt_id = ?1 AND scope = ?2",
+        )
+        .bind(attempt.as_str())
+        .bind(scope.as_str())
+        .bind(g1.generation())
+        .bind(g1.fingerprint())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_expected_retirement_resources
+                 (attempt_id, scope, inspection_generation, inspection_fingerprint,
+                  resource_kind, identity_kind, identity_codec, identity_value)
+             VALUES (?1, ?2, ?3, ?4, 'work_scope', 'opaque', 'opaque_string_v1', ?2)",
+        )
+        .bind(attempt.as_str())
+        .bind(scope.as_str())
+        .bind(g1.generation())
+        .bind(g1.fingerprint())
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE close_retirement_inventories SET sealed = 1
+             WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+               AND inspection_fingerprint = ?4",
+        )
+        .bind(attempt.as_str())
+        .bind(scope.as_str())
+        .bind(g1.generation())
+        .bind(g1.fingerprint())
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(db
+            .close_retirement_inventory_is_complete(attempt.as_str())
+            .await
+            .unwrap());
+        assert_eq!(
+            db.list_close_expected_retirement_resources(attempt.as_str())
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 16);
+        let migrated: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
+                    (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"
+        ).bind(attempt.as_str()).fetch_one(&pool).await.unwrap();
+        assert_eq!(migrated, (0, 1));
+        let g1_resources = db
+            .list_close_expected_retirement_resources(attempt.as_str())
+            .await
+            .unwrap();
+        assert_eq!(g1_resources.len(), 2);
+        assert!(g1_resources.iter().all(|resource| resource.snapshot == g1));
+        assert!(db
+            .close_retirement_inventory_is_complete(attempt.as_str())
+            .await
+            .unwrap());
+
+        let worktree_resource = g1_resources
+            .iter()
+            .find(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
+            .unwrap();
+        db.route_close_attempt_to_repair(RouteCloseAttemptToRepairRequest {
+            attempt_id: attempt.clone(),
+            scope: scope.clone(),
+            residual: worktree_resource.resource.clone(),
+            reason: RetirementFailureReason::IdentityNotProven,
+            detail: "legacy worktree requires reinspection".to_string(),
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            db.retry_close_retirement(&attempt).await.unwrap().phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: attempt.clone(),
+            scopes: vec![ReplaceCloseInspectionScopeRequest {
+                scope: scope.clone(),
+                snapshot: CloseRetirementSnapshot::parse("g2", "g2-fingerprint").unwrap(),
+                losses: Vec::new(),
+            }],
+        })
+        .await
+        .unwrap();
+        let g2 = db
+            .get_close_obligation(attempt.as_str())
+            .await
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .clone();
+        assert_ne!(g1, g2);
+        let (id, fingerprint, locator): (String, String, String) = sqlx::query_as(
+            "SELECT worktree_id, worktree_fingerprint,
+                    'git_path_bytes_hex_v1:' || lower(hex(CAST(worktree_path AS BLOB)))
+             FROM work_scopes WHERE id = ?1",
+        )
+        .bind(scope.as_str())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let worktree = WorktreeIdentity::from_parts(
+            WorktreeId::parse(id).unwrap(),
+            WorktreeFingerprint::parse(fingerprint).unwrap(),
+            GitPathIdentity::decode_exact(&locator).unwrap(),
+        );
+        let resources = db
+            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+                attempt_id: attempt.clone(),
+                snapshot: g2.clone(),
+                scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                    scope: scope.clone(),
+                    inventory: CloseOwnedResourceInventory {
+                        worktree: Some(worktree),
+                        work_scopes: std::collections::BTreeSet::default(),
+                        bash_process_groups: std::collections::BTreeSet::default(),
+                        tmux_servers: std::collections::BTreeSet::default(),
+                        pty_sessions: std::collections::BTreeSet::default(),
+                        browser_sessions: std::collections::BTreeSet::default(),
+                        equivalent_live_resources: std::collections::BTreeSet::default(),
+                    },
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(resources.len(), 2);
+        assert!(resources.iter().all(|resource| resource.snapshot == g2));
+        assert!(db
+            .close_retirement_inventory_is_complete(attempt.as_str())
+            .await
+            .unwrap());
+        assert_eq!(
+            db.list_close_expected_retirement_resources(attempt.as_str())
+                .await
+                .unwrap(),
+            resources
+        );
+        let sealed: Vec<(String, String)> = sqlx::query_as(
+            "SELECT inspection_generation, inspection_fingerprint FROM close_retirement_inventories
+             WHERE attempt_id = ?1 AND sealed = 1 ORDER BY inspection_generation",
+        )
+        .bind(attempt.as_str())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            sealed,
+            vec![
+                (g1.generation().to_string(), g1.fingerprint().to_string()),
+                (g2.generation().to_string(), g2.fingerprint().to_string()),
+            ]
+        );
+        let retained: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
+                    (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"
+        ).bind(attempt.as_str()).fetch_one(&pool).await.unwrap();
+        assert_eq!(retained, (0, 1));
+    }
+
+    #[tokio::test]
+    async fn migration_176_excludes_a_preexisting_zero_inventory_attempt() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        setup_real_pre_176_schema(&pool).await;
+        let db = crate::Database::from_pool_for_tests(pool.clone(), String::new());
+        let conversation = db
+            .create_conversation("legacy-zero", "legacy-zero", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.begin_close_foundation(
+            &conversation.product_conversation_id,
+            &phoenix_core::domain::close::TranscriptConversationId::parse("legacy-zero").unwrap(),
+            "legacy-zero-attempt",
+        )
+        .await
+        .unwrap();
+
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 176)
+            .unwrap();
+        sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
+
+        let anchor_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_original_retirement_anchors
+             WHERE attempt_id = 'legacy-zero-attempt'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let exclusion_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_anchor_exclusions
+             WHERE attempt_id = 'legacy-zero-attempt'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(anchor_count, 0);
+        assert_eq!(exclusion_count, 1);
+        assert!(sqlx::query(
+            "INSERT INTO close_original_retirement_anchors
+                 (attempt_id, inspection_generation, inspection_fingerprint)
+             VALUES ('legacy-zero-attempt', 'later-generation', 'later-fingerprint')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_176_seals_anchor_and_exclusion_without_hidden_rowid_or_replace_escape() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE close_obligations (
+                 attempt_id TEXT PRIMARY KEY,
+                 phase TEXT NOT NULL,
+                 inspection_generation TEXT NOT NULL,
+                 inspection_fingerprint TEXT NOT NULL
+             );
+             CREATE TABLE close_attempt_scopes (
+                 attempt_id TEXT NOT NULL, scope TEXT NOT NULL,
+                 PRIMARY KEY (attempt_id, scope)
+             );
+             CREATE TABLE close_retirement_inventories (
+                 attempt_id TEXT NOT NULL, scope TEXT NOT NULL,
+                 inspection_generation TEXT NOT NULL, inspection_fingerprint TEXT NOT NULL,
+                 sealed INTEGER NOT NULL
+             );
+             CREATE TABLE close_expected_retirement_resources (
+                 attempt_id TEXT NOT NULL, scope TEXT NOT NULL,
+                 inspection_generation TEXT NOT NULL, inspection_fingerprint TEXT NOT NULL,
+                 resource_kind TEXT NOT NULL, identity_kind TEXT NOT NULL,
+                 identity_codec TEXT NOT NULL, identity_value TEXT NOT NULL
+             );
+             INSERT INTO close_obligations VALUES
+                 ('historical', 'retirement_requested', 'generation', 'fingerprint');",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let migration = MIGRATIONS
+            .iter()
+            .find(|migration| migration.version == 176)
+            .unwrap();
+        sqlx::raw_sql(migration.sql).execute(&pool).await.unwrap();
+
+        for table in [
+            "close_original_retirement_anchors",
+            "close_retirement_anchor_exclusions",
+        ] {
+            let sql: String = sqlx::query_scalar("SELECT sql FROM sqlite_schema WHERE name = ?1")
+                .bind(table)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert!(
+                sql.contains("WITHOUT ROWID"),
+                "{table} must not have a hidden rowid"
+            );
+            // The identifier comes only from the two fixed table names above.
+            let rowid_probe = sqlx::AssertSqlSafe(format!("SELECT rowid FROM {table}"));
+            assert!(matches!(
+                sqlx::query(rowid_probe).fetch_one(&pool).await,
+                Err(sqlx::Error::Database(_))
+            ));
+        }
+        let historical_exclusion: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = 'historical'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(historical_exclusion, 1);
+        sqlx::raw_sql(
+            "INSERT INTO close_obligations VALUES
+                 ('fresh', 'retirement_requested', 'generation', 'fingerprint');
+             INSERT INTO close_attempt_scopes VALUES ('fresh', 'scope-a');
+             INSERT INTO close_retirement_inventories VALUES
+                 ('fresh', 'scope-a', 'generation', 'fingerprint', 0);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let anchor = "INSERT INTO close_original_retirement_anchors
+             (attempt_id, inspection_generation, inspection_fingerprint)
+             VALUES ('fresh', 'generation', 'fingerprint')";
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "unsealed inventory"
+        );
+        sqlx::query(
+            "UPDATE close_retirement_inventories SET sealed = 1 WHERE attempt_id = 'fresh'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "missing work scope"
+        );
+        sqlx::query(
+            "INSERT INTO close_expected_retirement_resources VALUES
+                 ('fresh', 'scope-a', 'generation', 'fingerprint',
+                  'work_scope', 'opaque', 'opaque_string_v1', 'wrong-scope')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "wrong scope identity"
+        );
+        sqlx::query(
+            "UPDATE close_expected_retirement_resources SET identity_value = 'scope-a'
+             WHERE attempt_id = 'fresh'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM close_retirement_inventories WHERE attempt_id = 'fresh'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "missing inventory"
+        );
+        sqlx::query(
+            "INSERT INTO close_retirement_inventories VALUES
+                 ('fresh', 'scope-a', 'generation', 'fingerprint', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO close_retirement_inventories VALUES
+                 ('fresh', 'unexpected-scope', 'generation', 'fingerprint', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "extra inventory scope"
+        );
+        sqlx::query("DELETE FROM close_retirement_inventories WHERE scope = 'unexpected-scope'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO close_expected_retirement_resources VALUES
+                 ('fresh', 'scope-a', 'generation', 'fingerprint',
+                  'work_scope', 'opaque', 'opaque_string_v1', 'second-scope')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sqlx::query(anchor).execute(&pool).await.is_err(),
+            "duplicate work scope"
+        );
+        sqlx::query(
+            "DELETE FROM close_expected_retirement_resources WHERE identity_value = 'second-scope'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(sqlx::query(
+            "INSERT INTO close_original_retirement_anchors
+                 (attempt_id, inspection_generation, inspection_fingerprint)
+             VALUES ('fresh', 'generation', 'other-fingerprint')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        sqlx::query(anchor).execute(&pool).await.unwrap();
+
+        // Test the incoming conflict path with SQLite's default recursive_triggers=OFF.
+        sqlx::query("PRAGMA recursive_triggers = OFF")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for statement in [
+            "UPDATE close_original_retirement_anchors SET inspection_generation = 'changed' WHERE attempt_id = 'fresh'",
+            "DELETE FROM close_original_retirement_anchors WHERE attempt_id = 'fresh'",
+            "INSERT OR REPLACE INTO close_original_retirement_anchors VALUES ('fresh', 'generation', 'fingerprint')",
+            "UPDATE close_retirement_anchor_exclusions SET attempt_id = 'fresh' WHERE attempt_id = 'historical'",
+            "DELETE FROM close_retirement_anchor_exclusions WHERE attempt_id = 'historical'",
+            "INSERT OR REPLACE INTO close_retirement_anchor_exclusions VALUES ('historical')",
+        ] {
+            assert!(sqlx::query(statement).execute(&pool).await.is_err(), "{statement}");
+        }
+        for (statement, message) in [
+            (
+                "INSERT INTO close_retirement_anchor_exclusions VALUES ('fresh')",
+                "original retirement anchor cannot be excluded",
+            ),
+            (
+                "INSERT INTO close_original_retirement_anchors VALUES ('historical', 'generation', 'fingerprint')",
+                "excluded attempt cannot acquire an original retirement anchor",
+            ),
+        ] {
+            let refused = sqlx::query(statement).execute(&pool).await.unwrap_err();
+            assert!(refused.to_string().contains(message), "{statement}: {refused}");
+        }
+        let anchor_pair: (String, String) = sqlx::query_as(
+            "SELECT inspection_generation, inspection_fingerprint
+             FROM close_original_retirement_anchors WHERE attempt_id = 'fresh'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(anchor_pair, ("generation".into(), "fingerprint".into()));
+        let exclusions: Vec<String> = sqlx::query_scalar(
+            "SELECT attempt_id FROM close_retirement_anchor_exclusions ORDER BY attempt_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(exclusions, vec!["historical".to_string()]);
+
+        sqlx::query("DELETE FROM close_obligations WHERE attempt_id IN ('fresh', 'historical')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let surviving: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors),
+                    (SELECT COUNT(*) FROM close_retirement_anchor_exclusions)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(surviving, (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod native_close_initial_receipt_tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::MIGRATION_175;
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One fixture checks the full immutable receipt lifecycle.
+    async fn migration_175_binds_initial_receipts_to_their_exact_obligation_and_run() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE close_obligations (
+                 attempt_id TEXT NOT NULL UNIQUE,
+                 product_conversation_id TEXT NOT NULL,
+                 native_managed INTEGER NOT NULL DEFAULT 0
+                     CHECK (typeof(native_managed) = 'integer' AND native_managed IN (0, 1))
+             );
+             CREATE TABLE close_runs (
+                 attempt_id TEXT NOT NULL REFERENCES close_obligations(attempt_id) ON DELETE CASCADE,
+                 run_ordinal INTEGER NOT NULL,
+                 PRIMARY KEY (attempt_id, run_ordinal)
+             );
+             CREATE TRIGGER close_runs_reject_standalone_delete
+             BEFORE DELETE ON close_runs
+             WHEN EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = OLD.attempt_id)
+             BEGIN SELECT RAISE(ABORT, 'Close run must be retained with its authority'); END;
+             INSERT INTO close_obligations (attempt_id, product_conversation_id)
+                 VALUES ('attempt-a', 'product-a');
+             INSERT INTO close_obligations (attempt_id, product_conversation_id)
+                 VALUES ('attempt-b', 'product-b');
+             INSERT INTO close_runs VALUES ('attempt-a', 1);
+             INSERT INTO close_runs VALUES ('attempt-b', 1);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql(MIGRATION_175).execute(&pool).await.unwrap();
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(sqlx::query(
+            "INSERT INTO native_close_initial_receipts
+                 (request_id, source_transcript_id, source_message_id, source_tool_use_id,
+                  request_fingerprint, product_conversation_id, attempt_id, run_ordinal)
+             VALUES ('request-a', 'transcript', 'message', 'tool',
+                     'fingerprint', 'product-a', 'attempt-a', 1)",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        let rejected_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM native_close_initial_receipts WHERE request_id = 'request-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rejected_count, 0);
+        // Both parents are now eligible so later negative cases isolate their
+        // requested constraint rather than being masked by the native-parent guard.
+        sqlx::query("UPDATE close_obligations SET native_managed = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO native_close_initial_receipts
+                 (request_id, source_transcript_id, source_message_id, source_tool_use_id,
+                  request_fingerprint, product_conversation_id, attempt_id, run_ordinal)
+             VALUES ('request-a', 'transcript', 'message', 'tool',
+                     'fingerprint', 'product-a', 'attempt-a', 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for (product, attempt, ordinal) in [
+            ("product-b", "attempt-a", 1),
+            ("product-a", "attempt-b", 1),
+            ("product-a", "missing", 1),
+            ("product-a", "attempt-a", 2),
+            ("product-b", "attempt-b", 2),
+        ] {
+            assert!(sqlx::query(
+                "INSERT INTO native_close_initial_receipts
+                     (request_id, source_transcript_id, source_message_id, source_tool_use_id,
+                      request_fingerprint, product_conversation_id, attempt_id, run_ordinal)
+                 VALUES ('request-other', 'other-transcript', 'other-message', 'other-tool',
+                         'fingerprint', ?1, ?2, ?3)",
+            )
+            .bind(product)
+            .bind(attempt)
+            .bind(ordinal)
+            .execute(&pool)
+            .await
+            .is_err());
+        }
+        for statement in [
+            "INSERT INTO native_close_initial_receipts VALUES
+                ('   ', 'new-transcript', 'new-message', 'new-tool', 'fingerprint', 'product-b', 'attempt-b', 1)",
+            "INSERT INTO native_close_initial_receipts VALUES
+                ('request-new', 'new-transcript', '  ', 'new-tool', 'fingerprint', 'product-b', 'attempt-b', 1)",
+            "INSERT INTO native_close_initial_receipts VALUES
+                ('request-new', X'00', 'new-message', 'new-tool', 'fingerprint', 'product-b', 'attempt-b', 1)",
+            "UPDATE native_close_initial_receipts SET request_fingerprint = 'changed' WHERE request_id = 'request-a'",
+            "UPDATE native_close_initial_receipts SET attempt_id = 'attempt-b' WHERE request_id = 'request-a'",
+            "DELETE FROM native_close_initial_receipts WHERE request_id = 'request-a'",
+            "INSERT OR REPLACE INTO native_close_initial_receipts VALUES
+                ('request-a', 'new-transcript', 'new-message', 'new-tool', 'changed', 'product-b', 'attempt-b', 1)",
+            "INSERT OR REPLACE INTO native_close_initial_receipts VALUES
+                ('request-new', 'transcript', 'message', 'tool', 'changed', 'product-b', 'attempt-b', 1)",
+            "INSERT INTO native_close_initial_receipts VALUES
+                ('request-new', 'transcript', 'message', 'tool', 'changed', 'product-b', 'attempt-b', 1)",
+        ] {
+            assert!(sqlx::query(statement).execute(&pool).await.is_err(), "{statement}");
+        }
+        let retained: (String, String, String) = sqlx::query_as(
+            "SELECT request_fingerprint, product_conversation_id, attempt_id
+             FROM native_close_initial_receipts WHERE request_id = 'request-a'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            retained,
+            ("fingerprint".into(), "product-a".into(), "attempt-a".into())
+        );
+
+        sqlx::query("DELETE FROM close_obligations WHERE attempt_id = 'attempt-a'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM native_close_initial_receipts")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(remaining, 0);
     }
 }

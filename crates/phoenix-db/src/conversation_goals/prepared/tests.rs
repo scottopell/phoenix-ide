@@ -1724,6 +1724,17 @@ async fn prepare_retains_exact_source_and_payload_without_mutating_or_dispatchin
         action.source.source().execution.turn_id(),
         i64::try_from(turn.0).unwrap()
     );
+    let persisted_shape: (String, Option<String>, Option<i64>, String) = sqlx::query_as(
+        "SELECT source_kind,enrollment_id,expires_at_us,apply_state FROM conversation_goal_preparations WHERE reference=?",
+    )
+    .bind(action.reference.as_bytes().as_slice())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        persisted_shape,
+        ("local".into(), None, None, "prepared".into())
+    );
     assert_eq!(
         action.source.source().message_id.as_str(),
         source_call.message_id
@@ -2241,7 +2252,7 @@ async fn preparation_schema_rejects_update_delete_replace_and_malformed_shape() 
     );
     assert!(sqlx::query("INSERT OR REPLACE INTO conversation_goal_preparations SELECT * FROM conversation_goal_preparations WHERE reference=?")
         .bind(prepared.reference.as_bytes().as_slice()).execute(db.pool()).await.is_err());
-    assert!(sqlx::query("INSERT INTO conversation_goal_preparations (reference,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) SELECT ?,owner_id,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,'malformed-shape','create',1,NULL,objective,NULL,NULL FROM conversation_goal_preparations WHERE reference=?")
+    assert!(sqlx::query("INSERT INTO conversation_goal_preparations (reference,owner_id,source_kind,caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,tool_use_id,operation,expected_version,observed_goal_id,objective,disposition,reason) SELECT ?,owner_id,'local',caller_conversation_id,source_product_id,workflow_id,turn_id,message_id,'malformed-shape','create',1,NULL,objective,NULL,NULL FROM conversation_goal_preparations WHERE reference=?")
         .bind(Uuid::new_v4().as_bytes().as_slice()).bind(prepared.reference.as_bytes().as_slice()).execute(db.pool()).await.is_err());
     assert_eq!(preparation_count(&db).await, 1);
     assert!(db.conversation_goal(&owner).await.unwrap().is_none());

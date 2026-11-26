@@ -1259,9 +1259,30 @@ AND SHALL record resource disposition separately from lifecycle completion
 AND SHALL expose conspicuous `cleanup_attention` in History when resource cleanup failed or remains uncertain
 AND SHALL NOT represent retained resources as successfully retired merely because lifecycle ended
 
-WHEN Close cannot confirm both conversation execution and owned-process shutdown
+WHEN Close cannot confirm both conversation execution and owned-process shutdown before a positive shutdown/History commit
 THE SYSTEM SHALL keep that ProductConversation Open with typed `CloseIncomplete` status
 AND SHALL NOT enter History or imply that shutdown succeeded
+
+WHEN a later Close observation cannot confirm shutdown after that operation already committed History with positive shutdown evidence
+THE SYSTEM SHALL preserve History, the retained positive shutdown evidence, and unresolved cleanup attention
+AND SHALL NOT reopen ordinary execution, erase the shutdown seal, or represent uncertain remaining resources as retired
+
+WHEN a Close failure decision stops a run
+THE SYSTEM SHALL persist the typed primary failure, the complete exact normalized resource-failure child set, and mandatory Global delivery in the same owned transaction
+AND SHALL derive children from the structured failed resource/precondition decision, never by parsing residual or reason strings
+AND SHALL use a nonempty exact affected-resource set for `resource_failure`, including sealed expected identity/scope when live identity is ambiguous
+AND SHALL intentionally persist zero children only when no resource failed for that exact run; unknown effect outcomes SHALL remain unknown and SHALL NOT count as positive completion proof
+
+WHEN Stop, pause, cancellation, source replacement, or process-authority closure revokes an admitted native retry
+THE SYSTEM SHALL capture unfinished explicit successors in pre-state, serialized with finalization
+AND SHALL unconditionally stop each captured run, preserve exact failure/resource evidence, enqueue its mandatory delivery, and fence further effects in the same owning decision
+AND SHALL NOT depend on a callback from the revoked worker to establish a terminal run disposition
+
+WHEN exact retained Close cancellation terminalizes an Open explicit successor
+THE SYSTEM SHALL use the same stable exact shutdown proof for its failure and lifecycle disposition in that cancellation transaction
+AND SHALL preserve the cancelled outcome while moving Open to History with cleanup attention if conversation-and-owned-process shutdown is positively confirmed, or leaving Open with typed CloseIncomplete if it is not
+AND SHALL preserve already-History lifecycle and positive evidence regardless of later uncertainty
+AND SHALL persist its exact outcome message and publish History only for a real Open-to-History commit, never rely on a later completed-operation-excluding failure classifier to repair the disposition
 
 WHEN Close completes or records a confirmed-shutdown cleanup failure
 THE SYSTEM SHALL retain the transcript as read-only History
@@ -1283,19 +1304,44 @@ AND the user SHALL be able to start a new ProductConversation on the same projec
 EACH Close operation SHALL carry one durable Close-attempt identity bound to that exact ProductConversation identity
 AND THE SYSTEM SHALL permit at most one non-completed Close attempt for a given ProductConversation at a time
 AND SHALL create one durable run with ordinal `1` for the normal Close attempt
+AND SHALL retain the unified `close_conversation` request identity with that exact attempt, run, and ordinary ProductConversation/latest-row admission snapshot
+AND SHALL return the retained result for duplicate, concurrent, replayed, and lost-response requests without allocating a new attempt or run or changing transcript topology
+AND SHALL reject a stale or absent target without selecting a latest fallback or admitting a Close operation
 AND SHALL bind every Close phase transition, confirmation, cancellation, settlement, inspection, retirement, and finalization event to that exact Close-attempt identity and run ordinal
-AND SHALL permit explicit safe retry only as a fresh run with a monotonically increasing ordinal under the original Close authority, according to `specs/work-lifecycle/requirements.md` REQ-WL-002c
+AND SHALL permit exact explicit safe retry only as a fresh run with a monotonically increasing ordinal under the original Close authority, according to `specs/work-lifecycle/requirements.md` REQ-WL-002c
+AND SHALL bind the immutable exact typed remaining-effect plan or positive verified-completion provenance atomically to that successor and request receipt, and dispatch only that plan; a zero-effect verified-completion retry SHALL observe/finalize without generic settlement or inspection
+AND SHALL represent independent remaining WorkScope retirement as an exact typed planned effect, not as an implication of tmux/worktree success: its original scope/resource identity, sealed gate generation/authority, fresh safety evidence and fingerprint SHALL bind its ordered plan row and durable outcome
+AND SHALL retire that scope only after all pending scoped resource effects succeed and fresh proof excludes distinct live owners/live scoped resources; retained prior successes SHALL NOT be replayed, and a scope-only residual SHALL remain expressible as one nonempty exact effect
+AND SHALL require independent scope success in plan completeness and any later completion-only proof; process-epoch stop effects SHALL remain excluded from retry and missing original live permits SHALL fail closed without generic fallback or permit reconstruction
+AND SHALL require explicit Retry for every successor, including a zero-effect verified-completion successor; observation, metadata, elapsed time, startup, or changed external preconditions SHALL NOT admit a run
 AND SHALL retain completed Close attempts as historical records until permanent Delete removes their ProductConversation aggregate
-AND SHALL create a new Close-attempt identity after cancellation only when no earlier Close attempt for that ProductConversation remains active
+AND SHALL create a new Close-attempt identity after cancellation only with an exact cancelled-predecessor reference and explicit new Close intent, when no earlier Close attempt for that ProductConversation remains active
 AND SHALL allocate every Close-attempt identity uniquely across active and historical attempts
 AND SHALL retain a typed terminal outcome of `archived` or `cancelled` whenever an attempt becomes completed
 AND SHALL retain every stopped run's typed failure, shutdown evidence, and residual cleanup status without rewriting it as retry success
+AND SHALL commit explicit-retry fencing and terminalization with actual exact cancellation and owning durable Stop/pause/source-fence admission, not an optional notification
+AND SHALL close process authority if durable terminal state cannot be established, rather than guess success or leave live mutation authority
+AND SHALL clear matching cleanup attention and publish a real Open-to-History transition only with the owning successful completion transaction; uncertain later failure on History SHALL preserve History and truthful attention rather than reopen execution
+AND SHALL require fresh exact retained positive proof that all originally planned effects durably succeeded and no resource or destructive effects remain before admitting an explicitly requested zero-effect verified-completion retry
+AND SHALL require either a successor run with a nonempty exact persisted resource plan and every durable effect success (or a zero-effect verified-completion plan with retained positive provenance), or the original native initial run with its exact retained receipt, original inspection anchor, complete sealed scope/resource inventory, exact dispatch membership, every original resource and independent WorkScope success, and confirmed conversation/owned-process shutdown
+AND SHALL retain a truthful unsuccessful interruption even when every original resource effect succeeded, without fabricating a failed resource or recording successful Close completion
+AND SHALL require current live source authority separately from original completion proof under the original scope; Stop, pause, cancellation, revoking source replacement, and missing or ambiguous proof SHALL fence dispatch and finalization
+AND SHALL refuse unproven initial interruption and empty unproven plans without a hidden bootstrap retry
+AND SHALL report refusal or unavailable durable storage truthfully without guessing or looping
 AND SHALL retain the last bound inspection generation and fingerprint on a completed `archived` attempt
 AND SHALL omit that aggregate inspection pair from a completed `cancelled` attempt while preserving any normalized exact-attempt inspection and loss evidence already recorded before cancellation
 AND SHALL snapshot the exact ordered parent transcript-row continuation topology of that ProductConversation when the attempt is admitted
 AND SHALL bind every snapshot member to both that exact Close attempt and the parent transcript row's explicit ProductConversation membership
 AND SHALL treat subordinate execution conversations as aggregate participants rather than continuation-topology members
 AND SHALL preserve that admitted snapshot unchanged when later topology changes are permitted
+
+WHEN retirement inspection or a mutation-boundary recheck finds unpreserved staged, unstaged, conflicted/unmerged, untracked, ignored/build, initialized-submodule content, unreachable detached commits, or operational uncertainty
+THE SYSTEM SHALL retain one authoritative exact blocker decision and derive its user-facing projection from that same evidence, naming affected paths, commits or expected resources and concrete writer, permission, layout, error or deadline reasons
+AND SHALL stop destructive retirement without an in-Close discard override, repair, salvage, cleanup convenience or disposable-state classifier
+AND SHALL NOT derive deletion permission from repository metadata, including `.gitignore` or its absence
+AND SHALL expose conspicuous incomplete/disk-retained status, exact blockers, and explicit Retry or Stop decisions
+AND SHALL require separate owner-authorized cleanup or preservation followed by fresh inspection; separate action alone SHALL NOT authorize retry
+AND SHALL recheck ownership, identity, permissions and blockers at every relevant mutation boundary, adding newly observed failures to that same decision/projection rather than treating an earlier clear snapshot as a guarantee
 
 WHILE a non-completed Close attempt exists for a ProductConversation
 THE SYSTEM SHALL NOT permit a continuation successor to be created for that ProductConversation
@@ -1312,9 +1358,9 @@ AND SHALL preserve that seal while shutdown or cleanup remains unresolved
 
 WHEN Phoenix starts and finds an interrupted or stopped Close run
 THE SYSTEM SHALL observe and record its shutdown and residual status only
-AND SHALL NOT resume settlement, destructive cleanup, recovery, or retry
+AND SHALL NOT resume settlement, destructive cleanup, recovery, or retry, or admit any successor
 AND SHALL NOT infer confirmed shutdown from absence of a runtime row, PID, or path alone
-AND SHALL classify confirmed conversation-and-process shutdown as History with `cleanup_attention` and uncertain shutdown as Open with `CloseIncomplete`
+AND SHALL classify confirmed conversation-and-process shutdown as History with `cleanup_attention`; uncertain shutdown before any positive shutdown/History commit remains Open with `CloseIncomplete`, while later uncertainty SHALL preserve already committed History, retained positive shutdown evidence, and truthful cleanup attention without reopening execution
 
 **Rationale:** Closing ends the product lifecycle when shutdown is proven. Resource retirement is separate truth; cleanup failure must remain visible without keeping safely ended conversations in Open or granting automatic recovery authority.
 

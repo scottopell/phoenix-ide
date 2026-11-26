@@ -61,6 +61,16 @@ pub(super) async fn body_sql<'a>(
     Ok(Cow::Owned(modified))
 }
 
+fn registered_migration_count_between(after: u32, through: u32) -> u32 {
+    u32::try_from(
+        MIGRATIONS
+            .iter()
+            .filter(|migration| after < migration.version && migration.version <= through)
+            .count(),
+    )
+    .expect("registered migration count fits u32")
+}
+
 async fn fixture(prefix: u32, populated: bool) -> SqlitePool {
     let db = Database::open_in_memory_prefix_for_test(prefix)
         .await
@@ -126,7 +136,12 @@ async fn adhd_language_migration_preserves_jobs_and_children() {
     .execute(&pool)
     .await
     .is_err());
-    assert_eq!(run_through_for_test(&pool, 171).await.unwrap(), 0);
+    assert_eq!(run_through_for_test(&pool, 172).await.unwrap(), 1);
+    assert_eq!(
+        run_pending_migrations(&pool).await.unwrap(),
+        registered_after(172)
+    );
+    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
     assert_eq!(
         sqlx::query_scalar::<_, i64>("PRAGMA foreign_keys")
             .fetch_one(&pool)
@@ -323,6 +338,11 @@ fn registered_identity_order_and_exact_bodies() {
         (163, "product_conversation_read_state"),
         (164, "coordinator_durable_tracking"),
         (165, "watch_ending_evidence"),
+        (172, "coordinator_scan_origin_labels"),
+        (177, "native_close_exact_observation_receipts"),
+        (178, "native_close_explicit_retry_admission"),
+        (179, "native_close_source_fence"),
+        (180, "native_close_retry_failure"),
     ];
     for (version, name) in identities {
         let entries = MIGRATIONS
@@ -357,6 +377,18 @@ fn registered_identity_order_and_exact_bodies() {
         (include_str!("product_conversation_read_state.sql"), 163),
         (include_str!("../coordinator_tracking/schema.sql"), 164),
         (include_str!("watch_ending_evidence.sql"), 165),
+        (include_str!("coordinator_scan_origin_labels.sql"), 172),
+        (include_str!("close_original_retirement_anchor.sql"), 176),
+        (
+            include_str!("native_close_exact_observation_receipts.sql"),
+            177,
+        ),
+        (
+            include_str!("native_close_explicit_retry_admission.sql"),
+            178,
+        ),
+        (include_str!("native_close_source_fence.sql"), 179),
+        (include_str!("native_close_retry_failure.sql"), 180),
     ] {
         let entries = MIGRATIONS
             .iter()
@@ -533,7 +565,10 @@ async fn registered_fresh_upgrade_slack_children_ledger_and_reentry() {
             let pool = fixture(prefix, populated).await;
             run_through_for_test(&pool, 142).await.unwrap();
             let before = snapshot(&mut pool.acquire().await.unwrap()).await;
-            assert_eq!(run_through_for_test(&pool, 149).await.unwrap(), 7);
+            assert_eq!(
+                run_through_for_test(&pool, 149).await.unwrap(),
+                registered_migration_count_between(142, 149)
+            );
             let mut conn = pool.acquire().await.unwrap();
             preserved(&mut conn, &before).await;
             drop(conn);
@@ -638,7 +673,10 @@ async fn registered_body_faults_rollback_and_same_connection_retry() {
             .await
             .unwrap();
         drop(conn);
-        assert_eq!(run_through_for_test(&pool, 149).await.unwrap(), 7);
+        assert_eq!(
+            run_through_for_test(&pool, 149).await.unwrap(),
+            registered_migration_count_between(142, 149)
+        );
         let mut conn = pool.acquire().await.unwrap();
         preserved(&mut conn, &before).await;
         drop(conn);
@@ -815,7 +853,7 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
         .await
         .unwrap();
     let before_rollback = snapshot(&mut pool.acquire().await.unwrap()).await;
-    let error = run_pending_migrations(&pool).await.unwrap_err();
+    let error = run_through_for_test(&pool, 147).await.unwrap_err();
     assert!(
         error.to_string().contains("creation receipt ledger fault"),
         "{error}"
@@ -960,5 +998,5 @@ async fn registered_creation_receipt_retention_preserves_jobs_and_children_atomi
             target.id.clone()
         )
     );
-    assert_eq!(run_pending_migrations(&pool).await.unwrap(), 0);
+    assert_eq!(run_through_for_test(&pool, 147).await.unwrap(), 0);
 }

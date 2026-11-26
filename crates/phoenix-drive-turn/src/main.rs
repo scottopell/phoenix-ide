@@ -53,7 +53,7 @@ async fn main() {
         database: args.database,
         timeout: args.timeout,
     };
-    match drive_turn::run(request).await {
+    match Box::pin(drive_turn::run(request)).await {
         Ok(result) => match serde_json::to_writer(std::io::stdout(), &result) {
             Ok(()) => println!(),
             Err(error) => {

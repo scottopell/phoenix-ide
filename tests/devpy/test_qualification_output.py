@@ -295,6 +295,21 @@ class QualificationOutputTests(unittest.TestCase):
         stream = os.fdopen(read_fd, "rb", buffering=0)
         original_popen = subprocess.Popen
         ready_read, ready_write = os.pipe()
+        release_read, release_write = os.pipe()
+        owned_release_fds = {release_read, release_write}
+        original_append = self.dev._QualificationOutputLog.append
+        marker = b"root finished"
+        marker_window = bytearray()
+        marker_appended = threading.Event()
+
+        def append_and_acknowledge(log, data):
+            original_append(log, data)
+            if not marker_appended.is_set():
+                marker_window.extend(data)
+                if marker in marker_window:
+                    marker_appended.set()
+                    os.write(release_write, b"R")
+
         writer = original_popen(
             [sys.executable, "-c",
              "import os,sys; print('writer ready',flush=True); os.write(int(sys.argv[1]),b'R'); "
@@ -308,7 +323,10 @@ class QualificationOutputTests(unittest.TestCase):
 
         def launch(*args, **kwargs):
             kwargs["stdout"] = write_fd
+            kwargs["pass_fds"] = (*kwargs.get("pass_fds", ()), release_read)
             root = original_popen(*args, **kwargs)
+            os.close(release_read)
+            owned_release_fds.remove(release_read)
             root.stdout = stream
             roots.append(root)
             os.close(held_write_fds.pop())
@@ -321,9 +339,13 @@ class QualificationOutputTests(unittest.TestCase):
             started = time.monotonic()
             with mock.patch.object(self.dev.subprocess, "Popen", side_effect=launch), \
                  mock.patch.object(self.dev.os, "killpg") as kill, \
+                 mock.patch.object(self.dev._QualificationOutputLog, "append", new=append_and_acknowledge), \
                  mock.patch.object(self.dev._QualificationOutputLog, "DRAIN_SECONDS", 0.05):
                 result = self.run_step("cargo clippy", [sys.executable, "-c",
-                                                     "print('root finished',flush=True)"], timeout=3)
+                                                     "import os,sys; print('root finished',flush=True); os.read(int(sys.argv[1]),1)",
+                                                     str(release_read)], timeout=3)
+            self.assertTrue(marker_appended.is_set(),
+                            "release must follow the raw marker append, including split reads")
             self.assertEqual(len(roots), 1)
             self.assertEqual(roots[0].returncode, 0)
             self.assertEqual(result, 1)
@@ -341,6 +363,8 @@ class QualificationOutputTests(unittest.TestCase):
                   "signals=0 payload=INCOMPLETE")
         finally:
             os.close(ready_read)
+            for descriptor in owned_release_fds:
+                os.close(descriptor)
             for descriptor in held_write_fds:
                 os.close(descriptor)
             writer.stdin.close()

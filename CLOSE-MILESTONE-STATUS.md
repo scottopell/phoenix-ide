@@ -1,0 +1,1415 @@
+# Architectural reduction candidate — unqualified
+
+## Main integration candidate — source reviewed, execution pending
+
+- Integrates main `59021bdad0181fd2d0c700558d42a17997208445` into the
+  owned feature branch, not PR #1161 into main. The PR remains draft/unqualified.
+- Preserves main migration 172 (`coordinator_scan_origin_labels`) and moves only
+  the unshipped feature migration tail to 173–191. Fresh/through-171/main-172
+  upgrade and idempotence coverage is present in source; execution is pending.
+  Published main ADR identities were preserved at integration; the three unmerged
+  feature ADRs moved to 286–288. At that time the duplicate published ADR-285 was
+  left unchanged; it is now reconciled by retaining Coordinator ADR-285 and
+  renumbering the Kache qualification to ADR-289 (originally #1183).
+- Reconciles Close serial dispatch with main's ordinary concurrent-tool batches
+  and cancellation inbox. Close envelopes preserve acknowledgement/retirement
+  ownership; only acknowledged UserCancel enters the cancellation inbox.
+- Exit now retains original inspection, preparation, process-entry and physical
+  custody until classified, with bounded polling/joins and no refreshed physical
+  deadline. Fatal or unknown durable custody retains the original owner/gates;
+  it is not reported as completed retirement. These repairs do not weaken the
+  production writer/source/Stop guards.
+- Scoped independent source reviews found and drove repairs to cancellation
+  ordering, commit-cutoff responsiveness, worker custody, retry fatal retention,
+  and regression witnesses. Final narrow review found no remaining concrete
+  blocker in those repaired seams. This is not whole-PR or compilation approval.
+- Added causal inspection-collector and process-entry custody tests, direct
+  settlement-entry observation, virtual-time original-cutoff assertions, and
+  sender-envelope regressions. Automatic hosted qualification requires actual
+  execution receipts for these selections; none has executed on this candidate.
+- Exact `e3cf3c7a5` run 45689466800 remains active at this checkpoint (frontend
+  and specifications passed; database pending). Its outcome will be retained
+  separately and cannot qualify this newer integrated source. Broad integrated
+  CI and installed disposable-Mac usability through the designated executor
+  remain outstanding. No local executable validation, PR-to-main merge,
+  installation or deployment has occurred.
+
+## Exact `80362eb12` terminal receipts — formatting-only failure
+
+- [Exact run 45666550377](https://github.com/scottopell/phoenix-ide/actions/runs/45666550377)
+  finished **failure** at source `80362eb126293af471cfc977053f1e9546106b90`,
+  tree `af21a3934ad4dbde51085ef3f6007da63a5796e2`. Its only failed step was
+  `Require exact source formatting`; this follow-up manually applies its sole
+  whitespace hunk in the live-descriptor test. The patched tree is not qualified
+  by the previous tree's execution. No formatter or executable validation ran locally.
+- All six mandatory public physical journeys actually executed and passed,
+  including clean explicit retry/reclaim/replay and all four intended Stop cuts.
+  The fixed four retry and four assessment samples also each passed. Each focused
+  invocation reports **1 passed, 0 failed, 0 ignored**; no retry-until-green.
+- Both pending-physical Stop/resume regressions, anchored typed writer-gap
+  propagation, and live Linux descriptor attribution each executed and passed
+  **1/0/0**. The descriptor control holds a real writable FD in the test process,
+  calls the production detector after quarantine, and requires that process/path
+  attribution with retained quarantine/admin state. It is not a separate-process
+  writer control or a full public Close journey.
+- Focused wrapper receipts show UID/GID 65534, empty groups, all five capability
+  sets zero, `no_new_privs=1`, distinct caller/private PID namespace inodes and
+  tmpfs fixture storage. Normal supervisor exit status was zero. Configured
+  timeout bounds and wrapper-reported descendant termination are not independent
+  post-run process/storage audits or exercised timeout/failure-teardown proof.
+- Executed module receipts include foundation **270**, native DB **82**,
+  migrations **180**, source-entry **10**, runtime actor **52**, matcher **9**,
+  public parser **4**, and retry assessment **7** passed, with no failed/ignored
+  tests. These selections overlap and do not constitute the full runtime suite.
+  Frontend and specification jobs passed.
+- Exact `ea1e82d58` run 45656308137 is also terminal **failure**: six mandatory
+  journeys and eight fixed samples passed, but three newly selected regressions
+  were refused by the old wrapper allowlist (**zero executed**), plus formatting
+  failed. Exact `50538326c` run 45652361228 is terminal **failure**, including
+  clean retry source-entry busy refusal; later successes do not establish every
+  historical contention cause. Earlier active/pending notes below are historical.
+- PR #1161 remains draft/unqualified/unmerged and currently conflicts with main.
+  No broad PR CI exists for `80362eb12`; exact Linux receipts are not a substitute.
+  Conflict integration, broad qualification and installed disposable-Mac usability
+  through the designated release executor remain outstanding. No merge, install,
+  deployment, production guard relaxation or optional device/system gate added.
+
+## Approved bounded hosted isolation (source candidate, execution pending)
+
+- Original question reply `coordinator-question-reply:e5fe7b20-5702-439c-b27e-2cb596f9f1da`
+  confirms **Approve bounded isolation**. This supersedes the isolation hold in
+  historical checkpoints below, not production guards or the installed-Mac gate.
+- The disposable GitHub-hosted Linux wrapper creates private PID/mount namespaces
+  and real namespace-local `/proc`, then drops to nobody with empty supplementary
+  groups, all capability sets empty, and `no_new_privs`. Fixture storage is private
+  tmpfs; preflight verifies credentials, namespace separation, and storage.
+  No production code/privilege or source/writer/Stop policy changes.
+- A privileged supervisor aborts at 75 seconds with a 5-second kill grace and
+  couples namespace-init lifetime to its supervisor. The test has a 70-second
+  inner deadline. Timeout is a failure, not another sample or a renewed deadline.
+  Staging cleanup occurs outside the namespace after supervisor exit; cleanup
+  failure is fatal. These bounds and teardown still require hosted evidence.
+- Exact wrapper allowlists and the broad nextest dispatcher include the two
+  pending-mutation regressions, anchored typed-gap regression, and new live Linux
+  descriptor control. The latter holds a real writable FD, calls the production
+  `/proc` descriptor detector after quarantine, requires attribution to that FD's
+  process/path, and proves retained quarantine/admin state before deletion.
+  It replaces neither the six mandatory public journeys nor shared-host acceptance.
+- Broad [45656326364](https://github.com/scottopell/phoenix-ide/actions/runs/45656326364)
+  at `ea1e82d58` is terminal **failure** at Rust formatting, before Rust test
+  qualification. All five exact hosted formatting hunks are manually applied.
+  Exact [45656308137](https://github.com/scottopell/phoenix-ide/actions/runs/45656308137)
+  is pending at this checkpoint. Older exact `50538326c` run
+  [45652361228](https://github.com/scottopell/phoenix-ide/actions/runs/45652361228)
+  is still progressing through regression steps, with two earlier failed steps;
+  no terminal result or failure-cause claim is made here.
+- Narrow independent source review found no concrete blocker in isolation and
+  live-writer control; this is publication review, not executable qualification.
+  No local formatter, syntax check, build or fixture ran. No merge/install/deploy.
+  Isolated green will not prove shared-host Mac usability or every historical cause.
+
+## Pending-physical caller repair after `50538326c`
+
+- Broad [45652378449](https://github.com/scottopell/phoenix-ide/actions/runs/45652378449)
+  is terminal **failure** at the formatting gate, before Rust test qualification.
+  This follow-up manually applies the complete retained hosted Rust formatting
+  proposal, including the chained error assertion. No formatter ran locally.
+- Exact [45652361228](https://github.com/scottopell/phoenix-ide/actions/runs/45652361228)
+  remains in progress at this source checkpoint; frontend/specifications passed.
+  It tests `50538326c`, not this unexecuted follow-up. Its first watcher exited
+  on GitHub HTTP500; after checking no surviving watcher, one replacement watches
+  the same run. That retrieval failure is not a workflow/test failure.
+- Source review establishes a possible explicit-retry contention schedule:
+  repeated actor revalidation takes the same eligibility mutex as an otherwise
+  eligible worker leaf; a confirmed non-entry Busy becomes terminal mutation
+  refusal. This is not a diagnosis of historical merged Busy/Refused failures.
+- The narrow repair skips idle `WorktreePhysical` polling revalidation only while
+  its retained observation is not ready. Fatal handling remains first. Physical
+  readiness is published after child/DB/source custody release; ready handling
+  still revalidates and routes stale-source outcomes to stopped observation.
+  Leaf checks still enforce exact original command, deadline and revocation.
+  No Busy retry, authority renewal, writer-proof relaxation or new framework.
+- Two deterministic clean-writer journeys pause immediately before the actual
+  mutation admission sink. Each requires five further actor cursor services
+  without revalidation, then either resumes into existing retirement/replay
+  assertions or acknowledges Stop before releasing the worker and checks no new
+  effects and unchanged retained targets. These fixtures do not qualify ambient
+  production writer detection, entered-leaf unknown release, or historical cause.
+- A stopped anchored assessment test injects a typed inspection gap at the writer
+  observation seam and verifies preserved path/detector/reason/PID, unchanged
+  failed run and inspection rows, no successor, and retained worktree path.
+  This is assessment propagation evidence, not public-actor admission evidence
+  or proof of filesystem content equality. All three new exact selectors are
+  required in a separate failure-path hosted step; the six existing mandatory
+  production physical journeys remain unchanged. No new tests ran locally.
+- Source-only independent review found no remaining demonstrated correctness
+  blocker in this repair slice. Hosted compilation/execution and unchanged
+  acceptance remain required; CI isolation decision `e5fe7b20` is still pending.
+  No merge, installation, privileged setup or real-user fixture was performed.
+
+## Current disposition after exact `818b08b40`
+
+- Exact Close run [45627288649](https://github.com/scottopell/phoenix-ide/actions/runs/45627288649)
+  is terminal **success** at source `818b08b40b6f582880575392e54fb9ce4e10bc28`,
+  tree `0e007389d5a8d3fc21f76076116218ec049ab354`. Retained exact-source receipts
+  include production physical retirement **1 passed**, source-entry **9 passed**,
+  foundation **270 passed**, native DB **82 passed**, migrations **180 passed**.
+  These finite successes do not diagnose older source-unavailable failures or
+  establish shared-host liveness. The inventory producer's new failure path
+  was not exercised by this green run.
+- Retained exact `9a65b8191` run
+  [45618326108](https://github.com/scottopell/phoenix-ide/actions/runs/45618326108)
+  is also terminal **success**. Active-run notes below are historical checkpoints.
+- Broad run [45627305546](https://github.com/scottopell/phoenix-ide/actions/runs/45627305546)
+  remains terminal **failure**. Its failed physical journey expected preliminary
+  still-dirty retry `storage_rejected`, but got `retry_inspection_blocked`,
+  detector `linux_mapping`, PID `18927`, reason `unavailable`, with **no new run
+  admitted**. That invocation never reached its intended Stop cut. This is
+  existing fail-closed guard evidence, not proof of an unsafe writer or a
+  harmless vanished process. Exact green does not replace missing acceptance.
+- Human decision `e5fe7b20` still gates privileged CI isolation. Do not loosen
+  writer proof or spend repeated full runs hoping the inspection gap vanishes.
+  Essential acceptance remains clean reclaim, exact dirty/blocker reporting,
+  Stop/source/replay, and installed-Mac validation through the sole release
+  executor; optional assembled-system and physical-device debt adds no new gate.
+- This source-only follow-up renders existing failed/unattempted/unknown/
+  residual remaining-resource rows without conflating them with residual
+  outcomes. Anchored retry preserves typed writer-inspection gaps rather than
+  erasing them to storage strings. Neither change fabricates missing operational
+  blocker classifications or adds persisted permission/syscall detail.
+- New deterministic source-entry characterization pauses real ExplicitRetry
+  actor revalidation while it owns eligibility: worker entry must return Busy
+  without effects, then enter once after release under the same tuple/deadline.
+  This demonstrates a possible schedule, **not** the cause of old merged
+  Busy/Refused failures and **not** a runtime liveness repair. Sink-level
+  resumability/Stop proof and any resulting narrow repair remain unfinished.
+  The new changes have not yet run hosted validation.
+- PR #1161 remains draft, unmerged and uninstalled. No local executable
+  validation, privileged setup, real-user fixture, merge or deployment was run.
+
+## Current qualification and reviewed lint follow-up
+
+### Complete broad9a receipts and independent DB diagnostics
+
+Final shard-4 artifact is now retained at
+`/tmp/close-9a65b8191/shard4-final-artifact`. Terminal stderr
+`check/processes/invocation-3434-ba37f3c162194e2c9f0a834484f22715.stderr.log`
+reports 1747/1747 passed (1 slow), 5552 skipped outside the partition. All four
+artifact source receipts identify synthetic merge
+`f3a2669c083fb0082554837fc3e8ce3ba3b882f3`, run45618338984 attempt1.
+
+All six named public journeys actually dispatched as individual tests with zero
+ignored: reclaim/replay, prepared Stop and before-writer Stop passed; initial
+retirement, assessment Stop and before-observation Stop failed. The latter two
+failed before their intended barrier/Stop, not at a successfully exercised cut.
+Actual harness stdout for each shows nobody UID/GID65534 (all four credential
+fields), runner UID1001, own-group-only membership and zero capabilities. Source
+requires source/staged SHA256 equality for runtime/launcher before dispatch;
+the digests themselves are not printed receipts. These six executions are
+3 pass/3 fail, not broad acceptance, complete process-tree closure or proof that
+the failed cuts ran. Wrapper/profiler PIDs are not writer attribution.
+
+The exact-workflow inventory producer was success-only even though downstream
+focused diagnostic consumers run on failure. This caused missing-file failures
+after exact2b3 public failures, not focused test execution. The producer now uses
+`success() || failure()` so independent selected diagnostics can execute after a
+failed public journey, but not after cancellation. Original failures remain
+fatal; full success-only suites, exact selectors/count checks, pipefail and all
+physical custody/privilege rules are unchanged. This intentionally pays bounded
+DB compilation/inventory cost for failure evidence; it is not a runtime fix.
+Failure-path hosted execution of the new condition remains unverified.
+
+### fdfe hosted formatting follow-up; qualification remains blocked
+
+Published `fdfe106c6846e07c7ef154a387da09f5b784b961` adds mutation Busy/Refused
+strings and prints exact failed dirty-retry JSON; neither changes behavior.
+[CI45625288436](https://github.com/scottopell/phoenix-ide/actions/runs/45625288436)
+failed early exact-source formatting on one mutation Refused-arm line wrap.
+The complete hosted proposal is applied unchanged; dependent executable lanes
+were skipped, not passed. Evidence: `/tmp/close-fdfe106c6/ci-failed.log`.
+No local executable validation ran. Exact fdfe
+[45625278385](https://github.com/scottopell/phoenix-ide/actions/runs/45625278385)
+is pending behind retained active exact9a65. Watcher logs are retained in
+`/tmp/close-fdfe106c6/close-watch.log` and
+`/tmp/close-9a65b8191/close-watch.log`.
+
+The 9a65 broad run is now terminal failed. Shard 4 completed successfully
+(job139232534382; `/tmp/close-9a65b8191/shard4.log`); the later final artifact
+receipt above establishes its exact 1747 passed count.
+The three failed shard classifications below remain unresolved. Exact9a65
+successful interim steps are not terminal acceptance or causal repair.
+
+### Fresh 9a65 broad failures remain fail-closed inspection gaps
+
+Later [CI45618338984](https://github.com/scottopell/phoenix-ide/actions/runs/45618338984)
+terminal result: all non-test lanes and Rust archive build passed. Three
+shards failed; shard 4 passed all 1747 selected tests. Retained logs/artifacts:
+`/tmp/close-9a65b8191/{shard1.log,shard2.log,shard3.log,rust-evidence}`.
+
+- Shard 1: 1575/1765 run, 1574 pass/1 fail, 190 selected unrun. Assessment-Stop
+  journey failed in its preliminary still-dirty retry: typed
+  `retry_inspection_blocked`, expected `storage_rejected`, before the intended
+  barrier or Stop. Existing output omits its detector/PID; the assertion now
+  prints the exact JSON on failure without accepting another code or relaxing
+  any safety/Stop assertion.
+- Shard 2: 1611/1761 run, 1610 pass/1 fail, 150 selected unrun. Initial public
+  retirement reached ArchivedCleanupAttention rather than Archived; persisted
+  Worktree Residual/ManualRepairRequired and LinuxMapping PID21136 Unavailable
+  after owner-status ENOENT. Initial run 1 was admitted; no retry/Stop cut here.
+- Shard 3: 1557/1755 run, 1556 pass/1 fail, 198 selected unrun. Pre-observation
+  Stop journey returned `retry_inspection_blocked` before its barrier:
+  LinuxCwd PID18633 Unavailable, no successor admitted, no retry receipt, disk
+  retained. Intended Stop was never sent. Earlier ignored-content warning is
+  accumulated history, not the current clean retry cause.
+
+No source-entry Busy/Refused cause is established by these failures, and no
+vanished PID is inferred harmless. Production fail-closed policy and held
+privilege/isolation decision are unchanged. Exact9a65 is active and is retained;
+its current successful steps cannot replace these failed broad receipts. This
+follow-up adds only mutation refusal classification and failure-output precision,
+not a liveness/behavioral repair or sampling-until-green policy.
+
+### Retained 2b3 terminal evidence: post-admission mutation refusal
+
+[Exact45608183589](https://github.com/scottopell/phoenix-ide/actions/runs/45608183589)
+is terminal failed, source `2b3f34be7321ae48c8dd587f326c61b2ac7ab6f2`, tree
+`1428ba19ee0c833549b907d4b8fbab959d166669` (artifact source receipts verified).
+Primary clean retry failed; all four primary Stop journeys passed. Fixed clean
+samples were 3 pass/1 fail (sample 2); four assessment samples passed. These are
+independent fixed invocations, not an eventual successful retry. Evidence:
+`/tmp/close-2b3f34be7/{close-final-run.json,close-failed.log,artifacts}`.
+
+Both failures durably admitted run 2, then stopped with Worktree Failed and
+WorkScope Unattempted, `IdentityNotProven`/`ShutdownUncertain`, and
+`original Close source unavailable at Worktree mutation`. Primary retained an
+admin-delete target; sample 2 retained a Worktree-delete target. Thus this failure
+reached physical cleanup and must not be described as an untouched pre-admission
+assessment refusal. Earlier ignored-content warnings do not identify its cause.
+Mutation's confirmed-release branch also conflated Busy/Refused; the narrow
+follow-up distinguishes those strings with no admission, retry, scheduling,
+release-classification or custody change. The observed branch remains unknown.
+
+Other 2b3 failures were independently classified: focused DB inventory was
+success-gated and skipped after the physical failures, so later always-run
+wrappers failed on missing `selected-tests.txt`/`inventory.log` before their
+focused tests. Native DB actually passed 82 tests before its inventory check
+failed; full migrations passed 180. These are neither focused execution receipts
+nor evidence those migration algorithms failed. Exact formatting also failed on
+the previously corrected missing-status assertion. Workflow gating is unchanged.
+
+The `9a65b81917cf2621969e6d710cb4ce2e21a49e44` broad run passed early
+formatting, Clippy, musl, UI/spec/task, dev.py, e2e and Rust archive build;
+its terminal test failures are classified above. The diagnostic jobs compiled synthetic merge
+`f3a2669c083fb0082554837fc3e8ce3ba3b882f3` (feature 9a65 into main4aba9625),
+not the exact feature source. Exact9a65 has started after retained2b3 ended.
+These positives establish compile/lint repair only, not intermittent behavior.
+
+### 8b770 hosted compile/lint repair
+
+Published `8b770f1d12cbca284d0cfd18a0be7c2d1d866b55`, the independently
+reviewed formatting-only follow-up. [CI45617302819](https://github.com/scottopell/phoenix-ide/actions/runs/45617302819)
+passed early exact-source formatting, task validation and UI/spec checks. It is
+still active, but completed musl and Clippy jobs exposed introduced blockers in
+the earlier inspection-gap mapping: `application_error` needlessly took the now
+non-Copy error by value, two tests imported writer types from `native_close`
+instead of the existing DB facade, and two adapter assertions treated
+`ToolOutput::output()` as a field. Evidence: `/tmp/close-8b770f1d1/{musl,clippy,ui-specs}.log`.
+The narrow repair borrows at all formatter callsites, uses existing DB exports,
+and keeps each ToolOutput alive while reading its output method. No error-code,
+classification, admission or custody semantics change. Hosted executable proof of
+the corrected source is still required; no local executable validation was run.
+The older exact 2b3 remains active with failures; full classification awaits its
+terminal logs. Exact 8b770 is pending. These are distinct feature/exact and broad
+synthetic-merge results, not interchangeable receipts.
+
+### bf211 hosted result and formatting-only correction
+
+Published `bf211d78f60a2033e68e911bc54f387847322758` after independent
+source review. [CI45616956112](https://github.com/scottopell/phoenix-ide/actions/runs/45616956112)
+is terminal failed: early formatting requests two line-wrap changes in the new
+Git Busy/Refused diagnostic branches. Both proposals are applied unchanged;
+Rust/dependent executable lanes were skipped, not passed. Evidence:
+`/tmp/close-bf211d78f/ci-failed.log`. No local formatter or executable validation.
+The exact bf211 run remains pending behind active 2b3. Exact be1 was automatically
+superseded by GitHub concurrency (terminal cancelled); no manual cancellation.
+
+### Hosted formatting, source-entry diagnosis, and manual retry guidance
+
+Follow-up to `be1eb187671cfdb04db5cfd00b4bc79c4647d5fd`: all four hosted
+formatting proposals from [CI45613284565](https://github.com/scottopell/phoenix-ide/actions/runs/45613284565)
+are applied manually unchanged. That run failed early source formatting; Rust and
+dependent lanes were skipped, not passed. No local executable validation was run.
+
+The confirmed-release Git-spawn refusal now distinguishes `source-entry busy`
+from `source-entry refused`. Both branches still disarm and fail closed before
+any child spawn. The actual branch behind the 8b5 post-admission source-unavailable
+failure is not yet proven; this is diagnostic separation, not a behavioral fix.
+Do not conflate it with the distinct broad pre-admission `/proc` inspection gap.
+
+Stopped Close now offers a manual Coordinator link and exact copyable request,
+not the known-refused legacy HTTP retry callback. The request uses the snapshot's
+authoritative `product_conversation_id`, exact attempt ID, and decimal-string
+`failed_run_ordinal`; it performs no admission, automatic send, or retry loop.
+Independent review caught a transcript/ProductConversation targeting error before
+publication. The corrected regression deliberately separates those IDs and uses
+ordinal `9007199254740993` to guard against JavaScript numeric rounding. Other
+non-stopped controls are unchanged. This does not add structured writer rows,
+syscall-stage/permission precision, or prove initial/API/UI full parity.
+
+Source review and hosted qualification remain distinct. At this checkpoint,
+[exact 2b3](https://github.com/scottopell/phoenix-ide/actions/runs/45608183589)
+is in progress and [exact be1](https://github.com/scottopell/phoenix-ide/actions/runs/45613274182)
+is pending. Their existing single watchers are retained; no manual cancellation,
+rerun, or dispatch. Earlier pending exact runs may be superseded automatically by
+GitHub concurrency. This candidate remains draft/unqualified; no merge or rollout.
+
+### Actionable inspection-gap mapping — narrow correction, parity still open
+
+Source trace confirms captured-loss pre-admission writer gaps were collapsed to
+`storage_rejected` after classification. The correction carries only an existing
+classified gap (target path, detector, optional PID, reason) through an in-memory
+assessment error to the existing native application/tool boundary. The response
+is `retry_inspection_blocked`, states no new run admitted and disk contents retained,
+and requires an explicit fresh retry. Unrelated DB/probe/content errors remain
+Storage; positive writer evidence is not relabeled as an inspection gap. No new
+persistence, detector exclusion, admission change, automatic retry or privileged
+fixture setup is introduced. Anchored retry behavior remains unchanged.
+
+Focused source regressions cover typed target retention/short-circuit, unknown PID,
+known/unknown PID mapping, unrelated text containing gap remaining Storage, and
+existing Storage/Fatal tool codes. The hosted 2b3 broad run is terminal failed
+**early formatting only**, requesting one multiline assertion in the missing-status
+regression; its proposal is applied unchanged. Executable lanes were skipped, not
+passed. Exact 2b3 qualification remains queued behind retained 8b5 evidence; it is
+not discarded or substituted with a later green sample. Current source changes
+still require independent review and hosted qualification.
+
+Remaining precision/parity limitations are explicit: `CloseWriterObservation` has
+no syscall-stage or permission-denied field; those details are debug-only before
+this mapping, so `unavailable` cannot honestly be rendered as permission denied or
+as a specific failed syscall. Initial admitted physical failure persists existing
+exact writer rows and projects its detector/PID/reason error detail, but the UI has
+no structured writer-row projection. Before the follow-up above, its stopped branch had no Retry action and
+the HTTP retry handler deliberately refuses native-retirement rows rather than
+admitting through that button. Exposing it blindly would widen authority and offer
+a false action. These initial/UI/precision gaps remain **unresolved acceptance**,
+not hidden by this captured-loss tool correction. Explicit native retry still
+requires its exact current Coordinator source; no UI admission widening is claimed.
+
+### Shared-host practicality remains an independent product gate
+
+Privileged PID/mount/private-storage fixture isolation is **on hold pending the
+human decision**. No isolation, credential, production detector or safety-policy
+change is made. Such isolation would qualify a controlled fixture universe, not
+ordinary shared-host liveness.
+
+Latest [CI45600271194](https://github.com/scottopell/phoenix-ide/actions/runs/45600271194)
+compiled synthetic merge `1fa0102d7f6bdc1f96a77c8e4fcacb619909f721` (8b5 into
+main 4aba9625a). Shards 1/3/4 passed **1764 / 1753 / 1746**; shard 2 ran
+**1574 / 1760**, **1573 passed / 1 failed**, leaving 186 selected tests unrun.
+Non-test required lanes passed. The prepared-Stop journey now exposes its original
+pre-barrier `storage_rejected`: fresh Linux descriptor owner-status ENOENT for PID
+21582 became `Vanished`, then an attributed `Unavailable` inspection gap. Durable
+reads show only stopped run 1 and no retry receipt. Stop was not sent. Its preceding
+dirty call also encountered a mapping gap for PID 21577; neither PID had a proven
+owner/incarnation. Evidence is `/tmp/close-8b51143e4/ci-failed.log` and bounded shard
+artifacts. This proves this occurrence, **not** historical a251/c0d causes.
+
+A deterministic Linux-only regression removes the initial synthetic process status
+before scanning and requires an attributed PID-17 `Unavailable` gap for descriptor,
+cwd and mapping detector tags, with no inspect callback. It preserves current
+policy and uses no production change. Local source review and `git diff --check`
+are not hosted executable proof; regression execution remains pending publication.
+
+Recorded installed source is `9885834f049683f5e6fa9c840668bdab92eb8a01`, corroborated
+by `~/.phoenix-ide/deployed.sha` and deployment status source/release/expected SHA.
+This is recorded installation identity, **not** live process attestation. Exact
+source inspection shows macOS already has analogous conservative liveness risk:
+`mac_writer_process` requires complete BSD info before owner filtering, then an
+executable for same-user candidates; `mac_writer_scan` fails on the first gap.
+`stable_writer_observation` returns `ProcessChanged` after absent/changed identity
+even when inspection found no worktree authority. Descriptor enumeration also
+requires vnode evidence before target filtering. Consequently unrelated process/FD
+churn can block clean Close; persistent inaccessible relevant processes can block
+retries indefinitely. No incidence or live-host failure is measured here.
+
+Existing real-production-detector successes (exact 4fa and 6d8, and the bounded
+6064908e3 milestone) prove successful disposable Linux paths on those runs, not
+universal shared-host availability, macOS syscall acceptance or starvation freedom.
+`tasks/41013-p3-ready--close-writer-scan-live-qualification.md` records live-scan
+coverage gaps; its stale executive cross-reference is not fresh acceptance.
+No verified ordinary shared-macOS public Close success is established by the
+bounded source/artifact/history evidence reviewed here.
+
+Analysis-only options, **not implemented or approved policy**: preserve current
+fail-closed behavior while surfacing exact gap stage/detector/PID/native reason and
+explicit fresh retry; this improves honesty but cannot cure persistent starvation.
+A narrower terminal-incapability exclusion would need a retained kernel-backed
+identity proving the *same captured incarnation* cannot retain live authority,
+while keeping transferred/forked holders independently visible. ENOENT, PID reuse,
+process names, ancestry, negative target matches or access denial are not that
+proof. Current REQ-WL-002e treats changing/ambiguous evidence as a gap; a different
+exclusion therefore needs an explicit contract/security decision and platform proof.
+A truthful recoverable blocker remains preferable to a fabricated clean result,
+but controlled-test success alone does not close the product usability gate.
+
+### 556 early formatting — hosted correction only
+
+[CI45599205760](https://github.com/scottopell/phoenix-ide/actions/runs/45599205760)
+for diagnostic head `556cbaa86113d623fdba6e3baa664abf0b84017f` failed early
+formatting at the two newly mutable public retry task bindings. Hosted rustfmt
+requests only wrapping each binding before `tokio::spawn`; both unchanged proposals
+are applied together. Rust build/tests/Clippy/musl and dependent lanes were skipped,
+not passed. Remaining release-helper completion is still pending at this checkpoint.
+Exact [Close45599196850](https://github.com/scottopell/phoenix-ide/actions/runs/45599196850)
+is queued behind c0d. This formatting correction changes no behavior and does not
+resolve or qualify either intermittent failure. Evidence: `/tmp/close-556cbaa86/early-source.log`.
+
+Exact 6d8 artifacts additionally confirm foundation **270 / 0 / 0**, native DB
+**82 / 0 / 0**, migrations **180 / 0 / 0** and each of six public physical/retry/Stop
+selectors **1 / 0 / 0** at source `6d8b7a769abcfc9aba70764d5672b1374a46499a`.
+These passing receipts remain historical evidence, not causal resolution.
+
+### c0d assessment-barrier failure — unresolved, diagnostic follow-up only
+
+[CI45591019848](https://github.com/scottopell/phoenix-ide/actions/runs/45591019848)
+is terminal failed. Its compiled source is synthetic merge
+`160823795487f0d78f830544775ef45eeb1e77e1` (feature c0d into main 4aba9625a),
+verified from checkout/build logs. Clippy, musl, early formatting, build/codegen,
+dev.py/task/UI/specs/E2E and release helper jobs passed. Rust shards 2/3/4 ran
+**1760 / 1753 / 1746**, all passing. Shard 1 ran **1637 / 1764**: **1636 passed,
+1 failed**, with 127 selected tests not run after fail-fast.
+
+The failing selector is **Stop during captured-loss assessment**, not the clean
+retry/replay selector. It timed out at `Pause::reached` before sending Stop.
+The assessment checkpoint is success-only: an already-completed refusal can
+leave its armed arrival sender retained and produce the same timeout as pending
+work. No original tool result was observed by that failure path. This does not
+establish a Stop defect, a scheduling delay, or a common cause with a251's final
+clean `storage_rejected`. The old dirty-phase warning remains non-causal evidence.
+
+The follow-up preserves the same ten-second barrier guard, racing arrival against
+the public task's actual completion. Failure prints the original result or pending
+state plus before/after bounded trace tails before diagnostic awaits, joins or
+aborts the failed public waiter, then reads bounded durable evidence including
+source state. Barrier success and all existing Stop/physical/durable assertions
+remain unchanged. There is no production behavior change or retry masking.
+
+The fixed diagnostic matrix now includes four independent samples of each observed
+failing selector, with distinct logs and sticky aggregate failure. Each process
+retains its 90-second plus kill-grace fence; the diagnostic step alone is bounded
+at sixteen minutes for eight samples. Existing journey and safety timeouts are
+unchanged. This is evidence collection, not a behavioral fix or merge acceptance.
+
+[Close45583380922](https://github.com/scottopell/phoenix-ide/actions/runs/45583380922)
+for exact 6d8 is now terminal **success**, with its artifacts preserved under
+`/tmp/close-6d8b7a769/artifacts/`; it does not explain either intermittent failure.
+Exact c0d [Close45591009329](https://github.com/scottopell/phoenix-ide/actions/runs/45591009329)
+has started; its results remain pending. Current c0d evidence is preserved under
+`/tmp/close-c0d72cbfb/`. No local executable validation, manual workflow operation,
+merge or deployment. Candidate remains **draft and unqualified**.
+
+### 6d8 broad results and bounded intermittent retry diagnosis
+
+Candidate `6d8b7a769abcfc9aba70764d5672b1374a46499a` remains **unqualified**.
+[CI45583392931](https://github.com/scottopell/phoenix-ide/actions/runs/45583392931)
+is terminal failed only at Clippy: `INSTALL_SHIM` appears after a statement.
+Early formatting, musl, Rust build/codegen, dev.py/task/UI/specs/E2E and all four
+Rust shards passed. Shards executed **1764**, **1760**, **1753** and **1746** tests,
+all passing; selected-out tests are not counted. Broad source was synthetic merge
+`99b533a4e3176f4e05d0b8d4d6e1c83d51e174a5`, not exact feature alone.
+All six unprivileged dispatcher selectors have actual **1 / 0 / 0** receipts,
+including Stop before physical observation. The repaired real-Chrome root-exit
+and handler-exit relaunch fixtures passed. Exact
+[Close45583380922](https://github.com/scottopell/phoenix-ide/actions/runs/45583380922)
+is still active; its final qualification is not claimed.
+
+Retained predecessor [Close45580506277](https://github.com/scottopell/phoenix-ide/actions/runs/45580506277)
+finished failed on a251. In addition to formatting, the clean public captured-loss
+retry actually returned `storage_rejected`. Four causal Stop selectors and initial
+physical retirement passed, as did native DB **82 / 0 / 0** and migrations
+**180 / 0 / 0**. Missing downstream DB inventories caused further receipt-gate
+failures; those are not independent selector executions. No Close runtime, journey
+or qualification workflow source changed from the passing 4fa7 to a251. This is an
+**unresolved intermittent behavioral failure**, not excused by the later broad pass.
+The sole ignored-content warning was retained from an earlier intentionally dirty
+retry: the accumulating trace buffer cannot establish the clean refusal's cause.
+
+This diagnostic follow-up moves the unchanged `Once` declaration before statements,
+prints the original clean refusal plus separately labeled before/after bounded
+trace tails before any diagnostic DB await, and reads retry receipt/run/cleanup
+and retirement state without diagnostic unwraps. A two-second outer evidence guard
+cannot suppress the already printed original refusal. Strict journey assertions,
+Stop fences, successful replay and physical/durable checks remain unchanged.
+
+Exact qualification adds four fixed, isolated clean-retry journey samples through
+the existing unprivileged harness. Each preserves a distinct log; every nonzero
+status, missing exact execution receipt or non-passing count fails the step. These
+are not retry-until-green, and a later success cannot erase an earlier failure.
+Per-sample 90-second plus kill-grace limits and an eight-minute step fence bound the
+investigation. Even all samples passing would not explain the observed failure:
+merge remains blocked pending trustworthy failing-stage evidence and resolution,
+not repeated whole pipelines until one green. No production safety policy changes,
+automatic recovery, sleeps, manual reruns/cancellation or local executable validation.
+Evidence is retained under `/tmp/close-a251508ae/` and `/tmp/close-6d8b7a769/`.
+
+### a251 early formatting refusal and unchanged hosted correction
+
+Candidate `a251508aea62e5841d12a4bfa741d904c7cf7921` is **not qualified**.
+[CI45580517021](https://github.com/scottopell/phoenix-ide/actions/runs/45580517021)
+is terminal failed: exact-source formatting requires only a multiline chain in
+the repaired Chrome root-exit observation loop. Broad Rust, Clippy/musl, dev.py,
+task and UI/E2E lanes were skipped, not passed. Both release-helper platforms
+passed. [Close45580506277](https://github.com/scottopell/phoenix-ide/actions/runs/45580506277)
+remains active; its hosted formatting proposal is retained under
+`/tmp/close-a251508ae/format/` and applied unchanged in this correction.
+
+Corrected-head publication does not wait for this known-nonqualifying source's
+entire Close run. Standard CI is already terminal; exact Close uses per-ref
+concurrency with `cancel-in-progress: false`, so its successor queues without
+canceling the active evidence/cache producer. No manual cancellation, rerun or
+dispatch is needed. This follow-up changes only hosted-requested formatting and
+this ledger, remains **unqualified**, and does not claim the skipped code gates
+or repaired browser fixtures have executed. No local executable validation ran.
+
+### 4fa7 hosted result and reviewed lint / real-Chrome fixture repairs
+
+Exact feature `4fa7be6a38ef2129d86a70f14d2f7ef049ba4b74` completed
+[Close45570531329](https://github.com/scottopell/phoenix-ide/actions/runs/45570531329)
+**successfully**, including final formatting, frontend and specifications.
+Parent-read artifacts establish foundation **270 / 0 / 0**, native DB
+**82 / 0 / 0**, migrations **180 / 0 / 0**, and each of the six exact public
+physical/Stop selectors **1 / 0 / 0** (passed / failed / ignored).
+
+[CI45570540238](https://github.com/scottopell/phoenix-ide/actions/runs/45570540238)
+completed **failed**. Broad Rust checked synthetic merge
+`38537147f5af0bb87bdb893b7003168aa12eaa3c` (main `4aba9625a` + feature 4fa7),
+not exact feature source alone. Rust build/codegen, early source, dev.py tests,
+task validation, UI/specs, E2E and both release-helper platforms passed.
+Test shards 1, 2 and 4 passed **1764**, **1760** and **1746** tests respectively;
+shard 3 stopped after **33 passed / 1 failed** of 1753 selected tests.
+The full Clippy and musl diagnostics identify four lint sites: a missing yield
+statement semicolon, two reads of an underscore-prefixed fixture owner, and a
+large directly awaited drive-turn future (same cause on GNU and musl).
+
+Five of the six dispatcher selectors have actual broad-run identity and execution
+receipts: initial retirement, public captured-loss retry/reclaim/replay, and Stop
+during assessment, while prepared and before writer acquisition each ran as
+`nobody` (UID/GID 65534, runner UID 1001) and passed **1 / 0 / 0**. The Stop before
+physical observation selector was in the fail-fast shard and is **not established
+through broad CI** on this source. Its exact Close receipt above remains distinct.
+
+The failing browser test was
+`get_session_evicts_and_relaunches_after_chrome_process_exits`: profile removal
+returned `Directory not empty`. The fixture had not installed the matched Chrome
+shim, selected root-only ownership, killed the root, then reaped it before
+retirement. Surviving profile-writing descendants are consistent with the failure,
+not individually identified by the log. The reviewed repair installs the existing
+matched shim for all three real-Chrome lifecycle fixtures, asserts owned-group
+launches on Linux/macOS, and observes root exit without reaping its identity anchor
+before retirement drains the group. Configured Chrome without its shim fails;
+the existing absent-Chrome gate is unchanged. Production lifecycle code is not
+changed, and unshimmed production root-only cleanup is not claimed fixed.
+
+After both workflows became terminal, this follow-up batches the four lint-site
+repairs and the browser fixture / CI environment repair. The drive-turn future is
+boxed, not spawned; fixture TempDir custody is retained. Independent source review
+found no concrete blockers. Evidence and frozen repair hashes are retained under
+`/tmp/close-4fa7be6a3/`. This follow-up remains **unqualified** pending fresh automatic
+exact Close and standard CI, including actual execution of the repaired Chrome
+fixtures and all six dispatcher selectors. No local executable validation, main
+merge, installation or release occurred.
+
+### 678 hosted result and formatting-only follow-up
+
+Candidate `678c573711d274de9f09baed20f9c239e769b024` is **not qualified**.
+[Close45561465961](https://github.com/scottopell/phoenix-ide/actions/runs/45561465961)
+completed all behavioral gates successfully but failed the final exact-source
+formatting gate: one test-helper signature requires multiline formatting.
+Parent-read logs again establish foundation **270 / 0 / 0**, native DB
+**82 / 0 / 0**, migrations **180 / 0 / 0**, and each of the six exact public
+physical/Stop selectors **1 / 0 / 0**. Frontend and specifications passed.
+[CI45561473214](https://github.com/scottopell/phoenix-ide/actions/runs/45561473214)
+failed early on that same signature; broad Rust build/lint/test jobs were skipped,
+so the new dispatcher, nextest serialization and lint repairs have no executable
+qualification yet. The dev.py tests and task-validation lanes were also skipped;
+there is no hosted dispatcher-fixture or real unprivileged detector execution
+receipt through the new integration.
+
+After both runs became terminal, the unchanged hosted formatting proposal was
+applied to that signature only. Evidence, terminal logs, exact selector counts
+and the proposal are retained in `/tmp/close-678c57371/`. This formatting-only
+follow-up remains **unqualified** pending fresh automatic Close and standard CI;
+no local executable validation, merge, install or release occurred.
+
+### 184 result and reviewed CI parity follow-up
+
+Exact feature `1847873311f980163ace684e151d1052ca21b662` completed
+[Close45549078100](https://github.com/scottopell/phoenix-ide/actions/runs/45549078100)
+**successfully**. The retained logs establish **270 / 0 / 0** foundation tests,
+**82 / 0 / 0** native DB tests and **180 / 0 / 0** migration tests
+(passed / failed / ignored). Initial public physical retirement, captured-loss
+cleanup → explicit retry → reclaim → replay, and each of four causal Stop
+selectors each executed **1 / 0 / 0**. Evidence is retained under
+`/tmp/close-184787331/artifacts/close-exact-source-1847873311f980163ace684e151d1052ca21b662-1/`.
+The before-writer selector does not establish held-writer contention coverage.
+
+[CI45549084694](https://github.com/scottopell/phoenix-ide/actions/runs/45549084694)
+completed **failed**. Its broad Rust source was synthetic merge
+`ff76488e42dcede2e89d25c8d9ce19bece536d43` (parents main
+`4aba9625a1dfc85ab25f07eaa1f4536a51b19a1e` and exact feature 184), not feature
+source alone. Build and test compilation passed. Remaining blockers were nine
+Clippy sites and five captured-loss public retry/Stop tests in each broad shard.
+One retry log proves fail-closed refusal because an ambient same-EUID runner
+process's `/proc/1150/exe` was unreadable; the other four barrier timeouts are
+consistent with pre-admission refusal, but their logs do not prove that same cause.
+Complete diagnostics and terminal receipts are retained in `/tmp/close-184787331/`.
+
+This follow-up repairs the nine lint sites without weakening Stop, scanner,
+identity or custody checks. Broad split tests opt into a six-exact-test dispatcher
+that reuses the existing checksum-verified unprivileged qualification harness and
+its real production detector. Other tests exec their original command unchanged.
+The runner-owned profiler remains outside the identity drop and retains output,
+identity and exit receipts. The original nextest test binary and CI-built
+`target/debug/phoenix_ide` launcher are staged; no test is skipped or replaced by a
+success receipt. Independent review caught and repaired an incorrect launcher
+filename and a shared-UID concurrency race before publication. An opt-in nextest
+group serializes the public physical Worktree module across whole invocations,
+including staging, preflight and cleanup, so these six harnesses cannot race one
+another's process scans. The split job explicitly provisions tmux rather than
+assuming the runner image supplies it. Focused dispatcher/profiler/argument,
+serialization-config and launcher source-contract fixtures are added, not locally
+executed.
+
+The follow-up is **unqualified** until fresh automatic exact Close and standard
+CI complete. Source inspection and `git diff --check` are not executable receipts;
+no local executable validation, main merge, installation or release occurred.
+The sections below preserve older candidate history, not current qualification.
+
+### a726 follow-up result and narrow correction
+
+`a72650da461c28abf4b81ceafb5213484a5bd33c` is **not qualified**:
+[Close45546904155](https://github.com/scottopell/phoenix-ide/actions/runs/45546904155)
+and [CI45546910501](https://github.com/scottopell/phoenix-ide/actions/runs/45546910501)
+are both terminal **failed**. CI's exact-source early lane rejected formatting;
+downstream broad compilation/Clippy lanes were skipped, not passed. Close retained
+five E0308 errors from one extracted inspection helper's incorrect `ResourceScopeKey`
+parameter, where its caller and `NativeInitialInspectionFailure::Scope` require
+`WorkScopeId`. This correction changes that parameter back to the exact captured
+WorkScope identity, without wrapping or broadening it to resource scope. It also
+applies the retained hosted formatting patch (five Rust files). Fresh hosted
+qualification is still required; no local executable validation ran.
+
+A726 did execute 82 native DB tests and 180 migration tests successfully; frontend
+and specifications also passed. Runtime/public physical journeys and the complete
+foundation run were not established for a726, so e169's green receipts below remain
+historical only. Retained logs/patches: `/tmp/close-a72650da4/`.
+
+Published `e169f02a4a6e72b543c79c3a4363b34faed9e2eb` completed
+[Close45532375109](https://github.com/scottopell/phoenix-ide/actions/runs/45532375109)
+**successfully**, including the complete foundation module (**270 passed / 0 failed /
+0 ignored**). Initial public physical Worktree retirement, captured-loss cleanup →
+explicit retry → reclaim → replay, and each of the four causal Stop selectors each
+executed **1 passed / 0 failed / 0 ignored**. These logs are retained under
+`/tmp/close-e169f02a4/artifacts/close-exact-source-e169f02a4a6e72b543c79c3a4363b34faed9e2eb-1/`.
+The before-writer selector is pre-acquisition, not held-writer contention proof.
+
+[CI45532383507](https://github.com/scottopell/phoenix-ide/actions/runs/45532383507)
+completed **failed**. Rust qualification used synthetic merge
+`6ed3d36f458f9e9f4208d580fb45d4a51070d8b2`, with parents main `469647699` and
+feature `e169f02a4`; early source checks used the exact feature source. The complete
+retained Clippy capture reported 268 emissions / 234 distinct source-site+lints
+across three crates. Rust test compilation also rejected the unused completion
+receipt re-export and never-constructed completion admission variant. E2e, dev.py
+tests, UI/specs, task validation and early source checks passed; broad Rust test
+execution was skipped after compilation failed. Close-only green is not merge-ready.
+
+This follow-up removes that dead completion residue while preserving historical
+Replay, consolidates repeated match/exit logic, boxes large live payloads and shared
+future boundaries, and extracts cohesive scanner/physical binding helpers. All Stop,
+identity, deadline, retained-custody and replay assertions remain required. Independent
+source review caught and corrected boxed generic-bound arguments, a cancel-wrapper
+name collision, irrefutable Replay patterns and remaining repeated match arms.
+The finite original diagnostic inventory was reconciled by source inspection; this
+is not a compiler, Clippy or formatter receipt. No local executable validation ran.
+The follow-up remains **unqualified** pending fresh automatic Close and standard CI
+on its published source. No main merge, installation or release is claimed.
+
+## Historical candidate evidence
+
+The current source reduces the Close expansion against shipped RC16
+`9885834f049683f5e6fa9c840668bdab92eb8a01`. The keep/share/delete ledger is
+[CLOSE-ARCHITECTURE-REDUCTION.md](CLOSE-ARCHITECTURE-REDUCTION.md).
+
+- Historical published head `7c659cc3282c89c8df812f9c8b7e1b79e06df53e`:
+  [Close45521202899](https://github.com/scottopell/phoenix-ide/actions/runs/45521202899)
+  and [CI45521211723](https://github.com/scottopell/phoenix-ide/actions/runs/45521211723)
+  are terminal **failed**. Exact Close artifacts under `/tmp/close-7c659cc32/`
+  prove actual initial public physical Worktree retirement and captured-loss
+  cleanup → explicit retry → reclaim → replay, each **1 passed / 0 failed / 0 ignored**.
+  All four causal Stop selectors (assessment, before writer acquisition, prepared,
+  before physical observation) likewise each executed **1 / 0 / 0**. Frontend,
+  specifications and final exact-source formatting passed. These are real reduced
+  implementation results, not overall qualification or held-writer contention proof.
+- That Close run's sole failed gate was the complete foundation module:
+  **269 passed / 1 failed / 0 ignored**. The approval source-fence regression
+  incorrectly unwrapped `close_safe_retry_progress` after the run was stopped;
+  it correctly refused with `retry progress requires the exact latest running
+  resource plan`. This follow-up asserts that public refusal and compares the
+  retained exact run's pending resources through the storage reader, preserving
+  the source-fence, obligation and no-rewrite assertions. The Coordinator-home
+  prerequisite was already present in the published source; it was not this failure.
+- Standard CI compiles synthetic merge `32a80c9dbb0f1dc247223b95e5cad922696806fb`
+  (parents main `469647699` and feature `7c659cc32`), not the feature SHA alone.
+  Its concrete blockers were dead `InitialProcessSelection::WholeKind`, unused
+  production `NativeInitialSourceFence::process_interrupted`, and core test
+  `manual_string_new`. E2e and seed setup failed while building on the same DB
+  errors. The e2e `run.py: error: unrecognized arguments:
+  product_conversation_context_continuation` diagnostic is explicitly emitted by
+  `test_parse_args_rejects_positional_arguments`, immediately followed by `ok`;
+  all 46 harness self-tests completed OK (one skipped) before the failing build.
+  It is accounted for, not an independent scenario invocation failure.
+- This unqualified follow-up deletes the obsolete whole-kind authorization facade
+  instead of suppressing its lint, migrates its assertions to live exact-resource
+  entry callbacks, retains exact dispatch/prior-success/retirement/source refusals,
+  confines the interruption constructor to its test-only caller, and uses
+  `String::new()` in the empty-source-ID refusal fixture. Source-only independent
+  review found no semantic/compile blocker; the stopped-reader refusal is now
+  explicit. Manual formatting and `git diff --check` are not executable validation.
+  Fresh automatic exact-head Close and standard CI are required after publication.
+- The entries below describe earlier candidates and their then-pending repairs;
+  they do not override the latest terminal results above.
+
+- Integrated head `efee002934983e84606a34e4a2b98a68d98957f5`: automatic
+  [Close45517506691](https://github.com/scottopell/phoenix-ide/actions/runs/45517506691)
+  and [CI45517517914](https://github.com/scottopell/phoenix-ide/actions/runs/45517517914)
+  **failed**. Browser custody cases, including both new detached/gate/replacement
+  regressions, each executed successfully. The 82 native Close DB tests passed;
+  the enclosing request/observation gate still failed because runtime compilation
+  prevented its required inventory. Runtime compilation rejected the prior repair's
+  wrong `ContentBlock` module path; no public journeys or causal Stops executed.
+  Frontend was 114 passed / 1 failed on a stale mobile tooltip expectation; specs
+  passed. Standard CI stopped on three Rust format differences. This next candidate
+  corrects the import to the declaration's `domain::llm_types` module, aligns the
+  tooltip assertion with separate cleanup/explicit retry semantics, and applies
+  the exact hosted formatting patch. These repairs remain unqualified.
+- Reduction head `d180a5e12d2bd985af94d26f5f89397299548963`: automatic Close
+  [45509934652](https://github.com/scottopell/phoenix-ide/actions/runs/45509934652)
+  **failed**. All 82 native Close DB tests (including the ordinary-approval
+  transaction source-fence regression), four shared-source core tests, frontend
+  and specification lanes passed. Runtime test compilation failed on a missing
+  `ContentBlock` import; runtime public journeys and Stop cases did not execute.
+  The hosted format-only patch and import repair are incorporated in this next
+  candidate, not yet qualified. Standard PR CI was absent while main conflicts
+  prevented a synthetic merge.
+- This candidate integrates main `4696476996c66b77de85a23ac9331a4ef04bc8e3`,
+  preserving its extracted UI action components and dead-browser detection while
+  routing dead-session retirement through existing gate/custody/completion
+  ownership. Source review found and repaired moved-key, adapter-arity and Arc
+  receiver hazards. Two deterministic synthetic-slot regressions cover detached
+  gate waiting and post-wait replacement preservation; existing blocking-profile
+  cleanup tests, not those synthetic fixtures, cover physical deletion custody.
+  Main's published ADR-283 (ordinary foreground batches), ADR-284 (eight-owner
+  window), and both original ADR-285 records (Kache qualification and Coordinator
+  evidence labels) were left unchanged at integration. Branch-local Close records
+  moved 283→286, native task approval 284→287, and unified Close 285→288. The
+  duplicate was pre-existing upstream and was not resolved in that integration;
+  the subsequent documentation correction retains Coordinator as canonical
+  ADR-285 and renumbers Kache qualification to ADR-289 (original #1183). Proposed
+  Close ADR-288 remains superseded by accepted Close ADR-286. Integrated behavior
+  remains unqualified pending exact-head hosted checks.
+- Previous head `cb7e805735220fd260537a42e33e15baacaff70f`: Close qualification
+  [45491118337](https://github.com/scottopell/phoenix-ide/actions/runs/45491118337)
+  **passed**. Standard PR CI
+  [45491139148](https://github.com/scottopell/phoenix-ide/actions/runs/45491139148)
+  **failed**. Neither result qualifies this reduction.
+- Shared exact executing-source predicate replaces duplicate core/DB/IDE logic;
+  it remains validation, not mutation authority. Unexposed native task approval
+  DB/runtime modules are removed from this candidate, preserved at local ref
+  `preserve/native-task-approval-cb7e80573`. Migration 172 and later identities,
+  reviewed-proposal state/checkpoint/provider compatibility remain intact.
+- Removed the alternate test-only initial adapter and no-entry initial metadata
+  wrappers; live resource custody, two-stage handback, physical cleanup, source
+  fencing, recovery and retry evidence remain required. Cross-crate fixtures use
+  the retained public settlement API.
+- Independent source reviews found ordinary-approval restoration compile hazards,
+  a lost transaction source fence, a cross-crate test-only API caller and a fixture
+  prerequisite. Repairs are authored, including a direct storage-writer fencing
+  regression with legitimate Coordinator home initialization. That regression is
+  not permission for HTTP approval of the Coordinator.
+- Still-live cb7 lint/import findings are repaired in source. No local executable
+  validation was run. The next evidence is automatic exact-head hosted Close and
+  standard CI after publication; source review and `git diff --check` are not
+  compile, formatting or behavior qualification.
+- The `1068c2da76` captured-loss `storage_rejected` cause remains unknown. Later
+  passing journeys do not establish a causal fix or prove a flake.
+
+No merge, deployment, install or release is claimed or authorized by this record.
+The older progress entries below describe historical candidates only.
+
+---
+
+# Unified Close acceptance milestone
+
+## Integrated1497 terminal: behavior gates pass; hosted formatting correction requires fresh CI
+
+Exact head `1497af5a4cf221aa773cfd0c148df34eb61aa5b5` completed automatic Close Qualification **45477991582** with failure only at `Require exact source formatting`; frontend and specifications passed. All preceding behavior gates passed, including actual initial public production-detector retirement, captured-loss cleanup → explicit retry → reclaim → replay, and all four named causal Stop tests (each one passed/zero failed/zero ignored). Source-pinned artifacts retained under `/tmp/close-1497af5a4/artifacts/` establish both owner190 migrations, anchored/captured origin readers, permanent-member deletion regression, unified source-refusal tool regression and full DB/runtime/tool gates. The captured-loss success does not establish the cause of1068's refusal or justify a flake label.
+
+Broader PR CI **45478002370** failed its early Rust formatting gate, preventing downstream native lint/build qualification. The follow-up applies exactly the hosted four-hunk patch, independently reviewed: three line-wrap changes and one single-expression match-arm block simplification, without semantic change. No local formatter or executable validation is used. Fresh automatic exact-head Close and broader CI remain required; no merge-ready, installation or deployment claim is made. PR #1161 remains draft.
+
+
+## Integrated1068 terminal: captured-loss retry refusal; diagnostic/lint candidate unqualified
+
+Exact head `1068c2da76f2c6886f89aca21ec5f71381b17d4d` completed automatic Close Qualification **45457483295** and broader PR CI **45457498208** with failure. Early source formatting passed. The actual public captured-loss clean retry failed with `storage_rejected`; its underlying assessment/admission cause remains unproven. Initial public production-detector retirement, all four causal Stop cases, and migrations passed on that head. Prior90ba behavior success does not establish that this refusal is a flake. Terminal logs and artifacts are retained under `/tmp/close-1068c2da7/`.
+
+The follow-up integrates reviewed main `9885834f049683f5e6fa9c840668bdab92eb8a01` (rc16 and hosted fixture/diagnostic repairs) through merge `730261153e4fa34724497622f0228de9763bc4f9`. It corrects reported DB/tool Clippy and runtime warnings, retains full hosted Clippy diagnostics, and captures a bounded test-only scanner/retry trace tail at strict failed public assertions. This diagnostic change does **not** fix the unidentified storage refusal or expose internal errors through the public tool. Exact focused public journeys and all four Stop cases now precede expensive DB regressions in the existing automatic workflow; required green-path acceptance gates and timeouts remain intact. If focused journeys fail, DB inventory intentionally fails fast and no downstream DB execution is claimed without its own receipt.
+
+Source-only independent review covered DB SQL/bind/replay ordering, migration helpers, Bash/tmux custody and boxed-permit consumers, and diagnostic/workflow seams. Narrow per-function argument-count/line-count stylistic exceptions retain cohesive authority transactions and regression journeys rather than introducing request wrappers solely for lint counts; no module-wide or correctness-lint suppression is added. Source review and `git diff --check` are not compile, formatter or execution proof. New hosted diagnostics may reveal additional previously truncated failures.
+
+The integrated follow-up is unqualified until automatic exact-head Close and broader PR CI results are inspected. The next causal gate is the clean captured-loss retry with retained assessment/admission diagnostics, followed by all full required checks. No local executable validation, merge to main, installation or deployment is performed. PR #1161 remains draft.
+
+
+## Integrated90ba terminal: behavior gates pass; exact formatting correction pending qualification
+
+Exact head `90ba5f5d8982daeb35d2cd820168df9ffe414396` completed automatic Close Qualification **45438888784** with failure only at `Require exact source formatting`; every preceding DB/runtime/public-journey/resource/tool gate completed successfully, as did frontend and specifications. Terminal evidence is retained under `/tmp/close-90ba5f5d8/artifacts-terminal/`. Broader PR CI **45438908900** failed its early Rust formatting gate, so downstream native CI is not yet qualified on this head.
+
+The follow-up applies the exact hosted formatting artifact: one import-list line break in `runtime/close_retirement.rs`, independently source-reviewed with no token or ordering changes. No local formatter/build/test execution or weakened check is used. Fresh automatic exact-head Close Qualification and broader PR CI remain required; no merge-ready, install or deployment claim is made.
+
+Feedback from hosted checks remains authoritative; prior behavior success does not substitute for the corrected candidate's required checks. PR #1161 remains draft.
+
+
+## Integrated9d0a1b9a8 terminal: actual Close acceptance passes; broader CI remains blocked
+
+Exact combined head `9d0a1b9a89d024b99e52c2996ddd77e7c74bfe08` passed automatic Close Qualification **45415555421** (DB, frontend, specifications; sole watcher exit0). Downloaded artifacts under `/tmp/close-9d0a1b9a8/artifacts/` have matching full source pins. Actual named logs establish initial public physical Worktree retirement; production-detector captured-loss cleanup → explicit retry → physical reclaim → replay; all four causal Stop tests (each1passed/0failed/0ignored); both owner190 migrations; anchored/captured origin readers; and `native_close_explicit_retry_rejects_untrusted_source_without_legacy_surface`. This is integrated execution evidence, not substitution by earlier branch-only passes or test inventory.
+
+Broader PR CI **45415572623** remains failed. Its Git-constructor lint and task validation are fixed, but subsequent terminal/browser Clippy, production warnings-as-errors, manual-transaction and event-wait checks reveal additional finite blockers. The follow-up removes the unreachable obsolete service/runtime retry chain rather than restoring the legacy tool, scopes proven legacy test adapters to tests while keeping live source-entry workers, preserves retained ownership/error payloads, extracts ordered terminal/browser phases without new deadlines, and retains causal waits with outer test watchdogs. The independent SQLite writer fixture now owns a SQLx transaction through the same Stop witness and rollback boundary. No shipped SQL or required acceptance gate changes.
+
+Independent source-only reviews found and corrected a missing test-only browser enum arm, a newly unused retry import, the test-only snapshot import, and four missed unused wrappers. No blanket lint suppression is added; the sole narrow dead-code allowance documents the frozen reject-only legacy HTTP request DTO without altering its wire shape or reactivating it. Source review is not compile proof. Fresh automatic exact-head Close and PR CI runs remain required for the follow-up, including hosted formatting. No local executable validation, merge, install or deployment was performed. PR #1161 remains draft.
+
+## Integrated16d477 terminal: DB/UI/spec pass; runtime test compile blocks journeys
+
+Exact head `16d477b919096b3f6fa1ad1630671369932f75d9` completed automatic Close run **45400233243** with failure. DB qualification, frontend and specifications passed, including the digest regression and renumbered migration execution. Hosted formatting patch is empty. Runtime test compilation reports three E0308 errors: tracking-context fixtures send an `AcknowledgedEventRequest` to main's evolved `AcknowledgedRuntimeRequest` channel. Downstream wrapper errors about an unset runtime binary are consequences of compilation failure, not executed public-journey failures. Integrated initial/captured-loss public journeys, four causal Stop cases and runtime/tool acceptance remain unexecuted. Exact logs/artifacts and the terminal sole-watcher result are retained under `/tmp/close-16d477b91/`.
+
+PR CI **45400246575** also identifies finite integration blockers: unnecessary browser mutability, two test-only native process-group helpers compiled in production, missing Errors documentation for the bounded Git-registration reader, three direct Git constructors plus an OsStr lint false positive, and duplicate unpublished task ID53019. The correction wraps all three fixture events in the actual channel variant without changing acknowledgement/retirement ownership; retains production browser custody and drain behavior; routes Git construction through the shared safe factory; constrains the lint to Command constructors with regression coverage; and renumbers only the unpublished task to53021. Historical shipped SQL is untouched. No blanket lint allowance, skipped required behavior gate, dependency downgrade or local executable validation is used.
+
+These source corrections require independent review and a new automatic exact-head hosted run. Earlier121795 journey/Stop passes remain evidence only for that branch-only head. PR #1161 remains draft; no integrated readiness, merge, installation or deployment claim is made.
+
+## Integrated34ccafc terminal: dependency compatibility blocks Rust execution
+
+Integrated head `34ccafc49b0170269c0b91ddaf3e6b64d536dc2a` completed Close run **45397534177** with failure. Frontend (including QuestionPanel and CoordinatorQuestionDock) and specification gates passed; hosted format patch is empty. Rust compilation fails E0277 at task-approval body hashing because main's updated digest output no longer implements whole-array `LowerHex`. Consequently the combined DB, public journey and Stop tests did not execute; their earlier121795 successes are not integrated acceptance. Terminal evidence is retained under `/tmp/close-34ccafc49/{db,exact,format}/` and the sole watcher exited1.
+
+PR CI **45397539488** independently rejects stale numbered SQL constant identifiers: migration173 references MIGRATION_157 and174 references MIGRATION_158. The source correction renames those private constants and test references to their actual173/174 identities without altering SQL bodies, and encodes digest bytes as fixed-width lowercase hex using existing core style. A standard SHA256(abc) regression is required as an actual exact hosted execution. These are narrow integration repairs, not a migration-ledger checker bypass or dependency downgrade. Corrected source remains unqualified until its new automatic exact-head run succeeds.
+
+## Main integration candidate: source reconciliation complete, hosted qualification owed
+
+Branch-only exact head `121795f15380df316973ce8e044dbd6ed352c642` completed automatic hosted run **45379847006** successfully. Actual named execution passed the public captured-loss reclaim/replay journey, all four causal Stop cases, initial physical Close journey, both owner-cleanup migration tests, typed origin routing, mandatory-delivery/permanent-deletion regression, and required DB/runtime/tools/UI/specification/format gates. Artifacts remain under `/tmp/close-121795f15/`; this is evidence for that immutable head, not the integrated candidate below.
+
+Draft PR **#1161** reconciles main `a479da92896d6dcd3b6a704c7f563510b6054bd1`, including UI1156, reserve1155, retention1158 and rc15 metadata. Main's shipped migrations169–171 and SQL remain unchanged; unpublished Close migrations169–187 move in order to172–190. Source-only independent review covered migration dispatch/order, exact-ending/provider replay/source fencing, runtime native-spawn/tool-preparation ownership and tool exposure. It found two deterministic fixture-tail assertion mismatches, corrected before publication. Source review is not executable qualification.
+
+The public native registry now exposes one `close_conversation` with initial/observe/explicit_retry actions and no obsolete `retry_close_safely` registration. An exact source-refusal/legacy-surface negative regression is required in the integrated hosted workflow. Existing actual journey/Stop/DB/UI/spec gates remain; finite main integration seam gates add native-spawn/tool-preparation ownership, exact ending/provider replay, QuestionPanel and CoordinatorQuestionDock tests.
+
+Remaining acceptance is successful automatic hosted qualification of the exact integrated commit, inspecting actual named executions and immutable source pins, then independent exact-head integration review/handoff. No branch-only results substitute for integrated execution. Full-model/ordinary assembled tmux/held-SQLite-writer contention and physical device/browser acceptance remain explicitly unproven, not new gates absent a demonstrated defect. No local executable validation, merge to main, installation, release or deployment is performed here.
+
+## Hosted3c692 terminal: actual public retry and all four Stop cases pass
+
+Automatic run **45369465587**, exact `3c692fd125aeb025dd0bbccc07348c8e99975083`, completed **failure only on five stale migration-tail count assertions**. Evidence is retained under `/tmp/close-3c692fd12/{db,exact,format}/`; its sole watcher completed. Frontend, specifications, formatting (empty exact hosted patch), production/runtime compilation and runtime qualification gates passed.
+
+Actual named execution now passes for the public production-detector captured-loss reclaim/replay journey and **all four intended causal Stop cases**: assessment, prepared, pre-writer acquisition, and pre-physical-observation. Each exact selector reports one passed/zero failed/zero ignored. The initial-Close physical journey remains green. This proves the named barriers, not actual held-writer contention or separately tracked ordinary-tmux assembly scenarios.
+
+Both migration187 upgrade/rollback regressions, both typed origin routing regressions and the supported permanent-member deletion regression passed as individually required exact tests. Native Close DB suite82 passed. Thus pending mandatory delivery still blocks deletion, canonical accepted delivery allows owner graph cleanup, and the regression's foreign-key check is empty. No historical migration or production source-authority relaxation was needed.
+
+The broad foundation/migrations suites exposed five fixture-tail counts missing the new migration: foundation14→15; migrations32→33,36→37 (two fixtures),15→16. These exact hosted actual/expected mismatches are the sole broad-suite failures (foundation268passed/1failed; migrations170passed/4failed). The reviewed follow-up changes only those five expectations plus this status; historical cutoffs and behavior stay unchanged. The registry-length184 expectation already passes and remains unchanged (holes99,154,157).
+
+Next gate is automatic exact-head requalification of those count-only corrections. Named acceptance on3c692 is established, but the required overall green immutable head is still owed. No local build/test/formatter/SQL/syntax execution, manual workflow operation, merge, installation, deployment or readiness claim.
+
+## Hosted ebe68 terminal: public reclaim/replay passes; test-source follow-up unqualified
+
+Automatic run **45364424705**, exact `ebe68f6c2d1aadae8df7ed00d9716928cae92fa5`, completed **failure**. Full exact-source evidence is retained under `/tmp/close-ebe68f6c2/`; its sole watcher completed. Frontend and specifications passed. The actual named production-detector **public captured-loss cleanup/reclaim/replay journey passed** (one executed test), as did the original initial-Close physical journey.
+
+All four Stop tests reached their intended barriers and progressed through Stop, worker release and source-refused public replay, then failed on the same invalid test oracle: calling the source-gated DB receipt replay reader after Stop had revoked that exact source. The production reader correctly rejects with `Close requires its current executing source`. The test-only correction now requires that refusal and separately observes the exact durable receipt (absent before admission, retained after admission) using request/source/fingerprint/target/intent identity. Existing full-row, history, no-effect, target and physical snapshots remain intact. No production source fence is relaxed; these four corrected tests remain unqualified until hosted execution passes.
+
+Hosted DB compilation reported E0599 only for the new regression's nonexistent `context.target()` accessor; the corrected test uses `command.intent().target()`, as neighboring fixtures do. This compile failure prevented migration187 and DB routing regressions from executing; no187 deletion success is claimed. The exact hosted formatting patch (two whitespace-only hunks) was reviewed/applied without local formatter execution. Independent source review found no actionable findings in the follow-up, but had missed the original invalid accessor; execution remains required.
+
+Next: automatic exact-head qualification of the test/accessor/format corrections, including both187 regressions, typed origin tests, pending-delivery/aggregate-delete regression and all four actual Stop cases. No local executable validation, manual workflow operation, merge, install, deployment or readiness claim.
+
+## Hosted0123 terminal result and unqualified owner/routing correction
+
+Automatic run **45352177351**, exact `0123c68c988a0d2de1a2b7b13f02a344904ad909`, completed **failure**. Exact artifacts and logs are retained under `/tmp/close-0123c68c9/`; the sole watcher exited. Full migrations172, captured-loss reinspection6 and actor51 passed. Production/runtime compilation, frontend, specifications and format passed. These results qualify0123 only, not the follow-up source below.
+
+The public captured-loss reclaim/replay journey and all four Stop cases now **actually execute**. They fail upstream of their intended assessment/Stop barriers because origin selection calls the sealed-inventory reader for a valid captured-loss origin, which deliberately has no sealed inventory. The initial-Close physical Worktree journey still passes. No captured-loss reclaim/replay or causal Stop safety pass is claimed.
+
+Permanent-member deletion now reaches the canonical mandatory-failure acceptance but fails FK787: historical completion-origin/revocation rows retain references after their owning obligation is deleted. Forward migration187 cleans up exactly that owner's admissions, revocations and origin in dependency order, retaining standalone deletion guards while the owner exists and independent pending mandatory-delivery restrictions. The unexecuted regression is authored to require pending refusal, canonical acceptance, supported aggregate deletion and an empty foreign-key check. Historical migrations remain unchanged.
+
+The routing correction uses a typed, read-only origin discriminator: exact target plus original-anchor presence, followed by strict validation of the selected anchored proof or captured-loss context in one snapshot. Errors never select another origin; no inventory is fabricated, admission granted, or source/dispatch check relaxed. Added captured-loss and anchored target/run regressions have independent exact inventory/execution gates. Independent source review caught and corrected a stale coordinator migration ledger and the anchored test's include-module selector; no other concrete source blockers were found. This is source review, not compile/test evidence.
+
+Next gate: automatic hosted qualification of the corrected immutable head, including both187 tests, both routing regressions, populated permanent deletion, actual public reclaim/replay and all four intended Stop barriers, plus existing DB/runtime/tools/UI/specification/format gates. Task66009 remains separately tracked ordinary-tmux assembly debt, not a new merge gate. No local execution, merge, installation, deployment or readiness claim.
+
+## Hosted ed710 terminal result and next exact qualification
+
+Automatic run **45344455940**, exact `ed710d35b1216b7ef5809a261b3135f696fae79d`, completed **failure**. Production/runtime test compilation passed; frontend, specification/devpy checks and format gate passed. Full migrations172 and foundation268 tests passed; native DB80 passed/one failed. Evidence is under `/tmp/close-ed710d35b/`.
+
+The required `registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays` journey and all four causal Stop cases **did not execute**: the identity wrapper rejected their selectors before launching the binary. The original initial-Close production-detector Worktree journey did execute and pass. The wrapper correction admits only those five additional exact disposable Worktree tests at both identity boundaries; private scratch, fixed flags, nobody identity, credential/capability preflight and original absolute bounds are unchanged. Independent source review verified all use the same disposable fixture, not broader Bash/Tmux suites.
+
+The actor qualification step stopped on a stale `3 passed` assertion after all six captured-loss reinspection tests passed. The assertion now requires six plus every named successful execution before the later actor suite; that later suite remains unexecuted in this run. The single DB failure was permanent member deletion while mandatory failure outbox custody remained pending. The fixture now verifies refusal/rollback, accepts the original and any source-stop failure through canonical coordinator steering, and only then tests aggregate cascade. No production/schema retention guard is removed. Both corrections are source-reviewed; hosted execution remains owed. The prior seed-build cause was not recoverable from its truncated old artifact, but this head's complete specifications check passed.
+
+Critical path: publish the reviewed fixture/qualification repairs after collecting this terminal run, then require actual captured-loss reclaim/replay, all causal Stop cases, the previously unreachable actor suite, complete DB and all existing hosted gates at the new immutable head. Task66009 remains separately tracked ordinary-tmux assembled qualification debt, not an invented additional gate. No local execution, merge, installation or deployment.
+
+## Hosted49 terminal result and reviewed follow-up
+
+Automatic run **45337279161** for exact `49a721951bac77ca2ec8706f61a85fb5376e5982` completed **failure**. The named public captured-loss production-detector reclaim/replay journey **did not execute**: production runtime compilation failed with E0505 in the retained Worktree dispatch worker. No public journey or causal Stop pass is claimed. Full DB/runtime artifacts and failed logs are retained under `/tmp/close-49a721951/`.
+
+- Frontend passed. Exact migration185 and186 upgrade/source/refusal tests each executed and passed, but their schema-only coverage did not establish populated captured-loss acceptance.
+- Populated captured-loss admission still failed1811: the trigger used Rust-style `Idle/Closed/Error` instead of actual persisted `idle/terminal/error`. The unpublished branch migration186 now corrects that exact member-state predicate alongside its archive correction, preserving all stopped-origin/effect-free guards and immutable184 SQL. The exact source-rewrite selector is updated.
+- Foundation had one stale tmux post-source-fence snapshot expectation; source invalidation legitimately terminalizes the running retry. The fixture now proves fencing changes state and subsequent refused dispatch changes nothing. Migration delete fixture used cancellation after retirement admission; it now records exact expected-resource evidence and completes through supported owning APIs before asserting retained dispatch and aggregate deletion.
+- The E0505 correction consumes/forgets the entire optional lease before forgetting its owner on unknown release. Fatal fencing and uncertain custody remain intact; classified releases still drop normally. This is source-reviewed, not compile-verified.
+- Specifications failed during seed Cargo build101, with the actual compiler diagnostic evicted from the check runner's 200-line tail. Existing bounded full diagnostics capture is now enabled within the always-uploaded hosted evidence tree. The exact seed failure cause remains unclassified until complete capture is available; do not infer it solely from the separate runtime E0505.
+- Reviewed hosted formatting, independent execution of all selected public causal cases, and task66009 remain included in the next candidate. Next mandatory evidence is exact-head hosted compilation, populated DB gates, actual named public reclaim/replay plus causal Stop execution, frontend/specification/format gates. No local builds/tests/formatters/SQL execution, merge, installation or deployment.
+
+## Current finite safety scope at published49a721951
+
+Independent read-only map of published `49a721951bac77ca2ec8706f61a85fb5376e5982` found no new demonstrated safety defect in inspected retry/tmux custody. Retry Complete latches Fatal before its DB await; unclassified completion cannot become ordinary retry. Retained tmux workers already reacquire exact DB/source entry at the actual sink, use the original deadline, latch backend fatal authority on unknown writer release, and retain uncertain custody. No replacement ownership framework is warranted.
+
+Remaining **qualification debt**, tracked in task **66009**: assembled ordinary native-retry actor + DB + tmux causal Stop/readiness/death/replacement/unknown-release cases. The finite source review found no demonstrated implementation defect; these are not three newly invented merge gates. Existing selected tests/specs and actual public Worktree acceptance remain mandatory. Lower-layer registry/sink/custody tests do not substitute for that assembly. A source-only fixture investigation found no existing controllable fake-backend readiness hold or assembled ordinary-retry fixture; adding honest tests needs a bounded fixture/seam, not invented receipts. No implementation blocker is inferred merely from absent coverage.
+
+Initial/retry admission, context/evidence/failure/finalization still contain actor-inline DB waits. These can delay Stop mailbox service under DB contention; no post-ACK unauthorized dispatch was demonstrated by the review. Do not claim general Stop responsiveness or label every await a safety blocker. A held-writer causal test is needed for a broader responsiveness claim; never timeout/drop a mutating DB future.
+
+Public acceptance remains the exact named production-detector **blocked → separate owner cleanup → explicit retry → fresh admission → actual reclaim → History/replay** journey. Its canonical result acknowledgement uses real `persist_tool_round_and_state`; this is not a live model/tool-executor transcript round-trip. Such a round-trip is **not an additional normative acceptance gate** (REQ-BED-016/018). Hosted run **45337279161** for49a721951 is terminal failure; its exact outcomes and reviewed follow-up are recorded above. The public journey did not execute because the runtime failed compilation.
+
+## Reached 4069 failures — reviewed correction awaiting hosted qualification
+
+- Exact `4069ee8199cdf5e66695b1745edfe9fc8ee4a960`, automatic run **45329704586**, completed **failure**. Frontend and specifications passed. Native DB: **77 passed / 4 failed** (captured-loss admission origin trigger). Full migrations: **168 passed / 1 failed** (active sealed participant delete fixture). Lineage tail omitted185. Tmux: **117 passed / 2 failed** (fenced registry entry incorrectly expected Live). Runtime public/actor qualification did not compile: three test-only API/name/typed-ID errors. Migration185 tests did not execute because their namespace was omitted from the inventory filter. Full final artifacts and compiler JSON are retained under `/tmp/close-4069ee819/exact/`; failed log at `/tmp/close-4069ee819/final-failed.log`.
+- Forward migration **186** replaces only the exact shipped captured-loss origin trigger, removing its archived prerequisite while retaining quiescent state, exact stopped captured-loss provenance and effect-free constraints. Uncertain Close must remain Open; the correction does not manufacture History success. Missing/changed trigger fails closed transactionally. Upgrade/reentry/rollback/source-rewrite tests plus exact workflow execution gates are authored; behavioral acceptance still depends on the populated native admission/public journey tests.
+- Delete fixture now cancels through the supported pre-retirement API and proves dispatch remains before aggregate deletion. Tmux fixtures assert authoritative retained Arc identity and Gone fence, retaining independent pre/post-kill process proof. Runtime snapshot uses the actual inspection API and string attempt IDs. Latest migration ledgers/counts and inventory namespace are corrected.
+- This source correction and the retained dispatch-worker follow-up below remain uncompiled/unexecuted until the next automatic hosted run. Remaining custody/causal tmux/deadline and end-to-end reclaim/replay acceptance gaps below remain open. No local builds, tests, formatters, SQL experiments, merge or deployment.
+
+## Dispatch writer custody follow-up — source review, prior hosted gate failed
+
+- Published `4069ee8199cdf5e66695b1745edfe9fc8ee4a960` (semantic commit `510b6089b92e1f44690adf2719c8f2e5fcb70e0f` plus reviewed hosted-derived formatting). Automatic run **45329704586** completed failure; frontend and specifications succeeded. The migration185 step failed its inventory whitelist before executing its two tests. The whitelist correction below does not turn that nonexecution into a pass. Evidence/watcher are retained under `/tmp/close-4069ee819/`, sole watcher `@94`.
+- Source review identified another actor-inline writer wait at Worktree dispatch. A retained/joined dispatch worker now acquires source entry only after DB validation, checks the original deadline, retains the lease through release classification, and prevents later physical preparation after Stop. Unknown release closes the fatal fence and retains custody without parking the worker forever. This follow-up has not compiled or executed.
+- New public causal regression pauses the retained worker immediately **before** writer acquisition, requires Stop ACK while held, then checks no dispatch or cleanup-plan metadata before/after Stop, worker join and replay. It does not hold SQLite or prove responsiveness under actual SQLite contention. Its exact execution selector is required in the hosted workflow.
+- Independent source review caught and corrected missing test-only cfg guards and missing dispatch-absence assertions. Remaining actor-inline evidence/finalization/admission waits, runtime tmux Stop/wait and unknown-release regressions, public end-to-end reclaim/replay execution, remain open as the scoped coverage/responsiveness limits above; full transcript round-trip is not a separate normative gate. No merge, deployment, installed delivery or general responsiveness claim. No local builds/tests/formatters/SQL execution.
+
+## Tmux retry custody and reached-failure correction — unqualified source
+
+This section supersedes the pending-7420 and absent-tmux statements below.
+
+- Exact source `7420c12b98245bf3474c68fdfb1c88d77158a25b`, automatic run **45321704779**, completed **failure**. Frontend passed; database and specifications failed. The runtime acceptance path did not compile (`close_safe_retry_execution_order` lookup), so neither the public captured-loss journey nor causal Stop tests have passed. Complete artifacts and failed logs are retained in `/tmp/close-7420c12b9/`.
+- Reached DB failures were an invalid live WorkScope column lookup, captured-loss fixtures querying nonexistent columns or requiring a seal where absence is the invariant, historical writers invoked against old schemas, and stale migration counts. Source corrections use the real `work_scopes` identity/locator, public settlement APIs, explicit historical schema probes, and updated ledgers. They are not execution evidence.
+- Tmux retry now has a retained/joined worker with original absolute deadline, exact persisted dispatch, and fresh DB/source entry around irreversible approval handoff and registry cleanup. No source lease spans helper readiness/death waits. Entered approval may complete after Stop; the lease authorizes the irreversible handoff, not the later asynchronous `kill-server` instruction. Unknown writer release explicitly retains custody and closes the fatal fence without a permanently parked worker blocking join.
+- Independent source reviews caught the dispatch trigger's worktree-only exception, fatal join hang, short-write regression, source-refusal/sink-error conflation, test module/selector defects, invalid typed test resources, and remaining runtime helper privacy. Corrections include narrow migration **185** for exact original-inventory tmux dispatch, preserving the existing worktree and captured-origin arms. New DB, migration, backend, short-write, and registry refusal tests are inventoried in hosted qualification. Source review is not compile or behavioral acceptance.
+- **Remaining gates:** exact-head hosted compile, migrations, all DB/runtime/frontend/specification suites, disposable public reclaim/replay and causal Stop tests; tmux actor-level Stop/wait and unknown-release regression proof; actor-inline admission/evidence writer/finalization bounded-custody review (no general responsiveness claim). Full transcript-round-trip is not an additional normative gate. No merge, installation, deployment, usable delivery, or broad Stop-responsiveness claim follows from this source slice. Validation remains hosted-only, with one watcher and no manual rerun/cancel/dispatch.
+
+
+## Bounded retry cursor correction — source progress, not acceptance
+
+This section supersedes older pending-run and absent-cursor statements below.
+
+- Source `4607ce27f3bb04165bf872f47744c2de05c79aa3`, automatic run **45316819881**, completed **failure**. Frontend/specifications passed; Rust qualification stopped at compile errors before the new public acceptance proof. Evidence is retained under `/tmp/close-4607ce27f/`. Source fixes restore the retry-plan helper still referenced by sinks, use the real test Database constructor, encode digest bytes without unsupported LowerHex, unwrap typed local-authority results correctly, and use the actual source-state and audited SQL APIs/table names.
+- The exact hosted format patch was applied as local commit `10b89d44deedc27a7f6fa6d7925259b5f191ea9f`. Subsequent integration was preserved in retained stash `108d5957079427e5c152e417c29de74025c3faa8`, restored, and all five formatting/source conflicts were resolved with disjoint source reviews. Both retained stashes remain backups; neither was dropped. No local build/test/formatter was run.
+- Admitted Worktree/WorkScope retry now has an actor-owned finite cursor, retained/joined preparation/drain/effect workers, exact source-entry callbacks after DB writer validation, and leases through confirmed release. Shared physical and metadata leaves branch on actual Initial vs ExplicitRetry authority; retry reads its accepted per-scope inspection rather than fabricating an initial anchor. Stop closes future entry and observes an already-entered physical result without synthesizing post-Stop success. This is uncompiled/unexecuted source progress.
+- Read-only inventory waits now share the original absolute deadline and do not occupy the actor. Cursor service retains absolute due times, and FIFO retained queue heads give sampled Stop/Shutdown control priority while ordinary traffic cannot indefinitely starve retry progress. Unknown writer/metadata/physical custody remains retained on a closed fatal fence. Later source corrections return retained workers for actor joins while preserving uncertain custody; the older parked-worker behavior described at this milestone is superseded. Do not describe unknown-custody paths as successfully joined or normally settled actor exits.
+- Required unprivileged hosted public tests now include the success/replay path plus causal barriers for Stop during assessment, after real Git preparation, and after actual physical deletion before actor observation. Stop ACK must precede barrier release; no successor/effect on pre-admission Stop, no physical entry after preparation Stop, and no fabricated success after entered deletion Stop. These tests have not run. They use registered public tools plus the real source actor; initial canonical result persistence is deliberately driven through the public DB checkpoint API, not an LLM transcript round trip.
+- UI no longer infers “disk retained” from process-shutdown certainty. Both controls/page say “Close incomplete — cleanup not confirmed”; a component regression preserves exact blockers/read-only controls for both certainty variants.
+- **Finite gaps still blocking completion:** superseded by the current finite safety scope above. Tmux retry is now retained/off-actor with actual sink guards and exact DB custody; actor-inline DB wait responsiveness remains limited, assembled tmux causal regression coverage remains absent, and the named public reclaim/replay journey still needs exact-head execution. Full transcript-round-trip is not a separate acceptance gate. The new cursor is not a basis to claim general Stop responsiveness, completed acceptance, merge/install/deploy, or an installed usable delivery.
+- Next action: automatic exact-head hosted qualification, classify/correct reached failures, then finish the remaining source-custody gaps with regression proof. One watcher only; no manual rerun/cancel/dispatch.
+
+## Current source-only captured-loss integration (not delivery acceptance)
+
+This section supersedes all qualification-pending/source-absence statements below.
+
+- Published source `4afc55e3979164d29e43ed5a78faabd4b7d9bbfc`, automatic run **45310398112**, completed **failure**. Frontend/specifications passed; database qualification failed. All artifacts and failed logs are retained at `/tmp/close-4afc55e39/`. The exact hosted formatting patch was empty. No local build/test/formatter was run.
+- Concrete failures reached: canonical acknowledgement exists but a separate legacy completion-origin fence still suppresses its explicit retry allowance; historical176/179 fixtures invoke current source writers without migration183; Coordinator Goal discovery ledger omits183. Source corrections now leave allowance suppression with the receipt-aware pre-completion fence when no automatic successor was admitted, retain automatic-origin revocation/running-successor fencing, upgrade historical fixtures before current writers, and extend the discovery ledger through184. These corrections are not yet executed.
+- Current integration adds migration184's distinct immutable captured-origin plan/resources/per-scope inspection evidence, exact explicit retry admission, execution authority projection, runtime finite captured-scope assessment and original-worktree registration checks. It never creates an original-retirement anchor or authorizes old process stops. Migration rewrites are bounded to named known trigger shapes and fail closed on mismatches; dispatch identity constraints have INSERT/UPDATE membership and original reference-retention guards. Captured children now cascade only with owning aggregate deletion; standalone mutation/deletion is rejected. Admission, migration parity/cascade, exact replay, Stop/source/durable-work refusal tests are authored, not qualified.
+- A required unprivileged production-detector public regression now covers retained initial loss -> canonical initial-result acknowledgement -> fresh retry occurrence -> still-dirty refusal -> independent tracked/untracked/ignored-build remediation -> explicit retry -> physical path/registration absence -> retired WorkScope -> History result -> exact replay without new effects. It is source-only; no claim that this journey has compiled or passed.
+- Production source actor preparation now owns/joins a read-only retry-assessment continuation, allowing Stop/events during assessment while retaining request/settlement/gates. **Historical gap, superseded by the later bounded cursor:** admitted physical retry resources now use retained workers and per-sink source-entry custody. Remaining actor-inline DB waits limit responsiveness claims, and assembled tmux causal regression coverage is still unqualified. Do not replace this with a detached worker or infer that the generalized source matcher alone supplies that custody.
+- Review found and corrected concrete permanent-Delete cascade and test-provenance defects. Review is source evidence only, not compile or runtime qualification. The retained stash `178f5dec9b367ebf1b78c6ff4a7eb0ca038d0951` is an older scaffold backup, already applied and not dropped; it is not the final delta.
+- Next gate is automatic hosted qualification of the exact next published source, with explicit inventories/execution of the new DB/migration/public physical tests. No manual rerun/cancel/dispatch, merge, install, deployment, or delivery-complete claim is made.
+
+## Historical acknowledgement correction notes
+
+The following describes older revisions, not current source completeness.
+
+## Latest qualification and acknowledgement source slice
+
+This snapshot supersedes the older pending-run notes retained below.
+
+- Acknowledgement source `701aec5b847392c77d8761724c09e5a79e8a82b1`, automatic run **45308458082**, is terminal **failure**: database compile reports `Uuid::as_str` at `source_fence.rs:301`, so acknowledgement/runtime tests were not reached. Frontend passed. Specification harness reached `test_seed.ModernSeedTest` but its Cargo build failed; no passing specification claim. Artifacts: `/tmp/close-701aec5b8/artifacts`. The concrete UUID conversion is corrected in the next source revision, together with the **exact** hosted formatting patch; no local formatter/build ran.
+- Unaccepted delegated captured-successor DB scaffolding is preserved in stash object `178f5dec9b367ebf1b78c6ff4a7eb0ca038d0951` (`Unaccepted partial captured-loss successor DB implementation; source-only pending review`). It is **not integrated or qualified**; it has no regression tests and its generic schema trigger/FK rewrite needs redesign/review before use. Current qualification correction excludes that partial delta. No new admission/physical path is claimed.
+
+- Exact published `1691113769ab518b9c47c5b578569d27ed130a74`, automatic run **45300827365**, is terminal **success**. Artifacts: `/tmp/close-169111376/artifacts`. Personally inspected exact source, foundation **266/266**, full migrations **160/160**, native DB **65/65** including both retained-projection/source-replacement regressions, runtime actor **51/51**, separate production-detector physical test **1/1** (nobody UID65534, CapEff0), frontend **113 + 218**, executed typecheck/eslint/stylelint/spec checks, and **empty** hosted format patch. Sole watcher exited 0.
+- Older e72/run45266230371 and cf30/run45275318159 are terminal failures, not active. Both passed runtime actor **51/51** and separate physical **1/1**. cf30 also passed all four durable-member quiescence regressions; its known retained Observe fixture and exact-format failures are corrected and green at HEAD169.
+- The next source-only slice distinguishes canonical initial Close result acknowledgement from source loss/Stop. Immutable receipt-bound evidence is written atomically after canonical result rows and before state fencing, across both finalized and pending canonical-round paths. Same-assistant serial tool progress can retain the exact successful result until that checkpoint; Stop first still suppresses the origin and cannot be resurrected by a late result. Migration183 and eight acknowledgement regressions are wired into hosted validation. **This slice has not compiled or executed; source review is not qualification.**
+- This seam does **not** implement captured-loss successor admission. The complete disposable public **blocked files → separate owning-agent cleanup → explicit retry → fresh safe admission → disk reclaimed → truthful History/replay** journey remains owed. No merge/install/deploy or delivery-complete claim follows from the green prerequisite run.
+
+## Historical qualification notes
+
+## Current qualification and durable-member retry fence
+
+- Follow-on durable-member fence was committed/pushed as `cf30f27503375fdbd2220130f4715d3bc3fb9cc4`; automatic run45275318159 is pending behind e72. It must not be replaced by another publication while pending. Its four regressions remain unexecuted.
+- e72 artifacts now personally inspected: exact source SHA matches; frontend WorkActions113 / ProductConversationPage218 pass, typecheck/lint executed successfully. Database foundation262/262, full migrations160/160, migration182, lineage and prepared-conversation checks pass. Native Close module63pass/1fail: `exact_observe_receipt_keeps_completed_initial_loss_origin_readable` replaces the original command through ordinary state persistence, correctly suppressing the original source before its final reader assertion. Runtime checks remain in progress; overall e72 is not yet terminal.
+- Reviewed correction isolates the reader's retained-receipt projection using the existing receipt insertion helper and renames the regression `retained_observe_receipt_does_not_replace_initial_loss_provenance`. It makes no Observe source-admission claim: only the current Coordinator can issue Observe, and replacing its original command through ordinary persistence correctly suppresses the origin. A proposed independent ordinary observer was rejected during source review before publication. The production Coordinator and source-loss fences remain unchanged. Added exact gated negative `original_source_replacement_suppresses_captured_loss_origin` proves original source replacement still refuses the reader without a successor/effect or altered retained failure evidence. New test/correction remain source-only until a later exact-head automatic run. e72 hosted formatting patch was downloaded and applied exactly to its three affected source files; this is not local formatting or a whole-new-head formatting pass.
+
+- Published base `e72cd00e81dbd1d9abe618e89cd508137ad6bae5` is executing automatic hosted run [45266230371](https://github.com/scottopell/phoenix-ide/actions/runs/45266230371). Exact SHA/status checked: database/runtime in progress; frontend and specifications completed successfully. Available e72 database/frontend artifacts are classified above. Sole watcher `@88` / `close-e72cd00e8-watch` remains active; evidence directory `/tmp/close-e72cd00e8`.
+- Prior exact39821 run45257098758 is terminal failure, not active. Its classified evidence is retained `/tmp/close-39821ca11`: frontend WorkActions113 and ProductConversationPage218 passed; typecheck/lint executed successfully; hosted formatting patch empty. Database/migration stale182 fixture repairs have now passed exact e72 execution; public snapshot-helper repairs still await runtime evidence.
+- Reviewed bounded follow-on source gates existing anchored explicit retry on **current durable captured-member obligations**, using the existing settlement counter in the same admission/mutation transaction. Historical original retirement proof is not current quiescence. Exact receipt replay remains observation-only; uncertain failure may still terminalize honestly, while fresh definitely-stopped placement requires the durable fence. This is not process proof and does not replay stop effects.
+- Four new source-only regressions cover refusal before new admission, unchanged receipt replay, dispatch/success/finalization fences, and uncertain failure versus false stopped placement. The fixture inserts schema-valid independent durable ownership below ordinary turn admission, without disabling triggers. Workflow inventory and actual execution gates use the four exact test names. Independent source review found no concrete blocker; compilation, runtime behavior and formatting remain unverified until hosted execution.
+- **Full captured-loss retry remains unfinished:** e72's read-only original-context reader and test-only finite reinspection do not admit a successor or reclaim disk. Distinct immutable captured-origin admission, fresh positive shutdown evidence, source/Stop fences, successor-bound retirement and the public separate-cleanup → explicit-retry → reclaimed-disk → truthful-History → replay journey are still owed. No fabricated original anchor or process-epoch stop authority is permitted.
+- No local build/test/formatter/script/SQL/UI execution, manual CI rerun/cancel/dispatch, merge, deployment, or real-user destructive action. Reviewed source corrections may queue only while preserving the active exact-head run and without replacing an unclassified pending source. The earlier active-run statements below are historical and superseded by this section.
+
+## Historical captured-loss evidence slice
+
+The following describes the preceding publication; current run ownership and unfinished acceptance are stated above.
+
+## Current qualification and captured-loss evidence slice
+
+- Exact `a6bb83389063678c485b7eed96ef505665afb469`, run `45255463741`, is terminal **failure**. Its original watcher exited on a GitHub HTTP 500; sole resumed watcher `@86` subsequently exited with the terminal result. Full logs and exact artifacts are retained under `/tmp/close-a6bb83389`.
+- Actual hosted results: native Close DB **60 passed** (including loss terminalization and rollback); migration182 **1 passed**; core loss contract **21 passed**. Foundation **260 passed / 1 failed**, full migrations **159 passed / 1 failed**, and two migration-tail modules failed only on stale migration182 ledger/count expectations. This slice updates those exact expectations without weakening row-preservation or constraint assertions.
+- Actor suite **48 passed / 2 failed**. Both blocker journeys reached durable replay snapshotting, whose authority reader correctly refused the absent sealed inventory. The snapshot helper now records every actual expected-resource row directly (including identity storage class), rather than treating absence as authoritative inventory. Production guards remain unchanged. The separate production-detector public retirement passed **1/0/0 ignored**, as nobody UID65534 with CapEff0.
+- Frontend WorkActions **33 passed**; ProductConversationPage **214 passed / 4 failed**, all split text-node selectors already corrected in `39821ca110d2cdbdf6888f46f0eae9f61ffa2d12`. Subsequent UI checks did not execute on a6bb. Its remaining hosted formatting hunk is also in39821. Specifications passed.
+- Run `45257098758` is validating exact39821. No manual run dispatch/cancellation was performed. Existing workflow serialization has only one pending slot: do not queue another correction if it would replace an unclassified pending source.
+- New source-only evidence APIs retain the exact original captured-loss provenance, including after a real Observe receipt. Complete schema review confirms migrations173/174 add the receipt intent column: keep the `intent = 'initial'` filter. The finite inspector and public separately-clean/reinspect regression are test-only until an actual capture-origin retry owner exists. Hosted selectors require all four DB regressions, all three actual inspector tests, and the assembled journey to execute; review caught and corrected an initially mismatched inspector selector list.
+- This is **not end-to-end explicit retry**: no captured-origin successor admission, positive shutdown proof, dispatch, or successful reclaim is claimed. Remaining work must add a distinct immutable captured-origin plan, source/Stop fencing, genuine fresh quiescence, and first retirement authority. Existing anchored retry must not receive fabricated original proof. Two delegated admission attempts produced no files; no partial schema/admission changes were retained.
+- No local build, test, formatter, script, SQL execution, codegen, native experiment, merge, deploy, or real-user destructive action was performed. New source and fixture repairs still require exact-head hosted validation.
+
+The sections below are historical checkpoint notes; this current qualification supersedes their active-run and schema-status statements.
+
+## Current publication and active gate
+
+### Serialization reconciled; coalesced reviewed corrections can queue safely
+
+Recovered primary “after current run finishes” directions were scoped to named diagnostic publications; not a permanent ban on queuing a corrective head. Keep actual exact-head evidence and no manual cancellation/rerun. Existing workflow `concurrency: close-qualification-${{ github.ref }}` / `cancel-in-progress: false` serializes the next automatic run without concurrent qualification. One watcher85 remains attached to active a6bb; do not attach another watcher until that process exits. Coalesce the omitted hosted migration-format hunk with now-observed frontend correction rather than wait a complete cycle just for formatting.
+
+Current a6bb frontend actual results: WorkActions **33/0**; ProductConversationPage **214 passed / 4 failed**, all four `getByText` assertions incorrectly combine the code identity with a sibling category text node. Reviewed correction asserts actual code identity visible after disclosure plus complete parent-li text/category; retains every remount/certainty/resource assertion. No fresh UI pass yet. Retry preparation proceeds separately: new unpublished read-only DB captured-origin reader and fixtures; an initial review's nonexistent-intent-column claim was later disproved by complete schema review, and the original-intent filter was restored. Runtime expected-resource prototype cannot consume a true pre-anchor context and must not be shipped as usable retry or used to fabricate expected rows. Fresh admission/schema/quiescence coupling remains open.
+
+### a6bb correction run active; one omitted formatting hunk remains dirty
+
+Published `a6bb83389063678c485b7eed96ef505665afb469`; automatic [45255463741](https://github.com/scottopell/phoenix-ide/actions/runs/45255463741), sole watcher85 / `close-a6bb83389-watch`, evidence `/tmp/close-a6bb83389`. Prior watcher84 personally verified exited1/zsh. Corrective assertions/setup and most hosted formatting are in this exact run. **Integration mistake:** explicit staging omitted `crates/phoenix-db/src/migrations.rs`, leaving its exact hosted one-bind formatting wrap dirty. Expect that format gate to remain red; it is not a runtime fix. Do not bypass terminal gate with another immediate publication; classify this exact run's actual tests first, then include the preserved formatting hunk with any required corrections. No local formatter/tests executed. Pre-anchor explicit retry remains open.
+
+### f955 terminal failure fully classified; focused corrections reviewed
+
+Personally verified exact f955 automatic45248004989 **completed/failure**, watcher84 exited1 and independently at zsh. Full/final-failed logs and exact runtime artifacts retained `/tmp/close-f955c8fb8`. Actor **48 passed / 2 failed / 0 ignored**: both new content/rollback journeys failed **before Close ingress**, writing `.git/info/exclude` into missing info directory (fixture explicitly uses empty Git template). Correction creates this fixture directory first; no behavior assertion relaxed. Required production-detector real Worktree **1 passed / 0 failed / 0 ignored**, nobody65534 CapEff0, personally read actual log.
+
+Other introduced runtime fixture failures: unsupported dirty-status supplied leaf still treated status as final leaf though exact ignored enumeration now follows; corrected refusal boundary retains deadline/no-scratch/no-further-leaf checks. Changed ignored fingerprint correctly returns typed `ReinspectionRequired`, not Err; expectation now matches exact refusal while retaining file/quarantine assertions. Coordinator goal explicit migration ledger missed182; added only exact registered `(182, close_ignored_loss_category)`. Independent source review passed all three corrections. DB compile/format/Corepack corrections above also reviewed. Domain21/0 and specs passed; DB/migration suites and UI tests remain **nonexecution**, content/rollback assertions remain **unreached**, not passes. No local validation executed. Next correction publication is qualified as incomplete interim; pre-anchor fresh retry is still owed.
+
+### f955 early causal classification: DB test move and exact formatting correction prepared
+
+Downloaded exact-source DB and format artifacts while run45248004989 remains active. Domain wire/category tests **21 passed / 0 failed / 0 ignored**, including expected embedded-NUL panic (not failure). The database test binary **did not compile**: sole E0382 in `changed_loss_confirmation_inspection_replaces_evidence_and_token_atomically`, first `vec![second_loss]` moved the item needed for the final unchanged-loss assertion. Dirty correction clones only that first expected item, retaining both exact persisted-loss assertions. Other DB/migration log failures repeat this compilation diagnostic; no migration182 or DB runtime pass can be claimed.
+
+Applied the hosted `format/hosted-format.patch` verbatim using git apply after check; no local formatter executed. Independent source review confirmed the Rust delta is the formatting-only hosted proposal plus the single ownership clone; no safety/assertion weakening. Runtime actor step is failed but its final evidence is not yet available; the required separate production-detector step reports completed/success, not yet personally log-classified. Specifications passed. Publication remains blocked until whole-run terminal evidence and actual runtime failure logs are inspected.
+
+### f955 blocker interim slice published; hosted qualification active with frontend setup failure
+
+Published `f955c8fb811834fc04b4acee1e5e59ba194e975a` (hooks disabled) after terminal a584 classification. Automatic run [45248004989](https://github.com/scottopell/phoenix-ide/actions/runs/45248004989), sole watcher `@84` / `close-f955c8fb8-watch`, evidence `/tmp/close-f955c8fb8`. Prior watcher83 exited0 and zsh verified before watcher84. No manual dispatch/rerun. DB and specs still active; no next publication until terminal exact-head classification.
+
+Frontend job stopped **before any tests**: the artifact `frontend/close-work-actions-tests.log` shows `ERR_PNPM_BAD_PM_VERSION`, Corepack invoked from root selected default pnpm12 before `--dir ui` could select UI pin11. Dependencies installed successfully with working-directory ui. Dirty two-command correction now uses `(cd ui && pnpm exec vitest run <exact-file>)`, preserving root evidence tee and pipefail. Independent source review verified actual cwd selects pinned11 and subsequent dev.py lanes also run in UI_DIR. This is an introduced workflow setup defect, not UI test evidence. No tests/typecheck/lint ran; correction not published until terminal classification.
+
+### Terminal a584 verified success; blocker-only interim slice ready for hosted qualification
+
+Personally verified automatic run45238902877 **completed / success**, exact `a584e727beef9cd1dcae7371b3cd0c47c905b6be`. Final failed log is empty, full terminal log and artifacts retained `/tmp/close-a584e727b`. Foundation **261/0/0 ignored**, including all six actual new-admission/historical regression executions; actor **48/0**; required production-detector real Worktree **1/0/0 ignored** under nobody UID65534 and CapEff0; exact formatting patch0bytes; both jobs passed. Watcher exited0 and `@83` independently verified at zsh. This closes the selector/admission qualification gate, not broader delivery.
+
+Reviewed blocker-only interim source is now ready for publication and its own automatic hosted checks: ignored leaf inventory/category/forward182, exact-attempt loss-free dispatch guard, retired discard confirmation, atomic retained-content incomplete terminalization with rollback ownership, and readable actual completed blockers. The new public content and rollback journeys plus frontend/domain/migration checks are mandatory hosted coverage. **Source-only so far; pre-anchor fresh explicit retry remains unimplemented, therefore this is explicitly an incomplete interim slice, not final Close acceptance.** No local validation, merge, deployment or real-user retirement performed.
+
+### a584 partial hosted evidence: six regressions actually executed
+
+Downloaded exact run45238902877's DB, format and specification artifacts to `/tmp/close-a584e727b/{db,format,specifications}`. DB `source.sha` is exactly `a584e727beef9cd1dcae7371b3cd0c47c905b6be`. Personally read **261 passed / 0 failed / 0 ignored** in `close-foundation.log`, including actual `... ok` lines for all six new-admission rejection/historical replay regressions under `close_foundation::tests::native_retry::`. The earlier nonexecution gap is now closed for those six. Hosted format patch is empty; Allium, specification shape and dev.py unit checks passed. Overall run is **still active** in same-server queue/early helper qualification; terminal runtime/physical classification remains mandatory before publication. The dirty blocker-only slice remains outside this evidence.
+
+### Source integration: blocker rollback ownership regression added, hosted gate still active
+
+The unpublished slice now includes `registered_native_close_loss_classification_rollback_retries_without_recollection`: a mandatory-outbox ABORT leaves the exact classification intent and authority owner live; lifecycle observation proves the failed step; a newly added ignored file makes any recollection detectable; removing the injected failure permits periodic retry of the same intent. Both test inventory and executed-name checks are required in hosted qualification. Independent source review found no remaining defect in that journey, **not compilation or execution proof**.
+
+Further source reviews caught and corrected the missing actor `ClassifyingLosses` match arm, two typed-ID API test calls, a generic fixture's per-scope/aggregate snapshot mismatch, the ignored-helper unit test's ambient repository/configured-Git assumptions, and a completed-page disclosure-label mismatch. The retired confirmation surface now says content is retained, not awaiting permission to discard. Frontend commands use explicit `pnpm exec vitest run` file selection. All these changes remain dirty and outside a584's active run; no local validation or new publication performed.
+
+The pre-anchor retry design boundary is now concrete: immutable initial receipts/captured WorkScopes can establish finite original provenance, but **not retirement authority or shutdown proof**. A safe fresh explicit retry needs a typed capture-origin branch, successor-bound clean inspection and positive quiescence, reusing existing immutable effects/source fences. Existing anchored retry must remain unchanged; no fake anchor, stopped-run resumption, empty-inventory shutdown inference, new target discovery, or reconstructed stop permits. This is an implementation gap, not a new policy question or a delivered capability.
+
+### a584e727b active; unpublished blocker repairs in integration
+
+Exact HEAD `a584e727beef9cd1dcae7371b3cd0c47c905b6be` has automatic hosted run [45238902877](https://github.com/scottopell/phoenix-ide/actions/runs/45238902877). Sole watcher: `close-a584e727b-watch`, tmux `@83`; evidence `/tmp/close-a584e727b`. Previous watcher `@82` was independently verified at zsh before attaching this watcher. The run remains active; specification checks passed, but terminal classification remains required before another publication.
+
+The larger blocker-only implementation remains **uncommitted and unvalidated**, outside that run. Source review repaired ignored-category serde parity, populated migration snapshot/count fixtures, missing ignored-leaf test imports and obsolete fingerprint expectations, readable completed-state loss identities, and typed retry of definitely rolled-back blocker terminalization. A compound regression includes wrong source/receipt and mandatory-outbox rollback. Hosted coverage is extended for domain, migration182, ignored inventory and frontend checks. These are source changes, not passing-test claims.
+
+**Open acceptance gap:** initial attempts blocked before retirement have no original sealed retirement anchor; existing explicit retry deliberately refuses them. Capture is separate from dispatch but remains retirement-authorized by API/schema. Fake anchors, dropped loss rows, resuming stopped runs, or recreated process-epoch stop permits are not acceptable shortcuts. Safe original-target fresh reinspection remains owed before delivery. Interim shutdown-uncertain results stay visible without a nonfunctional Retry or History success.
+
+### Terminal d78c1ed5e: selector-only failure classified; disjoint blocker source prepared
+
+Personally verified run45230247643 **completed / failure**, exact d78c1ed5e6c32e63797755cf2a0ce1d6d360e59a. Sole failing step is the exact six-selector inventory prefix; compilation passed, complete foundation suite skipped. Native Close suite57/0 does not cover six new included tests. Specification/Allium and formatting gates pass. Required real production-detector Worktree **1/0/0 ignored** with nobody/caps0 passes again; actor and existing physical/Stop/safety gates passed. Sole watcher exited1; `@82` verified zsh before next watcher. Full terminal logs and dedicated evidence retained `/tmp/close-d78c1ed5e`.
+
+In parallel, disjoint source/test preparation advanced ignored leaf inventory/fingerprints and submodule mapping, domain/forward182 migration, shared exact-attempt no-loss admission guards, retired DB/HTTP discard admission, and UI retained blockers. Review corrected migration rebuild/fixture issues and added source-bound atomic pre-retirement blocker terminalization; source review/integration still ongoing. **Not yet published/validated**; pre-anchor explicit retry remains a concrete coupling gap, no fabricated shutdown proof or Retry affordance. This preparation is not held behind selector qualification. Next publication is only reviewed one-line selector repair plus status; prepared implementation remains separate dirty work until reviewed.
+
+### d78c1ed5e active: compile fixed, specification/format pass; exact selector prefix correction ready
+
+Run45230247643 still active (runtime matcher/actor). Personally read hosted artifacts: DB **compilation passed**; inventory includes all six new tests under **`close_foundation::tests::native_retry::`**, not `native_close::source_fence::tests::`. The source file is `include!`d by close_foundation.rs into `tests::native_retry`. Existing exact inventory guard used the wrong prefix; corrected one line after evidence and independent review. All six suffixes match hosted inventory exactly. Selected-test regex already includes them; complete foundation suite selects them but is skipped on this inventory failure. Successful `native_close::` suite **57/0** does NOT execute these six. Prior review claims that it did, or that old selectors existed, were incorrect. No new-admission/historical regression pass is claimed.
+
+Hosted **Allium + specification shape + dev.py unit tests all pass**, and exact hosted-format.patch is empty (0 bytes). No additional source repair identified. Hold corrective publication until personally classifying full exact terminal run; sole watcher remains `@82`. Evidence `/tmp/close-d78c1ed5e/{db/,specifications/,format/}`. Remaining broader blocker-only source implementation untouched.
+
+### Current d78c1ed5e corrective publication: automatic qualification running
+
+Committed/pushed `d78c1ed5e6c32e63797755cf2a0ce1d6d360e59a` with hooks disabled after exact prior terminal classification and review. [Automatic run45230247643](https://github.com/scottopell/phoenix-ide/actions/runs/45230247643) active; sole watcher `close-d78c1ed5e-watch` pane `@82`, evidence `/tmp/close-d78c1ed5e`. Prior watcher `@81` verified zsh/exited1 before starting this watcher. No new test/parser/format pass claimed; await exact terminal evidence before further publication. No local build/test/script/fmt/SQL/native experiment, manual rerun, merge or deploy.
+
+### Terminal d38ab1253 classified; reviewed compile/baseline/format correction ready
+
+Personally verified run45223536108 **completed / failure**, exact `d38ab1253df0d4e53e564f23d2418a1144365bc9`. Watcher exited1, pane `@81` returned zsh before next publication. Sole DB root cause E0369 in the new no-mutation test; affected DB suites did not execute. Allium parsing passed; only new analyse finding is the exact renamed external startup listener tuple. **Specification shape and dev.py unit tests passed.** Required formatting failed with the exact one-line proposal now applied. All remaining runtime/focused gates passed: actor **48/0**, production-detector Worktree **1/0/0 ignored** under nobody/all IDs65534/own group/caps0, controlled physical and both Stop journeys, exact live self-descriptor safety regression. Full logs and exact dedicated evidence retained `/tmp/close-d38ab1253/{full-run.log,final-failed.log,final-run.json,exact/,db/,specifications/,format/}`.
+
+Corrective source remains limited to full event Debug snapshot equality in test, exact existing baseline startup-rule rename, and hosted line wrap. Independent source review found no blocker, diff check passes. This is compile/baseline/format repair, not a new production policy or a claim the new admission tests passed. Broader simplification remains incomplete.
+
+### d38ab1253 early failures classified; corrective source reviewed, awaiting terminal run
+
+At current check run45223536108 remains active in same-server queue qualification. DB test compilation fails E0369: new rejection regression compares `Vec<PendingWatchEvent>`, whose DTO has no PartialEq. DB tests are nonexecution, not failures of the new admission policy. Prepared correction compares complete Debug snapshots (all exposed fields, existing repository convention); no production DTO change. Hosted Allium **parse passed**, analyse rejected only changed `PhoenixStartupObservedCloseRun` listener tuple: baseline retained removed automatic-specific rule name. Prepared exact one-name baseline replacement with `StartupCannotAdmitCloseSuccessor`, retaining all four exact sorted listeners, no wildcard/new suppression. Specification-shape pass is not yet established. Exact hosted format patch applied (one completion.rs line wrap). Independent corrective source review found no blocker; `git diff --check` passes. No local validator run and no corrective commit/push before exact terminal classification.
+
+Runtime actor ownership and required production-detector Worktree steps have succeeded again; still retrieve dedicated logs and final artifacts before asserting exact counts. Sole watcher remains `@81`; no duplicate watcher. Remaining public gates and final formatting/run conclusion are pending.
+
+### Current exact source d38ab1253: automatic hosted qualification active
+
+Published `d38ab1253df0d4e53e564f23d2418a1144365bc9`, [automatic run45223536108](https://github.com/scottopell/phoenix-ide/actions/runs/45223536108), in progress. One watcher `close-d38ab1253-watch` / pane `@81`, evidence `/tmp/close-d38ab1253`; prior watcher `@80` exited0 before this watcher started. Checkback scheduled. Personally classify exact terminal source, specification gate, no-new-admission/historical tests, production Worktree regression and formatting before further publication. No current-head test or parser success is claimed.
+
+### Simplification slice: reviewed source and coupled contract, hosted validation next
+
+New native automatic metadata-only successor admission is rejected before writes; exact pre-existing receipts remain replayable and historical finalization/source/cancellation safety is retained. No runtime loop was removed (the DB API had no runtime caller). Negative no-mutation and six historical/rejection selectors are mandatory in hosted inventory. Historical tests seed legacy data, not new production admission. Independent source review caught and corrected a fixture's double consumption of its allowance; final review found no remaining blocker.
+
+Work Lifecycle and coupled Bedrock requirements/Allium now align with Close ADR-286: no automatic successors or in-Close discard/repair/classifier; exact ignored/build and operational blockers; separate owner cleanup; mutation rechecks; truthful incomplete placement. Review restored the retained explicit-plan/provenance and atomic cancellation safeguards, and bound blocker decisions to complete immutable scope inspections. Source-only cross-spec review found no remaining blocker. New hosted job uses existing pinned Allium and specification-shape lanes; no local validators executed. This is not implementation completion or a parser/test-pass claim: native ignored/blocker/discard/UI changes and remaining public/platform acceptance are still pending.
+
+### Integrated-source candidate note — reconciliation and tests pending
+
+This documentation integration is a candidate only, not a qualification or completion claim. Reconcile current main590 source against the Close candidate and run the required exact-source tests before treating it as integrated. Preserve main migration172; Close's unshipped migration range is 173–191 and remains unqualified. The runtime cancellation-inbox/batch-custody path needs its documented adaptation to the integrated source. Prior e3cf was still running at its recorded checkpoint; do not infer a terminal result from that historical status. No local executable validation was run for this documentation-only reconciliation.
+
+### Terminal 6064908e3: production-detector Worktree milestone PASSED
+
+Personally reverified exact [run45205202022](https://github.com/scottopell/phoenix-ide/actions/runs/45205202022), **completed / success**, SHA `6064908e38550f08198987ccf0aafc413e644734`. Required real production-detector public Worktree journey **1 passed / 0 failed / 0 ignored** under capability-free nobody (all UID/GID fields65534, own group only, CapInh/Prm/Eff/Amb zero). Original checkout/Git admin retirement, independent WorkScope success, durable evidence, Archived/History and no-extra-effects replay assertions passed. Exact self-custody safety regression, actor48/0, controlled physical and both Stop journeys passed; formatting patch is empty. Evidence retained `/tmp/close-6064908e3/{exact/,format/,full-run.log,final-run.json,final-failed.log}`. Sole watcher exited0 and pane `@80` returned to zsh; no new watcher needed.
+
+This qualifies that Linux identity, not the ordinary UID1001 ambient-capability environment or native macOS execution. Broader Close delivery remains incomplete: accepted simplifications, blocker/projection equivalence including ignored/build content, remaining assembled registered-resource coverage, and supported-platform/delivery verification are pending. All historical active/pending detector and unresolved-policy paragraphs below are superseded by this terminal result and the settled finite contract. No merge, deployment, local native execution or real-user cleanup performed.
+
+### Finite simplified delivery contract (scope decisions, not implemented claims)
+
+Latest primary review `fe190600-13e4-412b-8b89-dadfe5bef3ad:d82e78a5-8ff0-4440-a9cf-faa81f212a7d` verified: ignored/build content belongs in blocker inventory; no Close disposable/regenerable classifier. Owning agent can clean separately only under its own authority. Definitely stopped conversations may leave Active only with conspicuous **Close incomplete — disk retained**, blockers and retry; uncertain shutdown stays visible. Recheck at mutation boundary and expose newly encountered concrete failures. No inspection snapshot guarantees completion.
+
+Finite retained checklist:
+1. One idempotent native `close_conversation`, Stop and explicit safe retry; replay adds no effects and retry cannot expand captured targets.
+2. Authoritative WorkScope registrations define owned inventory. Use existing shutdown mechanisms for registered Bash groups, tmux servers, PTYs and browsers, plus original linked Worktree and independent WorkScope retirement. No new discovery/ownership framework, external-process cleanup or per-kind product reselection. Concrete gaps are public assembled coverage (not missing manager scaffolds), particularly Browser/Tmux/PTY; source already has native capture/dispatch for all four process kinds.
+3. Reclaim clean owned original linked Worktree checkout/admin entry; preserve siblings/main checkout, refs/PRs and unrelated resources. Dirty tracked/untracked/ignored/build content and unpreserved commits block. No classifier, automatic salvage, discard confirmation override or blocker-cleaning automation.
+4. One actual blocker source drives both decision and projection: exact file/commit identities and concrete operational impediments (writer/path/permissions/Git/layout/deadline/unknown ownership). Revalidate exact identity/ownership and safety at mutation boundaries; new failures become blockers, never implied success.
+5. Bounded existing per-resource teardown with retained custody, no later unauthorized effects after Stop/uncertainty, successful-prefix persistence, explicit retry only with valid original authority. Shared/unowned interference blocks but does not enter cleanup scope.
+6. Truthful durable completion/History and conspicuous incomplete status/retry. Definitely stopped may leave Active under above condition; uncertain remains visible. Replay/reconnect/restart observe retained state without automatic destructive continuation or duplicate effects.
+7. Validate changed paths with focused safety tests, disposable public Close/replay/Stop and supported-platform native mechanisms plus user-facing blocker/incomplete projections. No opaque inherited 'all specs' or unrelated release/device project added as hidden gate.
+
+Removed from critical path: automatic metadata-only completion successor/driver/public-equivalence automation; in-Close discard/salvage; regenerable-content classifier; automatic blocker repair. Existing explicit completion integrity and installed historical data remain protected. Deferred: new EquivalentLiveResource manager (no producer/dispatcher exists), unrelated iPhone/release-signing/updater/rollback/general refactors. These deferrals do not remove any actual registered owned resource. Remaining concrete engineering decisions are implementation details: expose existing manager authority-loss as explicit retry blocker rather than invent restart ownership; choose visible incomplete placement consistent with approved contract; safely observe legacy successor rows without executing removed automation. Native platform qualification must be stated against supported shipped platforms, not silently skipped or expanded into open-ended audit. Cuts/updated UI/blocker behavior are pending implementation and verification, not claimed delivered. Current physical proof continues unchanged.
+
+
+### Active exact 6064908e3 compile/format repair qualification
+
+16:07UTC owner check: exact run **in_progress**, runtime matcher/actor stage; required production detector pending. No named test outcome inferred from stage progress. Same sole watcher retained; next resuming reminder `31817f97-c053-424c-9e9f-244e74855180` due2026-11-23 16:22:14UTC. No new source/publication or acceptance claim.
+
+15:46UTC owner check exact run still **in_progress**, native Close DB request/observation tests; required production detector pending. Same sole watcher retained. Next resuming reminder `32b359f0-a0a0-4160-9472-90091ec50f3b` due2026-11-23 16:06:57UTC supersedes earlier reminder (whose unresolved-policy notes were superseded by primary review above). Only dirty status, no active writers or new publication. Actual physical milestone remains open.
+
+**Current HEAD `6064908e38550f08198987ccf0aafc413e644734`**, reviewed DirEntry type fix and exact hosted format patch committed/pushed hooks-disabled after terminal2c classification. Automatic exact [run45205202022](https://github.com/scottopell/phoenix-ide/actions/runs/45205202022) **in_progress**. Sole watcher `close-6064908e3-watch` (`@80`), evidence `/tmp/close-6064908e3`; prior2c watcher returned zsh before new. Resuming reminder `6da9cdf1-c346-4ec8-91c9-441f7089f2c6` due2026-11-23 15:46:40UTC; old2c reminder canceled. No active delegates. Actual exact-custody/public production-detector runtime acceptance still pending; no compiled/pass proof claimed. Verified product scope delta below remains pending implementation; ignored policy/placement unresolved. Earlier active-source paragraphs superseded.
+
+
+### Verified scope delta and terminal 2c67178eb repair
+
+Primary user review verified directly at Coordinator transcript `fe190600-13e4-412b-8b89-dadfe5bef3ad`, user_api message `fe190600-13e4-412b-8b89-dadfe5bef3ad:3d551c4f-8b27-4e01-a1b5-882b0114f621`: agrees to cut automatic completion-only successor; keep single idempotent close_conversation and normal owned-worktree reclamation; do not take on cleaning blockers; inventory must correspond1:1 with actual Close blockers. Scope reconciliation pending implementation: remove/defer automatic metadata-only successor and in-Close salvage/discard convenience, preserve explicit safe retry/idempotence/Stop/deletion safety; unify decision/projection evidence for files/commits and operational impediments. No ignored-path blind spot/generic-only attention where concrete cause known. **Unresolved** ignored-content proven-disposable policy and stopped-but-incomplete placement remain pending user decision; existing conservative protection applies. No accepted cut is claimed implemented. Current physical detector gate unchanged; no CI restart for planning. Later normative/spec reconciliation must supersede older automatic-successor acceptance obligations without rewriting installed migrations or deleting ordinary completion integrity.
+
+Personally classified exact [run45198509514](https://github.com/scottopell/phoenix-ide/actions/runs/45198509514) **completed / failure**, SHA2c67178eb58761bba18f871fd2ade7bf02eb5f8c. Runtime compilation fails E0599: DirEntry.file_name() returns OsString, not Option, so new descriptor parser cannot call and_then directly. Subsequent required test/actor/inventory failures are nonexecution/absent-binary consequences; no new runtime proof or test counts. Earlier DB/foundation/WorkScope stages pass. Exact formatting gate failed; retained `/tmp/close-2c67178eb/format/hosted-format.patch` applied verbatim after terminal classification. Type fix uses `.file_name().to_str().and_then(parse)` for DirEntry; Path process parsing unchanged. Independent source review found no blocker and rest is formatting-only. Source-ready for hosted validation, not compiled/tested. Evidence final JSON/failedlog/exact artifact retained in `/tmp/close-2c67178eb`. Production-detector milestone remains FAILED/OPEN; broader obligations now exclude approved automatic-successor automation but retain single interface and actionable blocker equivalence.
+
+
+### Active exact 2c67178eb custody repair qualification
+
+15:11UTC owner check: exact run still **in_progress**, shared WorkScope lifecycle regression boundaries; required production-detector stage pending. Same sole watcher retained, next resuming reminder `a30542cf-08eb-442d-bc6d-a30051d7d82e` due2026-11-23 15:31:14UTC supersedes earlier checkback. Only dirty status file, no active delegates or new publication. Acceptance remains open.
+
+**Current HEAD `2c67178eb58761bba18f871fd2ade7bf02eb5f8c`**, reviewed exact live deletion-custody repair committed/pushed hooks-disabled after terminaldf attribution personally classified. Automatic exact [run45198509514](https://github.com/scottopell/phoenix-ide/actions/runs/45198509514) **in_progress**. Sole watcher `close-2c67178eb-watch` (`@79`), evidence `/tmp/close-2c67178eb`; olddf watcher returned zsh before new watcher. Resuming reminder `f1aa8dbe-95d0-4e29-8fde-521b02f88212` due2026-11-23 15:10:55UTC; olddf pending reminder canceled. No active delegates. Next personally classify exact compiler/format/focused safety and actual required public production-detector results; no runtime acceptance claimed yet. Current milestone FAILED/OPEN. Historical active-source paragraphs below superseded.
+
+
+### Terminal df6aa0ddb: same-process read-only directory authority confirmed
+
+Personally verified exact [run45190605565](https://github.com/scottopell/phoenix-ide/actions/runs/45190605565) **completed / failure**, SHA `df6aa0ddb17ace16923639758726ec6ed34db3af`; sole failure required production-detector test **0 passed / 1 failed**, actor **48 passed / 0 failed**, controlled physical lifecycle and both Stop pass, all other focused stages/format pass (empty patch). Persisted typed observation: LinuxDescriptor, **PID15357 equal scanner_pid15357**, staged runtime-test executable, matched relocated object, **DirectoryDescriptor(ReadOnly)**. Thus same-process descriptor cause confirmed; numeric FD not retained in existing evidence and not claimed identified. Source necessarily holds the object custody FD across this exact scan. Artifacts/full logs retained `/tmp/close-df6aa0ddb/{exact/,format/,full-run.log,final-run.json,final-failed.log}`. Watcher exited1/returned zsh before next publication.
+
+Prepared exact live-custody repair below now supported by hosted attribution and final independent source review with no remaining blocker for hosted validation. No compilation/runtime proof yet. Hard production-detector public physical/admin/WorkScope/Archived/History/replay and all writer-safety assertions remain unchanged; Linux exact-custody regression required by workflow. Mac matcher implemented and high-bit normalization regression source added, native macOS gate still owed. Current required milestone remains FAILED/OPEN until next exact hosted pass. No local execution, merge, deploy or real-user cleanup.
+
+
+### Active exact df6aa0ddb diagnostic; reviewed uncommitted custody candidate
+
+14:39UTC owner check: exact run still **in_progress**, runtime matcher/actor stage; required production-detector stage pending. Same sole watcher retained; next resuming reminder `4bb0e0b1-b8f7-49a2-8995-b09c0687d6dc` due2026-11-23 14:54:36UTC. Complete reviewed candidate remains uncommitted/unexecuted; no additional source changes or publication.
+
+14:21UTC final independent source review after all fixes/coverage found **no remaining source-level blocker for hosted validation**; not compilation/runtime proof. All delegate work returned. `git diff --check` passes. Diagnostic run still active migration172 regressions; same watcher/reminder retained. Six callback closure fixes and replaced-slot case are now complete (earlier reminder's in-progress notes are historical). Four dirty files are exactly status, workflow, scanner, physical driver. Do not publish until current terminal typed evidence is personally classified.
+
+**Current committed/pushed HEAD `df6aa0ddb17ace16923639758726ec6ed34db3af`**, diagnostic-only typed authority evidence. Automatic exact [run45190605565](https://github.com/scottopell/phoenix-ide/actions/runs/45190605565) **in_progress** at14:19UTC, complete Close foundation module; production-detector journey pending. Sole watcher `close-df6aa0ddb-watch` (`@78`), evidence `/tmp/close-df6aa0ddb`; prior9744 watcher exited before new watcher. Resuming reminder `7324df7e-1faf-48fd-8fba-b6606a63a946` due2026-11-23 14:39:17UTC. No next publication before personally classifying this exact terminal run and typed first-hit evidence.
+
+Uncommitted candidate now implements borrowed exact live deletion-custody descriptor through `after_move` and scoped Linux/macOS descriptor detectors only. Existing witness remains held; match current PID/fd/dev/inode/kind and live original slot validation after normal repeated descriptor observations; every other descriptor/process/cwd/mapping and fail-closed gap unchanged. No global registry/wholePID/inode exception. Linux fakeproc regression covers ordinary block, exact exemption, repeated scans, mixed inventory, other descriptor/PID, different witness identity, original slot replacement, fdinfo uncertainty. Mac unsigned-device normalization high-bit test added; mac native execution still owed. Workflow requires exact new Linux regression nonignored pass.
+
+Partial delegate first stopped incomplete; integrator recovered and source-reviewed before proceeding. Independent review found duplicate test function prefix, missing test type qualification, mac signed-device mismatch and generic callback lifetime blockers; all fixed in source, no local execution. Follow-up review found no additional production correctness blocker, requested mixed/replaced-slot coverage now added. Candidate remains uncompiled/unexecuted and uncommitted while diagnostic run is pending. No active delegate writers. Production-detector milestone remains FAILED/OPEN until actual exact hosted pass. Broader gates/fallback unchanged. Earlier active-source paragraphs below superseded.
+
+
+### Terminal 9744f585e classification; typed writer attribution
+
+Exact [run45182764667](https://github.com/scottopell/phoenix-ide/actions/runs/45182764667) **completed / failure**, personally verified SHA `9744f585e79157f4623e73b38ada10696e12b28c`, full logs and exact artifacts. Staging/preflight SUCCEEDED under all nobody IDs65534, own group only, zero capabilities; required actual production-detector public test **executed: 0 passed / 1 failed**, ArchivedCleanupAttention instead of Archived. Durable Worktree residual ManualRepairRequired says positive external-writer authority holds moved object; no InspectionGap. Later Node attribution has no identity-failure record and cannot identify the original positive scanner witness. Actor **48 passed / 0 failed**, controlled real lifecycle and both Stop journeys pass; every other focused stage and formatting pass (empty format patch). Sole watcher exited1 and returned zsh before any next publication. Evidence `/tmp/close-9744f585e/{final-run.json,final-failed.log,full-run.log,exact/,format/}`. Production milestone remains FAILED/OPEN, not a preflight blocker now.
+
+Independent source investigation found a concrete necessary self-candidate: final-delete `OwnedDeletionSlot` retains read-only directory FD through `after_move`; production scanner includes own PID and correctly treats directory descriptors as authority. Existing panic omits durable typed writer observations, so exact first-hit PID/authority not established by logs yet. Narrow diagnostic now prints existing `list_close_writer_observations` Results per captured scope and scanner PID, preserving all query errors and hard assertions; no scanner/policy/schema change. Independent signature/Debug/error-path review found no blocker for hosted validation.
+
+Source-only repair design is explicit post-move borrowed custody capability for the single exact live retained FD, current PID + numeric slot + live captured dev/inode/kind validation after normal repeated observations. Continue scanning every other descriptor including another same-process handle and all other processes; cwd/mappings/uncertainty unchanged. Do not drop custody, exclude whole PID/inode/read-only directories or add global registry. Linux and macOS libproc paths both need exact matching; no lsof path in this source. Design is not implemented or runtime proven; exact typed first-hit attribution remains next hosted evidence. Broader Close gates remain open and retry fallback retained.
+
+
+### Active exact 9744f585e qualification
+
+13:40 UTC owner check: exact run still **in_progress**, migration-tail regressions; required production-detector stage **pending**. Same sole watcher retained, next resuming reminder `b16d24f9-0ed9-4755-92fe-3612586f80ba` due2026-11-23 14:00:09 UTC supersedes earlier checkback. No new publication or execution proof.
+
+**Current HEAD `9744f585e79157f4623e73b38ada10696e12b28c`**, reviewed staged-executable/private-cwd repair committed/pushed hooks-disabled after personally classified terminal6c. Automatic exact [run45182764667](https://github.com/scottopell/phoenix-ide/actions/runs/45182764667) **in_progress**. Sole watcher `close-9744f585e-watch` (`@77`), evidence `/tmp/close-9744f585e`; old6c watcher exited before this started. Owner-resuming reminder `aae71f96-f727-421a-95f4-db6dc7c0b8a4` due2026-11-23 13:39:47 UTC. No active delegates/writers. Next personally classify exact terminal preflight and actual one-test result; current required real production-detector acceptance remains FAILED/OPEN. No local execution or production operations. Historical active-source/checkback text below superseded.
+
+
+### Terminal 6c0788abd classification; staged-executable repair
+
+Personally inspected exact [run45173633727](https://github.com/scottopell/phoenix-ide/actions/runs/45173633727), **completed / failure**, SHA `6c0788abd86e6ac259f8ac2aa3436a2ec16d598b`. Actor **48 passed / 0 failed**, controlled physical lifecycle and both Stop journeys pass; all other focused stages and exact-source formatting pass (empty format patch). Required production-detector test **did not execute**: preflight verified all four nobody UID/GID65534, own-group-only and zero CapInh/Prm/Eff/Amb, then aborted because runtime/launcher files were not accessible executable files under that identity. No test count or production scanner success. Attribution correctly reports no logged identity-scan failure, not a detector pass. Full required milestone remains FAILED/OPEN. Watcher exited1 and pane returned to zsh; no active watcher process. Evidence `/tmp/close-6c0788abd/{final-run.json,final-failed.log,full-run.log,exact/,format/}`.
+
+Narrow reviewed repair streams only the two existing runner-built executables into nobody-owned private scratch and verifies SHA256 equality before execution. Source files must remain regular readable executable non-setid files; newly staged copies mode0700, no source checkout permission changes/root execution/build or security-policy change. Selected fixture creates absolute disposable Git paths and requires no checkout cwd; preflight/test now use private scratch. Exact selector rejected before staging and rechecked under dropped identity with cleanup already installed. Existing UID/group/caps/proc checks, production scanner default, exact one-test/nonignored workflow guards, same-identity5m/outer6m deadlines and post-test-failure scratch retention unchanged. Staging is bounded by workflow emergency timeout, not a separate inner staging deadline. Independent review found two issues (unneeded checkout traversal and selector-rejection scratch leak); both fixed, follow-up no concrete blocker for hosted validation. No local execution; actual real-detector journey still unproven. Broader Browser/Tmux/automatic-completion/public equivalence and full CI/macOS/install gates remain owed; retain retry fallback.
+
+
+### Active exact 6c0788abd qualification
+
+13:03 UTC owner check: exact-source run remains **in_progress**, now later same-server queue qualification. Broader actor stage **success**, required production-detector stage **failure**, attribution stage **success**. Failure logs not yet collected; preflight failure versus executed public journey failure is not established. Required milestone remains FAILED/OPEN. Same sole watcher retained; next resuming reminder `70b05d68-c48d-4e30-905d-05bafbec1c11` due 2026-11-23 13:13:25 UTC. Next terminal logs/artifact classification before any source publication. Earlier checkback paragraphs below superseded.
+
+12:42 UTC owner check: exact-source run still **in_progress**, now migration-tail regression modules; production-detector journey has not executed. Existing sole watcher retained. Next resuming reminder `83509017-91c0-4c8b-873d-135c2b00b8ce` due 2026-11-23 13:02:57 UTC supersedes the earlier reminder below. No new source publication or acceptance claim.
+
+**Current HEAD `6c0788abd86e6ac259f8ac2aa3436a2ec16d598b`**, committed/pushed hooks-disabled. Automatic [run45173633727](https://github.com/scottopell/phoenix-ide/actions/runs/45173633727) personally checked at 12:25 UTC: exact SHA, **in_progress**, currently migration176 authority regressions; required capability-free production-detector journey has not executed yet. Sole existing watcher `close-6c0788abd-watch` (`@76`) retained, evidence `/tmp/close-6c0788abd`. Existing owner-resuming reminder `bd0900b4-fc5b-4607-9e70-56feba2eac40` due 2026-11-23 12:42:40 UTC retained. No new publication, duplicate watcher, local execution or active delegate writers. Working tree was clean before this status update.
+
+Next personally classify exact terminal source, actual identity/capability preflight and required one-test nonignored physical Worktree/admin/WorkScope/Archived/History/replay result. Passing under capability-free nobody would qualify that environment only; ordinary UID1001 capable-systemd EACCES remains separate known failed-environment evidence. Controlled physical proof is not a substitute, and broader Close acceptance remains owed. Historical active-run paragraphs below are superseded.
+
+
+### Read-only next-gate inventory (not acceptance or publication)
+
+Independent source inventory while current hosted run executes found native Browser/Tmux resource preparation/execution already implemented in `native_initial/resource.rs`, but no matching live-resource registered public Close acceptance journeys in `native_close_admission_tests`. Existing empty-WorkScope public path and lower-level helper/custody tests are not assembled equivalence. Smallest proposed next slice after current gate classification is one disposable real Tmux public Close success/replay journey, preserving original server/socket/token identity, durable resource evidence, independent WorkScope success, truthful terminal/History state and no additional replay teardown; use existing same-server helper boundary. Browser assembled coverage remains separate. Completion-only automatic successor has DB implementation/tests, but runtime driver/public equivalence needs investigation before claiming wiring or liveness. No code authored or broader scope activated by this inventory; all delegates returned. Keep retry fallback and broader macOS/full-CI/install gates.
+
+### Terminal 234950038 classification; ambient capable systemd identified
+
+Exact [run45163638731](https://github.com/scottopell/phoenix-ide/actions/runs/45163638731) **completed / failure**, personally inspected final JSON, failed logs and exact-source artifact. Actor **48 passed / 1 failed**, dedicated production-detector **0 passed / 1 failed**; controlled lifecycle and Stop journeys passed. Both production invocations fail same PID1365/start953 at `/proc/1365/exe` EACCES13. Exact artifact `public-worktree-process-attribution.jsonl` verifies same incarnation before/after: **Name systemd, StateS, PPid1, all UID/GID1001, CapPrm/CapEff0000000800000000**, while later diagnostic Node UID1001 has caps0. Ambient capable same-effective-UID service, not fixture child. Exact kernel access rule/nondumpability still not directly proven. Required production gate remains FAILED/OPEN under runner UID1001. Other focused steps and formatting passed (empty format proposal). Sole watcher exited1 and gone. Evidence `/tmp/close-234950038/{final-run.json,final-failed.log,owner-failed.log,exact/,format/}`; attribution artifact is in **close-exact-source**, not close-db-evidence.
+
+Reviewed next suitable-host candidate uses existing `nobody` account solely for the one exact disposable production-detector journey, clean env and **zero active/inheritable capabilities**, private0700 scratch, ordinary real host `/proc` with unchanged effective-UID policy. `sudo -n -u nobody` only drops privileges; no root tests/build, account creation, chmod/chown checkout, proc mounts, namespace, capability/security-policy changes, skips of candidate processes or detector seam. Preflight aborts if identity/caps/source/binary accessibility not proven; no fallback. This addresses known ambient runner-identity contamination by selecting an ordinary capability-free test identity, NOT by certifying UID1001 inspectability or modifying production behavior.
+
+Broader actor suite remains existing runner identity with production test removed only from duplicate module execution; separate REQUIRED exact one-test/zeroignored guard retains it as acceptance gate. Wrapper structurally admits only that exact Git/Worktree test/options, not Bash/Tmux actor suite. Independent review found initial timeout/lifetime blocker for broad identity actor run; narrowed test scope, same-identity5m inner deadline,6m emergency outer bound, failure scratch retention fix it sufficiently for hosted validation. Does not guarantee every descendant termination on forced kill; disposable hosted job end final boundary. Two source reviews no remaining blocker, not executed locally. Followup attribution still later **runner-view**, not nobody scanner credentials. Hosted pass would prove production detector plus full public lifecycle under this capability-free identity; ordinary UID1001 environment remains known fail-closed/unsupported for this fixture. Full broader Close acceptance/macOS/release/install gates remain owed.
+
+**Prior HEAD `2349500384d33993d18565b3ec7c20bfd9b469bf`**, reviewed bounded hosted process attribution + exact hosted formatting, committed/pushed hooks-disabled. Automatic [run45163638731](https://github.com/scottopell/phoenix-ide/actions/runs/45163638731) active at exact source. Sole watcher `close-234950038-watch` (`@75`), evidence `/tmp/close-234950038`. 12:07 UTC owner check: exact-source run remains active at later same-server queue qualification. Actor and independent required production-detector stages failed; bounded attribution stage completed without failure, artifact awaits terminal collection. Same sole watcher retained, no new publication. Next owner-resuming reminder `cb9a8ba7-4db9-48e0-ae17-a368db074deb` due2026-11-23 12:12:26 UTC. No active delegates. Next terminal personally classify actor + dedicated real-detector test, download `evidence/public-worktree-process-attribution.jsonl` from standard artifact; separate proven controlled lifecycle from FAILED/OPEN production-detector public acceptance. No production policy/namespace/privilege changes. Historical active-source paragraphs superseded.
+
+### Terminal a6ad83a82 failure; exact EACCES evidence and attribution candidate
+
+Personally classified exact [run45154882295](https://github.com/scottopell/phoenix-ide/actions/runs/45154882295), `a6ad83a827ec696e67c9f92a973bd22f5c626f29`, **completed / failure**. Actor **48 passed / 1 failed**; controlled physical lifecycle and both Stop journeys pass. Required production-detector positive fails in actor suite AND independent exact invocation (**0 passed / 1 failed**). Both independently log **process_exe_read_link `/proc/1162/exe`, PermissionDenied/EACCES13, PID1162 start_ticks948, identity_before**. This is initial process-identity inspection before descriptor traversal, not evidence of an actual writer. Production correctly retained cleanup attention/tombstone. Full detector acceptance remains **FAILED/OPEN**. Other focused qualifications passed. Formatting failed one scanner tracing hunk; exact hosted proposal downloaded/applied, not locally formatted. Evidence `/tmp/close-a6ad83a82/{final-run.json,final-failed.log,format/hosted-format.patch}`. Sole watcher exited1; no process remains.
+
+Bounded disjoint read-only investigation: same persistent inaccessible incarnation suggests a shared runner inspection constraint, but executable EACCES alone does not prove nondumpability, parent origin, fixture leak or detector defect. No established container/PID namespace mechanism found in repo. No skip/privilege/capability/security-policy change justified. Narrow next candidate uses existing hosted Node/tooling and evidence upload: immediately after required exact production journey, capture at most four *current log* PID/start pairs, 64KiB bounded reads, five-second cooperative deadline/ten-second external timeout, allowlisted proc credentials/state/PPID/short Name/start/exe basename or errno only. Stat-only identity checks bracket metadata; known replacements skipped; parent explicitly best-effort/unverified. No cmdline/env/descriptor inventory/target contents, no new authority or production operations. This is diagnostic evidence, not a root repair or acceptance substitute. Independent source review raised two bounded-read/identity-bracket issues; both corrected and follow-up source-ready review no blocker. No script/local native execution.
+
+A process-incarnation/credential diagnostic is needed before choosing a suitable isolated hosted environment or production repair. Unprivileged namespace is only a possible later proposal, availability unproven; no privileged fallback or ordinary-host fail-open. Source publication below superseded by this terminal result. Attempted coordinator receipt target lookup returned target_not_found, so no delivery claim.
+
+**Prior HEAD `a6ad83a827ec696e67c9f92a973bd22f5c626f29`**, reviewed required production-detector public journey + diagnostic-only scanner capture, committed/pushed hooks-disabled after terminal9a success personally verified. Automatic exact-source [run45154882295](https://github.com/scottopell/phoenix-ide/actions/runs/45154882295) active. Sole watcher `close-a6ad83a82-watch` (`@74`); evidence `/tmp/close-a6ad83a82`. 10:59 UTC owner check: exact-source run remains active at runtime matcher/actor ownership, including controlled and production-detector public Worktree journeys. No terminal outcome yet. Same sole watcher retained. Next owner-resuming reminder `bda8a3ec-3e59-4e1f-884a-ab608eaa2e7d` due2026-11-23 11:09:30 UTC. No active delegates. Required production-detector milestone remains **OPEN**, distinct from proven9a controlled physical lifecycle. Next personally classify actor plus dedicated production-detector exact-test logs at this source, then evidence-backed root repair as needed; preserve all safety/acceptance assertions. Historical publication/active-run prose below superseded.
+
+### Terminal 9a428fd96 success; real-detector candidate publication
+
+Personally classified [run45147850263](https://github.com/scottopell/phoenix-ide/actions/runs/45147850263), exact `9a428fd9684e7d41544b80043f3365c15e40c41d`, **completed / success**. Sole watcher exited0 and process gone. Full logs `/tmp/close-9a428fd96/full-run.log` prove actor **48 passed / 0 failed**, both Stop public journeys passed, positive controlled-writer public journey passed all real physical/admin removal, original durable Worktree evidence, independent WorkScope, Archived/History and no-effect replay assertions. Exact attributed unavailable-inventory regression passed. All focused workflow steps and exact-source formatting passed. This is controlled-lifecycle proof only; required production-detector public acceptance still **FAILED/OPEN** from f1f.
+
+Terminal gate now satisfied for publication of the independently reviewed next candidate described below: explicit required production-detector public journey and diagnostic-only scanner origin/errno capture, unchanged fail-closed semantics and positive assertions. Review simplification removed redundant Once; source diff check passes. No local execution, production operations, or real-user resources. No formatting proposal required from green9a source. No active child writers. Historical active-run text below superseded.
+
+### Required real-detector gate retained; next candidate prepared during 9a428fd96 CI
+
+The commissioned milestone is **not** satisfied by the controlled-writer journey. The detector-enabled disposable public Close -> original physical Worktree/admin absence -> independent WorkScope -> Archived/History -> no-effect replay is an explicit required acceptance gate. It remains **FAILED/OPEN** at prior f1f source, not merely optional later coverage. Controlled lifecycle results and production-detector results must be reported separately.
+
+Bounded disjoint read-only diagnosis found exact PID1410 Unavailable origin is still **unknown**: LinuxDescriptor attribution includes status read/UID/State/zombie validation, initial stat/exe, and fd inventory/entry errors. Existing logs retain no failed operation/path/errno, PPID or process-lifetime samples. No evidence establishes environment constraint, fixture leak or detector bug. Do not infer exit from ENOENT or nondumpability from EACCES alone.
+
+Prepared uncommitted next candidate: separate unignored `registered_native_close_with_production_detector_retires_worktree_and_replays` leaves the manager seam false and uses all unchanged positive assertions; explicit Stop matching prevents accidental Stop mode. Existing ubuntu-latest hosted workflow inventories/requires it and independently runs it `--exact` after ordinary earlier failures, with dedicated retained log and one-passed/nonignored guard. Test-only narrowly filtered global tracing subscriber captures native worker thread stderr. Scanner diagnostics label information-loss operation/path/error kind/raw errno and already sampled process metadata; no new probes/retries/permissions/deadlines/enum/schema or gap-policy changes. Independent adversarial review confirmed unchanged call counts, deadline precedence and fail-closed classifications, no concrete blocker for hosted validation. Applied review simplification removing redundant Once wrapper. No local execution; runtime proof absent.
+
+**Historical gate (now satisfied by terminal success above): publication awaited personally classified terminal9a428fd96 run45147850263.** Same sole watcher/reminder below retained. All children returned; only integrator owns pending source. Next publish this already prepared diagnosis/gate candidate after current terminal classification, absorbing any current failures/hosted formatting first. Missing full-detector milestone remains visible even if controlled source passes.
+
+**Current HEAD `9a428fd9684e7d41544b80043f3365c15e40c41d`**, reviewed controlled-writer lifecycle isolation plus exact unavailable-inventory regression, committed/pushed hooks-disabled. Automatic exact-source [run45147850263](https://github.com/scottopell/phoenix-ide/actions/runs/45147850263) active. Sole watcher `close-9a428fd96-watch` (`@73`), evidence `/tmp/close-9a428fd96`. 10:07 UTC owner check: exact-source run remains active, now runtime matcher/actor ownership including controlled public Worktree journey; no terminal actor outcome yet. Same sole watcher retained. Next owner-resuming reminder `daf85f8d-b4cf-4e0d-845e-cffd7d177d0f` due2026-11-23 10:17:47 UTC. No runtime acceptance claim; live Linux detector availability remains separate/open even if controlled lifecycle passes. No active writers. Next exact terminal classification and all real physical/WorkScope/History/replay assertions, then remaining Close acceptance gates.
+
+### Terminal f1f483404 classification; controlled lifecycle candidate
+
+[Run45139473278](https://github.com/scottopell/phoenix-ide/actions/runs/45139473278) **completed / failure**, exact `f1f483404571aefb526f43785ca0a97aad30fdd8` personally classified final JSON/log. Actor **47 passed / 1 failed**; both Stop-preservation journeys passed; all other focused qualification and formatting passed. Positive outcome remains ArchivedCleanupAttention. New diagnostic successfully retained exact cause: **LinuxDescriptor inspection gap, PID1410, Unavailable**, with real native cleanup tombstone retained. This proves fail-closed refusal, not physical success; syscall/errno/precise origin of PID1410 unavailability not established. Evidence `/tmp/close-f1f483404/{final-run.json,final-failed.log,owner-failed.log}`. Sole watcher exited1; no watch process remains.
+
+Reviewed next slice isolates only positive Worktree lifecycle via existing per-manager `cfg(test)` clean-writer observation seam, before manager publication. Real public Close/actor/Git/filesystem and every hard Archived/physical/admin/WorkScope/History/replay assertion remain unchanged. Stop variants keep production-default scanner. Production detector is unchanged, unknown/Unavailable still blocking. Added deterministic fake-proc exact LinuxDescriptor/PID/Unavailable regression and required hosted selector. Independent source review found no concrete blocker, not runtime proof.
+
+**Coverage limit:** any resulting positive pass qualifies actual physical lifecycle under controlled writer observations, NOT live Linux /proc detector availability. That separate availability/assembled-path gate remains unsatisfied; existing detector/persistence safety regressions remain required. New fake-proc test is scanner-only, not durable persistence or public negative journey proof. No production repair inferred from ambiguous PID diagnostics. No local native execution, no merge/deploy/release/real-user retirement. Previous active-run prose below is historical and superseded.
+
+**Historical HEAD `f1f483404571aefb526f43785ca0a97aad30fdd8`**, reviewed schema-correct independent failure diagnostic, committed/pushed hooks-disabled. Automatic exact-source [run45139473278](https://github.com/scottopell/phoenix-ide/actions/runs/45139473278) in progress. Sole watcher `close-f1f483404-watch` (`@72`); evidence `/tmp/close-f1f483404`. 09:20 UTC reminder resumed owner: exact-head run still active; actor module step failed, later actual same-server queue qualification running. No terminal log/diagnostic yet. Same sole watcher retained; no new publication. Next owner-resuming reminder `cd37e59f-cc8a-4c1c-8767-e26fb35367ca` due 2026-11-23 09:25:54 UTC. No runtime acceptance result yet; all children returned. Next terminal classification -> actual retained cleanup reason -> structural repair -> unchanged acceptance journey. Earlier active-run prose below is superseded by this section and terminal classification.
+
+### Terminal 76fa68d7e classification and corrected diagnostic candidate
+
+Run [45132975050](https://github.com/scottopell/phoenix-ide/actions/runs/45132975050) is **completed / failure** at exact `76fa68d7ebaa1a50e518b9fb1fee434641120c9d`, personally inspected final JSON/log. Watcher exited1 and process is gone. Actor **47 passed / 1 failed**, both public Stop-preservation journeys passed. The positive journey entered its failure diagnostic, which panicked at a fixture query for nonexistent receipt column `accepted_at_us`; this masked the actual outcome/history. Thus cleanup root cause still unproven. All later focused qualification and exact-source formatting passed. Evidence `/tmp/close-76fa68d7e`.
+
+Narrow source correction: failure-only diagnostic now independently formats retirement evidence/history Results, including query errors, instead of invoking the strict replay helper. The original Archived assertion is unchanged. Replay helper now snapshots all nine real receipt fields (there is no receipt timestamp) and actual `close_runs.created_at_us/ended_at_us` integer columns instead of nonexistent started_at/completed_at. Independent complete fixture SQL/schema/type review found no blocker for hosted validation; no local execution or runtime-proof claim. Root-cause repair and real physical/WorkScope/History/replay acceptance remain owed. No active writers or watcher after terminal classification; prior pending-reminder text below is historical.
+
+**Historical diagnostic HEAD `76fa68d7ebaa1a50e518b9fb1fee434641120c9d`**, reviewed, committed and pushed hooks-disabled. Automatic exact-source [run45132975050](https://github.com/scottopell/phoenix-ide/actions/runs/45132975050) is in progress. Sole watcher `close-76fa68d7e-watch` (`@71`), evidence `/tmp/close-76fa68d7e`. 08:22 UTC reminder resumed owner; exact-head run remains in progress at actual same-server queue qualification. Actor matcher/ownership step has failed; terminal classification and diagnostic logs not yet available. Same sole watcher retained, no new publication. Next conversation-resuming reminder `4e62e205-89aa-4616-9a7d-86d4de6ce9cc` due 2026-11-23 08:27:48 UTC. Next: classify exact-head terminal evidence, use retained cleanup reason to repair actual cause, and continue unchanged positive/safety assertions through hosted acceptance. No runtime proof for this diagnostic candidate yet. No active writers.
+
+**Prior published HEAD `89f56ebe85c99aaf626869a8ded5536dfae129d2`**. Automatic [run45126179018](https://github.com/scottopell/phoenix-ide/actions/runs/45126179018) is **completed / failure**, personally verified against exact SHA and final logs. Actor module **47 passed / 1 failed**: both public Stop-preservation journeys passed; positive public Worktree journey reached the durable outcome assertion and returned `ArchivedCleanupAttention`, not required `Archived`. Later physical/admin absence, independent WorkScope, History and replay assertions remain unproven. Remaining focused qualification steps and exact-source formatting passed (empty hosted format proposal). Evidence `/tmp/close-89f56ebe8/{final-run.json,final-failed.log,watch-exit-status}`; watcher exited1 and no watch process remains. Earlier reminder was cancelled. No active child writers.
+
+**Published diagnostic slice:** diagnostic-only durable evidence on the unchanged Archived assertion. The diagnostic helper now reads the original anchor optionally, so an absent anchor is explicitly `null` without suppressing resource-history reasons/details; query errors still fail. Existing successful acceptance separately requires the anchor and replay equality still detects changes. Independent narrow review found no blocker for hosted validation, not runtime proof. No speculative production repair, no local native execution, no merge/deploy/release or real-user retirement. Root cause and actual physical acceptance remain owed.
+
+### Terminal ee5ab4dd7 result and fixture repair
+
+Run45119335730 at exact ee5ab4dd702d20f449cc7e5370ebbe7f62c2ca77 is completed/failure, personally classified from final JSON/log; watcher exited1 and process is gone. Compilation and all DB/shared qualification passed. Actor module **47 passed /1 failed**: both public Stop preservation journeys passed; positive journey executed but failed early fixture comparison of product-conversation UUID against transcript `TARGET_ID`, before later physical/terminal assertions. Therefore no real Worktree acceptance claim. Remaining focused qualification steps passed. Formatting also failed; exact hosted proposal applied. Narrow fixture repair compares admission and durable receipt to independently captured `fixture.target` ProductConversationId; hard deletion/admin/WorkScope/terminal/History/replay assertions unchanged. Independent narrow source review ready for hosted qualification. No active writers, no local execution.
+
+**Current repaired HEAD `ee5ab4dd702d20f449cc7e5370ebbe7f62c2ca77`**, pushed after independent narrow review. Automatic run [45119335730](https://github.com/scottopell/phoenix-ide/actions/runs/45119335730) completed/failure (classified above). Inactive watcher `close-ee5ab4dd7-watch` (`@69`); evidence `/tmp/close-ee5ab4dd7`. 06:21 UTC reminder resumed owner; exact-head GitHub status still in_progress, advanced to `Execute native Close runtime matcher and actor ownership tests`; earlier DB/shared WorkScope qualification stages passed. No terminal evidence or real Worktree result yet. Same sole watcher retained. Rearmed conversation reminder `e1dc4503-9e96-4f50-995d-a8f6ae87a6a0` for 2026-11-23 06:41:50 UTC; inspect terminal evidence and continue repair, or rearm if still active. New candidate has no runtime execution result yet. All children returned; no active writers.
+
+### Terminal c04781c68 failure and narrow repair
+
+Run45098128942 at exact c04781c68 completed/failure. Personally inspected final JSON/log and watcher exit1; watcher process is gone. Compiler root cause E0432: physical.rs imported nonexistent `administrative_final_residue_prefix`. Runtime inventory and PHOENIX_RUNTIME_TEST_BINARY failures are downstream consequences. **Real Worktree public journeys did not execute.** Formatting also failed. Exact-head hosted formatting proposal downloaded/applied. Narrow repair removes invalid import and supplies the private incarnation-hashed `.phoenix-admin-delete-<hex>-` prefix used consistently by native allocation/residue detection; two pure regression tests authored. Independent narrow review found no source blocker or other semantic Rust delta. No local execution.
+
+Prior detached watcher completed without owner resumption; that was not follow-through. New run monitoring pairs the sole watcher with a conversation reminder/checkback that resumes the owner to read terminal evidence, classify and fix further in-scope failures. No acceptance claim until exact-final hosted public journeys execute and pass.
+
+**Historical candidate `c04781c68c247fa71e1d6367bb9fa9b2bed4e2e7`**, “Retire original linked Worktrees through native public Close”, committed/pushed hooks-disabled. Automatic exact-head run [45098128942](https://github.com/scottopell/phoenix-ide/actions/runs/45098128942) completed/failure; watcher `close-c04781c68-watch` (`@68`) exited, evidence `/tmp/close-c04781c68`. Terminal classification is recorded above; real public journeys did not execute. Frozen candidate `/tmp/close-real-worktree-public-v1.patch`, SHA256 `5439a90f101b9831dfc2e42f6791ac955e4bf0e4ffbaa546381beffddf04c1b4`, base `51cf8c7a3c2f895f5581e687c3b3567111e1af50`; independent final review verified 16/16 changed files included/matching, no concrete blocker. All physical/public modules are now committed and wired, with explicit hosted inventory+execution assertions for all three public journeys, metadata/physical modules and ten added mutation/fsmonitor regressions. No hosted acceptance result yet; no local builds/fixtures or production retirement.
+
+Prior terminal gate:
+
+Published `51cf8c7a3c2f895f5581e687c3b3567111e1af50` — **Preserve original Close authority through Worktree effect leaves**. Hooks-disabled commit/push succeeded. Automatic exact-head run [45091273681](https://github.com/scottopell/phoenix-ide/actions/runs/45091273681) is completed/failure, personally classified against exact SHA: all runtime/qualification steps passed; only exact-source formatting failed. Watcher `close-51cf8c7a3-watch` (`@67`) exited 1, process exit verified; evidence `/tmp/close-51cf8c7a3/{final-run.json,final-failed.log,watch-exit-status}`. Its hosted formatting proposal was applied/merged preserving the new integration; no local formatter. That prior watcher is inactive; only the new c04781c68 watcher above is active.
+
+Frozen published source review: `/tmp/close-worktree-leaf-prerequisites-v2.patch`, SHA256 `ff8794c75cb6518904037309b9d0373cd77b03ec6edf36aee4c707eab839cd0c`, base `a165d91bc4c42e099237d9cccb84af49a0f629db`. Final independent review found no concrete blocker; hosted compilation/tests passed and formatting alone failed as classified above. That publication excluded the then-residual physical scaffold and public fixture. They are now integrated in the dirty candidate described below; that change has no hosted compile/runtime proof yet.
+
+## Physical acceptance candidate (published c04781c68; qualification pending)
+
+Accountable integrator owns aggregate wiring/review/publication. All child batches have returned; **no active delegate writers**. Completed disjoint ownership:
+- Physical/recovery/safety writers: `close_retirement.rs`, `native_initial/worktree/{physical.rs,git_leaf.rs,mutation.rs}`. Actual clean-linked checkout and exact admin retirement now authored, not residual scaffold. Shared filesystem/Git-leaf safety dependency serialized integration.
+- Metadata writer: `phoenix-db/src/native_close/initial.rs`, `native_initial/worktree/metadata.rs`, `executor/native_close/source_entry.rs`. Original metadata source lease acquired after DB writer/validation, retained across mutation/commit and parked on unknown release; independent review found no remaining blocker.
+- Actor writer: `executor/native_close.rs` and `native_close/post_retirement.rs`. Original dispatch -> retained preparation -> physical observation -> durable Worktree success -> independent WorkScope success -> final completion. Pending observation/preparation returns control to actor for Stop/fatal processing.
+- Public fixture writer: `native_close_admission_tests/worktree_physical.rs`, three registered-tool journeys: positive real linked checkout/admin deletion with terminal/History/WorkScope/replay proof; acknowledged Stop preservation; Stop plus reused-path preservation. Full hard assertions retained. Parent wired module/factories; no execution yet.
+
+The three reviewed mutation-boundary blockers have source fixes: descriptor-relative no-follow slot identity rechecked inside each admitted unlink; retained reservation descriptor plus non-overwrite descriptor-relative relocation; immutable checkout and registration witness rechecked inside admitted rename. New regression source covers replacement/symlink/destination collisions. Additional fixes: scoped confirmed Worktree snapshot selected through original aggregate/anchor provenance (not compared to aggregate fingerprint); immutable admin `gitdir`/`commondir` witness before/after relocation; strict known unsupported-fsmonitor classification; correct probe ordinal; nonblocking actor readiness; fixture expected-registration baseline and terminal response contract.
+
+**Concrete remaining gate:** hosted compilation/disposable public-path runtime proof and formatting at exact final candidate. Independent final repaired-descriptor and aggregate-source reviews found no concrete blocker. Production source is being prepared as candidate, not deployed; no real-user retirement performed. No acceptance claim. Hosted formatting of new source is still unverified. Keep `retry_close_safely`; no merge/deploy/release action.
+
+## Historical prerequisite candidate and terminal gate
+
+Published repair checkpoint: `a165d91bc4c42e099237d9cccb84af49a0f629db`. Automatic run [45084756106](https://github.com/scottopell/phoenix-ide/actions/runs/45084756106) is **completed / failure**, personally classified against exact HEAD. Every runtime/qualification step passed, including the Bash Stop handback and original Worktree continuation tests. Only exact-source formatting failed. Evidence: `/tmp/close-a165d91bc/{final-run.json,final-failed.log,watch-exit-status}`. Watcher exited 1; process exit verified. Exact-head hosted formatting proposal downloaded and applied; no local formatter or fixture execution.
+
+Reviewed follow-on candidate (not physical activation):
+- Mandatory per-mutation filesystem executor, native original-context refusal latch/unknown-release retention, and root/object descriptors held through final release classification.
+- Worktree-only original-source eligibility and regression.
+- Shared per-command Git callback plumbing through inspection, registration/common-directory and root fsmonitor leaves; native child supervisor retains the same receipt/source/deadline and waits only after confirmed release.
+- Canonical full-snapshot inspection with mandatory Git callback. The native read-only subset refuses dirty state, hidden suppression, detached HEAD and all gitlinks; legacy observation framing remains shared. Ignored-content deletion proof remains separate.
+- Independent static reviews found one invalid synthetic common-directory response and newly orphaned legacy wrappers; both corrected. Hosted selectors now include the new Git supervisor and eleven shared-helper regressions. Compilation/execution/formatting of this candidate remain unverified.
+
+Physical Worktree deletion remains blanket-blocked. Unwired `physical.rs` is residual-only, and the public positive `worktree_physical.rs` fixture is still unwired/unexecuted. Neither is included in this prerequisite publication. Required next integration: original-context metadata/source boundary without nested SQLite writers; relocation-aware root binding; shared orchestration avoiding overlapping mutable context borrows; root fsmonitor/writer evidence and full-snapshot rechecks; retained physical observation and exact Worktree then independent WorkScope success. No acceptance claim, main merge, deploy, release or real-user destructive action.
+
+## Historical checkpoint (superseded by the section above)
+
+- Branch: `feat/unified-close-receipts`.
+- Published HEAD: `28dac533252755af1ee1fe936f6a3c32cc98db22`.
+- Automatic hosted run: [45078608171](https://github.com/scottopell/phoenix-ide/actions/runs/45078608171), exact published HEAD above: **completed / failure**, personally classified from `/tmp/close-28dac5332/final-run.json` and `final-failed.log`. Single watcher exited with status 1; no replacement watcher for that run. Runtime matcher/actor module: 43 passed / 2 failed (live Bash group missing ordinary registry membership; stale-source fixture repolled an already-consumed oneshot). Exact formatting also failed. All later focused steps passed. Pending repair includes the reviewed membership handback, invalid second oneshot poll removal, and hosted formatting proposal.
+- Pending continuation/Bash handback freeze: `/tmp/close-continuation-and-bash-handback-v3.patch`, SHA-256 `42582e9241f1b5bc389d113ca6004bb6b4a603d020f7b7be8c16a1c3dbd6b418`. Independent static review found no blocker; no execution qualification.
+
+## Ownership and actual work
+
+Integrator owns shared `native_initial/worktree.rs`, executor/post-retirement wiring, workflow, review and publication gates.
+
+One parallel batch of two write-capable `gpt-6.1-sol` workers returned; neither is still writing:
+
+1. Physical adapter: new `native_initial/worktree/physical.rs` and shared `close_retirement.rs`. Returned **residual-only scaffold**, not a physical deleter. Shared ignored-content status leaf was extracted. Not wired or accepted.
+2. Public fixture: new `native_close_admission_tests/worktree_physical.rs`. Initial partial registered public-tool journey used disposable real linked Worktrees. A bounded recovery worker completed the manual API audit and corrected the source. Not wired, compiled, executed or accepted.
+
+Do not mistake these partial sources for a passed acceptance journey. Existing published Worktree adapter remains read-only/status-only, with physical resource retirement blocked.
+
+## Evidence boundary
+
+- Existing process-only/public fixtures and unknown-release tests are not proof of real Worktree removal.
+- Pending Bash fix restores the exact original handle membership only after confirmed nonentry and explicit successful compensation; scope remains fenced. Unknown release retains custody. Static review only.
+- Pending Worktree continuation preserves the original owner, receipt, source worker and absolute deadline across status operations. New real Git admission tests are authored but unexecuted.
+- **No disposable registered-public-Close journey has yet proven physical Worktree removal, independent WorkScope retirement and correct public terminal state.**
+
+## Concrete blocker and next acceptance
+
+The legacy exact-removal graph contains nested Git/fsmonitor children, quarantine/private renames, descriptor unlink operations and administrative deletion. Each needs admission through the same original DB/live-source/deadline context, with classified writer release before another leaf. Wrapping the whole graph in one callback would retain stale authority and deadlock on nested metadata writes. Unknown release/metadata/child completion must retain custody, not become a retryable ordinary failure.
+
+Next: finish safe leaf plumbing and public fixture API audit; install Worktree-only source control and retained post-retirement operation; record exact original Worktree success only after proven checkout plus admin retirement, then WorkScope success and finalization. The current exact-head terminal run is classified; next publication is limited to reviewed repairs. Physical milestone source remains separate and unaccepted.
+
+## Restrictions
+
+Hosted-only execution: no local Cargo/build/check/test/fmt/rustfmt/dev.py, SQL/process fixtures or native fixture execution. No manual CI rerun/cancel/dispatch, duplicate watcher, real-user destructive fixture, merge/rebase/release/deployment. Retain `retry_close_safely` until full acceptance and release/install gate. No new production authority.

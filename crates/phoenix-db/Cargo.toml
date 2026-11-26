@@ -41,7 +41,7 @@ schemars = { workspace = true, features = ["uuid1"] }
 chrono = { workspace = true, features = ["serde"] }
 
 # Row/PK identifiers
-uuid = { workspace = true, features = ["v4"] }
+uuid = { workspace = true, features = ["v4", "v5"] }
 
 # Random suffix for slug-collision disambiguation
 rand = { workspace = true }

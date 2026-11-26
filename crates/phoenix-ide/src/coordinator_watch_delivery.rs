@@ -231,6 +231,7 @@ mod tests {
             title: "Example".into(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Review".into(),
+            reviewed_proposal: None,
         };
         db.update_conversation_state(&source.id, &waiting)
             .await
@@ -297,6 +298,7 @@ mod tests {
                 title: "Example".into(),
                 priority: phoenix_core::task_source::Priority::P1,
                 plan: "Review".into(),
+                reviewed_proposal: None,
             },
         )
         .await
@@ -552,7 +554,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(lines.len(), targets.len());
         for (line, (scope, kind, identity, disposition)) in lines.into_iter().zip(targets) {
-            assert_eq!(line, format!("- Scope: {scope}. Resource kind: {}. Identity (opaque, opaque_string_v1): {identity}. Disposition: {}.", kind.as_str(), disposition.as_str()));
+            assert_eq!(
+                line,
+                format!(
+                    "- Scope: {scope}. Resource kind: {}. Identity (opaque, opaque_string_v1): {identity}. Disposition: {}.",
+                    kind.as_str(),
+                    disposition.as_str()
+                )
+            );
         }
         assert_eq!(text.matches("Mandatory Close cleanup failure").count(), 1);
         assert!(text.contains("Cleanup run ordinal: 2"));

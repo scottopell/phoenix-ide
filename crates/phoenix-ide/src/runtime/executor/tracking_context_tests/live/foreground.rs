@@ -189,11 +189,13 @@ impl Session {
         let (retired, retirement) = tokio::sync::oneshot::channel();
         self.handle
             .acknowledged_event_tx
-            .send(crate::runtime::AcknowledgedEventRequest {
-                event,
-                acknowledgement,
-                retirement,
-            })
+            .send(crate::runtime::AcknowledgedRuntimeRequest::Event(Box::new(
+                crate::runtime::AcknowledgedEventRequest {
+                    event,
+                    acknowledgement,
+                    retirement,
+                },
+            )))
             .await
             .unwrap();
         assert_eq!(
@@ -271,11 +273,13 @@ impl Session {
         let (retired, retirement) = tokio::sync::oneshot::channel();
         self.handle
             .acknowledged_event_tx
-            .send(crate::runtime::AcknowledgedEventRequest {
-                event: Event::SteeringQueueChanged,
-                acknowledgement,
-                retirement,
-            })
+            .send(crate::runtime::AcknowledgedRuntimeRequest::Event(Box::new(
+                crate::runtime::AcknowledgedEventRequest {
+                    event: Event::SteeringQueueChanged,
+                    acknowledgement,
+                    retirement,
+                },
+            )))
             .await
             .unwrap();
         assert_eq!(

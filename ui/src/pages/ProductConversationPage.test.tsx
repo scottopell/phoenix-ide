@@ -2604,8 +2604,9 @@ describe('ProductConversationPage', () => {
       close: {
         attempt_id: 'stopped-close', phase: 'completed', outcome,
         run_ordinal: '2', run_status: 'stopped',
-        confirmation_snapshot: null, inspections: [], losses: [],
-        residuals: [],
+        confirmation_snapshot: null, inspections: [],
+        losses: [{ scope: 'scope-loss', generation: '3', category: 'modified', identity: 'src/retained.rs' }],
+        residuals: [{ scope: 'scope-residual', resource_kind: 'worktree', identity: 'tree:retained', reason: 'ownership_conflict', detail: 'still live' }],
         failure: {
           occurrence_id: 'close-failure:2:stopped-close',
           reason: 'identity_not_proven', detail: 'Exact failure before inventory',
@@ -2635,6 +2636,11 @@ describe('ProductConversationPage', () => {
       expect(status).toHaveTextContent('identity not proven — Exact failure before inventory');
       expect(status).toHaveTextContent('Failure close-failure:2:stopped-close');
       expect(status).toHaveTextContent(lifecycle === 'history' ? 'Conversation and processes stopped.' : 'Shutdown uncertain.');
+      fireEvent.click(screen.getByText('Exact work items (1)'));
+      expect(screen.getByText('scope-loss: src/retained.rs')).toBeVisible();
+      expect(screen.getByText('scope-loss: src/retained.rs').closest('li')).toHaveTextContent('scope-loss: src/retained.rs · modified');
+      expect(status).toHaveTextContent('scope-residual: worktree · tree:retained · ownership conflict — still live');
+      fireEvent.click(screen.getByText('Residual resources (1)'));
       fireEvent.click(screen.getByText('Remaining resources (4)'));
       const resources = status.querySelectorAll('ol li');
       expect(resources).toHaveLength(4);
@@ -2658,6 +2664,76 @@ describe('ProductConversationPage', () => {
         ? 'product-conversation-history' : 'product-conversation-close-incomplete')).toBeVisible();
     }
     expect(api.getProductConversationHistorySnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it('renders completed Close loss identities from encoded git path bytes', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(makeSnapshot({
+      ordinary_lifecycle: 'history',
+      writable_transcript_row_id: null,
+      close: {
+        attempt_id: 'completed-close-with-losses',
+        phase: 'completed',
+        outcome: 'archived_cleanup_attention',
+        run_ordinal: '3',
+        run_status: 'completed',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [
+          { scope: 'repo', generation: '9', category: 'ignored', identity: 'git_path_bytes_hex_v1:7461726765742f63616368652f6974656d2e62696e' },
+          { scope: 'repo', generation: '9', category: 'modified', identity: 'git_path_bytes_hex_v1:626164ff' },
+        ],
+        residuals: [],
+        failure: null,
+      },
+    }));
+
+    renderPage();
+    const status = await screen.findByRole('alert', { name: 'Close status' });
+    fireEvent.click(screen.getByText('Exact work items (2)'));
+    expect(status).toHaveTextContent('repo: target/cache/item.bin · ignored');
+    expect(status).toHaveTextContent('repo: bad\\xff · modified');
+    expect(screen.queryByRole('button', { name: /Retry exact Close/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /discard exact items/i })).not.toBeInTheDocument();
+  });
+
+  it('keeps stopped content-blocked Close visibly shutdown-uncertain with exact ignored loss identity', async () => {
+    const { api } = await import('../api');
+    vi.mocked(api.getProductConversationHistorySnapshot).mockResolvedValue(makeSnapshot({
+      ordinary_lifecycle: 'open',
+      writable_transcript_row_id: 'row-open',
+      close: {
+        attempt_id: 'content-blocked-close',
+        phase: 'completed',
+        outcome: 'close_incomplete',
+        run_ordinal: '2',
+        run_status: 'stopped',
+        confirmation_snapshot: null,
+        inspections: [],
+        losses: [{ scope: 'repo', generation: '9', category: 'ignored', identity: 'target/cache/item.bin' }],
+        residuals: [],
+        failure: {
+          occurrence_id: 'close-failure:2:content-blocked-close',
+          reason: 'identity_not_proven',
+          detail: 'Content blocked shutdown before closure could be confirmed',
+          stop_certainty: { kind: 'shutdown_uncertain' },
+          remaining_resources: [],
+        },
+      },
+    }));
+
+    renderPage();
+    const status = await screen.findByRole('alert', { name: 'Close status' });
+    expect(status).toHaveTextContent('Close incomplete — shutdown could not be confirmed');
+    expect(status).toHaveTextContent('Shutdown uncertain.');
+    fireEvent.click(screen.getByText('Exact work items (1)'));
+    expect(screen.getByText('repo: target/cache/item.bin')).toBeVisible();
+    expect(screen.getByText('repo: target/cache/item.bin').closest('li')).toHaveTextContent('repo: target/cache/item.bin · ignored');
+    expect(status).toHaveTextContent('Run 2 · stopped. No automatic retry.');
+    expect(status).not.toHaveTextContent('Closed — cleanup needs attention');
+    expect(screen.getByTestId('product-conversation-close-incomplete')).toBeVisible();
+    expect(screen.queryByTestId('product-conversation-composer')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Retry exact Close/ })).not.toBeInTheDocument();
   });
 
   it('refreshes cleanup-attention History to archived through the mounted conversation stream', async () => {

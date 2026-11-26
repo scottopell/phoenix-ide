@@ -186,4 +186,3 @@ function stripDiffSearchLineEnding(text: string): string {
 function headerText(fileDiff: { name: string; prevName?: string }): string {
   return fileDiff.prevName && fileDiff.prevName !== '' ? `${fileDiff.prevName} → ${fileDiff.name}` : fileDiff.name;
 }
-

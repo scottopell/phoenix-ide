@@ -174,6 +174,111 @@ jobs:
       - name: ./dev.py check (rust,cargo-fmt) build phase
         timeout-minutes: 20
         run: ./dev.py check --lanes rust,cargo-fmt --rust-phase build --profile-work --profile-work-dir "$RUST_EVIDENCE_DIR/check"
+      - name: Capture production run-inner future layout evidence
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUST_EVIDENCE_DIR/production-run-inner-future-layout.log"
+          set +e
+          cargo test --locked -p phoenix_ide --lib runtime::executor::close_run_inner_layout_tests::production_run_inner_future_layout -- --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          test_status=${pipeline_status[0]}
+          tee_status=${pipeline_status[1]}
+          set -e
+          bytes=$(wc -c < "$log" | tr -d ' ')
+          running=$(grep -Ec '^running 1 test$' "$log" || true)
+          result=$(grep -Ec '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$log" || true)
+          run_inner=$(grep -Ec '^production run_inner future: [0-9]+ bytes$' "$log" || true)
+          continuation=$(grep -Ec '^native Close continuation/cursor layouts: initial=[0-9]+ bytes, retry=[0-9]+ bytes, admitted_retry_cursor=[0-9]+ bytes$' "$log" || true)
+          printf 'test_status=%s tee_status=%s bytes=%s running_one_test=%s passing_result=%s run_inner_measurement=%s continuation_measurement=%s\n' "$test_status" "$tee_status" "$bytes" "$running" "$result" "$run_inner" "$continuation" | tee "$RUST_EVIDENCE_DIR/production-run-inner-future-layout.receipt"
+          test "$test_status" -eq 0
+          test "$tee_status" -eq 0
+          test "$bytes" -gt 0
+          test "$running" -eq 1
+          test "$result" -eq 1
+          test "$run_inner" -eq 1
+          test "$continuation" -eq 1
+      - name: Publish raw future layout before continuation qualification
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: runtime-future-layout-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RUST_EVIDENCE_DIR }}/receipt.txt
+            ${{ env.RUST_EVIDENCE_DIR }}/production-run-inner-future-layout.log
+            ${{ env.RUST_EVIDENCE_DIR }}/production-run-inner-future-layout.receipt
+          if-no-files-found: warn
+      - name: Install GDB for ancillary owner-handoff diagnostic
+        timeout-minutes: 5
+        continue-on-error: true
+        shell: bash
+        run: |
+          if ! command -v gdb >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends gdb
+          fi
+      - name: Capture bounded owner-handoff GDB backtrace
+        timeout-minutes: 5
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          ulimit -c 0
+          prefix="$RUST_EVIDENCE_DIR/owner-handoff-gdb"
+          test_name=continuation_service::native::tests::owner_handoff::native_owner_rejection_continuation_busy_recovery_and_coordinator_retention
+          printf 'run=%s attempt=%s source=%s tree=%s parents=%s started=%s outcome=not-inferred\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" \
+            "$(git show -s --format=%P HEAD)" "$(date -u +%FT%TZ)" > "$prefix.receipt"
+          {
+            id
+            printf 'stack_limit_kib=%s core_limit=%s test=%s\n' "$(ulimit -s)" "$(ulimit -c)" "$test_name"
+            printf 'rust_min_stack=%s\n' "${RUST_MIN_STACK-<unset>}"
+            gdb --version
+          } > "$prefix.metadata" 2>&1
+          set +e
+          cargo test --locked -p phoenix_ide --lib --no-run --message-format=json > "$prefix.cargo.jsonl" 2> "$prefix.cargo.log"
+          cargo_status=$?
+          set -e
+          printf 'cargo_status=%s\n' "$cargo_status" >> "$prefix.receipt"
+          test "$cargo_status" -eq 0
+          executable=$(jq -ers '[.[] | select(.reason == "compiler-artifact" and (.target.kind | index("lib")) and .profile.test == true and .executable != null) | .executable] | unique | if length == 1 then .[0] else error("expected one libtest executable") end' "$prefix.cargo.jsonl")
+          printf 'executable=%s\n' "$executable" >> "$prefix.metadata"
+          # No stack-size override, privilege escalation, core files, or success inference.
+          # GDB's inferior exit code/signal are raw evidence, not GDB's own status.
+          set +e
+          timeout --kill-after=10s 120s gdb -nx -iex 'set auto-load off' --batch \
+            -ex 'set disable-randomization off' -ex 'set pagination off' \
+            -ex 'set print frame-arguments none' -ex 'set print entry-values no' \
+            -ex 'handle SIGSEGV stop print nopass' \
+            -ex 'tbreak crates/phoenix-db/src/lib.rs:14232' -ex run \
+            -ex 'echo Prompt-tail entry native-stack sample:\n' -ex 'bt 64' \
+            -ex 'frame apply 40 -q info frame' -ex continue -ex 'bt 64' -ex 'info threads' \
+            -ex 'info registers rip rsp rbp' -ex 'print $_siginfo' -ex 'info proc mappings' \
+            -ex 'frame apply 40 -q info frame' -ex 'frame 0' -ex 'x/32i $pc' \
+            -ex 'print $_exitcode' -ex 'print $_exitsignal' \
+            --args "$executable" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "$prefix.log"
+          pipeline_status=("${PIPESTATUS[@]}")
+          gdb_status=${pipeline_status[0]}
+          tee_status=${pipeline_status[1]}
+          set -e
+          printf 'gdb_timeout_status=%s tee_status=%s inferior_status=raw-exitcode-and-exitsignal-in-transcript finished=%s outcome=not-inferred\n' \
+            "$gdb_status" "$tee_status" "$(date -u +%FT%TZ)" >> "$prefix.receipt"
+      - name: Publish owner-handoff diagnostic before continuation qualification
+        if: always()
+        timeout-minutes: 2
+        continue-on-error: true
+        uses: actions/upload-artifact@v6
+        with:
+          name: owner-handoff-gdb-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.RUST_EVIDENCE_DIR }}/receipt.txt
+            ${{ env.RUST_EVIDENCE_DIR }}/production-run-inner-future-layout.log
+            ${{ env.RUST_EVIDENCE_DIR }}/production-run-inner-future-layout.receipt
+            ${{ env.RUST_EVIDENCE_DIR }}/owner-handoff-gdb.*
+          if-no-files-found: warn
       - name: Qualify missing continuation notification witness
         timeout-minutes: 15
         shell: bash
@@ -229,8 +334,8 @@ jobs:
           - { part: "test 3-4", phase: test, partition: 3/4 }
           - { part: "test 4-4", phase: test, partition: 4/4 }
           - { part: codegen, phase: codegen, partition: "" }
-    # 10 setup/browser + 5 download + 35 check (1800 s cargo test + extract) + 2 evidence.
-    timeout-minutes: 52
+    # 3 identity tools + 10 setup/browser + 5 download + 35 check + 2 evidence.
+    timeout-minutes: 55
     env:
       PYTHONUNBUFFERED: "1"
       PHOENIX_DEV_TRACE_ENDPOINT: "off"
@@ -239,6 +344,8 @@ jobs:
       PHOENIX_CHECK_ALL: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '1' || '' }}
       PHOENIX_CHECK_BASE: ${{ github.event_name == 'pull_request' && 'origin/main' || '' }}
       PHOENIX_CHECK_CARGO_TEST_TIMEOUT_SECS: "1800"
+      PHOENIX_CHECK_CLOSE_UNPRIVILEGED: "1"
+      PHOENIX_TEST_CHROME_SHIM_EXECUTABLE: ${{ github.workspace }}/target/debug/phoenix_ide
       PHOENIX_BASH_LAUNCH_TEST_EXE: ${{ github.workspace }}/target/debug/phoenix_ide
       PHOENIX_BASH_LAUNCH_TEST_REQUIRED: '1'
     steps:
@@ -277,6 +384,13 @@ jobs:
           node-version: 26
           cache: pnpm
           cache-dependency-path: ui/pnpm-lock.yaml
+      - name: Prepare Close identity qualification tools
+        if: ${{ matrix.phase == 'test' }}
+        timeout-minutes: 3
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          /usr/bin/tmux -V
       - name: Prepare pinned Chromium for native browser tests
         if: ${{ matrix.phase == 'test' }}
         timeout-minutes: 10
@@ -404,7 +518,16 @@ jobs:
         with:
           tool: cargo-deny@0.18.9
       - name: ./dev.py check (clippy, deps)
+        env:
+          PHOENIX_CHECK_DIAGNOSTIC_DIR: ${{ runner.temp }}/close-clippy-diagnostics
         run: ./dev.py check --lanes clippy,deps
+      - name: Retain full Clippy diagnostics
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: clippy-diagnostics-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/close-clippy-diagnostics
+          if-no-files-found: warn
 
   check-e2e:
     name: check (e2e)

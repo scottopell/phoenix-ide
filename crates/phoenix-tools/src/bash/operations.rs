@@ -26,7 +26,7 @@ use std::os::unix::process::ExitStatusExt;
 
 use super::handle::{
     BashLaunchIdentity, ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState,
-    KillSignal, BASH_LAUNCH_UUID_ENV_VAR, TOMBSTONE_TAIL_LINES,
+    KillSignal, WaiterSettlement, BASH_LAUNCH_UUID_ENV_VAR, TOMBSTONE_TAIL_LINES,
 };
 use super::registry::{BashHandleError, BashTerminalEffect, LiveHandleSummary, SpawnReservation};
 use super::ring::RingBuffer;
@@ -1474,23 +1474,19 @@ fn start_io_tasks(
     });
 
     // Waiter task: call wait(), drain readers, then demote the handle.
-    let h = handle.clone();
-    tokio::spawn(async move {
-        run_waiter(
-            h,
-            async move { child.wait().await },
-            stdout_join,
-            stderr_join,
-            WaiterContext {
-                owner_scope,
-                lifecycle_sink,
-                terminal_effect,
-                sandbox_scratch_dir,
-                progress_reporter,
-            },
-        )
-        .await;
-    });
+    tokio::spawn(run_waiter(
+        handle.clone(),
+        async move { child.wait().await },
+        stdout_join,
+        stderr_join,
+        WaiterContext {
+            owner_scope,
+            lifecycle_sink,
+            terminal_effect,
+            sandbox_scratch_dir,
+            progress_reporter,
+        },
+    ));
 }
 
 async fn read_pipe_to_ring<R>(
@@ -1734,46 +1730,107 @@ impl LiveBashProgressReporter {
     }
 }
 
-async fn run_waiter<F>(
+/// The exact handle's non-cloneable success authority. Only this module can
+/// publish success; sibling modules may transfer or drop it, never recreate it
+/// for an existing handle because its watch sender remains private.
+#[must_use = "the unique producer belongs to the exact handle's waiter"]
+pub(super) struct WaiterSettlementProducer {
+    sender: tokio::sync::watch::Sender<WaiterSettlement>,
+}
+
+pub(super) fn waiter_settlement_channel() -> (
+    tokio::sync::watch::Sender<WaiterSettlement>,
+    WaiterSettlementProducer,
+) {
+    let (sender, _) = tokio::sync::watch::channel(WaiterSettlement::Pending);
+    let producer = WaiterSettlementProducer {
+        sender: sender.clone(),
+    };
+    (sender, producer)
+}
+
+impl WaiterSettlementProducer {
+    fn settle(self) {
+        self.sender.send_if_modified(|state| {
+            if matches!(*state, WaiterSettlement::Pending) {
+                *state = WaiterSettlement::Settled;
+                true
+            } else {
+                false
+            }
+        });
+    }
+}
+
+fn run_waiter<F>(
     handle: Arc<Handle>,
     child_exit: F,
     stdout_join: Option<tokio::task::JoinHandle<()>>,
     stderr_join: Option<tokio::task::JoinHandle<()>>,
     context: WaiterContext,
-) where
+) -> impl std::future::Future<Output = ()>
+where
     F: std::future::Future<Output = std::io::Result<std::process::ExitStatus>>,
 {
+    // Establish custody before the returned future can be spawned or dropped.
+    // A duplicate invocation must not install another guard and revoke a winner.
+    let producer = handle
+        .take_waiter_settlement_producer()
+        .expect("the exact Bash handle already has a waiter settlement producer");
     let panic_guard = ExitWatchPanicGuard::new(handle.clone());
-    let started_at = Instant::now();
-    let exit_status = child_exit.await;
+    async move {
+        let started_at = Instant::now();
+        let exit_status = child_exit.await;
 
-    let cause = match exit_status {
-        Ok(status) => exit_status_to_cause(status),
-        Err(e) => {
-            tracing::warn!(?e, %handle.handle_id, "child wait() failed; recording as exited(None)");
-            FinalCause::Exited { exit_code: None }
+        let child_wait_succeeded = exit_status.is_ok();
+        let cause = match exit_status {
+            Ok(status) => exit_status_to_cause(status),
+            Err(e) => {
+                tracing::warn!(?e, %handle.handle_id, "child wait() failed; recording as exited(None)");
+                FinalCause::Exited { exit_code: None }
+            }
+        };
+
+        let finished_at = SystemTime::now();
+
+        let drain_proof = drain_then_transition_to_terminal(
+            &handle,
+            stdout_join,
+            stderr_join,
+            cause,
+            started_at,
+            finished_at,
+            &context,
+        )
+        .await;
+
+        let scratch_clean = if let Some(dir) = context.sandbox_scratch_dir {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+                Err(e) => {
+                    tracing::debug!(path = %dir.display(), error = %e, "failed to remove explore bash scratch directory");
+                    handle.unverify_waiter(format!("scratch cleanup failed: {e}"));
+                    false
+                }
+            }
+        } else {
+            true
+        };
+
+        if !child_wait_succeeded {
+            handle.unverify_waiter("child wait returned an error");
+        } else if let Some(reason) = drain_proof.reason {
+            handle.unverify_waiter(reason);
+        } else if scratch_clean {
+            producer.settle();
         }
-    };
-
-    let finished_at = SystemTime::now();
-
-    drain_then_transition_to_terminal(
-        &handle,
-        stdout_join,
-        stderr_join,
-        cause,
-        started_at,
-        finished_at,
-        &context,
-    )
-    .await;
-
-    if let Some(dir) = context.sandbox_scratch_dir {
-        if let Err(e) = std::fs::remove_dir_all(&dir) {
-            tracing::debug!(path = %dir.display(), error = %e, "failed to remove explore bash scratch directory");
-        }
+        panic_guard.disarm();
     }
-    panic_guard.disarm();
+}
+
+struct ReaderDrainProof {
+    reason: Option<String>,
 }
 
 async fn drain_then_transition_to_terminal(
@@ -1784,21 +1841,27 @@ async fn drain_then_transition_to_terminal(
     started_at: Instant,
     finished_at: SystemTime,
     context: &WaiterContext,
-) {
+) -> ReaderDrainProof {
     // Drain the reader tasks BEFORE transitioning to terminal so the
     // ring captures any final chunk the kernel buffered between the
     // child's last write and its exit. Without this, the tombstone
     // tail can be missing trailing output from fast-exiting commands
     // or commands whose final line was unterminated.
     let drain = async {
-        if let Some(h) = stdout_join {
-            let _ = h.await;
+        let mut failure = None;
+        for (name, join) in [("stdout", stdout_join), ("stderr", stderr_join)] {
+            if let Some(join) = join {
+                if let Err(error) = join.await {
+                    failure.get_or_insert_with(|| format!("{name} reader task failed: {error}"));
+                }
+            }
         }
-        if let Some(h) = stderr_join {
-            let _ = h.await;
-        }
+        failure
     };
-    let _ = tokio::time::timeout(READER_DRAIN_TIMEOUT, drain).await;
+    let drain_reason = match tokio::time::timeout(READER_DRAIN_TIMEOUT, drain).await {
+        Ok(reason) => reason,
+        Err(_) => Some("reader drain timed out".to_string()),
+    };
     if let Some(reporter) = &context.progress_reporter {
         reporter.maybe_emit_handle(handle, true).await;
         reporter.deactivate();
@@ -1831,6 +1894,9 @@ async fn drain_then_transition_to_terminal(
                 );
             }
         }
+    }
+    ReaderDrainProof {
+        reason: drain_reason,
     }
 }
 
@@ -4582,6 +4648,432 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn handled_pipe_read_error_still_settles_reader_resources() {
+        struct FailedReader(Arc<std::sync::atomic::AtomicBool>);
+        impl AsyncRead for FailedReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Poll::Ready(Err(std::io::Error::other("synthetic pipe read failure")))
+            }
+        }
+        impl Drop for FailedReader {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let handle = live_handle();
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader_handle = handle.clone();
+        let reader = FailedReader(dropped.clone());
+        let join = tokio::spawn(async move {
+            read_pipe_to_ring(reader, reader_handle, None).await;
+        });
+        run_waiter(
+            handle.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+            Some(join),
+            None,
+            WaiterContext {
+                owner_scope: scope("conv-ops"),
+                lifecycle_sink: None,
+                terminal_effect: BashTerminalEffect::InventoryOnly,
+                sandbox_scratch_dir: None,
+                progress_reporter: None,
+            },
+        )
+        .await;
+        assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Settled
+        );
+        let state = handle.state().await;
+        let HandleState::Tombstoned(tomb) = state.as_ref() else {
+            panic!("expected unchanged legacy terminal state");
+        };
+        assert_eq!(tomb.final_cause, FinalCause::Exited { exit_code: Some(0) });
+        // This certifies pipe/task lifetime, not successful or lossless capture.
+    }
+
+    #[tokio::test]
+    async fn waiter_child_wait_error_is_unverified() {
+        let handle = live_handle();
+        let context = WaiterContext {
+            owner_scope: scope("conv-ops"),
+            lifecycle_sink: None,
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+            sandbox_scratch_dir: None,
+            progress_reporter: None,
+        };
+        run_waiter(
+            handle.clone(),
+            std::future::ready(Err(std::io::Error::other("synthetic wait error"))),
+            None,
+            None,
+            context,
+        )
+        .await;
+        assert_eq!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Unverified("child wait returned an error".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn waiter_reader_join_error_is_unverified_but_success_settles_late_subscribers() {
+        let failed = live_handle();
+        let reader = tokio::spawn(async { panic!("synthetic reader failure") });
+        let context = WaiterContext {
+            owner_scope: scope("conv-ops"),
+            lifecycle_sink: None,
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+            sandbox_scratch_dir: None,
+            progress_reporter: None,
+        };
+        run_waiter(
+            failed.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+            Some(reader),
+            None,
+            context,
+        )
+        .await;
+        assert!(matches!(
+            *failed.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Unverified(ref reason) if reason.contains("stdout reader task failed")
+        ));
+
+        let settled = live_handle();
+        let context = WaiterContext {
+            owner_scope: scope("conv-ops"),
+            lifecycle_sink: None,
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+            sandbox_scratch_dir: None,
+            progress_reporter: None,
+        };
+        run_waiter(
+            settled.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+            None,
+            None,
+            context,
+        )
+        .await;
+        assert_eq!(
+            *settled.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Settled
+        );
+    }
+
+    #[tokio::test]
+    async fn armed_panic_guard_unverifies_even_after_settlement() {
+        let handle = live_handle();
+        run_waiter(
+            handle.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+            None,
+            None,
+            WaiterContext {
+                owner_scope: scope("conv-ops"),
+                lifecycle_sink: None,
+                terminal_effect: BashTerminalEffect::InventoryOnly,
+                sandbox_scratch_dir: None,
+                progress_reporter: None,
+            },
+        )
+        .await;
+        assert_eq!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Settled
+        );
+        drop(ExitWatchPanicGuard::new(handle.clone()));
+        assert!(matches!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Unverified(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn waiter_scratch_cleanup_failure_keeps_legacy_terminal_exit_but_unverifies() {
+        let handle = live_handle();
+        let scratch_parent = tempfile::tempdir().expect("scratch parent");
+        let scratch_file = scratch_parent.path().join("not-a-directory");
+        std::fs::write(&scratch_file, b"fixture").expect("create file");
+        let context = WaiterContext {
+            owner_scope: scope("conv-ops"),
+            lifecycle_sink: None,
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+            sandbox_scratch_dir: Some(scratch_file.clone()),
+            progress_reporter: None,
+        };
+
+        run_waiter(
+            handle.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+            None,
+            None,
+            context,
+        )
+        .await;
+
+        let state = handle.state().await;
+        let HandleState::Tombstoned(tomb) = state.as_ref() else {
+            panic!("expected terminal handle despite scratch cleanup failure, got {state:?}");
+        };
+        assert_eq!(tomb.final_cause, FinalCause::Exited { exit_code: Some(0) });
+        assert!(
+            scratch_file.is_file(),
+            "remove_dir_all unexpectedly removed file"
+        );
+        assert!(matches!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Unverified(ref reason) if reason.contains("scratch cleanup failed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn waiter_missing_scratch_directory_is_settled() {
+        let handle = live_handle();
+        let scratch_parent = tempfile::tempdir().expect("scratch parent");
+        let missing_scratch = scratch_parent.path().join("already-missing");
+        let context = WaiterContext {
+            owner_scope: scope("conv-ops"),
+            lifecycle_sink: None,
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+            sandbox_scratch_dir: Some(missing_scratch),
+            progress_reporter: None,
+        };
+
+        run_waiter(
+            handle.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+            None,
+            None,
+            context,
+        )
+        .await;
+
+        assert_eq!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Settled
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_unpolled_run_waiter_unverifies_without_polling_child() {
+        let handle = live_handle();
+        let child_polled = std::sync::atomic::AtomicBool::new(false);
+        let waiter = run_waiter(
+            handle.clone(),
+            std::future::poll_fn(|_| {
+                child_polled.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::task::Poll::<std::io::Result<std::process::ExitStatus>>::Pending
+            }),
+            None,
+            None,
+            WaiterContext {
+                owner_scope: scope("conv-ops"),
+                lifecycle_sink: None,
+                terminal_effect: BashTerminalEffect::InventoryOnly,
+                sandbox_scratch_dir: None,
+                progress_reporter: None,
+            },
+        );
+        drop(waiter);
+        assert!(!child_polled.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!handle.state().await.is_terminal());
+        assert!(matches!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Unverified(_)
+        ));
+        assert!(matches!(
+            *handle.exit_observer().borrow(),
+            Some(ExitState::WaiterPanicked)
+        ));
+    }
+
+    #[test]
+    fn waiter_success_producer_is_take_once_across_handle_clones() {
+        let handle = live_handle();
+        let other = handle.clone();
+        let producer = handle
+            .take_waiter_settlement_producer()
+            .expect("first claim");
+        assert!(other.take_waiter_settlement_producer().is_none());
+        drop(producer);
+        assert!(handle.take_waiter_settlement_producer().is_none());
+        assert_eq!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Pending
+        );
+    }
+
+    #[test]
+    fn waiter_unique_success_producer_cannot_overwrite_failure() {
+        let handle = live_handle();
+        let producer = handle
+            .take_waiter_settlement_producer()
+            .expect("first claim");
+        handle.unverify_waiter("retained failure");
+        producer.settle();
+        assert_eq!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Unverified("retained failure".into())
+        );
+        assert!(handle.take_waiter_settlement_producer().is_none());
+    }
+
+    #[tokio::test]
+    async fn duplicate_waiter_claim_cannot_revoke_completed_settlement() {
+        let handle = live_handle();
+        let context = || WaiterContext {
+            owner_scope: scope("conv-ops"),
+            lifecycle_sink: None,
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+            sandbox_scratch_dir: None,
+            progress_reporter: None,
+        };
+        run_waiter(
+            handle.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+            None,
+            None,
+            context(),
+        )
+        .await;
+        let duplicate = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_waiter(
+                handle.clone(),
+                std::future::pending::<std::io::Result<std::process::ExitStatus>>(),
+                None,
+                None,
+                context(),
+            )
+        }));
+        assert!(duplicate.is_err());
+        assert_eq!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Settled
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_polled_pending_run_waiter_unverifies_without_terminalizing() {
+        use std::future::Future as _;
+        let handle = live_handle();
+        let context = WaiterContext {
+            owner_scope: scope("conv-ops"),
+            lifecycle_sink: None,
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+            sandbox_scratch_dir: None,
+            progress_reporter: None,
+        };
+        let mut waiter = Box::pin(run_waiter(
+            handle.clone(),
+            std::future::pending::<std::io::Result<std::process::ExitStatus>>(),
+            None,
+            None,
+            context,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(waiter.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        drop(waiter);
+
+        assert!(matches!(
+            *handle.exit_observer().borrow(),
+            Some(ExitState::WaiterPanicked)
+        ));
+        assert!(!handle.state().await.is_terminal());
+        assert!(matches!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Unverified(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn waiter_reader_join_error_still_awaits_gated_stderr_reader() {
+        use std::future::Future as _;
+        struct SignalOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for SignalOnDrop {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let handle = live_handle();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let reader_handle = handle.clone();
+        let stderr_join = tokio::spawn(async move {
+            read_pipe_to_ring(
+                GatedReader {
+                    gate: Some(release_rx),
+                    chunk: Some(b"stderr-tail".to_vec()),
+                },
+                reader_handle,
+                None,
+            )
+            .await;
+        });
+        let (stdout_ended, stdout_completion) = tokio::sync::oneshot::channel();
+        let stdout_join = tokio::spawn(async move {
+            let _completion = SignalOnDrop(Some(stdout_ended));
+            panic!("synthetic stdout reader failure");
+        });
+        // This default current-thread test cannot resume until the panic task's
+        // poll has unwound. Prove its JoinHandle is already ready without consuming it.
+        stdout_completion.await.unwrap();
+        assert!(stdout_join.is_finished());
+        let context = WaiterContext {
+            owner_scope: scope("conv-ops"),
+            lifecycle_sink: None,
+            terminal_effect: BashTerminalEffect::InventoryOnly,
+            sandbox_scratch_dir: None,
+            progress_reporter: None,
+        };
+        let mut waiter = Box::pin(run_waiter(
+            handle.clone(),
+            std::future::ready(Ok(std::process::ExitStatus::from_raw(0))),
+            Some(stdout_join),
+            Some(stderr_join),
+            context,
+        ));
+        assert!(
+            std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(waiter.as_mut().poll(cx).is_pending())
+            })
+            .await
+        );
+        assert!(!handle.state().await.is_terminal());
+        assert_eq!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Pending
+        );
+
+        release_tx.send(()).expect("stderr reader still gated");
+        waiter.await;
+        let state = handle.state().await;
+        let HandleState::Tombstoned(tomb) = state.as_ref() else {
+            panic!("expected terminal state after both reader tasks completed");
+        };
+        assert!(tomb
+            .final_tail
+            .iter()
+            .any(|line| line.bytes.as_slice() == b"stderr-tail"));
+        assert!(matches!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Unverified(ref reason) if reason.contains("stdout reader task failed")
+        ));
+    }
+
     #[tokio::test(start_paused = true)]
     async fn waiter_cannot_terminalize_before_reader_drains_unterminated_tail() {
         use std::future::Future as _;
@@ -4618,8 +5110,16 @@ mod tests {
         .await;
         assert!(pending, "finalization must wait for the gated reader");
         assert!(!handle.state().await.is_terminal());
+        assert_eq!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Pending
+        );
         release_tx.send(()).expect("reader still awaits its gate");
         finalize.await;
+        assert_eq!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Settled
+        );
 
         let state = handle.state().await;
         let HandleState::Tombstoned(tomb) = state.as_ref() else {
@@ -4678,6 +5178,10 @@ mod tests {
         tokio::time::advance(READER_DRAIN_TIMEOUT).await;
         waiter.await;
         assert!(handle.state().await.is_terminal());
+        assert!(matches!(
+            *handle.subscribe_waiter_settlement().borrow(),
+            WaiterSettlement::Unverified(ref reason) if reason == "reader drain timed out"
+        ));
         drop(release);
     }
 

@@ -3,12 +3,33 @@
 use nix::unistd::Pid;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 
 use super::child_lifecycle::{ChildExitReceipt, TerminalChildLifecycle};
 use super::command_tracker::CommandTracker;
 use phoenix_core::{process_identity::ProcessIdentity, work_scope::ResourceScopeKey};
+
+/// Monotonic, read-only retirement signal shared with the attached relay.
+#[derive(Clone, Default, Debug)]
+pub struct TerminalRetirementRequest(Arc<AtomicBool>);
+
+impl TerminalRetirementRequest {
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+
+    fn request(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn request_for_test(&self) {
+        self.request();
+    }
+}
 
 /// One outer liveness budget for terminal retirement during Close.
 ///
@@ -140,6 +161,8 @@ pub struct TerminalHandle {
     /// so neither reclaimer can proceed into the relay's acquire path while
     /// another relay is still running. See task 24691 follow-up.
     pub attach_permit: Arc<Semaphore>,
+    /// Monotonic per-physical-handle teardown request. Never reset.
+    pub retirement_requested: TerminalRetirementRequest,
 }
 
 impl std::fmt::Debug for TerminalHandle {
@@ -215,6 +238,70 @@ impl TerminalInstanceIdentity {
 }
 
 #[derive(Debug)]
+struct OriginalTerminalRetirementTarget {
+    work_scope: ResourceScopeKey,
+    instance: Option<TerminalInstanceIdentity>,
+    handle: Option<Arc<TerminalHandle>>,
+    child_exit: Option<ChildExitReceipt>,
+    generation: TerminalRetirementGeneration,
+    deadline: tokio::time::Instant,
+    owner: TerminalRetirementOwner,
+    registry: std::sync::Weak<Mutex<ActiveTerminalRegistryState>>,
+}
+
+/// An inert, non-cloneable exact terminal teardown prepared for a bounded owner.
+///
+/// Preparation performs no teardown. `complete` consumes this exact target; it
+/// does not reselect a terminal from the registry. This leaf is not source
+/// authorization, an exactly-once token, or a cancellation-safe supervisor:
+/// callers retain the original permit and must retain/supervise entered cleanup
+/// beyond their database callback. There is no rollback after entry, and cleanup
+/// already admitted may finish after Stop without per-syscall source checks.
+#[must_use]
+pub struct PreparedTerminalRetirement {
+    registry: ActiveTerminals,
+    target: Arc<TerminalHandle>,
+    original: Arc<OriginalTerminalRetirementTarget>,
+}
+
+/// Fixed-size failure reason from the synchronous first-effect fence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalRetirementEntryError {
+    RegistryBusy,
+    DeadlineExpired,
+    StaleTarget,
+    AlreadyRequested,
+    RegistryPoisoned,
+}
+
+/// Owner whose first effect has been synchronously admitted.
+#[must_use]
+pub struct EnteredTerminalRetirement {
+    registry: ActiveTerminals,
+    target: Arc<TerminalHandle>,
+    original: Arc<OriginalTerminalRetirementTarget>,
+}
+
+impl std::fmt::Debug for PreparedTerminalRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedTerminalRetirement")
+            .field("work_scope", &self.original.work_scope)
+            .field("generation", &self.original.generation)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareTerminalRetirementError {
+    NotCloseOwner,
+    ProjectionMismatch,
+    WrongRegistry,
+    StalePermit,
+    NoPhysicalTarget,
+    DeadlineExpired,
+}
+
+#[derive(Debug)]
 pub struct TerminalRetirementPermit {
     pub work_scope: ResourceScopeKey,
     pub instance: Option<TerminalInstanceIdentity>,
@@ -223,6 +310,272 @@ pub struct TerminalRetirementPermit {
     owner: TerminalRetirementOwner,
     had_entry: bool,
     child_exit: Option<ChildExitReceipt>,
+    original: Arc<OriginalTerminalRetirementTarget>,
+}
+
+impl PreparedTerminalRetirement {
+    fn try_enter_effect(&self) -> Result<(), TerminalRetirementEntryError> {
+        if tokio::time::Instant::now() >= self.original.deadline {
+            return Err(TerminalRetirementEntryError::DeadlineExpired);
+        }
+        let map = match self.registry.0.try_lock() {
+            Ok(map) => map,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(TerminalRetirementEntryError::RegistryBusy);
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                return Err(TerminalRetirementEntryError::RegistryPoisoned);
+            }
+        };
+        let original = &self.original;
+        let valid = map
+            .retirements
+            .get(&original.work_scope)
+            .is_some_and(|state| {
+                state.generation == original.generation.0
+                    && state.owner == Some(TerminalRetirementOwner::Close)
+            })
+            && map
+                .handles
+                .get(&original.work_scope)
+                .is_some_and(|current| Arc::ptr_eq(current, &self.target));
+        if !valid {
+            return Err(TerminalRetirementEntryError::StaleTarget);
+        }
+        if tokio::time::Instant::now() >= original.deadline {
+            return Err(TerminalRetirementEntryError::DeadlineExpired);
+        }
+        if self.target.retirement_requested.is_requested() {
+            return Err(TerminalRetirementEntryError::AlreadyRequested);
+        }
+        self.target.retirement_requested.request();
+        Ok(())
+    }
+
+    /// Synchronously claim the exact Close retirement as its first effect.
+    /// Every failure returns this original owner intact; this method performs no
+    /// allocation, logging, waiting, notification, or resource teardown.
+    ///
+    /// # Errors
+    /// Returns the original owner and an entry error if the registry is busy or
+    /// poisoned, the deadline expired, the target is stale, or retirement was
+    /// already requested. No first effect is performed on failure.
+    pub fn try_enter(
+        self,
+    ) -> Result<EnteredTerminalRetirement, (Self, TerminalRetirementEntryError)> {
+        if let Err(error) = self.try_enter_effect() {
+            return Err((self, error));
+        }
+        Ok(EnteredTerminalRetirement {
+            registry: self.registry,
+            target: self.target,
+            original: self.original,
+        })
+    }
+}
+
+impl EnteredTerminalRetirement {
+    /// Wake the relay and finish cleanup using the same exact owner and deadline.
+    /// This asynchronous completion is not part of the first-effect callback.
+    pub async fn complete(self) -> TerminalRetirementOutcome {
+        PreparedTerminalRetirement {
+            registry: self.registry,
+            target: self.target,
+            original: self.original,
+        }
+        .complete()
+        .await
+    }
+}
+
+impl PreparedTerminalRetirement {
+    // Keep the exact-target check and teardown notification under one registry lock.
+    fn request_teardown(
+        registry: &ActiveTerminals,
+        original: &OriginalTerminalRetirementTarget,
+        target: &Arc<TerminalHandle>,
+    ) -> Result<Arc<tokio::sync::Semaphore>, TerminalRetirementOutcome> {
+        let attach_permit = {
+            let map = registry.0.lock().expect("terminal registry poisoned");
+            // The synchronous registry lock is not preemptible by Tokio timeouts.
+            if tokio::time::Instant::now() >= original.deadline {
+                return Err(TerminalRetirementOutcome::Residual {
+                    reason: "terminal retirement deadline elapsed before teardown".into(),
+                });
+            }
+            let valid = map
+                .retirements
+                .get(&original.work_scope)
+                .is_some_and(|state| {
+                    state.generation == original.generation.0
+                        && state.owner == Some(TerminalRetirementOwner::Close)
+                })
+                && map
+                    .handles
+                    .get(&original.work_scope)
+                    .is_some_and(|current| Arc::ptr_eq(current, target));
+            if !valid {
+                let observed_absence = !map.handles.contains_key(&original.work_scope)
+                    && map
+                        .retirements
+                        .get(&original.work_scope)
+                        .is_some_and(|state| {
+                            state.generation == original.generation.0
+                                && state.owner == Some(TerminalRetirementOwner::Close)
+                        })
+                    && original
+                        .child_exit
+                        .as_ref()
+                        .is_some_and(ChildExitReceipt::exited);
+                return Err(if observed_absence {
+                    TerminalRetirementOutcome::Retired
+                } else {
+                    TerminalRetirementOutcome::Residual {
+                        reason: "prepared terminal generation or exact handle became stale".into(),
+                    }
+                });
+            }
+            // This is atomic with the first TearDown notification and therefore
+            // cannot be overwritten by relay setup.
+            target.stop_tx.send_replace(StopReason::TearDown);
+            Arc::clone(&target.attach_permit)
+        };
+        Ok(attach_permit)
+    }
+
+    // Consume relay authority so it is released before the removed handle is dropped.
+    fn remove_retired_target(
+        registry: &ActiveTerminals,
+        original: &OriginalTerminalRetirementTarget,
+        target: &Arc<TerminalHandle>,
+        relay_authority: tokio::sync::OwnedSemaphorePermit,
+    ) -> TerminalRetirementOutcome {
+        let removed = {
+            let mut map = registry.0.lock().expect("terminal registry poisoned");
+            if tokio::time::Instant::now() >= original.deadline {
+                drop(map);
+                drop(relay_authority);
+                return TerminalRetirementOutcome::Residual {
+                    reason: "terminal retirement deadline elapsed before registry removal".into(),
+                };
+            }
+            let valid = map
+                .retirements
+                .get(&original.work_scope)
+                .is_some_and(|state| {
+                    state.generation == original.generation.0
+                        && state.owner == Some(TerminalRetirementOwner::Close)
+                })
+                && map
+                    .handles
+                    .get(&original.work_scope)
+                    .is_some_and(|current| Arc::ptr_eq(current, target));
+            if !valid {
+                drop(map);
+                drop(relay_authority);
+                return TerminalRetirementOutcome::Residual {
+                    reason: "exact terminal changed before conditional removal".into(),
+                };
+            }
+            map.handles.remove(&original.work_scope)
+        };
+        drop(relay_authority);
+        drop(removed);
+        TerminalRetirementOutcome::Retired
+    }
+
+    /// Legacy completion and exact retained-evidence resolution. This may wait
+    /// before its first effect and must not be used as a synchronous entry fence.
+    /// Call `try_enter` at the source-owned fence for the bounded entry path.
+    ///
+    /// # Panics
+    /// Panics if the registry or master descriptor mutex is poisoned, or if the
+    /// captured terminal handle has no original child exit receipt.
+    pub async fn complete(self) -> TerminalRetirementOutcome {
+        let original = &self.original;
+        let target = self.target;
+        if tokio::time::Instant::now() >= original.deadline {
+            return TerminalRetirementOutcome::Residual {
+                reason: "terminal retirement deadline elapsed before teardown".into(),
+            };
+        }
+        let attach_permit = match Self::request_teardown(&self.registry, original, &target) {
+            Ok(attach_permit) => attach_permit,
+            Err(outcome) => return outcome,
+        };
+        let Ok(Ok(relay_authority)) =
+            tokio::time::timeout_at(original.deadline, attach_permit.acquire_owned()).await
+        else {
+            return TerminalRetirementOutcome::Residual {
+                reason: "terminal relay did not release after teardown request".into(),
+            };
+        };
+        if tokio::time::Instant::now() >= original.deadline {
+            drop(relay_authority);
+            return TerminalRetirementOutcome::Residual {
+                reason: "terminal retirement deadline elapsed before master close".into(),
+            };
+        }
+        {
+            let map = self.registry.0.lock().expect("terminal registry poisoned");
+            // The synchronous registry lock is not preemptible by Tokio timeouts.
+            if tokio::time::Instant::now() >= original.deadline {
+                return TerminalRetirementOutcome::Residual {
+                    reason: "terminal retirement deadline elapsed before teardown".into(),
+                };
+            }
+            if !map
+                .retirements
+                .get(&original.work_scope)
+                .is_some_and(|state| {
+                    state.generation == original.generation.0
+                        && state.owner == Some(TerminalRetirementOwner::Close)
+                })
+                || !map
+                    .handles
+                    .get(&original.work_scope)
+                    .is_some_and(|current| Arc::ptr_eq(current, &target))
+            {
+                let observed_absence = !map.handles.contains_key(&original.work_scope)
+                    && map
+                        .retirements
+                        .get(&original.work_scope)
+                        .is_some_and(|state| {
+                            state.generation == original.generation.0
+                                && state.owner == Some(TerminalRetirementOwner::Close)
+                        })
+                    && original
+                        .child_exit
+                        .as_ref()
+                        .is_some_and(ChildExitReceipt::exited);
+                drop(map);
+                drop(relay_authority);
+                return if observed_absence {
+                    TerminalRetirementOutcome::Retired
+                } else {
+                    TerminalRetirementOutcome::Residual {
+                        reason: "prepared terminal generation or exact handle became stale".into(),
+                    }
+                };
+            }
+        }
+        target.close_master_fd();
+        let receipt = original
+            .child_exit
+            .as_ref()
+            .expect("captured terminal handle must have its original child receipt");
+        if !matches!(
+            tokio::time::timeout_at(original.deadline, receipt.wait()).await,
+            Ok(Ok(_))
+        ) || tokio::time::Instant::now() >= original.deadline
+        {
+            drop(relay_authority);
+            return TerminalRetirementOutcome::Residual {
+                reason: "terminal child exit was not observed before the original deadline; exact handle retained".into(),
+            };
+        }
+        Self::remove_retired_target(&self.registry, original, &target, relay_authority)
+    }
 }
 
 impl TerminalRetirementPermit {
@@ -310,6 +663,12 @@ impl ActiveTerminals {
             .iter()
             .filter(|(candidate, _)| *candidate == scope)
             .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_registry_lock_for_test<T>(&self, action: impl FnOnce() -> T) -> T {
+        let _guard = self.0.lock().expect("terminal registry poisoned");
+        action()
     }
 
     #[must_use]
@@ -529,6 +888,7 @@ impl ActiveTerminals {
             &mut map,
             tokio::time::Instant::now() + TERMINAL_CLOSE_RETIREMENT_BUDGET,
             TerminalRetirementOwner::Relay,
+            Arc::downgrade(&self.0),
         ))
     }
 
@@ -574,6 +934,7 @@ impl ActiveTerminals {
         }
         map.handles
             .get(scope)
+            .filter(|handle| !handle.retirement_requested.is_requested())
             .filter(|handle| !handle.child_lifecycle.receipt().exited())
             .cloned()
     }
@@ -591,6 +952,7 @@ impl ActiveTerminals {
             .retirements
             .get(scope)
             .is_some_and(|retirement| retirement.owner.is_some())
+            || handle.retirement_requested.is_requested()
             || handle.child_lifecycle.receipt().exited()
             || !map
                 .handles
@@ -621,6 +983,7 @@ impl ActiveTerminals {
         map: &mut ActiveTerminalRegistryState,
         deadline: tokio::time::Instant,
         owner: TerminalRetirementOwner,
+        registry: std::sync::Weak<Mutex<ActiveTerminalRegistryState>>,
     ) -> TerminalRetirementPermit {
         map.spawn_reservations.remove(scope);
         let instance = map
@@ -643,14 +1006,26 @@ impl ActiveTerminals {
                 owner: Some(owner),
             },
         );
+        let generation = TerminalRetirementGeneration(generation);
+        let target = map.handles.get(scope).cloned();
         TerminalRetirementPermit {
             work_scope: scope.clone(),
-            instance,
-            generation: TerminalRetirementGeneration(generation),
+            instance: instance.clone(),
+            generation,
             deadline,
             owner,
             had_entry,
-            child_exit,
+            child_exit: child_exit.clone(),
+            original: Arc::new(OriginalTerminalRetirementTarget {
+                work_scope: scope.clone(),
+                instance,
+                handle: target,
+                child_exit: child_exit.clone(),
+                generation,
+                deadline,
+                owner,
+                registry,
+            }),
         }
     }
 
@@ -681,7 +1056,13 @@ impl ActiveTerminals {
         deadline: tokio::time::Instant,
     ) -> TerminalRetirementPermit {
         let mut map = self.0.lock().expect("terminal registry poisoned");
-        Self::build_retirement_permit(scope, &mut map, deadline, TerminalRetirementOwner::Close)
+        Self::build_retirement_permit(
+            scope,
+            &mut map,
+            deadline,
+            TerminalRetirementOwner::Close,
+            Arc::downgrade(&self.0),
+        )
     }
 
     fn matches_exact_instance(
@@ -756,6 +1137,72 @@ impl ActiveTerminals {
                 ),
             },
         }
+    }
+
+    /// Prepare an inert exact owner leaf outside any persistence transaction.
+    /// The permit's mutable reporting projection is checked against its immutable
+    /// original binding; a caller cannot redirect it by editing public fields.
+    ///
+    /// # Errors
+    /// Returns an error if the permit is not Close-owned, its reporting projection
+    /// differs from its original binding, it belongs to another registry, it has
+    /// no physical target, its deadline expired, or its exact target or fence is stale.
+    ///
+    /// # Panics
+    /// Panics if the terminal registry mutex is poisoned.
+    pub fn prepare_retirement(
+        &self,
+        permit: &TerminalRetirementPermit,
+    ) -> Result<PreparedTerminalRetirement, PrepareTerminalRetirementError> {
+        let original = &permit.original;
+        if permit.owner != TerminalRetirementOwner::Close
+            || original.owner != TerminalRetirementOwner::Close
+        {
+            return Err(PrepareTerminalRetirementError::NotCloseOwner);
+        }
+        if permit.work_scope != original.work_scope
+            || permit.instance != original.instance
+            || permit.generation != original.generation
+            || permit.deadline != original.deadline
+        {
+            return Err(PrepareTerminalRetirementError::ProjectionMismatch);
+        }
+        if !std::sync::Weak::ptr_eq(&original.registry, &Arc::downgrade(&self.0)) {
+            return Err(PrepareTerminalRetirementError::WrongRegistry);
+        }
+        let target = original
+            .handle
+            .as_ref()
+            .ok_or(PrepareTerminalRetirementError::NoPhysicalTarget)?;
+        if tokio::time::Instant::now() >= original.deadline {
+            return Err(PrepareTerminalRetirementError::DeadlineExpired);
+        }
+        {
+            let map = self.0.lock().expect("terminal registry poisoned");
+            let valid_fence = map
+                .retirements
+                .get(&original.work_scope)
+                .is_some_and(|state| {
+                    state.generation == original.generation.0
+                        && state.owner == Some(TerminalRetirementOwner::Close)
+                });
+            let valid_target = match (&original.handle, map.handles.get(&original.work_scope)) {
+                (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
+                (None, None) => true,
+                _ => false,
+            };
+            if !valid_fence || !valid_target {
+                return Err(PrepareTerminalRetirementError::StalePermit);
+            }
+        }
+        if tokio::time::Instant::now() >= original.deadline {
+            return Err(PrepareTerminalRetirementError::DeadlineExpired);
+        }
+        Ok(PreparedTerminalRetirement {
+            registry: self.clone(),
+            target: Arc::clone(target),
+            original: Arc::clone(original),
+        })
     }
 
     /// Retire only the exact terminal instance authorized by `permit`.
@@ -916,21 +1363,23 @@ impl ActiveTerminals {
     /// # Panics
     /// Panics if the registry mutex is poisoned.
     pub fn cancel_retirement(&self, permit: TerminalRetirementPermit) {
-        let TerminalRetirementPermit {
-            work_scope,
-            generation,
-            owner,
-            ..
-        } = permit;
-        let mut map = self.0.lock().expect("terminal registry poisoned");
-        if let Some(retirement) = map.retirements.get_mut(&work_scope) {
-            if retirement.generation == generation.0
-                && retirement.owner == Some(TerminalRetirementOwner::Close)
-                && owner == TerminalRetirementOwner::Close
-            {
-                retirement.owner = None;
+        let original = &permit.original;
+        if !std::sync::Weak::ptr_eq(&original.registry, &Arc::downgrade(&self.0)) {
+            return;
+        }
+        {
+            let mut map = self.0.lock().expect("terminal registry poisoned");
+            if let Some(retirement) = map.retirements.get_mut(&original.work_scope) {
+                if retirement.generation == original.generation.0
+                    && retirement.owner == Some(TerminalRetirementOwner::Close)
+                    && original.owner == TerminalRetirementOwner::Close
+                {
+                    retirement.owner = None;
+                }
             }
         }
+        // The captured handle may own its last reference; drop only outside the lock.
+        drop(permit);
     }
 
     /// Cascade-cleanup entry for `run_resource_cleanup_cascade`

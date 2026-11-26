@@ -3720,6 +3720,12 @@ async fn update_conversation_projection_tx(
     conversation: &ConversationAuthority,
     projection: &PersistedConversationProjection,
 ) -> DbResult<()> {
+    crate::native_close::fence_native_retry_sources_tx(
+        &mut tx.tx,
+        &conversation.0,
+        &projection.state,
+    )
+    .await?;
     let state_json = serde_json::to_string(&projection.state)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let updated = sqlx::query(
@@ -3745,6 +3751,12 @@ async fn update_conversation_state_for_adoption_tx(
     conversation: &ConversationAuthority,
     input: &MaterializeAuthoritativeTurnInput,
 ) -> DbResult<()> {
+    crate::native_close::fence_native_retry_sources_tx(
+        &mut tx.tx,
+        &conversation.0,
+        &input.accepted_state,
+    )
+    .await?;
     let state_json = serde_json::to_string(&input.accepted_state)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
     let updated = sqlx::query(

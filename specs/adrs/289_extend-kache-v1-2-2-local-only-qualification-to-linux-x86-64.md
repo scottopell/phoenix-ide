@@ -1,9 +1,16 @@
-# ADR-285: Extend Kache v1.2.2 strict local-only qualification to Linux x86_64
+# ADR-289: Extend Kache v1.2.2 strict local-only qualification to Linux x86_64
 
 - **Status:** Accepted
 - **Date:** 2026-11-25
 - **Extends:** [ADR-225](225_kache-v1-2-2-strict-local-only-selection.md) (macOS arm64 local-only selection remains unchanged)
 - **Affects:** development methodology; REQ-COMP-001, REQ-COMP-008
+
+Provenance note: This decision and its complete evidence were originally published
+as ADR-285 in #1183 (commit `59021bdad`). ADR-285 was already canonical for
+Coordinator evidence-origin labels, introduced by #1182 (commit `2c267e571`), so
+this record is renumbered to ADR-289 solely to resolve the numbering collision.
+No decision or evidence is withdrawn or changed. Commit-qualified citations to
+`59021bdad` or #1183 continue to identify this record under its original number.
 
 ## Context
 

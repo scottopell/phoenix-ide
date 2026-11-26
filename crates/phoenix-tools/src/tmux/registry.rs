@@ -44,7 +44,7 @@ use tokio::sync::{OnceCell, RwLock};
 
 use super::backend::{
     ExactProcessState, GlobalEnvRead, SocketEndpoint, SocketFileIdentity, SystemTmuxBackend,
-    TmuxBackend, TokenBoundKill, SERVER_TOKEN_VAR,
+    TmuxBackend, TmuxDestructiveEntry, TokenBoundKill, SERVER_TOKEN_VAR,
 };
 use super::{parse_last_exit_marker, probe::ProbeResult};
 
@@ -173,6 +173,19 @@ enum TmuxRetirementAuthority {
     EndpointAbsent,
 }
 
+/// Immutable authority captured when the permit is issued.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TmuxRetirementOriginal {
+    work_scope: ResourceScopeKey,
+    instance: TmuxServerInstanceIdentity,
+    generation: TmuxRetirementGeneration,
+    authority: TmuxRetirementAuthority,
+    exact_process: Option<ProcessIdentity>,
+    had_entry: bool,
+    expires: tokio::time::Instant,
+    registry_identity: Arc<()>,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct TmuxRetirementPermit {
     pub work_scope: ResourceScopeKey,
@@ -182,9 +195,38 @@ pub struct TmuxRetirementPermit {
     exact_process: Option<ProcessIdentity>,
     had_entry: bool,
     expires: tokio::time::Instant,
+    cancel_expires: tokio::time::Instant,
+    registry_identity: Arc<()>,
+    original: TmuxRetirementOriginal,
 }
 
 impl TmuxRetirementPermit {
+    fn new(original: TmuxRetirementOriginal) -> Self {
+        Self {
+            work_scope: original.work_scope.clone(),
+            instance: original.instance.clone(),
+            generation: original.generation,
+            authority: original.authority,
+            exact_process: original.exact_process,
+            had_entry: original.had_entry,
+            expires: original.expires,
+            cancel_expires: original.expires,
+            registry_identity: Arc::clone(&original.registry_identity),
+            original,
+        }
+    }
+
+    fn matches_original(&self) -> bool {
+        self.work_scope == self.original.work_scope
+            && self.instance == self.original.instance
+            && self.generation == self.original.generation
+            && self.authority == self.original.authority
+            && self.exact_process == self.original.exact_process
+            && self.had_entry == self.original.had_entry
+            && self.expires == self.original.expires
+            && Arc::ptr_eq(&self.registry_identity, &self.original.registry_identity)
+    }
+
     #[must_use]
     pub fn generation(&self) -> TmuxRetirementGeneration {
         self.generation
@@ -193,6 +235,69 @@ impl TmuxRetirementPermit {
     #[must_use]
     pub fn had_entry(&self) -> bool {
         self.had_entry
+    }
+}
+
+/// In-memory, single-use authority for one already-fenced physical tmux server.
+/// Preparing and dropping it neither tears down the server nor releases the fence;
+/// the caller retains the original permit for disciplined rollback. This is
+/// source-only in-memory authority: it provides no DB/durable exactly-once
+/// guarantee and no cancellation supervision. The caller must retain and
+/// supervise the permit through completion or disciplined rollback.
+#[must_use = "complete the exact retirement or retain the permit for rollback"]
+#[derive(Debug)]
+pub struct PreparedTmuxRetirement {
+    registry: Arc<TmuxRegistry>,
+    entry: Arc<TmuxScopeEntry>,
+    permit: TmuxRetirementPermit,
+}
+
+impl PreparedTmuxRetirement {
+    /// Consumes the captured original entry, never selecting another target.
+    ///
+    /// # Errors
+    /// Returns a probe error when exact shutdown evidence cannot be read.
+    pub async fn complete(self) -> Result<TmuxRetirementOutcome, TmuxError> {
+        self.complete_with_entry(|| Ok(())).await
+    }
+
+    /// Acquires source custody separately for each synchronous destructive sink.
+    /// No returned lease is held during helper readiness, shutdown observation,
+    /// or registry lock waits. The callback can refuse a stale source binding;
+    /// refusal returns `RemovalFailed` without being superseded by absence proof.
+    ///
+    /// # Errors
+    /// Returns a probe error when exact shutdown evidence cannot be read.
+    pub async fn complete_with_entry<F, Lease>(
+        self,
+        mut enter: F,
+    ) -> Result<TmuxRetirementOutcome, TmuxError>
+    where
+        F: FnMut() -> Result<Lease, String> + Send,
+    {
+        let mut with_entry = |sink: &mut dyn FnMut() -> Result<(), String>| {
+            let lease = enter()?;
+            let result = sink();
+            drop(lease);
+            result
+        };
+        self.complete_with_sink(&mut with_entry).await
+    }
+
+    /// Wrap each synchronous destructive sink, including the final registry mutation.
+    ///
+    /// # Errors
+    /// Returns a probe error when exact shutdown evidence cannot be read.
+    pub async fn complete_with_sink<F>(
+        self,
+        mut with_entry: F,
+    ) -> Result<TmuxRetirementOutcome, TmuxError>
+    where
+        F: FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String> + Send,
+    {
+        self.registry
+            .complete_retirement_on_entry(&self.permit, Some(self.entry), true, &mut with_entry)
+            .await
     }
 }
 
@@ -254,7 +359,7 @@ pub enum TmuxRetirementOutcome {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TmuxRetirementRehydration {
-    Permit(TmuxRetirementPermit),
+    Permit(Box<TmuxRetirementPermit>),
     AbsenceVerified,
     Residual { reason: String },
 }
@@ -540,6 +645,7 @@ pub struct TmuxRegistry {
     /// tool-level tests. Mirrors `BashHandleRegistry::lifecycle_sink`.
     lifecycle_sink: Option<TmuxLifecycleSink>,
     backend: Arc<dyn TmuxBackend>,
+    registry_identity: Arc<()>,
     #[cfg(test)]
     ensure_live_lock_test_hook: Option<Arc<EnsureLiveLockTestHook>>,
     #[cfg(test)]
@@ -588,6 +694,7 @@ impl TmuxRegistry {
             runtime_assets: OnceCell::new(),
             lifecycle_sink,
             backend,
+            registry_identity: Arc::new(()),
             #[cfg(test)]
             ensure_live_lock_test_hook: None,
             #[cfg(test)]
@@ -1416,6 +1523,7 @@ impl TmuxRegistry {
     }
 
     fn build_retirement_permit(
+        &self,
         work_scope: &ResourceScopeKey,
         server: &mut TmuxServer,
         had_entry: bool,
@@ -1426,7 +1534,7 @@ impl TmuxRegistry {
         server.retirement_generation = server.retirement_generation.wrapping_add(1);
         server.retirement_fenced = true;
         server.status = ServerStatus::Gone;
-        TmuxRetirementPermit {
+        TmuxRetirementPermit::new(TmuxRetirementOriginal {
             work_scope: work_scope.clone(),
             instance: server.exact_identity(),
             generation: TmuxRetirementGeneration(server.retirement_generation),
@@ -1434,7 +1542,8 @@ impl TmuxRegistry {
             had_entry,
             exact_process,
             expires,
-        }
+            registry_identity: Arc::clone(&self.registry_identity),
+        })
     }
 
     /// Seals tmux admission for a scope without probing or stopping a server.
@@ -1619,7 +1728,7 @@ impl TmuxRegistry {
                             });
                         }
                         current.status = ServerStatus::Live;
-                        let permit = Self::build_retirement_permit(
+                        let permit = self.build_retirement_permit(
                             work_scope,
                             &mut current,
                             true,
@@ -1630,7 +1739,7 @@ impl TmuxRegistry {
                         drop(current);
                         drop(map);
                         self.emit_lifecycle(work_scope);
-                        Ok(TmuxRetirementRehydration::Permit(permit))
+                        Ok(TmuxRetirementRehydration::Permit(Box::new(permit)))
                     }
                 };
             }
@@ -1800,7 +1909,7 @@ impl TmuxRegistry {
                             });
                         }
                         server.status = ServerStatus::Live;
-                        let permit = Self::build_retirement_permit(
+                        let permit = self.build_retirement_permit(
                             work_scope,
                             &mut server,
                             true,
@@ -1808,7 +1917,7 @@ impl TmuxRegistry {
                             exact_process,
                             expires,
                         );
-                        Ok(TmuxRetirementRehydration::Permit(permit))
+                        Ok(TmuxRetirementRehydration::Permit(Box::new(permit)))
                     }
                 }
             }
@@ -1925,7 +2034,7 @@ impl TmuxRegistry {
                 });
             }
         };
-        let permit = Self::build_retirement_permit(
+        let permit = self.build_retirement_permit(
             work_scope,
             &mut server,
             !created,
@@ -1955,6 +2064,17 @@ impl TmuxRegistry {
             && server.retirement_generation == permit.generation.0
             && server.socket_path == permit.instance.socket_path
             && server.server_token == permit.instance.server_token
+    }
+
+    // Rollback authority is evaluated against issuer-captured identity, not
+    // mutable permit reporting projections.
+    fn matches_original_instance(server: &TmuxServer, permit: &TmuxRetirementPermit) -> bool {
+        let original = &permit.original;
+        server.retirement_fenced
+            && server.work_scope == original.work_scope
+            && server.retirement_generation == original.generation.0
+            && server.socket_path == original.instance.socket_path
+            && server.server_token == original.instance.server_token
     }
 
     async fn verify_exact_absence(
@@ -2164,9 +2284,74 @@ impl TmuxRegistry {
         }
     }
 
+    /// Capture an exact, physical, already-fenced owner without teardown or
+    /// changing admission. Unlike ordinary completion, this cannot adopt a
+    /// later map entry or treat a placeholder/absence permit as an owner.
+    ///
+    /// # Errors
+    /// Returns a typed residual if the exact original physical target cannot
+    /// be proven within the permit's original deadline.
+    pub async fn prepare_retirement(
+        self: &Arc<Self>,
+        permit: &TmuxRetirementPermit,
+    ) -> Result<PreparedTmuxRetirement, TmuxRetirementOutcome> {
+        let residual = || TmuxRetirementOutcome::IdentityNotProven {
+            reason: "exact tmux retirement owner is absent, stale, or mismatched".to_string(),
+        };
+        if !permit.matches_original()
+            || !Arc::ptr_eq(&self.registry_identity, &permit.original.registry_identity)
+            || permit.original.authority != TmuxRetirementAuthority::ExactServer
+            || !permit.had_entry
+            || permit.exact_process.is_none()
+            || tokio::time::Instant::now() >= permit.expires
+        {
+            return Err(residual());
+        }
+        let deadline = RetirementDeadline::new(permit.expires);
+        let map = deadline
+            .read_map(self, "retirement prepare")
+            .await
+            .map_err(|reason| TmuxRetirementOutcome::RemovalFailed { reason })?;
+        let entry = map
+            .get(&permit.work_scope.stable_key())
+            .ok_or_else(residual)?;
+        let server = tokio::time::timeout_at(permit.expires, entry.server.read())
+            .await
+            .map_err(|_| TmuxRetirementOutcome::RemovalFailed {
+                reason: "tmux retirement prepare identity read lock exceeded the Close deadline"
+                    .to_string(),
+            })?;
+        if server.work_scope != permit.work_scope || !Self::matches_exact_instance(&server, permit)
+        {
+            return Err(residual());
+        }
+        drop(server);
+        // A map entry alone is not a physical target. This read-only backend
+        // check binds the original token and process; no spawn, kill or refresh.
+        let process = tokio::time::timeout_at(
+            permit.expires,
+            self.backend.server_process(
+                &permit.instance.socket_path,
+                &permit.instance.server_token,
+                permit.expires,
+            ),
+        )
+        .await
+        .map_err(|_| TmuxRetirementOutcome::RemovalFailed {
+            reason: "tmux retirement prepare process read exceeded the Close deadline".to_string(),
+        })?;
+        if process != permit.exact_process || tokio::time::Instant::now() >= permit.expires {
+            return Err(residual());
+        }
+        Ok(PreparedTmuxRetirement {
+            registry: Arc::clone(self),
+            entry: Arc::clone(entry),
+            permit: TmuxRetirementPermit::new(permit.original.clone()),
+        })
+    }
+
     /// # Errors
     /// Returns [`TmuxError`] when exact-instance absence cannot be verified.
-    #[allow(clippy::too_many_lines)]
     pub async fn complete_retirement(
         &self,
         permit: &TmuxRetirementPermit,
@@ -2179,6 +2364,45 @@ impl TmuxRegistry {
             Ok(entry) => entry,
             Err(reason) => return Ok(TmuxRetirementOutcome::RemovalFailed { reason }),
         };
+        self.complete_retirement_on_entry(permit, current_entry, false, &mut |sink| sink())
+            .await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn complete_retirement_on_entry(
+        &self,
+        permit: &TmuxRetirementPermit,
+        current_entry: Option<Arc<TmuxScopeEntry>>,
+        exact_owner: bool,
+        enter: &mut TmuxDestructiveEntry<'_>,
+    ) -> Result<TmuxRetirementOutcome, TmuxError> {
+        let deadline = RetirementDeadline::new(permit.expires);
+        // Keep map membership fixed through the token-bound kill on the exact
+        // path. The ordinary API retains its historical reselect semantics.
+        let initial_map = if exact_owner {
+            if tokio::time::Instant::now() >= permit.expires {
+                return Ok(TmuxRetirementOutcome::RemovalFailed {
+                    reason: "tmux exact owner deadline expired before teardown".to_string(),
+                });
+            }
+            let map = match deadline.read_map(self, "retirement complete initial").await {
+                Ok(map) => map,
+                Err(reason) => return Ok(TmuxRetirementOutcome::RemovalFailed { reason }),
+            };
+            if !Arc::ptr_eq(&self.registry_identity, &permit.registry_identity)
+                || !current_entry.as_ref().is_some_and(|original| {
+                    map.get(&permit.work_scope.stable_key())
+                        .is_some_and(|current| Arc::ptr_eq(current, original))
+                })
+            {
+                return Ok(TmuxRetirementOutcome::IdentityNotProven {
+                    reason: "exact tmux retirement owner was replaced before teardown".to_string(),
+                });
+            }
+            Some(map)
+        } else {
+            None
+        };
         let Some(entry) = current_entry else {
             return self.verify_exact_absence(permit).await;
         };
@@ -2188,8 +2412,14 @@ impl TmuxRegistry {
                 reason: "tmux exact teardown write lock exceeded the Close deadline".to_string(),
             });
         };
-        let exact_owned = Self::matches_exact_instance(&server, permit);
-        if !exact_owned {
+        let exact_instance_matches = Self::matches_exact_instance(&server, permit);
+        if !exact_instance_matches || (exact_owner && server.work_scope != permit.work_scope) {
+            if exact_owner {
+                return Ok(TmuxRetirementOutcome::IdentityNotProven {
+                    reason: "exact tmux retirement fence or identity changed before teardown"
+                        .to_string(),
+                });
+            }
             return self.verify_exact_absence(permit).await;
         }
         #[cfg(test)]
@@ -2225,26 +2455,59 @@ impl TmuxRegistry {
             .exact_process
             .map(|process| self.backend.process_state(process))
             .unwrap_or(ExactProcessState::Unproven);
+        if exact_owner && tokio::time::Instant::now() >= permit.expires {
+            return Ok(TmuxRetirementOutcome::RemovalFailed {
+                reason: "tmux exact owner deadline expired before teardown".to_string(),
+            });
+        }
         let kill_failure = if permit.authority != TmuxRetirementAuthority::ServerAbsenceVerified
             && process_state_before_teardown != ExactProcessState::DeadOrReused
             && matches!(pre_teardown, Some(SocketEndpoint::Socket(_)))
         {
-            match self
-                .backend
-                .kill_server_if_token(
-                    &permit.instance.socket_path,
-                    &self.config_path(),
-                    &permit.instance.server_token,
-                    permit.expires,
-                )
-                .await
-            {
+            // Only the prepared owner can authorize the destructive command
+            // with its captured PID and birth. Ordinary legacy retirement remains
+            // token-only; neither path selects another registry entry here.
+            let kill = if exact_owner {
+                match permit.exact_process {
+                    Some(process) => {
+                        match self
+                            .backend
+                            .kill_server_if_process_with_entry(
+                                &permit.instance.socket_path,
+                                &self.config_path(),
+                                &permit.instance.server_token,
+                                process,
+                                permit.expires,
+                                enter,
+                            )
+                            .await
+                        {
+                            Ok(kill) => kill,
+                            Err(reason) => {
+                                return Ok(TmuxRetirementOutcome::RemovalFailed { reason });
+                            }
+                        }
+                    }
+                    None => TokenBoundKill::TokenMismatch,
+                }
+            } else {
+                self.backend
+                    .kill_server_if_token(
+                        &permit.instance.socket_path,
+                        &self.config_path(),
+                        &permit.instance.server_token,
+                        permit.expires,
+                    )
+                    .await
+            };
+            match kill {
                 TokenBoundKill::Killed => None,
                 TokenBoundKill::DeadlineExceeded => Some(TmuxRetirementOutcome::RemovalFailed {
                     reason: "tmux exact teardown command exceeded the Close deadline".to_string(),
                 }),
                 TokenBoundKill::TokenMismatch => Some(TmuxRetirementOutcome::IdentityNotProven {
-                    reason: "tmux server token changed before exact teardown".to_string(),
+                    reason: "tmux server token or process changed before exact teardown"
+                        .to_string(),
                 }),
                 TokenBoundKill::Failed { reason } => {
                     Some(TmuxRetirementOutcome::RemovalFailed { reason })
@@ -2254,6 +2517,7 @@ impl TmuxRegistry {
             None
         };
         drop(server);
+        drop(initial_map);
 
         let exact_process_exit = if permit.authority == TmuxRetirementAuthority::ExactServer {
             match permit.exact_process {
@@ -2338,7 +2602,17 @@ impl TmuxRegistry {
                             });
                         };
                         if Self::matches_exact_instance(&server, permit) {
-                            server.status = ServerStatus::Gone;
+                            if let Err(reason) = enter(&mut || {
+                                if tokio::time::Instant::now() >= permit.expires {
+                                    return Err(
+                                        "tmux final authority exceeded the Close deadline".into()
+                                    );
+                                }
+                                server.status = ServerStatus::Gone;
+                                Ok(())
+                            }) {
+                                return Ok(TmuxRetirementOutcome::RemovalFailed { reason });
+                            }
                             true
                         } else {
                             false
@@ -2352,6 +2626,12 @@ impl TmuxRegistry {
                 drop(map);
                 if retained_fence && permit.had_entry {
                     self.emit_lifecycle(&permit.work_scope);
+                }
+                if exact_owner && !retained_fence {
+                    return Ok(TmuxRetirementOutcome::IdentityNotProven {
+                        reason: "exact tmux retirement owner was replaced before final proof"
+                            .to_string(),
+                    });
                 }
                 Ok(TmuxRetirementOutcome::Retired)
             }
@@ -2371,9 +2651,18 @@ impl TmuxRegistry {
         &self,
         mut permits: Vec<TmuxRetirementPermit>,
     ) -> Result<(), TmuxRetirementBatchCancellationError> {
+        if permits
+            .iter()
+            .any(|permit| !Arc::ptr_eq(&self.registry_identity, &permit.original.registry_identity))
+        {
+            return Err(TmuxRetirementBatchCancellationError {
+                reason: "tmux retirement permit belongs to a different registry".to_string(),
+                permits,
+            });
+        }
         let expires = permits
             .iter()
-            .map(|permit| permit.expires)
+            .map(|permit| permit.cancel_expires)
             .min()
             .unwrap_or_else(close_deadline);
         let deadline = RetirementDeadline::new(expires);
@@ -2382,14 +2671,14 @@ impl TmuxRegistry {
             Err(reason) => {
                 let retry_deadline = close_deadline();
                 for permit in &mut permits {
-                    permit.expires = retry_deadline;
+                    permit.cancel_expires = retry_deadline;
                 }
                 return Err(TmuxRetirementBatchCancellationError { reason, permits });
             }
         };
         let entries = permits
             .iter()
-            .map(|permit| map.get(&permit.work_scope.stable_key()).cloned())
+            .map(|permit| map.get(&permit.original.work_scope.stable_key()).cloned())
             .collect::<Vec<_>>();
         let mut guards = Vec::with_capacity(entries.len());
         for entry in &entries {
@@ -2402,7 +2691,7 @@ impl TmuxRegistry {
                 drop(map);
                 let retry_deadline = close_deadline();
                 for permit in &mut permits {
-                    permit.expires = retry_deadline;
+                    permit.cancel_expires = retry_deadline;
                 }
                 return Err(TmuxRetirementBatchCancellationError {
                     reason:
@@ -2418,12 +2707,12 @@ impl TmuxRegistry {
             let Some(server) = server else {
                 continue;
             };
-            if Self::matches_exact_instance(server, permit) {
+            if Self::matches_original_instance(server, permit) {
                 server.retirement_fenced = false;
                 if server.status == ServerStatus::Gone {
                     server.status = ServerStatus::NotProbed;
                 }
-                reopened.push(permit.work_scope.clone());
+                reopened.push(permit.original.work_scope.clone());
             }
         }
         drop(guards);
@@ -2450,35 +2739,42 @@ impl TmuxRegistry {
             hook.entered.notify_one();
             hook.release.notified().await;
         }
-        let deadline = RetirementDeadline::new(permit.expires);
+        if !Arc::ptr_eq(&self.registry_identity, &permit.original.registry_identity) {
+            return Err(TmuxRetirementCancellationError {
+                reason: "tmux retirement permit belongs to a different registry".to_string(),
+                permit,
+            });
+        }
+        let deadline = RetirementDeadline::new(permit.cancel_expires);
         let map = match deadline.read_map(self, "retirement cancellation").await {
             Ok(map) => map,
             Err(reason) => {
-                permit.expires = close_deadline();
+                permit.cancel_expires = close_deadline();
                 return Err(TmuxRetirementCancellationError { reason, permit });
             }
         };
-        let key = permit.work_scope.stable_key();
+        let key = permit.original.work_scope.stable_key();
         let Some(entry) = map.get(&key).cloned() else {
             return Ok(());
         };
-        let Ok(mut server) = tokio::time::timeout_at(permit.expires, entry.server.write()).await
+        let Ok(mut server) =
+            tokio::time::timeout_at(permit.cancel_expires, entry.server.write()).await
         else {
-            permit.expires = close_deadline();
+            permit.cancel_expires = close_deadline();
             return Err(TmuxRetirementCancellationError {
                 reason: "tmux retirement cancellation entry write lock exceeded the Close deadline"
                     .to_string(),
                 permit,
             });
         };
-        if Self::matches_exact_instance(&server, &permit) {
+        if Self::matches_original_instance(&server, &permit) {
             server.retirement_fenced = false;
             if server.status == ServerStatus::Gone {
                 server.status = ServerStatus::NotProbed;
             }
             drop(server);
             drop(map);
-            self.emit_lifecycle(&permit.work_scope);
+            self.emit_lifecycle(&permit.original.work_scope);
         }
         Ok(())
     }
@@ -2653,7 +2949,7 @@ impl TmuxRegistry {
                 .await
             {
                 Ok(TmuxRetirementRehydration::Permit(permit)) => {
-                    match self.complete_retirement(&permit).await {
+                    match self.complete_retirement(permit.as_ref()).await {
                         Ok(outcome) => outcome,
                         Err(error) => TmuxRetirementOutcome::RemovalFailed {
                             reason: error.to_string(),
@@ -2891,6 +3187,9 @@ mod tests {
     use crate::tmux::fake_backend::{FakeTmuxBackend, Stall};
     use tempfile::TempDir;
 
+    #[path = "prepared_retirement_entry.rs"]
+    mod prepared_retirement_entry;
+
     fn scope(id: &str) -> ResourceScopeKey {
         ResourceScopeKey::Work(phoenix_core::work_scope::WorkScopeId::parse(id).unwrap())
     }
@@ -3109,6 +3408,303 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepared_tmux_owner_is_inert_until_consumed_and_uses_original_token() {
+        fn assert_send_static<T: Send + 'static>(_: &T) {}
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = Arc::new(with_fake(tmp.path(), &fake));
+        let work_scope = scope("prepared-owner-inert");
+        let server = registry
+            .ensure_live(&work_scope, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity = live_identity(&server).await;
+        let mut permit = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .unwrap();
+        let prepared = registry.prepare_retirement(&permit).await.unwrap();
+        assert_send_static(&prepared);
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+        assert!(fake.server(&identity.socket_path).unwrap().live);
+        drop(prepared);
+        assert!(registry.is_retirement_fenced(&work_scope).await);
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+        let prepared = registry.prepare_retirement(&permit).await.unwrap();
+        let unpolled = prepared.complete();
+        assert_send_static(&unpolled);
+        drop(unpolled);
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+        assert!(fake.server(&identity.socket_path).unwrap().live);
+        let prepared = registry.prepare_retirement(&permit).await.unwrap();
+        permit.instance.server_token = "changed-after-prepare".to_string();
+        assert_eq!(
+            prepared.complete().await.unwrap(),
+            TmuxRetirementOutcome::Retired
+        );
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 1);
+        assert!(!fake
+            .server(&identity.socket_path)
+            .is_some_and(|server| server.live));
+    }
+
+    #[tokio::test]
+    async fn prepared_tmux_owner_requires_physical_target_not_placeholder() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = Arc::new(with_fake(tmp.path(), &fake));
+        let work_scope = scope("prepared-owner-placeholder");
+        let permit = registry
+            .begin_retirement_after_discovery(
+                &work_scope,
+                &PersistentTmuxDiscovery::EndpointAbsent,
+                close_deadline(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            registry.prepare_retirement(&permit).await,
+            Err(TmuxRetirementOutcome::IdentityNotProven { .. })
+        ));
+        assert!(registry.is_retirement_fenced(&work_scope).await);
+        assert_eq!(fake.kill_server_count(&permit.instance.socket_path), 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_tmux_owner_records_original_absence_not_replacement_kill() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = Arc::new(with_fake(tmp.path(), &fake));
+        let work_scope = scope("prepared-owner-socket-reuse");
+        let server = registry
+            .ensure_live(&work_scope, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity = live_identity(&server).await;
+        let permit = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .unwrap();
+        let prepared = registry.prepare_retirement(&permit).await.unwrap();
+        fake.kill_server(&identity.socket_path);
+        fake.spawn_session(&identity.socket_path, &registry.config_path(), tmp.path())
+            .await
+            .unwrap();
+        let replacement = fake.server(&identity.socket_path).unwrap();
+        assert_ne!(
+            replacement.token.as_deref(),
+            Some(identity.server_token.as_str())
+        );
+        assert_eq!(
+            prepared.complete().await.unwrap(),
+            TmuxRetirementOutcome::Retired
+        );
+        assert!(fake.server(&identity.socket_path).unwrap().live);
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_tmux_owner_never_kills_same_token_replacement_pid() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = Arc::new(with_fake(tmp.path(), &fake));
+        let work_scope = scope("prepared-owner-same-token-new-pid");
+        let server = registry
+            .ensure_live(&work_scope, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity = live_identity(&server).await;
+        let original = fake.server(&identity.socket_path).unwrap().process;
+        let permit = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .unwrap();
+        let prepared = registry.prepare_retirement(&permit).await.unwrap();
+        fake.kill_server(&identity.socket_path);
+        fake.spawn_session(&identity.socket_path, &registry.config_path(), tmp.path())
+            .await
+            .unwrap();
+        fake.set_global_env(
+            &identity.socket_path,
+            crate::tmux::backend::SERVER_TOKEN_VAR,
+            &identity.server_token,
+        )
+        .await;
+        let replacement = fake.server(&identity.socket_path).unwrap();
+        assert_ne!(replacement.process, original);
+        assert_eq!(
+            replacement.token.as_deref(),
+            Some(identity.server_token.as_str())
+        );
+        assert_eq!(
+            prepared.complete().await.unwrap(),
+            TmuxRetirementOutcome::Retired
+        );
+        assert!(fake.server(&identity.socket_path).unwrap().live);
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+    }
+
+    #[tokio::test]
+    async fn process_bound_fake_rejects_birth_mismatch_and_unproven_process() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let socket = tmp.path().join("process-bound.sock");
+        fake.spawn_session(&socket, tmp.path(), tmp.path())
+            .await
+            .unwrap();
+        let current = fake.server(&socket).unwrap();
+        let token = current.token.unwrap();
+        let wrong_birth = ProcessIdentity {
+            pid: current.process.pid,
+            start_time: current.process.start_time + 1,
+        };
+        for process in [
+            wrong_birth,
+            ProcessIdentity {
+                pid: u32::MAX,
+                start_time: 0,
+            },
+        ] {
+            assert_eq!(
+                fake.kill_server_if_process(&socket, tmp.path(), &token, process, close_deadline())
+                    .await,
+                TokenBoundKill::TokenMismatch
+            );
+            assert!(fake.server(&socket).unwrap().live);
+        }
+        assert_eq!(fake.kill_server_count(&socket), 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_tmux_owner_rejects_spoof_wrong_registry_and_no_target() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = Arc::new(with_fake(tmp.path(), &fake));
+        let other = Arc::new(with_fake(tmp.path(), &fake));
+        let work_scope = scope("prepared-owner-spoof");
+        let server = registry
+            .ensure_live(&work_scope, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity = live_identity(&server).await;
+        let mut permit = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .unwrap();
+        assert!(matches!(
+            other.prepare_retirement(&permit).await,
+            Err(TmuxRetirementOutcome::IdentityNotProven { .. })
+        ));
+        permit.work_scope = scope("spoofed-reporting-scope");
+        assert!(matches!(
+            registry.prepare_retirement(&permit).await,
+            Err(TmuxRetirementOutcome::IdentityNotProven { .. })
+        ));
+        permit.work_scope = work_scope.clone();
+        permit.instance.server_token = "spoofed-reporting-token".to_string();
+        assert!(matches!(
+            registry.prepare_retirement(&permit).await,
+            Err(TmuxRetirementOutcome::IdentityNotProven { .. })
+        ));
+        permit.instance = identity.clone();
+        fake.kill_server(&identity.socket_path);
+        assert!(matches!(
+            registry.prepare_retirement(&permit).await,
+            Err(TmuxRetirementOutcome::IdentityNotProven { .. })
+        ));
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+    }
+
+    #[tokio::test]
+    async fn prepared_tmux_owner_rejects_stale_fence_and_replaced_entry_without_kill() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = Arc::new(with_fake(tmp.path(), &fake));
+        let work_scope = scope("prepared-owner-replacement");
+        let server = registry
+            .ensure_live(&work_scope, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity = live_identity(&server).await;
+        let old = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .unwrap();
+        let prepared = registry.prepare_retirement(&old).await.unwrap();
+        let newer = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .unwrap();
+        assert!(matches!(
+            registry.prepare_retirement(&old).await,
+            Err(TmuxRetirementOutcome::IdentityNotProven { .. })
+        ));
+        assert!(matches!(
+            prepared.complete().await.unwrap(),
+            TmuxRetirementOutcome::IdentityNotProven { .. }
+        ));
+        let prepared = registry.prepare_retirement(&newer).await.unwrap();
+        let replacement = Arc::new(TmuxScopeEntry::new(TmuxServer::new(
+            work_scope.clone(),
+            identity.socket_path.clone(),
+        )));
+        registry
+            .inner
+            .write()
+            .await
+            .insert(work_scope.stable_key(), Arc::clone(&replacement));
+        assert!(matches!(
+            prepared.complete().await.unwrap(),
+            TmuxRetirementOutcome::IdentityNotProven { .. }
+        ));
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+        assert!(fake.server(&identity.socket_path).unwrap().live);
+        assert!(Arc::ptr_eq(
+            registry
+                .inner
+                .read()
+                .await
+                .get(&work_scope.stable_key())
+                .unwrap(),
+            &replacement
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn prepared_tmux_owner_uses_original_expiry_and_bounds_lock_waits() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = Arc::new(with_fake(tmp.path(), &fake));
+        let work_scope = scope("prepared-owner-deadline");
+        let server = registry
+            .ensure_live(&work_scope, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity = live_identity(&server).await;
+        let expires = tokio::time::Instant::now() + Duration::from_millis(100);
+        let permit = registry
+            .begin_retirement(&work_scope, None, None, expires)
+            .await
+            .unwrap();
+        let prepared = registry.prepare_retirement(&permit).await.unwrap();
+        let held = registry.inner.write().await;
+        let mut completion = Box::pin(prepared.complete());
+        assert!(futures::poll!(completion.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        assert!(matches!(
+            completion.await.unwrap(),
+            TmuxRetirementOutcome::RemovalFailed { .. }
+        ));
+        drop(held);
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+        assert!(matches!(
+            registry.prepare_retirement(&permit).await,
+            Err(TmuxRetirementOutcome::IdentityNotProven { .. })
+        ));
+        assert!(fake.server(&identity.socket_path).unwrap().live);
+    }
+
+    #[tokio::test]
     async fn unknown_pre_teardown_incarnation_remains_repair_required() {
         let tmp = TempDir::new().unwrap();
         let fake = FakeTmuxBackend::new();
@@ -3317,6 +3913,309 @@ mod tests {
                 .await,
             Err(TmuxError::BinaryUnavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn cancel_uses_original_scope_and_registry_not_mutable_projection() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = Arc::new(with_fake(tmp.path(), &fake));
+        let other = with_fake(tmp.path(), &fake);
+        let scope_a = scope("cancel-original-a");
+        let scope_b = scope("cancel-projection-b");
+        let server_a = registry
+            .ensure_live(&scope_a, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let server_b = registry
+            .ensure_live(&scope_b, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity_a = live_identity(&server_a).await;
+        let identity_b = live_identity(&server_b).await;
+        let mut permit_a = registry
+            .begin_retirement(&scope_a, None, None, close_deadline())
+            .await
+            .unwrap();
+        let permit_b = registry
+            .begin_retirement(&scope_b, None, None, close_deadline())
+            .await
+            .unwrap();
+        assert_eq!(permit_a.generation(), permit_b.generation());
+
+        other
+            .ensure_live(&scope_a, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let other_permit = other
+            .begin_retirement(&scope_a, None, None, close_deadline())
+            .await
+            .unwrap();
+        assert_eq!(permit_a.original.instance, other_permit.original.instance);
+        assert_eq!(
+            permit_a.original.generation,
+            other_permit.original.generation
+        );
+        let wrong_registry = other
+            .cancel_retirement(permit_a)
+            .await
+            .expect_err("foreign registry must retain rollback authority");
+        assert!(wrong_registry.reason().contains("different registry"));
+        assert!(other.is_retirement_fenced(&scope_a).await);
+        permit_a = wrong_registry.into_permit();
+        permit_a.work_scope = scope_b.clone();
+        permit_a.instance = identity_b;
+        registry
+            .cancel_retirement(permit_a)
+            .await
+            .expect("issuer can cancel its permit");
+        assert!(!registry.is_retirement_fenced(&scope_a).await);
+        assert!(registry.is_retirement_fenced(&scope_b).await);
+        assert_eq!(fake.kill_server_count(&identity_a.socket_path), 0);
+        assert!(other.is_retirement_fenced(&scope_a).await);
+        other.cancel_retirement(other_permit).await.unwrap();
+        registry.cancel_retirement(permit_b).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn batch_cancel_uses_each_original_target_when_projections_duplicate() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = with_fake(tmp.path(), &fake);
+        let scope_a = scope("batch-original-a");
+        let scope_b = scope("batch-original-b");
+        let server_a = registry
+            .ensure_live(&scope_a, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let server_b = registry
+            .ensure_live(&scope_b, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity_b = live_identity(&server_b).await;
+        let mut permit_a = registry
+            .begin_retirement(&scope_a, None, None, close_deadline())
+            .await
+            .unwrap();
+        let mut permit_b = registry
+            .begin_retirement(&scope_b, None, None, close_deadline())
+            .await
+            .unwrap();
+        permit_a.work_scope = scope_b.clone();
+        permit_a.instance = identity_b.clone();
+        permit_b.work_scope = scope_b.clone();
+        permit_b.instance = identity_b;
+        registry
+            .cancel_retirement_batch(vec![permit_a, permit_b])
+            .await
+            .unwrap();
+        assert!(!registry.is_retirement_fenced(&scope_a).await);
+        assert!(!registry.is_retirement_fenced(&scope_b).await);
+        assert_eq!(
+            fake.kill_server_count(&live_identity(&server_a).await.socket_path),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn single_cancel_ignores_spoofed_generation_and_preserves_newer_fence() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = Arc::new(with_fake(tmp.path(), &fake));
+        let work_scope = scope("single-stale-generation");
+        let server = registry
+            .ensure_live(&work_scope, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity = live_identity(&server).await;
+        let mut stale = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .unwrap();
+        let current = registry
+            .begin_retirement(&work_scope, None, None, close_deadline())
+            .await
+            .unwrap();
+        assert_ne!(stale.original.generation, current.generation());
+        stale.generation = current.generation();
+
+        registry.cancel_retirement(stale).await.expect(
+            "stale original is a no-op even when its projection spoofs the current generation",
+        );
+        assert!(registry.is_retirement_fenced(&work_scope).await);
+        registry
+            .cancel_retirement(current)
+            .await
+            .expect("current issuer permit remains cancellable");
+        assert!(!registry.is_retirement_fenced(&work_scope).await);
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_cancel_uses_original_generations_not_spoofed_projections() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let issuer = Arc::new(with_fake(tmp.path(), &fake));
+        let scope_a = scope("batch-stale-generation-a");
+        let scope_b = scope("batch-stale-generation-b");
+        let server_a = issuer
+            .ensure_live(&scope_a, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let server_b = issuer
+            .ensure_live(&scope_b, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity_a = live_identity(&server_a).await;
+        let identity_b = live_identity(&server_b).await;
+        let mut stale_a = issuer
+            .begin_retirement(&scope_a, None, None, close_deadline())
+            .await
+            .unwrap();
+        let current_a = issuer
+            .begin_retirement(&scope_a, None, None, close_deadline())
+            .await
+            .unwrap();
+        let mut current_b = issuer
+            .begin_retirement(&scope_b, None, None, close_deadline())
+            .await
+            .unwrap();
+        stale_a.generation = current_a.generation();
+        current_b.generation =
+            TmuxRetirementGeneration(current_b.generation().0.saturating_add(10));
+
+        issuer
+            .cancel_retirement_batch(vec![stale_a, current_b])
+            .await
+            .expect("batch uses original authority, with stale originals a no-op");
+        assert!(issuer.is_retirement_fenced(&scope_a).await);
+        assert!(!issuer.is_retirement_fenced(&scope_b).await);
+        issuer
+            .cancel_retirement(current_a)
+            .await
+            .expect("newer original fence remains cancellable");
+        assert!(!issuer.is_retirement_fenced(&scope_a).await);
+        assert!(!issuer.is_retirement_fenced(&scope_b).await);
+        assert_eq!(fake.kill_server_count(&identity_a.socket_path), 0);
+        assert_eq!(fake.kill_server_count(&identity_b.socket_path), 0);
+    }
+
+    #[tokio::test]
+    async fn wrong_registry_batch_cancel_retains_all_foreign_fences_for_issuer() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let issuer = Arc::new(with_fake(tmp.path(), &fake));
+        let other = with_fake(tmp.path(), &fake);
+        let scope_a = scope("foreign-batch-a");
+        let scope_b = scope("foreign-batch-b");
+        let server_a = issuer
+            .ensure_live(&scope_a, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let server_b = issuer
+            .ensure_live(&scope_b, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity_a = live_identity(&server_a).await;
+        let identity_b = live_identity(&server_b).await;
+        let permit_a = issuer
+            .begin_retirement(&scope_a, None, None, close_deadline())
+            .await
+            .unwrap();
+        let permit_b = issuer
+            .begin_retirement(&scope_b, None, None, close_deadline())
+            .await
+            .unwrap();
+
+        other
+            .ensure_live(&scope_a, tmp.path(), None, None)
+            .await
+            .unwrap();
+        other
+            .ensure_live(&scope_b, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let foreign_a = other
+            .begin_retirement(&scope_a, None, None, close_deadline())
+            .await
+            .unwrap();
+        let foreign_b = other
+            .begin_retirement(&scope_b, None, None, close_deadline())
+            .await
+            .unwrap();
+        assert_eq!(permit_a.original.instance, foreign_a.original.instance);
+        assert_eq!(permit_b.original.instance, foreign_b.original.instance);
+        assert_eq!(permit_a.original.generation, foreign_a.original.generation);
+        assert_eq!(permit_b.original.generation, foreign_b.original.generation);
+        let error = other
+            .cancel_retirement_batch(vec![permit_a, permit_b])
+            .await
+            .expect_err("foreign registry must reject the complete batch");
+        let permits = error.into_permits();
+        assert_eq!(permits.len(), 2);
+        assert!(issuer.is_retirement_fenced(&scope_a).await);
+        assert!(issuer.is_retirement_fenced(&scope_b).await);
+        assert!(other.is_retirement_fenced(&scope_a).await);
+        assert!(other.is_retirement_fenced(&scope_b).await);
+        issuer
+            .cancel_retirement_batch(permits)
+            .await
+            .expect("issuer retains authority over every fence");
+        assert!(other.is_retirement_fenced(&scope_a).await);
+        assert!(other.is_retirement_fenced(&scope_b).await);
+        other
+            .cancel_retirement_batch(vec![foreign_a, foreign_b])
+            .await
+            .unwrap();
+        assert!(!issuer.is_retirement_fenced(&scope_a).await);
+        assert!(!issuer.is_retirement_fenced(&scope_b).await);
+        assert_eq!(fake.kill_server_count(&identity_a.socket_path), 0);
+        assert_eq!(fake.kill_server_count(&identity_b.socket_path), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_retry_deadline_does_not_renew_teardown_expiry() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = Arc::new(with_fake(tmp.path(), &fake));
+        let work_scope = scope("cancel-retry-expiry");
+        let server = registry
+            .ensure_live(&work_scope, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let identity = live_identity(&server).await;
+        let original_expiry = tokio::time::Instant::now() + Duration::from_millis(100);
+        let permit = registry
+            .begin_retirement(&work_scope, None, None, original_expiry)
+            .await
+            .unwrap();
+        let prepared = registry.prepare_retirement(&permit).await.unwrap();
+        let held = registry.inner.write().await;
+        let cancellation = registry.cancel_retirement(permit);
+        tokio::pin!(cancellation);
+        assert!(futures::poll!(cancellation.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let retry = cancellation
+            .await
+            .expect_err("initial cancel deadline expires")
+            .into_permit();
+        assert_eq!(retry.expires, original_expiry);
+        assert_eq!(retry.original.expires, original_expiry);
+        assert!(retry.cancel_expires > retry.expires);
+
+        assert!(matches!(
+            registry.prepare_retirement(&retry).await,
+            Err(TmuxRetirementOutcome::IdentityNotProven { .. })
+        ), "a cancellation retry deadline must not renew teardown authority while the fence is held");
+        drop(held);
+        assert!(registry.is_retirement_fenced(&work_scope).await);
+        registry
+            .cancel_retirement(retry)
+            .await
+            .expect("explicit rollback retry has its own deadline");
+        assert!(fake.server(&identity.socket_path).unwrap().live);
+        assert_eq!(fake.kill_server_count(&identity.socket_path), 0);
+        drop(prepared);
     }
 
     #[tokio::test]
@@ -3640,7 +4539,7 @@ mod tests {
                 .unwrap(),
             TmuxRetirementRehydration::AbsenceVerified
         );
-        let permit = TmuxRetirementPermit {
+        let permit = TmuxRetirementPermit::new(TmuxRetirementOriginal {
             work_scope,
             instance: identity,
             generation: TmuxRetirementGeneration(1),
@@ -3648,7 +4547,8 @@ mod tests {
             exact_process: None,
             had_entry: true,
             expires: close_deadline(),
-        };
+            registry_identity: Arc::clone(&registry.registry_identity),
+        });
         assert_eq!(
             registry.complete_retirement(&permit).await.unwrap(),
             TmuxRetirementOutcome::AbsenceVerified
@@ -3875,7 +4775,7 @@ mod tests {
             .unwrap();
         fake.stall(&socket_path, Stall::AfterProbe);
         let registry = with_fake(tmp.path(), &fake);
-        let permit = TmuxRetirementPermit {
+        let permit = TmuxRetirementPermit::new(TmuxRetirementOriginal {
             work_scope: scope("deadline-stale-permit"),
             instance: TmuxServerInstanceIdentity {
                 socket_path,
@@ -3886,7 +4786,8 @@ mod tests {
             exact_process: None,
             had_entry: true,
             expires: close_deadline(),
-        };
+            registry_identity: Arc::clone(&registry.registry_identity),
+        });
         assert!(matches!(
             registry.complete_retirement(&permit).await.unwrap(),
             TmuxRetirementOutcome::IdentityNotProven { reason }
@@ -4062,7 +4963,10 @@ mod tests {
         assert_eq!(permit.exact_process, Some(server_process));
 
         assert_eq!(
-            restarted.complete_retirement(&permit).await.unwrap(),
+            restarted
+                .complete_retirement(permit.as_ref())
+                .await
+                .unwrap(),
             TmuxRetirementOutcome::Retired
         );
         assert_eq!(fake.kill_server_count(&persisted.socket_path), 1);

@@ -93,9 +93,11 @@ async fn refreshed(
 }
 
 async fn close_source(instance: &TestInstance, source: &phoenix_db::Conversation) {
-    let _response = crate::api::product_conversations::close_product_conversation(
-        axum::extract::State(instance.state.clone()),
-        axum::extract::Path(source.product_conversation_id.to_string()),
+    let _response = Box::pin(
+        crate::api::product_conversations::close_product_conversation(
+            axum::extract::State(instance.state.clone()),
+            axum::extract::Path(source.product_conversation_id.to_string()),
+        ),
     )
     .await
     .unwrap();

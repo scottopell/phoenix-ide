@@ -34,6 +34,9 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::ring::{RingBuffer, RingLine};
 
+mod native_retirement;
+pub use native_retirement::{NativeBashSignal, NativeBashSignalError};
+
 /// Default tombstone tail size (REQ-BASH-006: `TOMBSTONE_TAIL_LINES`).
 pub const TOMBSTONE_TAIL_LINES: usize = 2000;
 
@@ -189,6 +192,17 @@ pub enum ExitState {
     WaiterPanicked,
 }
 
+/// Resource-lifetime proof, independent from process lifecycle or output completeness.
+/// Success means the owned child wait succeeded, all present reader tasks returned
+/// normally (dropping their pipes), and command scratch was removed or absent.
+/// A handled read error can lose output but still release the reader's resources.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaiterSettlement {
+    Pending,
+    Settled,
+    Unverified(String),
+}
+
 /// A bash handle: identity + lifecycle state + watch-channel for exit notification.
 ///
 /// The handle is owned by exactly one `ResourceScopeKeyHandles` registry entry.
@@ -217,7 +231,7 @@ pub struct Handle {
     pub started_at: SystemTime,
     /// The current handle state. Always written through
     /// [`Self::transition_to_terminal`].
-    state: RwLock<Arc<HandleState>>,
+    state: Arc<RwLock<Arc<HandleState>>>,
     lifecycle_epoch: std::sync::Mutex<Option<Arc<AtomicU64>>>,
     /// Kill-attempt bookkeeping for `kill_pending_kernel` semantics.
     /// Separate from `LiveData` so recording an attempt does not require
@@ -229,6 +243,10 @@ pub struct Handle {
     /// (per `tokio::sync::watch` semantics).
     exit_signal: watch::Sender<Option<ExitState>>,
     exit_observer: watch::Receiver<Option<ExitState>>,
+    /// Aggregate proof from the one waiter responsible for this exact handle.
+    waiter_settlement: watch::Sender<WaiterSettlement>,
+    waiter_settlement_producer:
+        std::sync::Mutex<Option<super::operations::WaiterSettlementProducer>>,
 }
 
 impl std::fmt::Debug for Handle {
@@ -447,6 +465,7 @@ impl Handle {
             ring: Mutex::new(RingBuffer::new(ring_bytes_cap)),
         };
         let (tx, rx) = watch::channel::<Option<ExitState>>(None);
+        let (settlement_tx, settlement_producer) = super::operations::waiter_settlement_channel();
         Arc::new(Self {
             controller_scope,
             handle_id,
@@ -457,11 +476,13 @@ impl Handle {
             label,
             working_dir,
             started_at: SystemTime::now(),
-            state: RwLock::new(Arc::new(HandleState::Live(live))),
+            state: Arc::new(RwLock::new(Arc::new(HandleState::Live(live)))),
             lifecycle_epoch: std::sync::Mutex::new(None),
             kill_attempt: RwLock::new(None),
             exit_signal: tx,
             exit_observer: rx,
+            waiter_settlement: settlement_tx,
+            waiter_settlement_producer: std::sync::Mutex::new(Some(settlement_producer)),
         })
     }
 
@@ -642,6 +663,35 @@ impl Handle {
     /// the practical effect is no different.
     pub fn publish_exit(&self, state: ExitState) {
         let _ = self.exit_signal.send(Some(state));
+    }
+
+    /// Subscribe to the late-subscription-safe aggregate waiter settlement witness.
+    pub fn subscribe_waiter_settlement(&self) -> watch::Receiver<WaiterSettlement> {
+        self.waiter_settlement.subscribe()
+    }
+
+    /// Transfer the exact handle's sole success producer to its waiter.
+    /// No Arc clone can claim a replacement, even after the producer is dropped.
+    pub(super) fn take_waiter_settlement_producer(
+        &self,
+    ) -> Option<super::operations::WaiterSettlementProducer> {
+        self.waiter_settlement_producer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+
+    /// Fail closed. An armed panic guard may replace a prior success, but
+    /// failures are terminal and can never be overwritten by success.
+    pub(super) fn unverify_waiter(&self, reason: impl Into<String>) {
+        self.waiter_settlement.send_if_modified(|state| {
+            if matches!(*state, WaiterSettlement::Unverified(_)) {
+                false
+            } else {
+                *state = WaiterSettlement::Unverified(reason.into());
+                true
+            }
+        });
     }
 
     /// Return the live `LiveData`'s pgid if the handle is currently live
@@ -868,6 +918,7 @@ impl Drop for ExitWatchPanicGuard {
                 "bash waiter task dropped without disarm — publishing WaiterPanicked"
             );
             let _ = handle.exit_signal.send(Some(ExitState::WaiterPanicked));
+            handle.unverify_waiter("waiter task panicked or was cancelled");
         }
     }
 }

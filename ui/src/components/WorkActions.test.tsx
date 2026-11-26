@@ -325,6 +325,138 @@ describe('WorkControlBar — persisted Close recovery', () => {
     expect(screen.queryByRole('button', { name: 'Retry exact Close attempt' })).not.toBeInTheDocument();
   });
 
+  it.each([
+    ['conversation_and_processes_stopped', 'Close incomplete — cleanup not confirmed'],
+    ['shutdown_uncertain', 'Close incomplete — shutdown could not be confirmed'],
+  ] as const)('keeps stopped cleanup blockers visible without inferring disk retention from %s', async (certainty, label) => {
+    const snapshot = closeSnapshot('needs_repair', [{
+      scope: 'repo',
+      resource_kind: 'work_scope',
+      identity: 'scope:unresolved',
+      reason: 'inspection_failed',
+      detail: 'scope retirement not confirmed',
+    }]);
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      ...snapshot,
+      close: {
+        ...snapshot.close,
+        run_status: 'stopped',
+        failure: {
+          occurrence_id: 'close-failure:2:stopped-close',
+          reason: 'identity_not_proven',
+          detail: 'Stop admitted during physical retirement',
+          stop_certainty: certainty === 'conversation_and_processes_stopped'
+            ? { kind: certainty, confirmed_at_us: '1234567890123456' }
+            : { kind: certainty },
+          remaining_resources: [],
+        },
+      },
+    } as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-stop-retirement" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} mutationEnabled={false} />,
+    );
+
+    const status = await screen.findByLabelText('Close repair required');
+    expect(status).toBeVisible();
+    expect(status).toHaveTextContent(`⚠ ${label}`);
+    expect(status).not.toHaveTextContent('disk retained');
+    expect(status).toHaveTextContent('repo: work scope · scope:unresolved · inspection failed — scope retirement not confirmed');
+    expect(status).toHaveTextContent('identity not proven — Stop admitted during physical retirement');
+    expect(screen.getByTestId('clean-up-button')).toBeDisabled();
+    expect(screen.getByTestId('abandon-button')).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Retry exact Close attempt' })).not.toBeInTheDocument();
+    expect(api.retryCloseRetirement).not.toHaveBeenCalled();
+  });
+
+  it('renders every exact remaining-resource disposition in a stopped Close snapshot', async () => {
+    const snapshot = closeSnapshot('needs_repair');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      ...snapshot,
+      close: {
+        ...snapshot.close,
+        run_status: 'stopped',
+        residuals: [],
+        failure: {
+          occurrence_id: 'close-failure:remaining-resources',
+          reason: 'identity_not_proven',
+          detail: 'Cleanup could not be confirmed',
+          stop_certainty: { kind: 'conversation_and_processes_stopped', confirmed_at_us: '1234567890123456' },
+          remaining_resources: [
+            { scope: 'scope-alpha', resource_kind: 'worktree', identity: 'worktree:/exact/tree', disposition: 'failed' },
+            { scope: 'scope-beta', resource_kind: 'pty_session', identity: 'pty:exact-session', disposition: 'unattempted' },
+            { scope: 'scope-alpha', resource_kind: 'browser_session', identity: 'browser:unknown-session', disposition: 'unknown' },
+            { scope: 'scope-gamma', resource_kind: 'work_scope', identity: 'scope:residual-only', disposition: 'residual' },
+          ],
+        },
+      },
+    } as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-remaining-resources" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const status = await screen.findByLabelText('Close repair required');
+    expect(status).toHaveTextContent('Close incomplete — cleanup not confirmed');
+    expect(status).toHaveTextContent('conversation and processes stopped');
+    expect(status).toHaveTextContent('Cleanup could not be confirmed');
+    expect(status).not.toHaveTextContent('Residual resources');
+
+    expect(screen.getByText('Remaining resources (4):')).toBeVisible();
+    const resources = status.querySelectorAll('ol li');
+    expect(resources).toHaveLength(4);
+    for (const [index, text] of [
+      'scope: scope-alpha · resource_kind: worktree · identity: worktree:/exact/tree · disposition: failed',
+      'scope: scope-beta · resource_kind: pty_session · identity: pty:exact-session · disposition: unattempted',
+      'scope: scope-alpha · resource_kind: browser_session · identity: browser:unknown-session · disposition: unknown',
+      'scope: scope-gamma · resource_kind: work_scope · identity: scope:residual-only · disposition: residual',
+    ].entries()) {
+      expect(resources[index]).toHaveTextContent(text);
+    }
+  });
+
+  it('offers stopped Close retry for the authoritative product ID, not the successor transcript', async () => {
+    const snapshot = closeSnapshot('needs_repair', [{
+      scope: 'repo',
+      resource_kind: 'worktree',
+      identity: '/work/tree',
+      reason: 'inspection_failed',
+      detail: 'cleanup incomplete',
+    }]);
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      ...snapshot,
+      product_conversation_id: 'product-conversation-owned',
+      close: {
+        ...snapshot.close,
+        attempt_id: 'attempt-stopped-exact',
+        run_ordinal: '9007199254740993',
+        run_status: 'stopped',
+        failure: {
+          occurrence_id: 'close-failure:stopped',
+          reason: 'identity_not_proven',
+          detail: 'Cleanup could not be confirmed',
+          stop_certainty: { kind: 'conversation_and_processes_stopped', confirmed_at_us: '1234567890123456' },
+          remaining_resources: [],
+        },
+      },
+    } as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="successor-transcript-row" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const status = await screen.findByLabelText('Close repair required');
+    const request = screen.getByRole('textbox', { name: 'Explicit fresh safe retry request' });
+    expect(request).toHaveValue(
+      'Please make ONE explicit fresh safe retry via close_conversation for ProductConversation product-conversation-owned, attempt_id attempt-stopped-exact, failed_run_ordinal 9007199254740993. Do not run an automatic loop, use a stale fallback, or discard anything.',
+    );
+    expect(screen.getByRole('link', { name: 'Open Coordinator to request retry' })).toHaveAttribute('href', '/global/coordinator');
+    expect(status).toHaveTextContent('Nothing is admitted automatically');
+    expect(status).toHaveTextContent('send it normally in the Coordinator');
+    expect(screen.queryByRole('button', { name: 'Retry exact Close attempt' })).not.toBeInTheDocument();
+    expect(api.retryCloseRetirement).not.toHaveBeenCalled();
+  });
+
   it('renders exact residual repair evidence after reload', async () => {
     vi.mocked(api.getProductConversationSnapshot).mockResolvedValue(closeSnapshot('needs_repair', [{
       scope: 'scope-1',
@@ -341,6 +473,59 @@ describe('WorkControlBar — persisted Close recovery', () => {
     expect(await screen.findByLabelText('Close repair required')).toHaveTextContent(
       'scope-1: tmux server · server:owned · ownership conflict — different server incarnation is live',
     );
+  });
+
+  it('keeps needs-repair retries scoped to the repair phase and preserves exact loss rows', async () => {
+    const snapshot = closeSnapshot('needs_repair', [{
+      scope: 'repo',
+      resource_kind: 'worktree',
+      identity: '/work/tree',
+      reason: 'inspection_failed',
+      detail: 'cleanup incomplete',
+    }]);
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      ...snapshot,
+      close: {
+        ...snapshot.close,
+        run_status: 'running',
+        failure: null,
+        losses: [
+          { scope: 'repo', generation: '7', category: 'ignored', identity: 'git_path_bytes_hex_v1:7461726765742f69676e6f7265642e62696e' },
+          { scope: 'repo', generation: '7', category: 'modified', identity: 'git_path_bytes_hex_v1:626164ff' },
+        ],
+      },
+    } as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-stopped" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const status = await screen.findByLabelText('Close repair required');
+    expect(status).toHaveTextContent('repo: target/ignored.bin · ignored');
+    expect(status).toHaveTextContent('repo: bad\\xff · modified');
+    expect(status).toHaveTextContent('repo: worktree · /work/tree · inspection failed — cleanup incomplete');
+    expect(screen.queryByRole('button', { name: /discard exact items/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry exact Close attempt' })).toBeVisible();
+  });
+
+  it('shows awaiting loss rows without offering confirmation', async () => {
+    const snapshot = closeSnapshot('awaiting_loss_confirmation');
+    vi.mocked(api.getProductConversationSnapshot).mockResolvedValue({
+      ...snapshot,
+      close: { ...snapshot.close, losses: [{ scope: 'repo', generation: '8', category: 'modified', identity: 'src/main.rs' }] },
+    } as never);
+
+    renderWithProviders(
+      <WorkControlBar conversationId="conv-losses" convModeLabel="Work" phaseType="idle" continuedInConvId={null} prStatusHandle={prStatusHandle()} />,
+    );
+
+    const status = await screen.findByLabelText('Close incomplete');
+    expect(status).toHaveTextContent('Close blocked — content retained');
+    expect(status).toHaveTextContent('Close will not discard these items.');
+    expect(status).not.toHaveTextContent('awaiting loss confirmation');
+    expect(status).toHaveTextContent('repo: src/main.rs · modified');
+    expect(screen.queryByRole('button', { name: /discard exact items/i })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Keep work and cancel Close' })).toBeVisible();
   });
 
   it('requires the attempt-bound stop-work action before settlement', async () => {
@@ -2735,7 +2920,7 @@ describe('WorkControlBar — mobile PR rail (REQ-WAB-011)', () => {
     );
 
     expect(screen.getByTestId('mobile-work-fallback')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toHaveAttribute('title', expect.stringContaining('Exact tracked, untracked'));
+    expect(screen.getByRole('button', { name: /^Close conversation\./ })).toHaveAttribute('title', expect.stringContaining('Exact work blockers remain visible until resolved separately and Close is explicitly retried'));
     expect(screen.queryByLabelText('Open pull requests')).not.toBeInTheDocument();
   });
 

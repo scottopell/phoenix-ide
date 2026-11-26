@@ -18,7 +18,7 @@ use super::traits::{
     TerminalMutationEstablishment, TerminalSubAgentEvidence, ToolExecutor,
 };
 use super::{
-    AcknowledgedEventOutcome, AcknowledgedEventRequest, SseBroadcaster, SseEvent,
+    AcknowledgedEventOutcome, AcknowledgedRuntimeRequest, SseBroadcaster, SseEvent,
     SteeringWakeOutcome, SubAgentCancelRequest, SubAgentSpawnRequest, TaskApprovalHandoffData,
     TaskApprovalHandoffRequest,
 };
@@ -62,6 +62,12 @@ mod commit_cancellation;
 #[cfg(test)]
 mod concurrent_tools_tests;
 mod continuation;
+mod native_close;
+#[cfg(test)]
+pub(crate) use native_close::source_entry::SourceEntryController;
+pub(crate) use native_close::source_entry::{SourceEntryWorker, WorkerEntryResult};
+mod native_close_observe;
+pub(crate) mod native_close_retry;
 mod native_spawn;
 use native_spawn::{NativeSpawnCutoff, NativeSpawnHandoff, NativeSpawnPhase};
 mod self_goal;
@@ -153,12 +159,14 @@ enum AuthoritativeEffect {
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
     },
     ApproveTaskFreshHandoff {
         task_file: String,
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
     },
     PersistForkProposal {
         proposal_id: String,
@@ -361,22 +369,26 @@ impl ClassifiedEffect {
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             } => Self::Authoritative(Box::new(AuthoritativeEffect::ApproveTask {
                 task_file,
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             })),
             Effect::ApproveTaskFreshHandoff {
                 task_file,
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             } => Self::Authoritative(Box::new(AuthoritativeEffect::ApproveTaskFreshHandoff {
                 task_file,
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             })),
             Effect::PersistForkProposal {
                 proposal_id,
@@ -2288,7 +2300,8 @@ where
     terminals: crate::terminal::ActiveTerminals,
     event_rx: mpsc::Receiver<Event>,
     event_tx: mpsc::Sender<Event>,
-    acknowledged_event_rx: mpsc::Receiver<AcknowledgedEventRequest>,
+    acknowledged_event_rx: mpsc::Receiver<AcknowledgedRuntimeRequest>,
+    actor_database: Option<crate::db::Database>,
     cancellation_input_rx: Option<mpsc::Receiver<super::cancellation_inbox::CancellationInput>>,
     cancellation_custody: commit_cancellation::CancellationCustody,
     handoff_review_rx: Option<mpsc::Receiver<super::HandoffReviewRequest>>,
@@ -2408,6 +2421,12 @@ where
     fatal_local_authority_rx: Option<watch::Receiver<Option<&'static str>>>,
     fatal_external_effect_cancellation: Option<CancellationToken>,
     #[cfg(test)]
+    native_close_phase_observer: Option<
+        tokio::sync::mpsc::UnboundedSender<native_close::NativeCloseInitialContinuationPhase>,
+    >,
+    #[cfg(test)]
+    native_close_settlement_entry_observer: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    #[cfg(test)]
     external_effect_dispatch_barrier: Option<Arc<tokio::sync::Barrier>>,
     #[cfg(test)]
     semantic_publication_barrier: Option<Arc<tokio::sync::Barrier>>,
@@ -2441,6 +2460,10 @@ where
     svg_publication_lifetime: Arc<super::svg_artifacts::SvgPublicationLifetime>,
     handoff_completion_authority: Option<crate::runtime::AdmittedOperation>,
     required_settlement_authority: Option<RequiredSettlementScope>,
+    // Actor-only controller; background Close workers receive no reopening API.
+    native_close_source_entry: Option<native_close::source_entry::SourceEntryController>,
+    #[cfg(test)]
+    staged_native_close_source_entry: Option<native_close::source_entry::SourceEntryController>,
     handoff_completion_timestamp: Option<DateTime<Utc>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
@@ -2617,6 +2640,7 @@ where
             event_tx,
             broadcast_tx,
             acknowledged_event_rx,
+            actor_database: None,
             cancellation_input_rx: None,
             cancellation_custody: commit_cancellation::CancellationCustody::default(),
             handoff_review_rx: None,
@@ -2650,6 +2674,10 @@ where
                 fatal_local_authority_fence.external_effect_cancellation(),
             ),
             #[cfg(test)]
+            native_close_phase_observer: None,
+            #[cfg(test)]
+            native_close_settlement_entry_observer: None,
+            #[cfg(test)]
             external_effect_dispatch_barrier: None,
             #[cfg(test)]
             semantic_publication_barrier: None,
@@ -2666,6 +2694,9 @@ where
             svg_publication_lifetime: super::svg_artifacts::SvgPublicationLifetime::new(),
             handoff_completion_authority: None,
             required_settlement_authority: None,
+            native_close_source_entry: None,
+            #[cfg(test)]
+            staged_native_close_source_entry: None,
             handoff_completion_timestamp: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             recovery_disposition: RuntimeRecoveryDisposition::Continue,
@@ -2767,12 +2798,46 @@ where
             })
     }
 
+    /// Close admission synchronously, whether or not an entered leaf has drained.
+    fn try_revoke_native_close_source_entry(&mut self) -> bool {
+        self.native_close_source_entry
+            .as_mut()
+            .is_none_or(|controller| {
+                controller.revoke() != native_close::source_entry::ActorEntryResult::Busy
+            })
+    }
+
+    /// Before changing the source, wait for a leaf already holding its short
+    /// guard. Fatal unknown custody may never unlock and forbids publication.
+    async fn revoke_native_close_source_entry(&mut self) {
+        while !self.try_revoke_native_close_source_entry()
+            && !self
+                .fatal_local_authority_fence
+                .fatal_authority_loss_is_latched()
+        {
+            tokio::task::yield_now().await;
+        }
+    }
+
     fn install_live_state(
         &mut self,
         state: ConvState,
         state_updated_at: DateTime<Utc>,
         publish: bool,
     ) -> Result<(), String> {
+        if self
+            .native_close_source_entry
+            .as_ref()
+            .is_some_and(|controller| !controller.matches_state(&state))
+            && self
+                .native_close_source_entry
+                .as_mut()
+                .expect("checked controller")
+                .revoke()
+                == native_close::source_entry::ActorEntryResult::Busy
+        {
+            return Err("Close first effect must finish before source replacement".into());
+        }
         let _owner = self.live_state_owner()?;
         self.state = state;
         self.state_updated_at = state_updated_at;
@@ -2860,9 +2925,14 @@ where
     /// Set the parent event channel (for sub-agents)
     pub fn with_acknowledged_event_receiver(
         mut self,
-        receiver: mpsc::Receiver<AcknowledgedEventRequest>,
+        receiver: mpsc::Receiver<AcknowledgedRuntimeRequest>,
     ) -> Self {
         self.acknowledged_event_rx = receiver;
+        self
+    }
+
+    pub(crate) fn with_actor_database(mut self, db: crate::db::Database) -> Self {
+        self.actor_database = Some(db);
         self
     }
 
@@ -3279,6 +3349,70 @@ where
         startup_authority.owner = None;
         drop(startup_authority);
 
+        let mut pending_native_close_initial: Option<native_close::NativeCloseInitialContinuation> =
+            None;
+        let mut pending_native_close_retry: Option<
+            native_close_retry::NativeCloseRetryContinuation,
+        > = None;
+        let mut admitted_native_close_retry: Option<native_close_retry::AdmittedRetryCursor> = None;
+        // Fatal authority exits must not release a continuation's source authority
+        // or target gate while its owned preparation worker is still running.
+        // Outline repeated Close cleanup bodies: native poll-stack measurements,
+        // unlike future layout, include their construction temporaries even on
+        // ordinary dispatch. Keep loop control and continuation custody here.
+        macro_rules! join_pending_native_close_before_fatal {
+            () => {
+                Box::pin(self.join_pending_native_close_before_fatal(
+                    &mut pending_native_close_initial,
+                    &mut pending_native_close_retry,
+                    &mut admitted_native_close_retry,
+                ))
+                .await;
+            };
+        }
+        let mut queued_acknowledged_request: Option<AcknowledgedRuntimeRequest> = None;
+        let mut queued_event: Option<Event> = None;
+        let mut prefer_queued_event = false;
+        let mut native_close_step_ready = false;
+        // Retain one absolute deadline across select iterations. Recreating a
+        // relative sleep lets ordinary request traffic postpone Close forever.
+        let mut next_native_close_service_at = tokio::time::Instant::now();
+        let mut deferred_native_close_exit: Option<RuntimeExitDisposition> = None;
+
+        macro_rules! clean_up_native_close_after_source_event {
+            () => {
+                if let Some(continuation) = pending_native_close_initial.as_mut() {
+                    continuation.abort_inspection_if_source_revoked(&self.state);
+                    if continuation.phase
+                        == native_close::NativeCloseInitialContinuationPhase::InspectionRequired
+                    {
+                        continuation.abort_inventory_preparation();
+                    }
+                    if Box::pin(continuation.release_if_exactly_terminal()).await {
+                        pending_native_close_initial = None;
+                    }
+                }
+            };
+        }
+
+        macro_rules! defer_exit_until_native_close_observed {
+            ($event_loop:lifetime, $disposition:expr) => {{
+                let disposition = $disposition;
+                let Some(exit) = Box::pin(self.prepare_native_close_exit(
+                    &mut pending_native_close_initial,
+                    &mut pending_native_close_retry,
+                    &mut admitted_native_close_retry,
+                    disposition,
+                ))
+                .await
+                else {
+                    deferred_native_close_exit = Some(disposition);
+                    continue $event_loop;
+                };
+                return exit;
+            }};
+        }
+
         // Process events and outcomes in a loop - no recursion
         // Input sources:
         //   event_rx          — user events + legacy executor events (continuation, sub-agent results)
@@ -3290,32 +3424,87 @@ where
         let exhausted_maintenance_deadline = (self.exhausted_maintenance
             && matches!(self.state, ConvState::ContextExhausted { .. }))
         .then(|| tokio::time::Instant::now() + Duration::from_secs(30));
-        loop {
-            if self.fatal_local_authority_fence.is_closed() {
-                return self.closed_authority_exit().await;
-            }
-            if let Some(disposition) = self.recovery_exit_disposition() {
-                tracing::warn!(
-                    conversation_id = %self.context.conversation_id,
-                    "Exiting runtime to reconstruct an uncommitted operation from database truth"
-                );
-                return disposition;
-            }
-            if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
-                return self.fatal_local_authority_exit();
-            }
-            if self
-                .fatal_local_authority_fence
-                .fatal_authority_loss_is_latched()
+        'runtime_events: loop {
+            if self.local_terminal_authority == LocalTerminalAuthority::Fatal
+                || self
+                    .fatal_local_authority_fence
+                    .fatal_authority_loss_is_latched()
             {
+                join_pending_native_close_before_fatal!();
                 return self.fatal_local_authority_exit();
             }
-            if let Some(observed) = self.cancellation_custody.take_pending() {
-                if let Some(exit) = self.settle_cancellation_input(observed).await {
-                    return exit;
-                }
-                continue;
+            if deferred_native_close_exit.is_some()
+                && pending_native_close_initial.is_none()
+                && admitted_native_close_retry.is_none()
+            {
+                return deferred_native_close_exit
+                    .take()
+                    .expect("checked deferred exit");
             }
+            if self.fatal_local_authority_fence.is_closed() && deferred_native_close_exit.is_none()
+            {
+                self.revoke_native_close_source_entry().await;
+                self.abort_external_effects().await;
+                defer_exit_until_native_close_observed!(
+                    'runtime_events,
+                    RuntimeExitDisposition::CoordinatedShutdown
+                );
+            }
+            if deferred_native_close_exit.is_none() {
+                if let Some(disposition) = self.recovery_exit_disposition() {
+                    tracing::warn!(
+                        conversation_id = %self.context.conversation_id,
+                        "Exiting runtime to reconstruct an uncommitted operation from database truth"
+                    );
+                    defer_exit_until_native_close_observed!('runtime_events, disposition);
+                }
+            }
+            // Sample one FIFO head from each existing source-control queue before
+            // due service. Retain non-control heads, without reordering or dropping
+            // their acknowledgements; a head Stop always wins over Close progress.
+            let close_active = pending_native_close_initial.is_some()
+                || pending_native_close_retry.is_some()
+                || admitted_native_close_retry.is_some();
+            if close_active {
+                tokio::task::yield_now().await;
+            }
+            if queued_acknowledged_request.is_none() {
+                queued_acknowledged_request = self.acknowledged_event_rx.try_recv().ok();
+            }
+            if deferred_native_close_exit.is_none() && queued_event.is_none() {
+                queued_event = self.event_rx.try_recv().ok();
+            }
+            if deferred_native_close_exit.is_none() && !self.has_pending_cancellation() {
+                if let Some(input) = self
+                    .cancellation_input_rx
+                    .as_mut()
+                    .and_then(|rx| rx.try_recv().ok())
+                {
+                    self.retain_cancellation_input(input);
+                }
+            }
+            let cancellation_control_ready =
+                deferred_native_close_exit.is_none() && self.has_pending_cancellation();
+            let acknowledged_control_ready =
+                queued_acknowledged_request.as_ref().is_some_and(|request| {
+                    matches!(request, AcknowledgedRuntimeRequest::Event(request)
+                    if matches!(&request.event, Event::UserCancel { .. } | Event::Shutdown))
+                });
+            let event_control_ready = deferred_native_close_exit.is_none()
+                && queued_event.as_ref().is_some_and(|event| {
+                    matches!(event, Event::UserCancel { .. } | Event::Shutdown)
+                });
+            let source_control_ready = deferred_native_close_exit.is_none()
+                && (cancellation_control_ready
+                    || acknowledged_control_ready
+                    || event_control_ready);
+            // While Close is active, alternate retained non-control heads too:
+            // traffic on one queue cannot hide a Stop behind the other's FIFO head.
+            let serve_queued_event = close_active
+                && deferred_native_close_exit.is_none()
+                && prefer_queued_event
+                && queued_event.is_some()
+                && !acknowledged_control_ready;
             let terminal_retry_at = self
                 .terminal_transition_retry
                 .as_ref()
@@ -3325,6 +3514,10 @@ where
             let batch_deadline = self.foreground_dispatch.batch_deadline();
             let cancellation_resource_cutoff = self.cancellation_custody.pending_cutoff();
             let awaiting_recovery = matches!(self.state, ConvState::AwaitingRecovery { .. });
+            let next_native_retry_service_at = admitted_native_close_retry
+                .as_ref()
+                .map(native_close_retry::AdmittedRetryCursor::next_service_at)
+                .unwrap_or_else(tokio::time::Instant::now);
 
             tokio::select! {
                 biased;
@@ -3335,26 +3528,187 @@ where
                     }
                 }, if self.fatal_local_authority_rx.is_some() => {
                     tracing::error!(?boundary, "fatal local SQLite authority loss; aborting external runtime effects");
+                    join_pending_native_close_before_fatal!();
                     return self.fatal_local_authority_exit();
+                }
+                // Process shutdown closes admission without publishing fatal authority
+                // loss. Wake dormant Close phases once; a cancelled token must not
+                // remain an always-ready branch ahead of their classification work.
+                () = wait_for_optional_cancellation(self.fatal_external_effect_cancellation.clone()),
+                    if deferred_native_close_exit.is_none() => {
+                    if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                        join_pending_native_close_before_fatal!();
+                        return self.fatal_local_authority_exit();
+                    }
+                    self.revoke_native_close_source_entry().await;
+                    self.abort_external_effects().await;
+                    defer_exit_until_native_close_observed!(
+                        'runtime_events,
+                        RuntimeExitDisposition::CoordinatedShutdown
+                    );
+                }
+                () = std::future::ready(()), if cancellation_control_ready => {
+                    let exit = self.settle_cancellation_input().await;
+                    if exit == Some(RuntimeExitDisposition::FatalLocalAuthorityLoss)
+                        || self.fatal_local_authority_fence.fatal_authority_loss_is_latched()
+                    {
+                        join_pending_native_close_before_fatal!();
+                        return self.fatal_local_authority_exit();
+                    }
+                    clean_up_native_close_after_source_event!();
+                    if let Some(disposition) = exit {
+                        defer_exit_until_native_close_observed!('runtime_events, disposition);
+                    }
+                }
+                // Fatal authority remains first. A due Close service pass gets
+                // priority over traffic, then schedules its next deadline after
+                // the awaited work so overdue ticks cannot starve Stop requests.
+                () = tokio::time::sleep_until(next_native_close_service_at),
+                    if !source_control_ready && pending_native_close_initial.as_ref().is_some_and(|continuation| continuation.needs_service(native_close_step_ready)) => {
+                    let mut continuation = pending_native_close_initial.take().expect("guarded continuation");
+                    if Box::pin(continuation.observe_terminal_if_required()).await {
+                        self.revoke_native_close_source_entry().await;
+                        native_close_step_ready = false;
+                        continue;
+                    }
+                    if !continuation.should_step(native_close_step_ready) {
+                        next_native_close_service_at = continuation.next_service_at();
+                        pending_native_close_initial = Some(continuation);
+                        continue;
+                    }
+                    native_close_step_ready = false;
+                    // Continuation owns the exact admitted database authority; admission
+                    // configuration may change after transfer and is not reconsulted.
+                    #[cfg(test)]
+                    {
+                        continuation.settlement_entry_observer = self.native_close_settlement_entry_observer.clone();
+                    }
+                    let stepped = match Box::pin(continuation.ensure_source_entry(
+                        &mut self.native_close_source_entry,
+                        &self.state,
+                    ))
+                    .await
+                    {
+                        Ok(()) => Box::pin(continuation.step(&self.state)).await,
+                        Err(error) => Err(error),
+                    };
+                    #[cfg(test)]
+                    if let (Some(observer), Ok(phase)) = (&self.native_close_phase_observer, &stepped) {
+                        let _ = observer.send(*phase);
+                    }
+                    next_native_close_service_at = continuation.next_service_at();
+                    match stepped {
+                        Ok(phase @ native_close::NativeCloseInitialContinuationPhase::Settle) => {
+                            tracing::debug!(?phase, "initial Close continuation prepared; scheduling one settlement step");
+                            pending_native_close_initial = Some(continuation);
+                            native_close_step_ready = true;
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::ReachedSettlementPhase(phase)) => {
+                            tracing::debug!(?phase, "initial Close reached a typed settlement or inspection boundary");
+                            native_close_step_ready = phase == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection;
+                            pending_native_close_initial = Some(continuation);
+                        }
+                        Ok(
+                            native_close::NativeCloseInitialContinuationPhase::CollectingInspection
+                            | native_close::NativeCloseInitialContinuationPhase::PreparingInventory
+                            | native_close::NativeCloseInitialContinuationPhase::InspectionRequired
+                            | native_close::NativeCloseInitialContinuationPhase::WaitingForQuiescence
+                            | native_close::NativeCloseInitialContinuationPhase::Prepare,
+                        ) => {
+                            pending_native_close_initial = Some(continuation);
+                        }
+                        Ok(
+                            native_close::NativeCloseInitialContinuationPhase::Captured
+                            | native_close::NativeCloseInitialContinuationPhase::RetiringProcesses
+                            | native_close::NativeCloseInitialContinuationPhase::ProcessRetirementBlocked
+                            | native_close::NativeCloseInitialContinuationPhase::RuntimeProcessesDone
+                            | native_close::NativeCloseInitialContinuationPhase::ExitObservationOnly
+                            | native_close::NativeCloseInitialContinuationPhase::ClassifyingLosses
+                            | native_close::NativeCloseInitialContinuationPhase::ClassifyingInspectionFailure
+                            | native_close::NativeCloseInitialContinuationPhase::ClassifyingExitInterruption
+                            | native_close::NativeCloseInitialContinuationPhase::ObservingTerminal,
+                        ) => {
+                            pending_native_close_initial = Some(continuation);
+                            native_close_step_ready = false;
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::AwaitingStopWorkConfirmation) => {
+                            tracing::debug!("initial Close is awaiting Stop work confirmation");
+                            pending_native_close_initial = Some(continuation);
+                        }
+                        Ok(native_close::NativeCloseInitialContinuationPhase::Finished) => {
+                            self.revoke_native_close_source_entry().await;
+                            pending_native_close_initial = None;
+                        }
+                        Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority) => {
+                            if let Some(controller) = self.native_close_source_entry.as_mut() {
+                                controller.close_admission_for_fatal_exit();
+                            }
+                            pending_native_close_initial = Some(continuation);
+                            join_pending_native_close_before_fatal!();
+                            return self.fatal_local_authority_exit();
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "initial Close continuation stopped at classified boundary; retaining source owner for inspection");
+                            pending_native_close_initial = Some(continuation);
+                        }
+                    }
                 }
                 () = async {
                     match exhausted_maintenance_deadline {
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending().await,
                     }
-                }, if matches!(self.state, ConvState::ContextExhausted { .. }) => {
-                    return RuntimeExitDisposition::CoordinatedShutdown;
+                }, if deferred_native_close_exit.is_none() && matches!(self.state, ConvState::ContextExhausted { .. }) => {
+                    defer_exit_until_native_close_observed!(
+                        'runtime_events,
+                        RuntimeExitDisposition::CoordinatedShutdown
+                    );
+                }
+                assessment = async {
+                    match pending_native_close_retry.as_mut() {
+                        Some(continuation) => continuation.ready().await,
+                        None => std::future::pending().await,
+                    }
+                }, if !source_control_ready && pending_native_close_retry.is_some() => {
+                    let continuation = pending_native_close_retry.take().expect("guarded retry continuation");
+                    let (fatal, cursor) = Box::pin(self.finish_native_close_retry(continuation, assessment)).await;
+                    admitted_native_close_retry = cursor;
+                    if fatal {
+                        join_pending_native_close_before_fatal!();
+                        return self.fatal_local_authority_exit();
+                    }
+                }
+                () = tokio::time::sleep_until(next_native_retry_service_at), if !source_control_ready && admitted_native_close_retry.is_some() => {
+                    let mut cursor = admitted_native_close_retry.take().expect("guarded admitted retry");
+                    match Box::pin(cursor.step(&self.state, &mut self.native_close_source_entry)).await {
+                        Ok(true) => { self.revoke_native_close_source_entry().await; }
+                        Ok(false) => {
+                            admitted_native_close_retry = Some(cursor);
+                        }
+                        Err(_) => {
+                            admitted_native_close_retry = Some(cursor);
+                            join_pending_native_close_before_fatal!();
+                            return self.fatal_local_authority_exit();
+                        }
+                    }
                 }
                 Some(review) = async {
                     match self.handoff_review_rx.as_mut() {
                         Some(receiver) => receiver.recv().await,
                         None => std::future::pending().await,
                     }
-                } => {
+                }, if !source_control_ready && !(close_active && (queued_acknowledged_request.is_some() || queued_event.is_some())) => {
+                    if deferred_native_close_exit.is_some() {
+                        let _ = review.response.send(Err("runtime is exiting".into()));
+                        continue;
+                    }
                     let result = self.review_handoff_input(review.input).await;
                     let _ = review.response.send(result);
                     if self.exhausted_maintenance && matches!(self.state, ConvState::ContextExhausted { .. }) {
-                        return RuntimeExitDisposition::CoordinatedShutdown;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::CoordinatedShutdown
+                        );
                     }
                 }
                 () = async {
@@ -3364,46 +3718,135 @@ where
                 }
                 cancellation = async {
                     self.cancellation_input_rx.as_mut().expect("open cancellation inbox").recv().await
-                }, if self.cancellation_input_rx.is_some() => {
+                }, if !cancellation_control_ready && self.cancellation_input_rx.is_some() => {
                     match cancellation {
-                        Some(input) => {
-                            let observed = self.observe_cancellation_input(input);
-                            if let Some(exit) = self.settle_cancellation_input(observed).await { return exit; }
+                        Some(input) if deferred_native_close_exit.is_some() => {
+                            commit_cancellation::refuse_during_exit(input);
                         }
+                        Some(input) => self.retain_cancellation_input(input),
                         None => self.cancellation_input_rx = None,
                     }
                 }
-                Some(AcknowledgedEventRequest { event, acknowledgement, retirement }) = self.acknowledged_event_rx.recv() => {
+                Some(request) = async {
+                    match queued_acknowledged_request.take() {
+                        Some(request) => Some(request),
+                        None => self.acknowledged_event_rx.recv().await,
+                    }
+                }, if (!event_control_ready || acknowledged_control_ready) && !serve_queued_event => {
+                    prefer_queued_event = true;
+                    if deferred_native_close_exit.is_some() {
+                        native_close::refuse_during_exit(request);
+                        continue;
+                    }
+                    let super::AcknowledgedEventRequest { event, acknowledgement, retirement } = match request {
+                        AcknowledgedRuntimeRequest::Event(event) => *event,
+                        AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(request) => {
+                            let super::native_close_application::NativeCloseInitialRequest {
+                                source, backend, target, admitted, target_gate, response,
+                            } = *request;
+                            if pending_native_close_initial.is_some() || pending_native_close_retry.is_some() || admitted_native_close_retry.is_some() {
+                                drop(admitted);
+                                drop(target_gate);
+                                let _ = response.send(Err(super::native_close_application::NativeCloseApplicationError::SourceRefused));
+                                continue;
+                            }
+                            let result = Box::pin(self.admit_native_close_initial(&backend, source, target, admitted, target_gate, response)).await;
+                            let (fatal, continuation) = match result {
+                                Ok(native_close::NativeCloseInitialAdmission::Finished { .. }) => (false, None),
+                                Ok(native_close::NativeCloseInitialAdmission::Continued { continuation, .. }) => (false, Some(*continuation)),
+                                Err(error) => (matches!(error, super::native_close_application::NativeCloseApplicationError::FatalAuthority), None),
+                            };
+                            if let Some(continuation) = continuation {
+                                pending_native_close_initial = Some(continuation);
+                                native_close_step_ready = true;
+                            }
+                            if fatal {
+                                join_pending_native_close_before_fatal!();
+                                return self.fatal_local_authority_exit();
+                            }
+                            continue;
+                        }
+                        AcknowledgedRuntimeRequest::ExecuteNativeCloseObserve(request) => {
+                            let super::native_close_application::NativeCloseObserveRequest {
+                                source, referenced, admitted, target_gate, response,
+                            } = *request;
+                            let result = Box::pin(self.execute_native_close_observe(source, referenced, admitted)).await;
+                            let fatal = matches!(result, Err(super::native_close_application::NativeCloseApplicationError::FatalAuthority));
+                            drop(target_gate);
+                            let _ = response.send(result);
+                            if fatal {
+                                join_pending_native_close_before_fatal!();
+                                return self.fatal_local_authority_exit();
+                            }
+                            continue;
+                        }
+                        AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(request) => {
+                            if pending_native_close_initial.is_some() || pending_native_close_retry.is_some() || admitted_native_close_retry.is_some() {
+                                let _ = request.response.send(Err(super::native_close_application::NativeCloseApplicationError::SourceRefused));
+                                continue;
+                            }
+                            pending_native_close_retry = Box::pin(self.begin_native_close_retry(*request)).await;
+                            continue;
+                        }
+                    };
+                    if matches!(&event, Event::UserCancel { .. } | Event::Shutdown) {
+                        self.revoke_native_close_source_entry().await;
+                    }
                     let result = self.process_acknowledged_event(event).await;
+                    // The durable source fence is part of the event transaction; optional
+                    // Close observation must not delay its acknowledgement.
+                    let _ = acknowledgement.send(result);
+                    clean_up_native_close_after_source_event!();
                     let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
                     if terminal {
                         self.emit_terminal_lifecycle_event().await;
                     }
-                    let _ = acknowledgement.send(result);
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
                         let _ = retirement.await;
-                        return RuntimeExitDisposition::Interrupted;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Interrupted
+                        );
                     }
                     if terminal {
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
-                Some(event) = self.event_rx.recv() => {
+                Some(event) = async {
+                    match queued_event.take() {
+                        Some(event) => Some(event),
+                        None => self.event_rx.recv().await,
+                    }
+                }, if deferred_native_close_exit.is_none() => {
+                    prefer_queued_event = false;
                     // Eviction shutdown signal — exit cleanly so the broadcaster
                     // is dropped and connected SSE clients detect the closed
                     // stream and trigger a reconnect to the new runtime.
                     if matches!(event, Event::Shutdown) {
+                        self.revoke_native_close_source_entry().await;
                         self.svg_publication_lifetime.coordinated_shutdown();
                         tracing::info!(
                             conv_id = %self.context.conversation_id,
                             "Runtime shutdown signal received; aborting external effects and exiting executor loop"
                         );
                         self.abort_external_effects().await;
-                        return RuntimeExitDisposition::CoordinatedShutdown;
+                        if let Some(continuation) = pending_native_close_initial.as_mut() {
+                            if Box::pin(continuation.release_if_exactly_terminal()).await {
+                                pending_native_close_initial = None;
+                            }
+                        }
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::CoordinatedShutdown
+                        );
                     }
                     if let Err(e) = self.process_event(event).await {
                         if e.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:") {
                             tracing::error!(error = %e, "fatal local SQLite authority loss");
+                            join_pending_native_close_before_fatal!();
                             return self.fatal_local_authority_exit();
                         }
                         // process_event already broadcast a typed
@@ -3412,10 +3855,15 @@ where
                         tracing::error!(error = %e, "Error handling event");
                     }
                     if self.local_terminal_authority == LocalTerminalAuthority::Fatal {
+                        join_pending_native_close_before_fatal!();
                         return self.fatal_local_authority_exit();
                     }
+                    clean_up_native_close_after_source_event!();
                     if self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority {
-                        return RuntimeExitDisposition::Interrupted;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Interrupted
+                        );
                     }
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -3425,10 +3873,13 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
-                Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
+                Some((generation, llm_outcome)) = self.llm_outcome_rx.recv(), if deferred_native_close_exit.is_none() => {
                     self.process_generation_tagged_llm_outcome(generation, llm_outcome)
                         .await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
@@ -3439,7 +3890,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 () = async {
@@ -3447,7 +3901,7 @@ where
                         Some(retry_at) => tokio::time::sleep_until(retry_at).await,
                         None => std::future::pending::<()>().await,
                     }
-                }, if terminal_retry_at.is_some() => {
+                }, if deferred_native_close_exit.is_none() && terminal_retry_at.is_some() => {
                     self.retry_terminal_transition().await;
                     if matches!(self.state.step_result(), StepResult::Terminal(_)) {
                         tracing::info!(
@@ -3456,7 +3910,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 () = async {
@@ -3464,12 +3921,12 @@ where
                         Some(deadline) => tokio::time::sleep_until(deadline).await,
                         None => std::future::pending().await,
                     }
-                }, if batch_deadline.is_some() => {
+                }, if deferred_native_close_exit.is_none() && batch_deadline.is_some() => {
                     if let Err(error) = self.expire_batch_waits().await {
                         tracing::error!(%error, "batch wait deadline settlement failed");
                     }
                 }
-                observation = self.foreground_dispatch.observe() => {
+                observation = self.foreground_dispatch.observe(), if deferred_native_close_exit.is_none() => {
                     match self.accept_foreground_observation(observation) {
                         Ok(Some(event)) => {
                             if let Err(error) = self.process_event(event).await {
@@ -3480,11 +3937,15 @@ where
                         Err(error) => tracing::error!(%error, "foreground tool failed"),
                     }
                     if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+                        join_pending_native_close_before_fatal!();
                         return self.fatal_local_authority_exit();
                     }
                     if matches!(self.state.step_result(), StepResult::Terminal(_)) {
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 observation = async {
@@ -3492,7 +3953,7 @@ where
                         Some(handoff) => handoff.observe().await,
                         None => std::future::pending().await,
                     }
-                } => {
+                }, if deferred_native_close_exit.is_none() => {
                     match self.native_spawn_observed(observation).await {
                         Ok(Some(event)) => {
                             if let Err(error) = self.process_event(event).await {
@@ -3503,7 +3964,7 @@ where
                         Err(error) => tracing::error!(%error, "native spawn observation failed"),
                     }
                 }
-                Some((generation, tool_outcome)) = self.tool_outcome_rx.recv() => {
+                Some((generation, tool_outcome)) = self.tool_outcome_rx.recv(), if deferred_native_close_exit.is_none() => {
                     // Generation guard for the tool task, mirroring the
                     // `llm_outcome_rx` guard above. A `forward_tool_outcome`
                     // send whose generation has been superseded (by a later
@@ -3531,10 +3992,13 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
-                Some((generation, attempt)) = self.retry_outcome_rx.recv() => {
+                Some((generation, attempt)) = self.retry_outcome_rx.recv(), if deferred_native_close_exit.is_none() => {
                     // Generation guard for the retry-backoff timer, mirroring the
                     // LLM-outcome guard above. A fire whose generation has been
                     // superseded (a newer `Effect::ScheduleRetry`, or leaving the
@@ -3563,7 +4027,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 // Unified liveness backstop (REQ-SA-006, REQ-BED-005a): one arm
@@ -3574,7 +4041,7 @@ where
                         Some(d) => tokio::time::sleep_until(d).await,
                         None => std::future::pending::<()>().await,
                     }
-                }, if deadline.is_some() => {
+                }, if deferred_native_close_exit.is_none() && deadline.is_some() => {
                     self.handle_deadline_expiry().await;
                     // FM-5 prevention: terminal states exit the loop explicitly.
                     if let StepResult::Terminal(outcome) = self.state.step_result() {
@@ -3584,7 +4051,10 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 // REQ-BED-030: credential helper settled while awaiting recovery
@@ -3593,7 +4063,7 @@ where
                         Some(helper) => helper.wait_for_settlement().await,
                         None => std::future::pending::<()>().await,
                     }
-                }, if awaiting_recovery && self.credential_helper.is_some() => {
+                }, if deferred_native_close_exit.is_none() && awaiting_recovery && self.credential_helper.is_some() => {
                     if let Err(error) = self.handle_credential_settlement(TransitionAuthority::ExistingSettlement).await {
                         tracing::error!(%error, "Error handling credential settlement event");
                     }
@@ -3604,13 +4074,19 @@ where
                             "Conversation reached terminal state, exiting executor loop"
                         );
                         self.emit_terminal_lifecycle_event().await;
-                        return RuntimeExitDisposition::Terminal;
+                        defer_exit_until_native_close_observed!(
+                            'runtime_events,
+                            RuntimeExitDisposition::Terminal
+                        );
                     }
                 }
                 else => break,
             }
         }
 
+        if let Some(continuation) = pending_native_close_retry.take() {
+            Box::pin(continuation.join_before_exit()).await;
+        }
         self.abort_external_effects().await;
         tracing::info!(conv_id = %self.context.conversation_id, "Conversation runtime stopped");
         if self.recovery_disposition == RuntimeRecoveryDisposition::RecreateFromDatabase {
@@ -4082,6 +4558,9 @@ where
         event: Event,
         authority: TransitionAuthority,
     ) -> Result<(), String> {
+        if matches!(&event, Event::UserCancel { .. } | Event::Shutdown) {
+            self.revoke_native_close_source_entry().await;
+        }
         if self.fatal_local_authority_fence.is_closed()
             && self.handoff_completion_authority.is_none()
             && (self
@@ -4545,6 +5024,13 @@ where
         ordinary_input_id: Option<&str>,
         authority: TransitionAuthority,
     ) -> Result<Vec<Event>, String> {
+        if self
+            .native_close_source_entry
+            .as_ref()
+            .is_some_and(|controller| !controller.matches_state(&result.new_state))
+        {
+            self.revoke_native_close_source_entry().await;
+        }
         let notice_boundary = result.effects.iter().find_map(|effect| match effect {
             Effect::CancellationCompleted { accepted_child } => Some(if accepted_child.is_some() {
                 RequiredSettlementBoundary::Child
@@ -7311,6 +7797,85 @@ where
         }
     }
 
+    async fn join_pending_native_close_before_fatal(
+        &mut self,
+        pending_native_close_initial: &mut Option<native_close::NativeCloseInitialContinuation>,
+        pending_native_close_retry: &mut Option<native_close_retry::NativeCloseRetryContinuation>,
+        admitted_native_close_retry: &mut Option<native_close_retry::AdmittedRetryCursor>,
+    ) {
+        // Do not wait on the source mutex: unknown release deliberately
+        // retains it. Join workers, then let process-wide fatal handling
+        // fail-stop without unlocking or publishing a new source state.
+        if let Some(controller) = self.native_close_source_entry.as_mut() {
+            controller.close_admission_for_fatal_exit();
+        }
+        if let Some(continuation) = pending_native_close_retry.take() {
+            Box::pin(continuation.join_before_exit()).await;
+        }
+        if let Some(cursor) = admitted_native_close_retry.take() {
+            Box::pin(cursor.join_before_exit()).await;
+        }
+        if let Some(continuation) = pending_native_close_initial.take() {
+            // Fatal retention is not completion evidence: preserve the
+            // entire owner and its gates until process fail-stop, even
+            // when uncertainty is durable rather than a pending worker.
+            std::mem::forget(continuation);
+        }
+    }
+
+    async fn prepare_native_close_exit(
+        &mut self,
+        pending_native_close_initial: &mut Option<native_close::NativeCloseInitialContinuation>,
+        pending_native_close_retry: &mut Option<native_close_retry::NativeCloseRetryContinuation>,
+        admitted_native_close_retry: &mut Option<native_close_retry::AdmittedRetryCursor>,
+        disposition: RuntimeExitDisposition,
+    ) -> Option<RuntimeExitDisposition> {
+        self.revoke_native_close_source_entry().await;
+        if self
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched()
+        {
+            Box::pin(self.join_pending_native_close_before_fatal(
+                pending_native_close_initial,
+                pending_native_close_retry,
+                admitted_native_close_retry,
+            ))
+            .await;
+            return Some(self.fatal_local_authority_exit());
+        }
+        self.cancellation_custody.refuse_pending_during_exit();
+        if pending_native_close_retry.is_some()
+            || admitted_native_close_retry.is_some()
+            || pending_native_close_initial.is_some()
+        {
+            // Exit observation will no longer poll foreground tasks or deadlines.
+            self.abort_external_effects().await;
+        }
+        if let Some(continuation) = pending_native_close_retry.take() {
+            Box::pin(continuation.join_before_exit()).await;
+        }
+        if self
+            .fatal_local_authority_fence
+            .fatal_authority_loss_is_latched()
+        {
+            Box::pin(self.join_pending_native_close_before_fatal(
+                pending_native_close_initial,
+                pending_native_close_retry,
+                admitted_native_close_retry,
+            ))
+            .await;
+            return Some(self.fatal_local_authority_exit());
+        }
+        if let Some(continuation) = pending_native_close_initial.as_mut() {
+            continuation.begin_exit_interruption();
+        }
+        if pending_native_close_initial.is_some() || admitted_native_close_retry.is_some() {
+            None
+        } else {
+            Some(disposition)
+        }
+    }
+
     fn fatal_local_authority_exit(&mut self) -> RuntimeExitDisposition {
         self.abort_external_effects_in_memory();
         RuntimeExitDisposition::FatalLocalAuthorityLoss
@@ -8549,12 +9114,16 @@ where
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             } => {
                 self.execute_approve_task(
-                    task_file,
-                    title,
-                    priority,
-                    plan,
+                    TaskApprovalInput {
+                        task_file,
+                        title,
+                        priority,
+                        plan,
+                        reviewed_proposal,
+                    },
                     task_approval_execution.ok_or_else(|| {
                         "task approval execution was not resolved before effect admission"
                             .to_string()
@@ -8570,10 +9139,18 @@ where
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             } => {
                 let authority = admitted.reborrow();
                 let completion = self
-                    .execute_approve_task_fresh_handoff(task_file, title, priority, plan, authority)
+                    .execute_approve_task_fresh_handoff(
+                        task_file,
+                        title,
+                        priority,
+                        plan,
+                        reviewed_proposal,
+                        authority,
+                    )
                     .await?;
                 self.retain_handoff_completion_authority(
                     completion.as_ref(),
@@ -12469,19 +13046,24 @@ where
 
     fn restore_retryable_task_approval(
         &mut self,
-        task_file: String,
-        title: String,
-        priority: crate::task_source::Priority,
-        plan: String,
+        approval: TaskApprovalInput,
         error: &str,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
+        let TaskApprovalInput {
+            task_file,
+            title,
+            priority,
+            plan,
+            reviewed_proposal,
+        } = approval;
         self.install_live_state(
             ConvState::AwaitingTaskApproval {
                 task_file,
                 title,
                 priority,
                 plan,
+                reviewed_proposal,
             },
             Utc::now(),
             true,
@@ -12512,13 +13094,17 @@ where
     #[allow(clippy::too_many_lines)] // NonEmptyString construction adds wrapping lines
     async fn execute_approve_task(
         &mut self,
-        task_file: String,
-        title: String,
-        priority: crate::task_source::Priority,
-        plan: String,
+        approval: TaskApprovalInput,
         execution: TaskApprovalExecution,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<(), String> {
+        let TaskApprovalInput {
+            task_file,
+            title,
+            priority,
+            plan,
+            reviewed_proposal: reviewed_proposal_backup,
+        } = approval;
         if execution == TaskApprovalExecution::FollowUp {
             let result = self
                 .approve_follow_up_in_existing_scope(&task_file, &title, priority, &plan, admitted)
@@ -12527,7 +13113,15 @@ where
                 Ok(()) => Ok(()),
                 Err(FollowUpApprovalError::BeforeGit(error)) => {
                     self.restore_retryable_task_approval(
-                        task_file, title, priority, plan, &error, admitted,
+                        TaskApprovalInput {
+                            task_file,
+                            title,
+                            priority,
+                            plan,
+                            reviewed_proposal: reviewed_proposal_backup,
+                        },
+                        &error,
+                        admitted,
                     )?;
                     Err(error)
                 }
@@ -12621,6 +13215,7 @@ where
         let title_backup = title.clone();
         let priority_backup = priority;
         let plan_backup = plan.clone();
+        let reviewed_proposal_backup = reviewed_proposal_backup.clone();
 
         // Run blocking git/fs operations on a blocking thread.
         let blocking_admission = admitted.reborrow();
@@ -12796,6 +13391,7 @@ where
                         title: title_backup,
                         priority: priority_backup,
                         plan: plan_backup,
+                        reviewed_proposal: reviewed_proposal_backup,
                     },
                     Utc::now(),
                     true,
@@ -12831,6 +13427,7 @@ where
         title: String,
         priority: crate::task_source::Priority,
         plan: String,
+        reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
         authority: crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let cwd = self.context.filesystem_root().to_path_buf();
@@ -12840,6 +13437,7 @@ where
         let title_backup = title.clone();
         let priority_backup = priority;
         let plan_backup = plan.clone();
+        let reviewed_proposal_backup = reviewed_proposal.clone();
 
         let mut authority = authority;
         let blocking_admission = authority.reborrow();
@@ -12872,6 +13470,7 @@ where
                         title: title_backup,
                         priority: priority_backup,
                         plan: plan_backup,
+                        reviewed_proposal: reviewed_proposal_backup,
                     },
                     Utc::now(),
                     true,
@@ -12923,6 +13522,16 @@ where
             successor_conv_id: response.successor_conv_id,
         }))
     }
+}
+
+/// Input for task approval, including the reviewed proposal provenance.
+#[derive(Debug)]
+struct TaskApprovalInput {
+    task_file: String,
+    title: String,
+    priority: crate::task_source::Priority,
+    plan: String,
+    reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
 }
 
 /// Result of a successful task approval
@@ -13164,41 +13773,62 @@ fn reread_reviewed_task_handoff_snapshot(
     )
 }
 
-fn reread_reviewed_task_handoff_snapshot_at_exact_path(
-    cwd: &std::path::Path,
-    _repo_root: &std::path::Path,
+#[derive(Debug)]
+enum ReviewedTaskHandoffReadError {
+    Semantic(String),
+    Unavailable(String),
+}
+
+fn classify_reviewed_task_handoff_io_error(
+    error: &std::io::Error,
+    message: String,
+) -> ReviewedTaskHandoffReadError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        ReviewedTaskHandoffReadError::Semantic(message)
+    } else {
+        ReviewedTaskHandoffReadError::Unavailable(message)
+    }
+}
+
+fn read_reviewed_task_handoff_snapshot_at_exact_path(
+    cwd: &Path,
     tasks_dir_name: &str,
     task_file: &str,
     expected_title: &str,
     expected_priority: crate::task_source::Priority,
     expected_plan: &str,
-) -> Result<ReviewedTaskHandoffSnapshot, String> {
+) -> Result<ReviewedTaskHandoffSnapshot, ReviewedTaskHandoffReadError> {
     let path = cwd.join(task_file);
-    let metadata = path
-        .symlink_metadata()
-        .map_err(|error| format!("Failed to inspect reviewed task file '{task_file}': {error}"))?;
+    let metadata = path.symlink_metadata().map_err(|error| {
+        let message = format!("Failed to inspect reviewed task file '{task_file}': {error}");
+        classify_reviewed_task_handoff_io_error(&error, message)
+    })?;
     if !metadata.file_type().is_file() {
-        return Err(format!(
+        return Err(ReviewedTaskHandoffReadError::Semantic(format!(
             "Reviewed task file '{task_file}' must remain a regular file. Reject and re-approve the replacement artifact."
-        ));
+        )));
     }
-    let canonical_path = path
-        .canonicalize()
-        .map_err(|error| format!("Failed to resolve reviewed task file '{task_file}': {error}"))?;
-    let canonical_cwd = cwd
-        .canonicalize()
-        .map_err(|error| format!("Failed to resolve the working directory: {error}"))?;
+    let canonical_path = path.canonicalize().map_err(|error| {
+        let message = format!("Failed to resolve reviewed task file '{task_file}': {error}");
+        classify_reviewed_task_handoff_io_error(&error, message)
+    })?;
+    let canonical_cwd = cwd.canonicalize().map_err(|error| {
+        let message = format!("Failed to resolve the working directory: {error}");
+        classify_reviewed_task_handoff_io_error(&error, message)
+    })?;
     if !canonical_path.starts_with(&canonical_cwd) {
-        return Err(format!(
+        return Err(ReviewedTaskHandoffReadError::Semantic(format!(
             "Reviewed task file '{task_file}' resolves outside the working directory. Reject and re-approve the replacement artifact."
-        ));
+        )));
     }
-    let body = std::fs::read_to_string(&path)
-        .map_err(|error| format!("Failed to read reviewed task file '{task_file}': {error}"))?;
+    let body = std::fs::read_to_string(&path).map_err(|error| {
+        let message = format!("Failed to read reviewed task file '{task_file}': {error}");
+        classify_reviewed_task_handoff_io_error(&error, message)
+    })?;
     if body != expected_plan {
-        return Err(format!(
+        return Err(ReviewedTaskHandoffReadError::Semantic(format!(
             "Reviewed task file '{task_file}' no longer matches the approved plan. Reject and re-approve the updated artifact."
-        ));
+        )));
     }
     if let Some(stem) = detect_plain_markdown_task_stem(task_file) {
         let source = crate::task_source::TaskSource::PlainMarkdown { stem: stem.clone() };
@@ -13211,31 +13841,58 @@ fn reread_reviewed_task_handoff_snapshot_at_exact_path(
         });
     }
 
-    let filename = std::path::Path::new(task_file)
+    let filename = Path::new(task_file)
         .file_name()
-        .and_then(|f| f.to_str())
-        .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+        .and_then(|file| file.to_str())
+        .ok_or_else(|| {
+            ReviewedTaskHandoffReadError::Semantic(format!(
+                "task_file has no filename component: '{task_file}'"
+            ))
+        })?;
     let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
-        format!(
+        ReviewedTaskHandoffReadError::Semantic(format!(
             "task_file '{filename}' does not match the taskmd filename pattern (NNNNN-pX-status--slug.md)"
-        )
+        ))
     })?;
     if !task_file.starts_with(&format!("{tasks_dir_name}/")) {
-        return Err(format!(
+        return Err(ReviewedTaskHandoffReadError::Semantic(format!(
             "taskmd-named task files must be under {tasks_dir_name}/ (got '{task_file}')"
-        ));
+        )));
     }
     let derived_priority = phoenix_core::task_source::Priority(parsed.priority);
     if derived_priority != expected_priority {
-        return Err(format!(
+        return Err(ReviewedTaskHandoffReadError::Semantic(format!(
             "Reviewed task file '{task_file}' priority changed from the approved snapshot. Reject and re-approve the updated artifact."
-        ));
+        )));
     }
     Ok(ReviewedTaskHandoffSnapshot {
         task_id: parsed.id,
         task_title: expected_title.to_string(),
         artifact_body: body,
         task_file: task_file.to_string(),
+    })
+}
+
+fn reread_reviewed_task_handoff_snapshot_at_exact_path(
+    cwd: &std::path::Path,
+    _repo_root: &std::path::Path,
+    tasks_dir_name: &str,
+    task_file: &str,
+    expected_title: &str,
+    expected_priority: crate::task_source::Priority,
+    expected_plan: &str,
+) -> Result<ReviewedTaskHandoffSnapshot, String> {
+    read_reviewed_task_handoff_snapshot_at_exact_path(
+        cwd,
+        tasks_dir_name,
+        task_file,
+        expected_title,
+        expected_priority,
+        expected_plan,
+    )
+    .map_err(|error| match error {
+        ReviewedTaskHandoffReadError::Semantic(message)
+        | ReviewedTaskHandoffReadError::Unavailable(message) => message,
     })
 }
 
@@ -16797,9 +17454,11 @@ mod test_git_helpers {
 /// (not a private helper) so the handler's full transition-time behaviour
 /// is exercised end-to-end.
 #[cfg(test)]
-mod creation_completion_lifecycle_tests {
+pub(crate) mod creation_completion_lifecycle_tests {
     use super::*;
+    mod native_close_admission_tests;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::runtime::AcknowledgedEventRequest;
     use crate::tools::BrowserSessionManager;
     use phoenix_llm::ModelRegistry;
     use std::path::PathBuf;
@@ -16852,6 +17511,41 @@ mod creation_completion_lifecycle_tests {
             llm,
             event_tx,
         }
+    }
+
+    pub(crate) fn spawn_bounded_native_close_retry_actor(
+        db: crate::db::Database,
+        source_transcript_id: String,
+        state: ConvState,
+        fatal_local_authority_fence: Arc<crate::runtime::FatalLocalAuthorityFence>,
+    ) -> (
+        mpsc::Sender<AcknowledgedRuntimeRequest>,
+        tokio::task::JoinHandle<bool>,
+    ) {
+        let mut harness = runtime(state);
+        harness.runtime = harness
+            .runtime
+            .with_fatal_local_authority_fence(fatal_local_authority_fence);
+        harness.runtime.context.conversation_id = source_transcript_id;
+        harness.runtime.context.is_coordinator = true;
+        harness.runtime = harness.runtime.with_actor_database(db);
+        let (sender, receiver) = mpsc::channel(1);
+        harness.runtime = harness.runtime.with_acknowledged_event_receiver(receiver);
+        let task = tokio::spawn(async move {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(60),
+                harness.runtime.acknowledged_event_rx.recv(),
+            )
+            .await
+            .expect("bounded retry actor did not receive its request")
+            {
+                Some(AcknowledgedRuntimeRequest::ExecuteNativeCloseRetry(request)) => {
+                    harness.runtime.handle_native_close_retry(*request).await
+                }
+                _ => false,
+            }
+        });
+        (sender, task)
     }
 
     fn creation_claim() -> phoenix_core::domain::creation_protocol::CreationClaim {
@@ -16953,11 +17647,13 @@ mod creation_completion_lifecycle_tests {
         let (retirement_tx, retirement_rx) = oneshot::channel();
 
         acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event: creation_event(),
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
+            .send(AcknowledgedRuntimeRequest::Event(Box::new(
+                AcknowledgedEventRequest {
+                    event: creation_event(),
+                    acknowledgement: ack_tx,
+                    retirement: retirement_rx,
+                },
+            )))
             .await
             .unwrap();
 
@@ -17018,11 +17714,13 @@ mod creation_completion_lifecycle_tests {
         let (ack_tx, mut ack_rx) = oneshot::channel();
         let (_retirement_tx, retirement_rx) = oneshot::channel();
         acknowledged_event_tx
-            .send(AcknowledgedEventRequest {
-                event: creation_event(),
-                acknowledgement: ack_tx,
-                retirement: retirement_rx,
-            })
+            .send(AcknowledgedRuntimeRequest::Event(Box::new(
+                AcknowledgedEventRequest {
+                    event: creation_event(),
+                    acknowledgement: ack_tx,
+                    retirement: retirement_rx,
+                },
+            )))
             .await
             .unwrap();
 
@@ -19157,6 +19855,7 @@ mod authoritative_user_message_effect_tests {
             title: "Handoff completion".to_string(),
             priority: crate::task_source::Priority::P1,
             plan: "Complete the handoff".to_string(),
+            reviewed_proposal: None,
         };
         let (state_tx, state_rx) = watch::channel(rt.state.clone());
         rt.state_watcher = Some(state_tx);
@@ -19215,6 +19914,7 @@ mod authoritative_user_message_effect_tests {
             title: "Terminal settlement".to_string(),
             priority: crate::task_source::Priority::P1,
             plan: "Preserve exact terminal evidence".to_string(),
+            reviewed_proposal: None,
         };
 
         assert!(rt
@@ -19335,6 +20035,7 @@ mod authoritative_user_message_effect_tests {
             title: "Admitted terminal".to_string(),
             priority: crate::task_source::Priority::P1,
             plan: "Finish the admitted atomic unit".to_string(),
+            reviewed_proposal: None,
         };
         let settlement = tokio::spawn(async move {
             let result = rt
@@ -20849,6 +21550,7 @@ mod approved_explore_follow_up_tests {
                 title: "Follow up".to_string(),
                 priority: crate::task_source::Priority::P1,
                 plan: plan.to_string(),
+                reviewed_proposal: None,
             },
             storage,
             Arc::new(MockLlmClient::new("test-model")),
@@ -20915,10 +21617,13 @@ mod approved_explore_follow_up_tests {
         );
         runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Detached checkpoint".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Detached checkpoint".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 execution,
                 &mut admitted,
             )
@@ -20986,10 +21691,13 @@ mod approved_explore_follow_up_tests {
         );
         runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 TaskApprovalExecution::Initial,
                 &mut admitted,
             )
@@ -21031,15 +21739,27 @@ mod approved_explore_follow_up_tests {
         let mut runtime =
             approved_explore_runtime(worktree, task_file, reviewed_plan, storage, broadcast_tx);
         runtime.state = ConvState::LlmRequesting { attempt: 1 };
+        let reviewed = phoenix_core::domain::task_approval::ReviewedProposal::capture(
+            phoenix_core::domain::task_approval::ProposalOccurrence::capture(
+                "assistant-1",
+                "call-1",
+            )
+            .unwrap(),
+            &crate::task_source::TaskSource::detect("72004-p1-ready--follow-up.md").unwrap(),
+            reviewed_plan,
+        );
         let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
         let mut admitted = authority_fence.try_acquire().expect("open authority fence");
 
         let error = runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                reviewed_plan.to_string(),
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: reviewed_plan.to_string(),
+                    reviewed_proposal: Some(reviewed.clone()),
+                },
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -21047,10 +21767,16 @@ mod approved_explore_follow_up_tests {
             .expect_err("edited task must fail approval");
 
         assert!(error.contains("no longer matches the approved plan"));
-        assert!(matches!(
+        assert_eq!(
             runtime.state,
-            ConvState::AwaitingTaskApproval { .. }
-        ));
+            ConvState::AwaitingTaskApproval {
+                task_file: task_file.to_string(),
+                title: "Follow up".to_string(),
+                priority: crate::task_source::Priority::P1,
+                plan: reviewed_plan.to_string(),
+                reviewed_proposal: Some(reviewed),
+            }
+        );
     }
 
     #[tokio::test]
@@ -21081,10 +21807,13 @@ mod approved_explore_follow_up_tests {
 
         let error = runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -21107,10 +21836,13 @@ mod approved_explore_follow_up_tests {
         );
         recovered
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -21153,10 +21885,13 @@ mod approved_explore_follow_up_tests {
 
         let error = runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -21205,10 +21940,13 @@ mod approved_explore_follow_up_tests {
 
         runtime
             .execute_approve_task(
-                task_file.to_string(),
-                "Follow up".to_string(),
-                crate::task_source::Priority::P1,
-                plan.to_string(),
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Follow up".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
                 TaskApprovalExecution::FollowUp,
                 &mut admitted,
             )
@@ -22351,6 +23089,7 @@ mod approve_task_failure_effect_tests {
                 title: "Fresh handoff".to_string(),
                 priority: crate::task_source::Priority::P2,
                 plan: "Plan\n".to_string(),
+                reviewed_proposal: None,
             },
             Arc::new(InMemoryStorage::new()),
             llm,
@@ -22420,6 +23159,7 @@ mod approve_task_failure_effect_tests {
                 title: "Persist failure".to_string(),
                 priority: crate::task_source::Priority::P2,
                 plan: "# Persist failure\n".to_string(),
+                reviewed_proposal: None,
             },
             storage,
             Arc::new(MockLlmClient::new("test-model")),
@@ -22474,6 +23214,7 @@ mod approve_task_failure_effect_tests {
                 title: "Fix the login bug".to_string(),
                 priority: crate::task_source::Priority::P2,
                 plan: "Plan".to_string(),
+                reviewed_proposal: None,
             },
             Arc::new(InMemoryStorage::new()),
             llm.clone(),
@@ -30278,6 +31019,7 @@ mod steer_drain_detector_tests {
                 title: "task".into(),
                 priority: phoenix_core::task_source::Priority::P1,
                 plan: "plan".into(),
+                reviewed_proposal: None,
             },
             ConvState::AwaitingUserResponse {
                 questions: vec![],
@@ -35543,3 +36285,83 @@ mod tool_generation_guard_tests {
 
 #[cfg(test)]
 mod tracking_context_tests;
+
+#[cfg(test)]
+mod close_run_inner_layout_tests {
+    use super::*;
+    use crate::runtime::ProductionRuntime;
+    use std::future::Future;
+
+    fn future_size<Arg, F: Future>(_: impl FnOnce(Arg) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    fn future_size2<Arg1, Arg2, F: Future>(_: impl FnOnce(Arg1, Arg2) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    fn future_size3<Arg1, Arg2, Arg3, F: Future>(_: impl FnOnce(Arg1, Arg2, Arg3) -> F) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    fn future_size4<Arg1, Arg2, Arg3, Arg4, F: Future>(
+        _: impl FnOnce(Arg1, Arg2, Arg3, Arg4) -> F,
+    ) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    fn future_size7<Arg1, Arg2, Arg3, Arg4, Arg5, Arg6, Arg7, F: Future>(
+        _: impl FnOnce(Arg1, Arg2, Arg3, Arg4, Arg5, Arg6, Arg7) -> F,
+    ) -> usize {
+        std::mem::size_of::<F>()
+    }
+
+    #[test]
+    fn production_run_inner_future_layout() {
+        let run_inner_bytes = future_size(crate::runtime::ProductionRuntime::run_inner);
+        eprintln!("\nproduction run_inner future: {run_inner_bytes} bytes");
+        eprintln!(
+            "native Close continuation/cursor layouts: initial={} bytes, retry={} bytes, admitted_retry_cursor={} bytes",
+            std::mem::size_of::<native_close::NativeCloseInitialContinuation>(),
+            std::mem::size_of::<native_close_retry::NativeCloseRetryContinuation>(),
+            std::mem::size_of::<native_close_retry::AdmittedRetryCursor>(),
+        );
+        let runtime_bytes = std::mem::size_of::<crate::runtime::ProductionRuntime>();
+        let update_conversation_state_bytes =
+            future_size3(crate::db::Database::update_conversation_state);
+        eprintln!(
+            "type-only shared DB source-fence diagnostic: ProductionRuntime={runtime_bytes} bytes, raw Database::update_conversation_state future={update_conversation_state_bytes} bytes",
+        );
+        let process_event_bytes = future_size3(ProductionRuntime::process_event_with_authority);
+        let apply_transition_bytes =
+            future_size4(ProductionRuntime::apply_transition_result_with_authority);
+        let apply_deadline_bytes =
+            future_size4(ProductionRuntime::apply_transition_result_with_deadline);
+        let execute_effect_bytes = future_size2(ProductionRuntime::execute_effect);
+        let execute_authoritative_bytes =
+            future_size4(ProductionRuntime::execute_authoritative_effect);
+        let inline_drain_bytes = future_size7(ProductionRuntime::run_effects_with_inline_drain);
+        let apply_inner_bytes = future_size4(ProductionRuntime::apply_transition_result_inner);
+        let persist_state_bytes = future_size3(ProductionRuntime::persist_state_effect);
+        let commit_drain_bytes = future_size4(ProductionRuntime::commit_steering_drain);
+        eprintln!("raw runtime process_event_with_authority future={process_event_bytes} bytes");
+        eprintln!(
+            "raw runtime apply_transition_result_with_authority future={apply_transition_bytes} bytes"
+        );
+        eprintln!(
+            "raw runtime apply_transition_result_with_deadline future={apply_deadline_bytes} bytes"
+        );
+        eprintln!("raw runtime execute_effect future={execute_effect_bytes} bytes");
+        eprintln!(
+            "raw runtime execute_authoritative_effect future={execute_authoritative_bytes} bytes"
+        );
+        eprintln!("raw runtime run_effects_with_inline_drain future={inline_drain_bytes} bytes");
+        eprintln!("raw runtime apply_transition_result_inner future={apply_inner_bytes} bytes");
+        eprintln!("raw runtime persist_state_effect future={persist_state_bytes} bytes");
+        eprintln!("raw runtime commit_steering_drain future={commit_drain_bytes} bytes");
+        assert_ne!(
+            run_inner_bytes, 0,
+            "future layout diagnostic must report a real type"
+        );
+    }
+}

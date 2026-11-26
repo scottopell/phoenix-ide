@@ -15,6 +15,7 @@ use phoenix_core::process_identity::{
     current_process_identity, process_identity_matches, ProcessIdentity,
 };
 
+use super::close_gate;
 use super::probe::{command_output, probe_until, ProbeResult};
 use super::registry::{TmuxError, TMUX_DEFAULT_SESSION};
 
@@ -87,6 +88,11 @@ pub enum TokenBoundKill {
     Failed { reason: String },
 }
 
+/// Runs a synchronous destructive sink under caller-owned source custody.
+/// The sink must not retain the lease or suspend while holding it.
+pub type TmuxDestructiveEntry<'a> =
+    dyn FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String> + Send + 'a;
+
 #[async_trait]
 pub trait TmuxBackend: Send + Sync + std::fmt::Debug {
     fn binary_available(&self) -> bool;
@@ -142,6 +148,41 @@ pub trait TmuxBackend: Send + Sync + std::fmt::Debug {
         expires: Instant,
     ) -> TokenBoundKill;
 
+    /// Requires teardown bound to the exact process incarnation at the effect.
+    /// Backends without that capability fail closed; token/PID observations followed
+    /// by a new socket-path command are not an exact-process capability.
+    async fn kill_server_if_process(
+        &self,
+        _socket_path: &Path,
+        _config_path: &Path,
+        _expected_token: &str,
+        _expected_process: ProcessIdentity,
+        expires: Instant,
+    ) -> TokenBoundKill {
+        if Instant::now() >= expires {
+            TokenBoundKill::DeadlineExceeded
+        } else {
+            TokenBoundKill::Failed {
+                reason: "backend cannot bind tmux teardown to the exact process incarnation"
+                    .to_string(),
+            }
+        }
+    }
+
+    /// Exact teardown with source entry acquired only at the destructive sink.
+    /// Unsupported backends fail closed rather than holding entry over an await.
+    async fn kill_server_if_process_with_entry(
+        &self,
+        _socket_path: &Path,
+        _config_path: &Path,
+        _expected_token: &str,
+        _expected_process: ProcessIdentity,
+        _expires: Instant,
+        _enter: &mut TmuxDestructiveEntry<'_>,
+    ) -> Result<TokenBoundKill, String> {
+        Err("backend cannot enter exact tmux teardown at its destructive sink".into())
+    }
+
     /// `Ok(None)` when tmux reports no such window.
     async fn capture_pane(
         &self,
@@ -182,6 +223,20 @@ impl SystemTmuxBackend {
             binary_available: which::which("tmux").is_ok(),
         }
     }
+}
+
+fn resolve_exact_kill_entry(
+    result: TokenBoundKill,
+    refusal: Option<String>,
+    sink_result: Option<Result<(), String>>,
+) -> Result<TokenBoundKill, String> {
+    if let Some(reason) = refusal {
+        return Err(reason);
+    }
+    if let Some(Err(reason)) = sink_result {
+        return Ok(TokenBoundKill::Failed { reason });
+    }
+    Ok(result)
 }
 
 #[async_trait]
@@ -277,44 +332,86 @@ impl TmuxBackend for SystemTmuxBackend {
         expected_token: &str,
         expires: Instant,
     ) -> TokenBoundKill {
-        let token_test = format!("#{{==:#{{E:{SERVER_TOKEN_VAR}}},{expected_token}}}");
-        let mut command = tokio::process::Command::new("tmux");
-        command
-            .arg("-f")
-            .arg(config_path)
-            .arg("-S")
-            .arg(socket_path)
-            .args([
-                "if-shell",
-                "-F",
-                &token_test,
-                "kill-server",
-                "display-message -p PHOENIX_TOKEN_MISMATCH",
-            ])
-            .env_remove("TMUX")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        command.kill_on_drop(true);
-        match command_output(command, Some(expires)).await {
-            Ok(None) => TokenBoundKill::DeadlineExceeded,
-            Ok(Some(output)) if output.status.success() => {
-                if String::from_utf8_lossy(&output.stdout).contains("PHOENIX_TOKEN_MISMATCH") {
-                    TokenBoundKill::TokenMismatch
-                } else {
-                    TokenBoundKill::Killed
-                }
-            }
-            Ok(Some(output)) => TokenBoundKill::Failed {
-                reason: format!(
-                    "exact token-bound kill-server failed: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
-            },
-            Err(error) => TokenBoundKill::Failed {
-                reason: error.to_string(),
-            },
+        kill_server_if_condition(
+            socket_path,
+            config_path,
+            &format!("#{{==:#{{E:{SERVER_TOKEN_VAR}}},{expected_token}}}"),
+            expires,
+        )
+        .await
+    }
+
+    async fn kill_server_if_process(
+        &self,
+        socket_path: &Path,
+        config_path: &Path,
+        expected_token: &str,
+        expected_process: ProcessIdentity,
+        expires: Instant,
+    ) -> TokenBoundKill {
+        self.kill_server_if_process_with_entry(
+            socket_path,
+            config_path,
+            expected_token,
+            expected_process,
+            expires,
+            &mut |sink| sink(),
+        )
+        .await
+        .unwrap_or_else(|reason| TokenBoundKill::Failed { reason })
+    }
+
+    async fn kill_server_if_process_with_entry(
+        &self,
+        socket_path: &Path,
+        config_path: &Path,
+        expected_token: &str,
+        expected_process: ProcessIdentity,
+        expires: Instant,
+        enter: &mut TmuxDestructiveEntry<'_>,
+    ) -> Result<TokenBoundKill, String> {
+        if Instant::now() >= expires {
+            return Ok(TokenBoundKill::DeadlineExceeded);
         }
+        if !self.binary_available {
+            return Ok(TokenBoundKill::Failed {
+                reason: "tmux binary unavailable".into(),
+            });
+        }
+        let helper_executable = match std::env::current_exe() {
+            Ok(path) => path,
+            Err(error) => {
+                return Ok(TokenBoundKill::Failed {
+                    reason: format!("cannot locate helper executable: {error}"),
+                })
+            }
+        };
+        let mut refusal = None;
+        let mut sink_result = None;
+        let result = close_gate::retire_exact_on_server_with_entry(
+            socket_path,
+            config_path,
+            expected_token,
+            expected_process,
+            expires,
+            &helper_executable,
+            &mut |sink| {
+                let entered = enter(&mut || {
+                    sink_result = Some(sink());
+                    // Keep sink failures separate from source/writer entry refusal.
+                    // The entry lease must still observe a successful sink invocation.
+                    Ok(())
+                });
+                if let Err(reason) = entered {
+                    refusal = Some(reason.clone());
+                    Err(reason)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        resolve_exact_kill_entry(result, refusal, sink_result)
     }
 
     async fn capture_pane(
@@ -594,6 +691,51 @@ async fn run_tmux_quiet_output(socket_path: &Path, args: &[&str]) -> std::io::Re
         .await
 }
 
+async fn kill_server_if_condition(
+    socket_path: &Path,
+    config_path: &Path,
+    condition: &str,
+    expires: Instant,
+) -> TokenBoundKill {
+    let mut command = tokio::process::Command::new("tmux");
+    command
+        .arg("-f")
+        .arg(config_path)
+        .arg("-S")
+        .arg(socket_path)
+        .args([
+            "if-shell",
+            "-F",
+            condition,
+            "kill-server",
+            "display-message -p PHOENIX_TOKEN_MISMATCH",
+        ])
+        .env_remove("TMUX")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command.kill_on_drop(true);
+    match command_output(command, Some(expires)).await {
+        Ok(None) => TokenBoundKill::DeadlineExceeded,
+        Ok(Some(output)) if output.status.success() => {
+            if String::from_utf8_lossy(&output.stdout).contains("PHOENIX_TOKEN_MISMATCH") {
+                TokenBoundKill::TokenMismatch
+            } else {
+                TokenBoundKill::Killed
+            }
+        }
+        Ok(Some(output)) => TokenBoundKill::Failed {
+            reason: format!(
+                "exact token-bound kill-server failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        },
+        Err(error) => TokenBoundKill::Failed {
+            reason: error.to_string(),
+        },
+    }
+}
+
 async fn exact_server_process_identity_until(
     socket_path: &Path,
     expected_token: &str,
@@ -863,6 +1005,31 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    #[tokio::test(start_paused = true)]
+    async fn system_exact_process_teardown_fails_closed_without_path_command() {
+        let backend = SystemTmuxBackend {
+            binary_available: false,
+        };
+        let expires = Instant::now() + Duration::from_secs(1);
+        let process = ProcessIdentity {
+            pid: 42,
+            start_time: 123,
+        };
+        let socket = Path::new("/not-opened-by-exact-retirement/socket");
+        let config = Path::new("/not-opened-by-exact-retirement/config");
+        let outcome = backend
+            .kill_server_if_process(socket, config, "inherited-token", process, expires)
+            .await;
+        assert!(matches!(outcome, TokenBoundKill::Failed { .. }));
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(
+            backend
+                .kill_server_if_process(socket, config, "inherited-token", process, expires)
+                .await,
+            TokenBoundKill::DeadlineExceeded
+        );
+    }
+
     #[test]
     fn production_spawn_builds_exact_pane_environment() {
         let token = "test-server-token";
@@ -977,5 +1144,35 @@ mod tests {
             backend.endpoint(&socket).unwrap(),
             SocketEndpoint::Socket(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod exact_kill_entry_tests {
+    use super::{resolve_exact_kill_entry, TokenBoundKill};
+
+    #[test]
+    fn entry_refusal_remains_distinct_even_after_successful_sink() {
+        let result = resolve_exact_kill_entry(
+            TokenBoundKill::Killed,
+            Some("writer entry refused".into()),
+            Some(Ok(())),
+        );
+        assert_eq!(result, Err("writer entry refused".into()));
+    }
+
+    #[test]
+    fn sink_error_is_a_kill_failure_not_an_entry_refusal() {
+        let result = resolve_exact_kill_entry(
+            TokenBoundKill::Killed,
+            None,
+            Some(Err("approval sink failed".into())),
+        );
+        assert_eq!(
+            result,
+            Ok(TokenBoundKill::Failed {
+                reason: "approval sink failed".into(),
+            })
+        );
     }
 }

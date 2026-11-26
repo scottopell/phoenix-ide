@@ -1257,23 +1257,28 @@ impl Database {
                 "unactivated batch {batch_id} no longer has exact unclaimed membership"
             )));
         }
-        let failed = serde_json::to_string(&ConvState::Failed {
+        let failed_state = ConvState::Failed {
             error: "Sub-agent activation cancelled because parent membership was not committed"
                 .to_string(),
             error_kind: ErrorKind::Cancelled,
-        })
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
+        };
+        let failed = serde_json::to_string(&failed_state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
         for child in children {
-            sqlx::query(
+            let updated = sqlx::query(
                 "UPDATE conversations
                  SET state = ?2, state_kind = 'failed', state_updated_at = ?3, updated_at = ?3
                  WHERE id = ?1",
             )
-            .bind(child)
+            .bind(&child)
             .bind(&failed)
             .bind(abandoned_at.to_rfc3339())
             .execute(&mut *tx)
             .await?;
+            if updated.rows_affected() > 0 {
+                crate::native_close::fence_native_retry_sources_tx(&mut tx, &child, &failed_state)
+                    .await?;
+            }
         }
         if let Err(error) = tx.commit().await {
             let remaining = sqlx::query_scalar::<_, i64>(
@@ -1492,7 +1497,7 @@ impl Database {
             let serialized = serde_json::to_string(&failed)
                 .map_err(|error| DbError::Serialization(error.to_string()))?;
             let updated_at = requested_at.to_rfc3339();
-            sqlx::query(
+            let updated = sqlx::query(
                 "UPDATE conversations
                  SET state = ?2, state_kind = 'failed',
                      state_updated_at = ?3, updated_at = ?3
@@ -1503,6 +1508,14 @@ impl Database {
             .bind(updated_at)
             .execute(&mut *tx)
             .await?;
+            if updated.rows_affected() > 0 {
+                crate::native_close::fence_native_retry_sources_tx(
+                    &mut tx,
+                    child_conversation_id,
+                    &failed,
+                )
+                .await?;
+            }
         }
 
         let outcome = if cancelled_before_dispatch {
@@ -1785,7 +1798,7 @@ impl Database {
         {
             return LocalAuthorityResult::DurableFactEstablished(Err(error.into()));
         }
-        if let Err(error) = sqlx::query(
+        let updated = match sqlx::query(
             "UPDATE conversations
              SET state = ?2, state_kind = ?3, state_updated_at = ?4, updated_at = ?4
              WHERE id = ?1",
@@ -1797,7 +1810,19 @@ impl Database {
         .execute(&mut *tx)
         .await
         {
-            return LocalAuthorityResult::DurableFactEstablished(Err(error.into()));
+            Ok(updated) => updated,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        if updated.rows_affected() > 0 {
+            if let Err(error) = crate::native_close::fence_native_retry_sources_tx(
+                &mut tx,
+                child_conversation_id,
+                state,
+            )
+            .await
+            {
+                return LocalAuthorityResult::DurableFactEstablished(Err(error));
+            }
         }
         if let Err(error) = cut.commit(tx).await {
             let classified = if cut.classifier_unavailable() {
@@ -1926,6 +1951,8 @@ impl Database {
                 parent_conversation_id.to_string(),
             ));
         }
+        crate::native_close::fence_native_retry_sources_tx(&mut tx, parent_conversation_id, state)
+            .await?;
         let accepted = sqlx::query(
             "UPDATE sub_agent_runs SET parent_accepted_at_unix_micros = ?2
              WHERE child_conversation_id = ?1

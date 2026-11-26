@@ -1084,6 +1084,7 @@ mod tests {
             title: "Example".into(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Review".into(),
+            reviewed_proposal: None,
         };
         let assistant = Message {
             origin: InputOrigin::UnknownHistorical,
@@ -1182,6 +1183,7 @@ mod tests {
             title: "Example".into(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Review".into(),
+            reviewed_proposal: None,
         };
         let mut tx = db.pool().begin().await.unwrap();
         record_wait_entry_tx(&mut tx, &source.id, &waiting)
@@ -1266,6 +1268,7 @@ mod tests {
             title: "Example".into(),
             priority: phoenix_core::task_source::Priority::P1,
             plan: "Review".into(),
+            reviewed_proposal: None,
         };
         let legacy: ConvState = serde_json::from_value(serde_json::json!({
             "type": "awaiting_user_response", "tool_use_id": "reused", "questions": []
