@@ -13645,21 +13645,8 @@ impl Database {
         Ok(row.get(0))
     }
 
-    /// Scan all conversations for orphaned `tool_use` and inject synthetic `tool_result`.
-    /// An orphaned `tool_use` is an agent message containing `tool_use` blocks where
-    /// not all `tool_use` IDs have a corresponding `tool_result` in the following messages.
-    ///
-    /// Skips conversations in preserved (frozen) states — `context_exhausted`,
-    /// `terminal`, continuation/recovery states, and approval states. Those
-    /// match the allowlist in `reset_all_to_idle` (the conversation is not
-    /// going to make another LLM call, so injecting a synthetic `tool_result`
-    /// only adds noise to history).
-    async fn repair_orphaned_tool_use(&self, now: &DateTime<Utc>) -> DbResult<()> {
-        use phoenix_core::domain::llm_types::ContentBlock;
-
-        // Skip conversations whose state is preserved across restarts; their
-        // history is frozen and shouldn't be amended with synthetic results.
-        let conv_rows: Vec<(String, Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+    async fn orphan_tool_repair_targets(&self) -> DbResult<Vec<OrphanToolRepairTarget>> {
+        sqlx::query_as(
             "SELECT c.id,
                     CASE WHEN r.terminal_cause IN ('submit_result', 'submit_error')
                         THEN c.state END,
@@ -13685,9 +13672,18 @@ impl Database {
                )",
         )
         .fetch_all(&self.pool)
-        .await?;
+        .await
+        .map_err(Into::into)
+    }
 
-        for (conv_id, terminal_state, terminal_cause, terminal_at) in conv_rows {
+    /// Repair missing tool-result rows outside the frozen continuation and
+    /// approval states. The child lifecycle can prove an accepted submission.
+    async fn repair_orphaned_tool_use(&self, now: &DateTime<Utc>) -> DbResult<()> {
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        for (conv_id, terminal_state, terminal_cause, terminal_at) in
+            self.orphan_tool_repair_targets().await?
+        {
             // Get all messages for this conversation in order
             let messages: Vec<OrphanToolHistoryRow> = sqlx::query_as(
                 "SELECT message_id, sequence_id, message_type, content, created_at
@@ -16455,6 +16451,7 @@ impl MaterializedToolResult<'_> {
     }
 }
 
+type OrphanToolRepairTarget = (String, Option<String>, Option<String>, Option<i64>);
 type OrphanToolHistoryRow = (String, i64, String, String, String);
 
 fn recover_sub_agent_terminal_acknowledgement<'a>(
