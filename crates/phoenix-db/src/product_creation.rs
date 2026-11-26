@@ -2651,7 +2651,9 @@ impl Database {
             ));
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let fence_now = self.product_creation_fence_now().max(now.timestamp_micros());
+        let fence_now = self
+            .product_creation_fence_now()
+            .max(now.timestamp_micros());
         let updated = sqlx::query(
             "UPDATE product_creation_resource_reservations
              SET ownership_token = ?7, updated_at_unix_micros = ?1
@@ -2694,7 +2696,9 @@ impl Database {
             ));
         }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let fence_now = self.product_creation_fence_now().max(now.timestamp_micros());
+        let fence_now = self
+            .product_creation_fence_now()
+            .max(now.timestamp_micros());
         let updated = sqlx::query(
             "UPDATE product_creation_resource_reservations
              SET status = 'present', ownership_token = ?7, updated_at_unix_micros = ?1
@@ -2989,7 +2993,9 @@ impl Database {
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let fence_now = self.product_creation_fence_now().max(now.timestamp_micros());
+        let fence_now = self
+            .product_creation_fence_now()
+            .max(now.timestamp_micros());
         let reserved_id: Option<String> = sqlx::query_scalar(
             "UPDATE product_creation_jobs
              SET status = 'cleanup_ambiguous', retry_at_unix_micros = NULL,
