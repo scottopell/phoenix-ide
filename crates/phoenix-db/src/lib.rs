@@ -18636,7 +18636,10 @@ mod tests {
                 .unwrap(),
             CreationCasOutcome::Applied
         );
-        assert_eq!(db.next_conversation_creation_deadline().await.unwrap(), None);
+        assert_eq!(
+            db.next_conversation_creation_deadline().await.unwrap(),
+            None
+        );
         assert!(db
             .claim_next_conversation_creation_cleanup(
                 "cleanup-b",
@@ -18680,7 +18683,10 @@ mod tests {
             .expect("cleanup claim");
 
         assert_eq!(cleanup.lease_until, now + lease_duration);
-        assert_eq!(db.next_conversation_creation_deadline().await.unwrap(), None);
+        assert_eq!(
+            db.next_conversation_creation_deadline().await.unwrap(),
+            None
+        );
         assert!(db
             .claim_next_conversation_creation_cleanup(
                 "cleanup-b",
