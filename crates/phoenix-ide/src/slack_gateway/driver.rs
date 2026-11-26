@@ -965,7 +965,7 @@ mod tests {
     #[tokio::test]
     async fn private_notifications_attempt_once_for_acceptance_rejection_and_ambiguity() {
         for result in ["submitted", "failed", "invalid", "missing", "unconfigured"] {
-            let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+            let state = crate::api::handlers::api_test_support::make_test_state().await;
             let directory = tempfile::tempdir().unwrap();
             let trace = directory.path().join("calls");
             let response = serde_json::json!({"version":1,"notification_id":"notice","owner":"UFIXTURE","receipt":"receipt","state":result,"reason":"Rejected"}).to_string();
@@ -1056,7 +1056,7 @@ mod tests {
 
     #[tokio::test]
     async fn undispatched_reply_retries_after_tool_readiness_recovers() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let c = Config {
             phoenix_url: "https://localhost:8043".into(),
             ..config()
@@ -1207,7 +1207,7 @@ mod tests {
             .arg(&home)
             .status()
             .unwrap();
-        let mut state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let mut state = crate::api::handlers::api_test_support::make_test_state().await;
         let ids = Arc::new(Mutex::new(Vec::new()));
         state.llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(ReplyModel {
             requests: ids.clone(),
@@ -1446,7 +1446,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_candidate_failure_preserves_observation_of_the_entire_page() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let c = Config {
             enabled: true,
             saved_enabled: false,
@@ -1506,7 +1506,7 @@ mod tests {
         .into_iter()
         .flat_map(|code| [(code, false), (code, true)])
         {
-            let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+            let state = crate::api::handlers::api_test_support::make_test_state().await;
             let c = config();
             let source = phoenix_db::SlackSource {
                 workspace: c.workspace.clone(),
@@ -1574,7 +1574,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn final_state_write_failure_is_reconciled_without_restart_or_resend() {
         for private in [false, true] {
-            let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+            let state = crate::api::handlers::api_test_support::make_test_state().await;
             let directory = tempfile::tempdir().unwrap();
             let marker = directory.path().join("sends");
             let mut c = config();
@@ -1679,7 +1679,7 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     async fn pending_native_question_requires_phoenix_and_new_requests_stay_distinct() {
         use phoenix_core::domain::sm_state::{ConvState, QuestionRequestAuthority, UserQuestion};
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let c = config();
         let conv = state
             .db

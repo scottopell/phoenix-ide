@@ -114,16 +114,6 @@ import {
 import { EnsureReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useViewerRestorationSettled, useViewerSlot } from '../contexts/ViewerSlotContext';
 import { useConversationReadiness } from '../contexts/useConversationReadiness';
-import {
-  ForkProposalsProvider,
-  useForkProposals,
-  type ForkActionOutcome,
-} from '../contexts/ForkProposalsContext';
-
-const ForkProposalReview = lazy(() =>
-  import('../components/ForkProposalReview').then((m) => ({ default: m.ForkProposalReview })),
-);
-
 const TERMINAL_COLLAPSED_PX = 32;
 const terminalPaneMax = () => Math.min(800, Math.floor(window.innerHeight * 0.75));
 
@@ -425,7 +415,6 @@ function ConversationPageContent({
 
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
-  const [deletingConversation, setDeletingConversation] = useState(false);
   // Bumped by every user send or dismissal; see ErrorBanner `userActionSeq`.
   const userActionSeqRef = useRef(0);
   const historyGenerationRef = useRef(0);
@@ -1542,36 +1531,6 @@ function ConversationPageContent({
     }
   }, [navigate, showInfo]);
 
-  // Fork proposal review outcomes (REQ-PROJ-034 / 037): navigate to the new
-  // fork / refinement conversation, or toast a terminal/conflict result.
-  const handleForkOutcome = useCallback(
-    (outcome: ForkActionOutcome) => {
-      switch (outcome.kind) {
-        case 'spawned':
-        case 'promoted':
-          if (outcome.conversationId) {
-            const label = outcome.kind === 'spawned' ? 'fork' : 'refinement';
-            void openConversationById(
-              outcome.conversationId,
-              `Created ${label} conversation.`,
-              `Created ${label} conversation.`,
-              outcome.ownerGeneration,
-            );
-          }
-          break;
-        case 'dismissed':
-          showInfo('Proposal dismissed.');
-          break;
-        case 'already_resolved':
-          showInfo('This proposal was already resolved.');
-          break;
-        default:
-          outcome.kind satisfies never;
-      }
-    },
-    [openConversationById, showInfo],
-  );
-
   const handleTriggerContinuation = useCallback(async () => {
     if (!conversationId || isArchived || readOnly) return;
 
@@ -1926,20 +1885,6 @@ function ConversationPageContent({
     }
     navigate('/new');
   }, [creationFailedDraft, navigate]);
-  const handleDeleteProvisioningConversation = useCallback(async () => {
-    if (!conversationId || deletingConversation) return;
-    setDeletingConversation(true);
-    try {
-      await api.deleteConversation(conversationId);
-      await cacheDB.deleteConversation(conversationId);
-      clearCreateIntent(conversationId);
-      navigate('/');
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to delete conversation');
-      setDeletingConversation(false);
-    }
-  }, [conversationId, deletingConversation, navigate]);
-
   useEffect(() => {
     if (convStateForChildren.type === 'provisioning') return;
     if (convStateForChildren.type !== 'creation_failed' && convStateForChildren.type !== 'creation_cancelled') {
@@ -2249,13 +2194,6 @@ function ConversationPageContent({
     : conversation;
 
   return (
-    <ForkProposalsProvider
-      conversationId={conversationId}
-      ownerGeneration={conversationRouteOwnerRef.current.generation}
-      originTerminal={isArchived || isTerminalConversationState(convStateForChildren)}
-      onOutcome={handleForkOutcome}
-      onError={showError}
-    >
     <div
       {...(embeddedShell ? {} : { id: 'app' })}
       ref={setAppElement}
@@ -2350,14 +2288,6 @@ function ConversationPageContent({
           >
             Cancel
           </button>
-          <button
-            type="button"
-            className="context-exhausted-copy"
-            disabled={deletingConversation}
-            onClick={() => void handleDeleteProvisioningConversation()}
-          >
-            {deletingConversation ? 'Deleting…' : 'Delete'}
-          </button>
         </div>
       )}
       {convStateForChildren.type === 'creation_failed' && (
@@ -2370,14 +2300,6 @@ function ConversationPageContent({
             <div className="context-exhausted-actions">
               <button type="button" className="context-exhausted-continue" onClick={handleStartOverFromFailedCreation}>
                 Start over
-              </button>
-              <button
-                type="button"
-                className="context-exhausted-copy"
-                disabled={deletingConversation}
-                onClick={() => void handleDeleteProvisioningConversation()}
-              >
-                {deletingConversation ? 'Deleting…' : 'Delete'}
               </button>
               {creationFailedPrompt && (
                 <button
@@ -2405,14 +2327,6 @@ function ConversationPageContent({
             <div className="context-exhausted-actions">
               <button type="button" className="context-exhausted-continue" onClick={handleStartOverFromFailedCreation}>
                 Start over
-              </button>
-              <button
-                type="button"
-                className="context-exhausted-copy"
-                disabled={deletingConversation}
-                onClick={() => void handleDeleteProvisioningConversation()}
-              >
-                {deletingConversation ? 'Deleting…' : 'Delete'}
               </button>
             </div>
             {creationCancelledPrompt && (
@@ -2792,32 +2706,5 @@ function ConversationPageContent({
         onLiveResize={handleViewerLiveResize}
       />
     </div>
-    {/* Fork proposal review modal — full-screen, driven by the ForkProposals
-        store's openProposalId (REQ-PROJ-034 / 037). */}
-    <ForkReviewOverlay />
-    </ForkProposalsProvider>
-  );
-}
-
-/** Mounts the fork-proposal review modal when the store has an open proposal.
- *  Lives inside <ForkProposalsProvider> so it can read the open id + actions. */
-function ForkReviewOverlay() {
-  const fork = useForkProposals();
-  if (!fork || !fork.openProposalId) return null;
-  const proposal = fork.getProposal(fork.openProposalId);
-  // Only `pending` proposals are reviewable; a resolved one (e.g. another tab
-  // acted, then the list refetched) withdraws the modal.
-  if (!proposal || proposal.status !== 'pending') return null;
-  const proposalId = proposal.id;
-  return (
-    <Suspense fallback={null}>
-      <ForkProposalReview
-        proposal={proposal}
-        onApprove={() => fork.approve(proposalId)}
-        onDismiss={() => fork.dismiss(proposalId)}
-        onRequestChanges={(note) => fork.requestChanges(proposalId, note)}
-        onClose={fork.closeReview}
-      />
-    </Suspense>
   );
 }

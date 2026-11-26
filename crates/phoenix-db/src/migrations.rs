@@ -1003,6 +1003,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "native_close_origin_owner_cleanup",
         sql: include_str!("migrations/native_close_origin_owner_cleanup.sql"),
     },
+    Migration {
+        version: 192,
+        name: "dismiss_pending_fork_proposals",
+        sql: "UPDATE fork_proposals SET status = 'dismissed', resolved_at = COALESCE(resolved_at, CURRENT_TIMESTAMP) WHERE status = 'pending';",
+    },
 ];
 
 const MIGRATION_175: &str = r"

@@ -255,29 +255,6 @@ describe('InputArea rejected submission ownership', () => {
     expect(screen.getByRole('textbox')).toHaveValue('');
   });
 
-  it.each(['', 'new conversation draft'])('does not resurrect a pending send after hard-delete (fresh draft: %j)', async freshDraft => {
-    const pending = deferredSend();
-    const store = new DraftStore();
-    store.dispatch('a', { type: 'set_draft', text: '  deleted /broken-skill\n' });
-    render(<ConnectedRecoveryHarness store={store} send={pending.send} />);
-    fireEvent.click(screen.getByRole('button', { name: 'Send message' }));
-    expect(pending.send).toHaveBeenCalledWith('deleted /broken-skill', [], [rejectedFile]);
-
-    act(() => {
-      // The hard-delete cascade removes the draft lifetime, not just its text.
-      store.remove('a');
-      if (freshDraft) store.dispatch('a', { type: 'set_draft', text: freshDraft });
-    });
-    const freshRevision = store.getSnapshot('a');
-    await rejectExpansion(pending);
-
-    expect(store.getSnapshot('a')).toBe(freshRevision);
-    expect(store.getRejected('a')).toEqual([]);
-    expect(screen.getByRole('textbox')).toHaveValue(freshDraft);
-    expect(screen.queryByText('Unsent message')).not.toBeInTheDocument();
-    expect(screen.queryByLabelText('Attached files')).not.toBeInTheDocument();
-  });
-
   it('retains a rejection across unmount and restores attachments only on explicit recovery', async () => {
     const pending = deferredSend();
     const store = new DraftStore();

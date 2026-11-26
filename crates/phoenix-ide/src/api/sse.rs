@@ -45,7 +45,6 @@ impl SseStreamAudience {
                 | SseEvent::ConversationBecameTerminal { .. }
                 | SseEvent::ConversationUpdate { .. }
                 | SseEvent::Error { .. }
-                | SseEvent::ConversationHardDeleted { .. }
                 | SseEvent::BrowserSessionState { .. }
                 | SseEvent::BashToolProgress { .. }
                 | SseEvent::RateLimitSnapshot { .. }
@@ -562,16 +561,6 @@ mod tests {
                 "sequence_id": sequence_id,
                 "message": error.flat_message(),
                 "error": error,
-            }),
-            SseEvent::ConversationHardDeleted {
-                sequence_id,
-                conversation_id,
-                deleted_conversation_ids,
-            } => json!({
-                "type": "conversation_hard_deleted",
-                "sequence_id": sequence_id,
-                "conversation_id": conversation_id,
-                "deleted_conversation_ids": deleted_conversation_ids,
             }),
             SseEvent::BrowserSessionState {
                 sequence_id,
@@ -1414,16 +1403,6 @@ mod tests {
     }
 
     #[test]
-    fn parity_conversation_hard_deleted() {
-        let event = SseEvent::ConversationHardDeleted {
-            sequence_id: 21,
-            conversation_id: "product-1".to_string(),
-            deleted_conversation_ids: vec!["conv-1".to_string(), "conv-2".to_string()],
-        };
-        assert_parity(&event);
-    }
-
-    #[test]
     fn parity_browser_session_state_active() {
         let event = SseEvent::BrowserSessionState {
             sequence_id: 22,
@@ -1788,10 +1767,10 @@ mod tests {
     #[tokio::test]
     async fn aggregate_broadcast_lag_terminates_stream() {
         let (tx, rx) = tokio::sync::broadcast::channel(1);
-        let event = || SseEvent::ConversationHardDeleted {
+        let event = || SseEvent::Token {
             sequence_id: 1,
-            conversation_id: "aggregate".to_string(),
-            deleted_conversation_ids: Vec::new(),
+            text: "aggregate event".to_string(),
+            request_id: "aggregate-request".to_string(),
         };
         tx.send(event()).unwrap();
         tx.send(event()).unwrap();

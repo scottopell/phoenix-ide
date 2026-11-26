@@ -14,7 +14,6 @@ import { ContinuationOpeningSchema } from './conversation/opening';
 import type { AboutResourcesSnapshot } from './generated/AboutResourcesSnapshot';
 import type { SqliteWorkloadReportResponse } from './generated/SqliteWorkloadReportResponse';
 import type { SqliteReportWindow } from './generated/SqliteReportWindow';
-import type { ManagedWorktreeCleanupResponse } from './generated/ManagedWorktreeCleanupResponse';
 import type { ReleaseUpdateSnapshot } from './generated/ReleaseUpdateSnapshot';
 import type { ReleaseTransactionStatus } from './generated/ReleaseTransactionStatus';
 import type { ApproveReleaseUpdateResponse } from './generated/ApproveReleaseUpdateResponse';
@@ -1103,31 +1102,6 @@ export class MessageSliceAlignmentError extends Error {
   }
 }
 
-/** Lifecycle status of a decoupled task fork proposal (REQ-PROJ-034 / 037).
- *  `pending` is the only reviewable state; the other three are terminal
- *  resolutions and withdraw the Review affordance. Mirrors the Rust
- *  `ForkProposalStatus` serialization. */
-export type ForkProposalStatus = 'pending' | 'spawned' | 'dismissed' | 'promoted';
-
-/** One fork proposal as rendered to the review surface (REQ-PROJ-034).
- *  Hand-written to mirror the plain-`Serialize` Rust `ForkProposalSummary`
- *  — that module carries no `ts_rs::TS` derives, so there is no generated
- *  type to import (matches the rest of this client). */
-export interface ForkProposalSummary {
-  id: string;
-  status: ForkProposalStatus;
-  title: string;
-  priority: string;
-  task_file: string;
-  /** Snapshotted brief body. The snapshot is not in the transcript, so the
-   *  review modal renders the brief from here, keyed by proposal id. */
-  body: string;
-  /** Set once a proposal is `spawned` — the Work fork's conversation id. */
-  fork_conversation_id?: string;
-  /** Set once a proposal is `promoted` — the Explore refinement's id. */
-  refinement_conversation_id?: string;
-}
-
 export type McpConnState = 'connecting' | 'recovering' | 'ready' | 'unauthorized' | 'failed';
 export type McpTransportKind = 'stdio' | 'http';
 export type McpAuthKind = 'none' | 'static' | 'oauth';
@@ -1517,25 +1491,6 @@ export const api = {
   async deploymentSqliteWorkload(window: SqliteReportWindow): Promise<SqliteWorkloadReportResponse> {
     const resp = await fetch(`/api/deployment/sqlite-workload?window=${encodeURIComponent(window)}`);
     if (!resp.ok) throw new Error('Failed to load sqlite workload report');
-    return resp.json();
-  },
-
-  async cleanupManagedWorktree(path: string): Promise<ManagedWorktreeCleanupResponse> {
-    const resp = await fetch('/api/deployment/disk/managed-worktrees/cleanup', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path }),
-    });
-    if (!resp.ok) {
-      let detail = 'Failed to clean up worktree';
-      try {
-        const body = (await resp.json()) as { error?: string };
-        if (body.error) detail = body.error;
-      } catch {
-        // keep fallback
-      }
-      throw new Error(detail);
-    }
     return resp.json();
   },
 
@@ -2412,17 +2367,6 @@ export const api = {
     return resp.json();
   },
 
-  async deleteConversation(convId: string): Promise<{ ok: boolean }> {
-    const resp = await fetch(`/api/conversations/${convId}/delete`, {
-      method: 'POST',
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({})) as { error?: string; error_type?: string };
-      throw new ApiResponseError(err.error ?? 'Failed to delete', resp.status, err.error_type);
-    }
-    return resp.json();
-  },
-
   async closeProductConversation(reference: string): Promise<void> {
     const resp = await fetch(`/api/product-conversations/${encodeURIComponent(reference)}/close`, {
       method: 'POST',
@@ -3003,108 +2947,6 @@ export const api = {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.error || 'Failed to archive chain');
     }
-  },
-
-  /** DELETE /api/chains/:rootId — hard-delete every member of the chain.
-   *  Refused atomically (no partial wipe) if any member is busy. */
-  async deleteChain(rootId: string): Promise<{
-    success: boolean;
-    outcome: { type: 'deleted'; deleted_conversation_ids: string[] } | { type: 'already_absent' };
-  }> {
-    const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}`, {
-      method: 'DELETE',
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      if (resp.status === 409) {
-        throw new ConflictError(err as ConflictErrorDetail);
-      }
-      throw new ApiResponseError(err.error || 'Failed to delete chain', resp.status, err.error_type);
-    }
-    return resp.json();
-  },
-
-  // -----------------------------------------------------------------
-  // Decoupled task fork proposals (REQ-PROJ-034 / 037)
-  //
-  // The proposal id rides the existing tool-result `display_data`
-  // (`fork_proposal_id`); these endpoints anchor the Review affordance and
-  // its three actions to a specific proposal. A 409 means the proposal was
-  // already resolved (e.g. another tab acted) — callers refetch the list and
-  // let the affordance withdraw.
-  // -----------------------------------------------------------------
-
-  /** GET /api/conversations/:id/proposals — the conversation's fork proposals.
-   *  The Review affordance cross-references this by `display_data.fork_proposal_id`
-   *  to read each proposal's current `status`. */
-  async listForkProposals(convId: string): Promise<ForkProposalSummary[]> {
-    const resp = await fetch(`/api/conversations/${encodeURIComponent(convId)}/proposals`);
-    if (!resp.ok) {
-      if (resp.status === 404) throw new Error('Conversation not found');
-      throw new Error('Failed to list fork proposals');
-    }
-    return (await resp.json()).proposals as ForkProposalSummary[];
-  },
-
-  /** POST /proposals/:proposalId/approve — spawn the Work fork (REQ-PROJ-034).
-   *  Returns the new fork conversation's id. 409 ⇒ already resolved. */
-  async approveForkProposal(
-    convId: string,
-    proposalId: string,
-  ): Promise<{ fork_conversation_id: string }> {
-    const resp = await fetch(
-      `/api/conversations/${encodeURIComponent(convId)}/proposals/${encodeURIComponent(proposalId)}/approve`,
-      { method: 'POST' },
-    );
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      if (resp.status === 409) throw new ConflictError(err as ConflictErrorDetail);
-      throw new Error(err.error || 'Failed to approve proposal');
-    }
-    return resp.json();
-  },
-
-  /** POST /proposals/:proposalId/dismiss — record a `dismissed` resolution
-   *  (REQ-PROJ-034). Idempotent: `no_op` is true when already resolved. */
-  async dismissForkProposal(
-    convId: string,
-    proposalId: string,
-  ): Promise<{ success: boolean; no_op?: boolean }> {
-    const resp = await fetch(
-      `/api/conversations/${encodeURIComponent(convId)}/proposals/${encodeURIComponent(proposalId)}/dismiss`,
-      { method: 'POST' },
-    );
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      if (resp.status === 409) throw new ConflictError(err as ConflictErrorDetail);
-      throw new Error(err.error || 'Failed to dismiss proposal');
-    }
-    return resp.json();
-  },
-
-  /** POST /proposals/:proposalId/request-changes — promote the proposal to a
-   *  fresh Explore refinement carrying the user's change-request note
-   *  (REQ-PROJ-037). Returns the refinement conversation's id. 409 ⇒ already
-   *  resolved. */
-  async requestChangesForkProposal(
-    convId: string,
-    proposalId: string,
-    note: string,
-  ): Promise<{ refinement_conversation_id: string }> {
-    const resp = await fetch(
-      `/api/conversations/${encodeURIComponent(convId)}/proposals/${encodeURIComponent(proposalId)}/request-changes`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ note }),
-      },
-    );
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      if (resp.status === 409) throw new ConflictError(err as ConflictErrorDetail);
-      throw new Error(err.error || 'Failed to request changes');
-    }
-    return resp.json();
   },
 
 };

@@ -200,8 +200,10 @@ async fn process_claimed_product_creation(
             Stage::MaterializeWorktree,
         )
         .await?;
-        let planned_path =
-            deterministic_worktree_path(&repo_root, job.product_conversation_id.as_str());
+        let planned_path = match job.staging_path.as_deref() {
+            Some(path) => PathBuf::from(path),
+            None => product_worktree_path(Path::new(&repo_root), job.product_conversation_id.as_str())?,
+        };
         let reservation_id = format!("{}:worktree", job.request_id);
         let reserved = manager
             .db()
@@ -270,11 +272,9 @@ async fn process_claimed_product_creation(
         let (worktree, ownership_token) = tokio::task::spawn_blocking({
             let repo_root = repo_root.clone();
             let oid = oid.clone();
-            let key = job.product_conversation_id.to_string();
             move || {
                 let _lock = materialization_lock;
-                ensure_phoenix_staging_ignored(Path::new(&repo_root))?;
-                let path = deterministic_worktree_path(&repo_root, &key);
+                let path = planned_path;
                 let already_present = path.try_exists().map_err(|error| {
                     format!("could not inspect staging path {}: {error}", path.display())
                 })?;
@@ -778,6 +778,7 @@ async fn cleanup_unpublished_product_staging(
     let cleanup = cleanup_unpublished_product_staging_path(
         job.staging_path.as_deref(),
         job.staging_repo_root.as_deref(),
+        job.staging_exact_oid.as_deref(),
         ownership_token,
     )
     .await;
@@ -810,6 +811,7 @@ async fn cleanup_unpublished_product_staging(
 async fn cleanup_unpublished_product_staging_path(
     staging_path: Option<&str>,
     staging_repo_root: Option<&str>,
+    expected_oid: Option<&str>,
     ownership_token: Option<&str>,
 ) -> Result<Result<StagingCleanupOutcome, String>, tokio::task::JoinError> {
     let (Some(path), Some(repo_root)) = (
@@ -818,6 +820,7 @@ async fn cleanup_unpublished_product_staging_path(
     ) else {
         return Ok(Ok(StagingCleanupOutcome::AlreadyAbsent));
     };
+    let expected_oid = expected_oid.map(ToOwned::to_owned);
     let ownership_token = ownership_token.map(ToOwned::to_owned);
     tokio::task::spawn_blocking(move || {
         let path = PathBuf::from(path);
@@ -884,14 +887,24 @@ async fn cleanup_unpublished_product_staging_path(
                 ));
             }
         }
+        let status = crate::git_ops::run_git(
+            &path,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignored",
+                "--ignore-submodules=none",
+            ],
+        )?;
+        if !status.is_empty() {
+            return Err("unpublished worktree contains changes or ignored files".to_string());
+        }
+        let oid = expected_oid.ok_or_else(|| "unpublished worktree has no durable checkout pin".to_string())?;
+        crate::api::handlers::validate_detached_task_worktree(&path, &oid)?;
         crate::git_ops::run_git(
             Path::new(&repo_root),
-            &[
-                "worktree",
-                "remove",
-                "--force",
-                path.to_string_lossy().as_ref(),
-            ],
+            &["worktree", "remove", path.to_string_lossy().as_ref()],
         )?;
         Ok(StagingCleanupOutcome::Cleaned)
     })
@@ -909,6 +922,7 @@ async fn reconcile_product_creation_cleanup(
         let cleaned = cleanup_unpublished_product_staging_path(
             Some(&reservation.resource_identity),
             Some(&reservation.repository_identity),
+            cleanup.job.staging_exact_oid.as_deref(),
             reservation.ownership_token.as_deref(),
         )
         .await
@@ -1144,35 +1158,9 @@ fn read_product_creation_owner_marker(worktree_path: &Path) -> Result<Option<Str
     }
 }
 
-fn ensure_phoenix_staging_ignored(repo_root: &Path) -> Result<(), String> {
-    let common_dir = crate::git_ops::run_git(repo_root, &["rev-parse", "--git-common-dir"])?;
-    let common_dir = PathBuf::from(common_dir.trim());
-    let common_dir = if common_dir.is_absolute() {
-        common_dir
-    } else {
-        repo_root.join(common_dir)
-    };
-    let exclude_path = common_dir.join("info").join("exclude");
-    std::fs::create_dir_all(
-        exclude_path
-            .parent()
-            .ok_or_else(|| "git exclude path had no parent".to_string())?,
-    )
-    .map_err(|error| error.to_string())?;
-    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-    if !existing.lines().any(|line| line.trim() == "/.phoenix/") {
-        use std::io::Write;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&exclude_path)
-            .map_err(|error| error.to_string())?;
-        if !existing.is_empty() && !existing.ends_with('\n') {
-            writeln!(file).map_err(|error| error.to_string())?;
-        }
-        writeln!(file, "/.phoenix/").map_err(|error| error.to_string())?;
-    }
-    Ok(())
+fn product_worktree_path(repo_root: &Path, id: &str) -> Result<PathBuf, String> {
+    let common = PathBuf::from(git_common_dir_for_repository_root(repo_root)?);
+    Ok(common.join("phoenix-worktrees").join(id))
 }
 
 fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), String> {
@@ -1193,24 +1181,31 @@ fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), Str
             .ok_or_else(|| {
                 "origin did not advertise an authoritative default branch".to_string()
             })?;
+        let oid = stdout
+            .lines()
+            .filter_map(|line| line.strip_suffix("\tHEAD"))
+            .find(|oid| {
+                matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or_else(|| "origin did not advertise a valid default commit ID".to_string())?;
         run_git_with_timeout(
             repo_root,
             &[
                 "fetch",
-                "origin",
                 "--no-tags",
-                &format!("+refs/heads/{branch}:refs/remotes/origin/{branch}"),
+                "--no-prune",
+                "--no-prune-tags",
+                "--no-recurse-submodules",
+                "--no-auto-maintenance",
+                "--no-write-fetch-head",
+                "--refmap=",
+                "origin",
+                oid,
             ],
             Duration::from_secs(30),
         )?;
-        let oid = crate::git_ops::run_git(
-            repo_root,
-            &[
-                "rev-parse",
-                &format!("refs/remotes/origin/{branch}^{{commit}}"),
-            ],
-        )?;
-        return Ok((oid.trim().to_string(), branch.to_string()));
+        crate::git_ops::run_git(repo_root, &["cat-file", "-e", &format!("{oid}^{{commit}}")])?;
+        return Ok((oid.to_string(), branch.to_string()));
     }
     let oid = crate::git_ops::run_git(repo_root, &["rev-parse", "refs/heads/main^{commit}"])
         .map_err(|_| "repository has no origin and no local refs/heads/main".to_string())?;
@@ -4886,53 +4881,6 @@ mod product_creation_path_classification_tests {
 }
 
 #[cfg(test)]
-mod product_creation_ignore_tests {
-    use super::*;
-
-    #[test]
-    fn staging_ignore_uses_common_exclude_without_rewriting_gitignore() {
-        let repo = tempfile::tempdir().unwrap();
-        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
-        let gitignore = repo.path().join(".gitignore");
-        let original = b"target/\n\xff\xfe\n";
-        std::fs::write(&gitignore, original).unwrap();
-
-        ensure_phoenix_staging_ignored(repo.path()).unwrap();
-        ensure_phoenix_staging_ignored(repo.path()).unwrap();
-
-        assert_eq!(std::fs::read(gitignore).unwrap(), original);
-        let common_dir =
-            crate::git_ops::run_git(repo.path(), &["rev-parse", "--git-common-dir"]).unwrap();
-        let exclude = repo.path().join(common_dir.trim()).join("info/exclude");
-        let contents = std::fs::read_to_string(exclude).unwrap();
-        assert_eq!(
-            contents
-                .lines()
-                .filter(|line| *line == "/.phoenix/")
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn staging_ignore_separates_from_unterminated_common_exclude() {
-        let repo = tempfile::tempdir().unwrap();
-        crate::git_ops::run_git(repo.path(), &["init"]).unwrap();
-        let common_dir =
-            crate::git_ops::run_git(repo.path(), &["rev-parse", "--git-common-dir"]).unwrap();
-        let exclude = repo.path().join(common_dir.trim()).join("info/exclude");
-        std::fs::write(&exclude, "existing-rule").unwrap();
-
-        ensure_phoenix_staging_ignored(repo.path()).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(exclude).unwrap(),
-            "existing-rule\n/.phoenix/\n"
-        );
-    }
-}
-
-#[cfg(test)]
 mod product_creation_staging_ownership_tests {
     use super::*;
 
@@ -4989,6 +4937,7 @@ mod product_creation_staging_ownership_tests {
         let outcome = cleanup_unpublished_product_staging_path(
             Some(path.to_string_lossy().as_ref()),
             Some(repo.path().to_string_lossy().as_ref()),
+            Some(crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap().trim()),
             Some("owner-token"),
         )
         .await
@@ -5000,6 +4949,36 @@ mod product_creation_staging_ownership_tests {
     }
 
     #[tokio::test]
+    async fn owned_staging_with_ignored_content_is_not_removed() {
+        let repo = initialized_repo();
+        let path = product_worktree_path(repo.path(), "owned").unwrap();
+        add_detached_worktree(repo.path(), &path);
+        write_product_creation_owner_marker(&path, "owner-token").unwrap();
+        let common = git_common_dir_for_repository_root(repo.path()).unwrap();
+        let exclude = Path::new(&common).join("info/exclude");
+        std::fs::write(&exclude, "ignored-data\n").unwrap();
+        let ignored = path.join("ignored-data");
+        std::fs::write(&ignored, "preserve me").unwrap();
+        let oid = crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+
+        let outcome = cleanup_unpublished_product_staging_path(
+            path.to_str(),
+            repo.path().to_str(),
+            Some(oid.trim()),
+            Some("owner-token"),
+        )
+        .await
+        .unwrap();
+
+        assert!(outcome.is_err());
+        assert_eq!(std::fs::read_to_string(ignored).unwrap(), "preserve me");
+        assert_eq!(std::fs::read_to_string(exclude).unwrap(), "ignored-data\n");
+        assert!(crate::git_ops::run_git(repo.path(), &["status", "--porcelain"])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
     async fn absent_staging_resource_is_already_reconciled() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("absent");
@@ -5007,6 +4986,7 @@ mod product_creation_staging_ownership_tests {
         let outcome = cleanup_unpublished_product_staging_path(
             Some(path.to_string_lossy().as_ref()),
             Some(root.path().to_string_lossy().as_ref()),
+            None,
             Some("owner-token"),
         )
         .await
@@ -5039,6 +5019,7 @@ mod product_creation_staging_ownership_tests {
         let outcome = cleanup_unpublished_product_staging_path(
             Some(path.to_string_lossy().as_ref()),
             Some(repo.path().to_string_lossy().as_ref()),
+            Some(crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap().trim()),
             Some("original-owner"),
         )
         .await

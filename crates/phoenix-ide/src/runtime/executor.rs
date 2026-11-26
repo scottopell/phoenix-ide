@@ -168,14 +168,6 @@ enum AuthoritativeEffect {
         plan: String,
         reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
     },
-    PersistForkProposal {
-        proposal_id: String,
-        task_file: String,
-        title: String,
-        priority: crate::task_source::Priority,
-        body: String,
-        checkpoint: CheckpointData,
-    },
     ResolveTask {
         system_message: String,
         repo_root: String,
@@ -389,21 +381,6 @@ impl ClassifiedEffect {
                 priority,
                 plan,
                 reviewed_proposal,
-            })),
-            Effect::PersistForkProposal {
-                proposal_id,
-                task_file,
-                title,
-                priority,
-                body,
-                checkpoint,
-            } => Self::Authoritative(Box::new(AuthoritativeEffect::PersistForkProposal {
-                proposal_id,
-                task_file,
-                title,
-                priority,
-                body,
-                checkpoint,
             })),
             Effect::ResolveTask {
                 system_message,
@@ -2479,15 +2456,6 @@ where
     agent_config: phoenix_agents::AgentConfig,
     spawn_catalog: Option<super::agent_execution::SpawnCatalog>,
     spawn_parent_parallel_work_qualified: Option<bool>,
-    /// Sender to the single serialized fork-resolution consumer, used solely to
-    /// retire this conversation's still-pending fork proposals when it reaches a
-    /// terminal state (`ForkProposalsRetiredOnOriginTerminal`, REQ-PROJ-035). Set
-    /// by the runtime manager for parent conversations that can propose forks;
-    /// `None` for sub-agents and in tests that don't exercise the
-    /// terminal-retirement path. Routing through the consumer (rather than a raw
-    /// DB handle) keeps retirement serialized with approve/request-changes so a
-    /// terminal transition can't tear down an in-flight resolve's worktree.
-    fork_cmd_tx: Option<mpsc::Sender<super::fork_resolve::ForkCommand>>,
     /// Watch sender that publishes the current `ConvState` on every transition.
     /// The paired `watch::Receiver` lives in `ConversationHandle` so HTTP
     /// handlers can read live runtime state without holding the `runtimes` lock.
@@ -2710,7 +2678,6 @@ where
             agent_config: phoenix_agents::AgentConfig::default(),
             spawn_catalog: None,
             spawn_parent_parallel_work_qualified: None,
-            fork_cmd_tx: None,
             state_watcher: None,
         }
     }
@@ -2734,18 +2701,6 @@ where
         ack: tokio::sync::oneshot::Sender<Result<(), String>>,
     ) -> Self {
         self.startup_llm_recovery_ack = Some(ack);
-        self
-    }
-
-    /// Provide the fork-resolution consumer sender used to retire still-pending
-    /// fork proposals when this conversation reaches a terminal state
-    /// (REQ-PROJ-035). Set by the runtime manager for fork-proposing parent
-    /// conversations.
-    pub fn with_fork_command_sender(
-        mut self,
-        tx: mpsc::Sender<super::fork_resolve::ForkCommand>,
-    ) -> Self {
-        self.fork_cmd_tx = Some(tx);
         self
     }
 
@@ -4126,17 +4081,11 @@ where
         Box::pin(self.process_event_with_authority(event, authority)).await
     }
 
-    /// Broadcast `ConversationBecameTerminal` and retire this conversation's
-    /// still-pending fork proposals (REQ-PROJ-035).
-    ///
-    /// Send errors (no active receivers) are intentionally ignored.
+    /// Broadcast the terminal lifecycle edge.
     async fn emit_terminal_lifecycle_event(&self) {
-        emit_terminal_lifecycle_event(
-            &self.context.conversation_id,
-            self.fork_cmd_tx.as_ref(),
-            &self.broadcast_tx,
-        )
-        .await;
+        let _ = self
+            .broadcast_tx
+            .send_seq(|seq| SseEvent::ConversationBecameTerminal { sequence_id: seq });
     }
 
     /// Accept a forwarded LLM outcome only when its generation is current.
@@ -9172,26 +9121,6 @@ where
                 Ok(None)
             }
 
-            AuthoritativeEffect::PersistForkProposal {
-                proposal_id,
-                task_file,
-                title,
-                priority,
-                body,
-                checkpoint,
-            } => {
-                self.execute_persist_fork_proposal(
-                    proposal_id,
-                    task_file,
-                    title,
-                    priority,
-                    body,
-                    checkpoint,
-                    admitted,
-                )
-                .await
-            }
-
             AuthoritativeEffect::BroadcastAssistantMessage { message } => {
                 #[cfg(test)]
                 if let Some(barrier) = self.semantic_publication_barrier.take() {
@@ -11115,130 +11044,6 @@ where
         Ok(None)
     }
 
-    /// Persist a decoupled fork proposal atomically with the originating turn's
-    /// tool round (REQ-PROJ-033). The assistant message, synthetic success ack,
-    /// and the `fork_proposals` row commit in one transaction; the ack and the
-    /// row that the review surface reads are never durable independently.
-    #[allow(clippy::too_many_arguments)]
-    async fn execute_persist_fork_proposal(
-        &mut self,
-        proposal_id: String,
-        task_file: String,
-        title: String,
-        priority: phoenix_core::task_source::Priority,
-        body: String,
-        checkpoint: CheckpointData,
-        admitted: &mut crate::runtime::AdmittedOperation,
-    ) -> Result<Option<Event>, String> {
-        let CheckpointData::ToolRound(round) = checkpoint;
-        let (assistant_message, tool_results) = round.into_parts();
-
-        // Repo-relative normalization (REQ-PROJ-033): `task_file` is relative to
-        // the conversation's working_dir. The stored path is relative to the
-        // repository root so the spawn/review surface resolves it regardless of
-        // which worktree or subdir the origin ran in.
-        let normalized_task_file = normalize_task_file_repo_relative(
-            self.context.filesystem_root(),
-            &task_file,
-            &proposal_id,
-        );
-
-        let conv_id = self.context.conversation_id.clone();
-
-        let proposal = crate::db::ForkProposal {
-            id: proposal_id,
-            origin_conversation_id: conv_id.clone(),
-            task_file: normalized_task_file,
-            title,
-            priority: priority.as_str().to_string(),
-            body,
-            status: crate::db::ForkProposalStatus::Pending,
-            fork_conversation_id: None,
-            refinement_conversation_id: None,
-            created_at: Utc::now(),
-            resolved_at: None,
-        };
-
-        if tool_results
-            .iter()
-            .any(|result| matches!(result, ToolRoundResult::PendingSelfGoal { .. }))
-        {
-            return self
-                .persist_self_goal_checkpoint(
-                    assistant_message,
-                    tool_results,
-                    None,
-                    Some(&proposal),
-                    admitted,
-                )
-                .await;
-        }
-        let tool_results = finalized_round_results(tool_results)?;
-
-        // Build the assistant message row with a seq strictly greater than any
-        // ephemeral event broadcast earlier (mirrors `persist_checkpoint`).
-        let (reserved_broadcast_range, reserved_seqs) = self
-            .broadcast_tx
-            .persisted_message_reservation_authority()
-            .await
-            .reserve_next_range(1 + tool_results.len())
-            .expect("executor holds exclusive persisted-message reservation authority");
-        let _reserved_broadcast_range = reserved_broadcast_range;
-
-        let agent_content = MessageContent::agent(assistant_message.content);
-        let agent_seq = reserved_seqs[0];
-        let agent_msg = crate::db::Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::SystemGenerated,
-            message_id: assistant_message.message_id.clone(),
-            conversation_id: conv_id.clone(),
-            sequence_id: agent_seq,
-            message_type: agent_content.message_type(),
-            content: agent_content,
-            display_data: assistant_message.display_data.clone(),
-            usage_data: assistant_message.usage.clone(),
-            created_at: assistant_message.created_at,
-        };
-
-        // Build the synthetic tool-result rows. The success ack carries the
-        // `fork_proposal_id` in its display_data (UI-only) per the interception
-        // contract; `merge_duration_into_display_data` preserves it.
-        let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
-        for (result, tool_seq) in tool_results.iter().zip(reserved_seqs.iter().skip(1)) {
-            let tool_content = tool_result_transcript_content(result);
-            let merged_display =
-                merge_duration_into_display_data(result.display_data(), result.duration_ms);
-            tool_msgs.push(tool_result_message(
-                &agent_msg.message_id,
-                &conv_id,
-                *tool_seq,
-                Utc::now(),
-                tool_content,
-                merged_display,
-            ));
-        }
-
-        self.storage
-            .persist_fork_proposal_with_tool_round(&conv_id, &agent_msg, &tool_msgs, &proposal)
-            .await?;
-
-        // Broadcast the now-durable rows so connected clients render the
-        // assistant message and the success ack (matches `persist_checkpoint`).
-        // Duration is already present in each tool-result message's display_data;
-        // do not emit a follow-up update that can overtake later persisted rows.
-        let _ = self
-            .broadcast_tx
-            .admitted_publication(admitted)
-            .persisted_message(agent_msg);
-        for msg in tool_msgs {
-            let _ = self
-                .broadcast_tx
-                .admitted_publication(admitted)
-                .persisted_message(msg);
-        }
-
-        Ok(None)
-    }
-
     async fn execute_sub_agent_results_transition(
         &mut self,
         results: Vec<SubAgentResult>,
@@ -13136,7 +12941,12 @@ where
                 )),
             };
         }
-        if execution == TaskApprovalExecution::DetachedApprovedTaskCheckpoint {
+        let detached_approval = execution == TaskApprovalExecution::DetachedApprovedTaskCheckpoint
+            || matches!(
+                self.context.mode_context.as_ref(),
+                Some(ModeContext::Direct) | None
+            );
+        if detached_approval {
             let tasks_dir_name = self.context.tasks_dir_name.clone();
             let reviewed = reread_reviewed_task_handoff_snapshot(
                 self.context.filesystem_root(),
@@ -14425,55 +14235,6 @@ fn drop_leading_non_user(messages: Vec<LlmMessage>) -> (Vec<LlmMessage>, usize) 
         .count();
     let kept = messages.into_iter().skip(trimmed).collect();
     (kept, trimmed)
-}
-
-/// Normalize a working-dir-relative `task_file` to repository-relative
-/// (REQ-PROJ-033). For a Work/Branch origin whose cwd is the worktree top this
-/// is `task_file` unchanged; for a Direct origin started in a repo subdir it
-/// gains the subdir offset.
-///
-/// Falls back to the raw `task_file` (logged at warn) if the repo root cannot
-/// be detected or the joined path does not sit under it — losing the proposal
-/// is worse than storing a working-dir-relative path.
-fn normalize_task_file_repo_relative(
-    working_dir: &std::path::Path,
-    task_file: &str,
-    proposal_id: &str,
-) -> String {
-    let Some(repo_root) = phoenix_core::git::detect_git_repo_root(working_dir) else {
-        tracing::warn!(
-            proposal_id = %proposal_id,
-            working_dir = %working_dir.display(),
-            "fork proposal: no git repo root for working_dir; storing raw task_file"
-        );
-        return task_file.to_string();
-    };
-    let repo_root = std::path::Path::new(&repo_root);
-
-    // Compute the subdir offset from `working_dir`, not from
-    // `working_dir.join(task_file)`: the task file may not exist on disk yet, and
-    // `Path::canonicalize` fails on a non-existent path — falling back to the raw
-    // (still-symlinked) path and defeating the strip on platforms where tmp roots
-    // are symlinks (macOS /var -> /private/var). `working_dir` always exists, so
-    // canonicalizing it and the repo root resolves symlinks on both sides.
-    let canon_wd = working_dir
-        .canonicalize()
-        .unwrap_or_else(|_| working_dir.to_path_buf());
-    let canon_root = repo_root
-        .canonicalize()
-        .unwrap_or_else(|_| repo_root.to_path_buf());
-
-    if let Ok(offset) = canon_wd.strip_prefix(&canon_root) {
-        offset.join(task_file).to_string_lossy().into_owned()
-    } else {
-        tracing::warn!(
-            proposal_id = %proposal_id,
-            task_file = %task_file,
-            repo_root = %canon_root.display(),
-            "fork proposal: working_dir not under repo root; storing raw task_file"
-        );
-        task_file.to_string()
-    }
 }
 
 #[cfg(test)]
@@ -15942,47 +15703,6 @@ fn llm_error_to_outcome(
             message: error.message,
         },
     }
-}
-
-pub(crate) async fn complete_terminal_lifecycle_without_broadcast(
-    conversation_id: &str,
-    fork_cmd_tx: Option<&mpsc::Sender<super::fork_resolve::ForkCommand>>,
-) {
-    retire_fork_proposals_on_terminal(conversation_id, fork_cmd_tx).await;
-}
-
-pub(crate) async fn emit_terminal_lifecycle_event(
-    conversation_id: &str,
-    fork_cmd_tx: Option<&mpsc::Sender<super::fork_resolve::ForkCommand>>,
-    broadcast_tx: &SseBroadcaster,
-) {
-    complete_terminal_lifecycle_without_broadcast(conversation_id, fork_cmd_tx).await;
-    let _ = broadcast_tx.send_seq(|seq| SseEvent::ConversationBecameTerminal { sequence_id: seq });
-}
-
-async fn retire_fork_proposals_on_terminal(
-    conversation_id: &str,
-    fork_cmd_tx: Option<&mpsc::Sender<super::fork_resolve::ForkCommand>>,
-) {
-    let Some(tx) = fork_cmd_tx else {
-        return;
-    };
-    let (reply, reply_rx) = oneshot::channel();
-    if tx
-        .send(super::fork_resolve::ForkCommand::RetireForOrigin {
-            origin_id: conversation_id.to_string(),
-            reply,
-        })
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            conv_id = %conversation_id,
-            "fork retirement on terminal: consumer gone; skipped"
-        );
-        return;
-    }
-    let _ = reply_rx.await;
 }
 
 #[cfg(test)]
@@ -21636,6 +21356,73 @@ mod approved_explore_follow_up_tests {
             .approved_task_authority("approved-explore-follow-up")
             .expect("detached checkpoint objective");
         assert_eq!(objective.task_id, "72005");
+        assert_eq!(objective.task_file, task_file);
+    }
+
+    #[tokio::test]
+    async fn direct_approval_does_not_mutate_git_or_stage_existing_changes() {
+        let (_tmp, repo_root) = init_repo();
+        std::fs::create_dir(repo_root.join("tasks")).unwrap();
+        let tracked = repo_root.join("tracked.txt");
+        std::fs::write(&tracked, "baseline\n").unwrap();
+        run_git(&repo_root, &["add", "tracked.txt"]).unwrap();
+        run_git(&repo_root, &["commit", "-m", "baseline tracked file"]).unwrap();
+
+        std::fs::write(&tracked, "staged version\n").unwrap();
+        run_git(&repo_root, &["add", "tracked.txt"]).unwrap();
+        std::fs::write(&tracked, "partially staged version\n").unwrap();
+        let task_file = "tasks/72006-p1-ready--direct-approval.md";
+        let plan = "# Direct approval\n\nReviewed task snapshot.\n";
+        std::fs::write(repo_root.join(task_file), plan).unwrap();
+        let status_before = run_git(&repo_root, &["status", "--porcelain"])
+            .expect("read status before approval");
+        let head_before = run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap();
+        let branch_before = run_git(&repo_root, &["branch", "--show-current"]).unwrap();
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let broadcast_tx = SseBroadcaster::new(16, 0);
+        let mut runtime = approved_explore_runtime(
+            repo_root.clone(),
+            task_file,
+            plan,
+            storage.clone(),
+            broadcast_tx,
+        );
+        runtime.context.mode_context = Some(ModeContext::Direct);
+        let authority_fence = crate::runtime::FatalLocalAuthorityFence::new();
+        let mut admitted = authority_fence.try_acquire().expect("open authority fence");
+
+        runtime
+            .execute_approve_task(
+                TaskApprovalInput {
+                    task_file: task_file.to_string(),
+                    title: "Direct approval".to_string(),
+                    priority: crate::task_source::Priority::P1,
+                    plan: plan.to_string(),
+                    reviewed_proposal: None,
+                },
+                TaskApprovalExecution::Initial,
+                &mut admitted,
+            )
+            .await
+            .expect("direct approval should settle without Git mutations");
+
+        assert_eq!(run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap(), head_before);
+        assert_eq!(
+            run_git(&repo_root, &["branch", "--show-current"]).unwrap(),
+            branch_before
+        );
+        assert_eq!(
+            run_git(&repo_root, &["status", "--porcelain"]).unwrap(),
+            status_before,
+            "approval must preserve staged, unstaged, and untracked changes"
+        );
+        assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "partially staged version\n");
+        assert_eq!(storage.recorded_messages().len(), 1);
+        let objective = storage
+            .approved_task_authority("approved-explore-follow-up")
+            .expect("direct approval objective");
+        assert_eq!(objective.task_id, "72006");
         assert_eq!(objective.task_file, task_file);
     }
 
@@ -34418,166 +34205,6 @@ mod retry_timer_epoch_tests {
             rt.retry_timer_handle.is_none(),
             "the spent live timer handle is cleared after its fire is honored"
         );
-    }
-}
-
-// ============================================================
-// Decoupled fork-proposal persistence (REQ-PROJ-033)
-// ============================================================
-//
-// Distilled from specs/bedrock/bedrock.allium (ForkProposalIntercepted):
-// the synthetic success ack and the fork_proposals row must both be durable
-// after a successful persist, and the stored task_file is repository-relative.
-
-#[cfg(test)]
-mod fork_proposal_persist_tests {
-    use super::test_git_helpers::init_repo;
-    use super::*;
-    use crate::db::MessageContent;
-    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
-    use crate::state_machine::state::AssistantMessage;
-    use crate::state_machine::{CheckpointData, ConvContext};
-    use crate::tools::BrowserSessionManager;
-    use phoenix_llm::ModelRegistry;
-    use std::path::Path;
-    use std::sync::Arc;
-    use tokio::sync::mpsc;
-
-    type TestRuntime =
-        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
-
-    fn runtime_in_dir(conv_id: &str, working_dir: &Path) -> (TestRuntime, Arc<InMemoryStorage>) {
-        let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new(
-            conv_id,
-            working_dir.to_path_buf(),
-            "test-model",
-            200_000,
-            16_384,
-        );
-        let (_event_tx, event_rx) = mpsc::channel(32);
-        let event_tx_dup = mpsc::channel::<Event>(1).0;
-        let broadcaster = SseBroadcaster::new(128, 0);
-        let rt = ConversationRuntime::new(
-            context,
-            ConvState::LlmRequesting { attempt: 1 },
-            storage.clone(),
-            Arc::new(MockLlmClient::new("test-model")),
-            Arc::new(MockToolExecutor::new()),
-            Arc::new(BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()),
-            Arc::new(crate::tools::TmuxRegistry::new()),
-            Arc::new(ModelRegistry::new_empty()),
-            crate::terminal::ActiveTerminals::new(),
-            event_rx,
-            event_tx_dup,
-            broadcaster,
-        );
-        (rt, storage)
-    }
-
-    fn fork_effect(proposal_id: &str, task_file: &str) -> Effect {
-        let assistant = AssistantMessage::new(
-            "asst-fork".to_string(),
-            vec![phoenix_llm::ContentBlock::ToolUse {
-                id: "tool-fork-1".to_string(),
-                name: "propose_task".to_string(),
-                input: serde_json::json!({ "task_file": task_file }),
-            }],
-            None,
-            None,
-        );
-        let ack = ToolResult::success_with_display(
-            "tool-fork-1".to_string(),
-            "Fork proposal recorded — pending your review; continue your work".to_string(),
-            Some(serde_json::json!({ "fork_proposal_id": proposal_id })),
-        );
-        let checkpoint = CheckpointData::tool_round(assistant, vec![ack]).expect("tool_round");
-        Effect::PersistForkProposal {
-            proposal_id: proposal_id.to_string(),
-            task_file: task_file.to_string(),
-            title: "Fix the bug".to_string(),
-            priority: phoenix_core::task_source::Priority::P1,
-            body: "# Fix the bug\n\nplan body for the fork".to_string(),
-            checkpoint,
-        }
-    }
-
-    fn assert_round_persisted(storage: &InMemoryStorage, conv_id: &str, proposal_id: &str) {
-        let msgs = storage.get_all_messages(conv_id);
-        assert!(
-            msgs.iter().any(|m| m.message_id == "asst-fork"),
-            "assistant message must be persisted"
-        );
-        let ack = msgs
-            .iter()
-            .find(|m| m.message_id == tool_result_message_id("asst-fork", "tool-fork-1"))
-            .expect("synthetic success ack must be persisted");
-        assert!(
-            matches!(&ack.content, MessageContent::Tool(tc) if !tc.is_error),
-            "ack must be a success tool result"
-        );
-        assert_eq!(
-            ack.display_data
-                .as_ref()
-                .and_then(|d| d.get("fork_proposal_id"))
-                .and_then(|v| v.as_str()),
-            Some(proposal_id),
-            "ack display_data must carry the fork_proposal_id handle"
-        );
-    }
-
-    /// Worktree-top origin: `working_dir` IS the repo root, so the stored
-    /// `task_file` equals the working-dir-relative path unchanged.
-    #[tokio::test]
-    async fn persist_at_repo_root_keeps_task_file() {
-        let (_tmp, root) = init_repo();
-        let (mut rt, storage) = runtime_in_dir("conv-fork-root", &root);
-
-        let task_file = "tasks/00042-p1-ready--fix-thing.md";
-        rt.execute_effect(fork_effect("fp-root", task_file))
-            .await
-            .expect("PersistForkProposal must succeed");
-
-        let proposals = storage.get_fork_proposals();
-        assert_eq!(proposals.len(), 1);
-        let p = &proposals[0];
-        assert_eq!(p.id, "fp-root");
-        assert_eq!(p.origin_conversation_id, "conv-fork-root");
-        assert_eq!(p.status, crate::db::ForkProposalStatus::Pending);
-        assert_eq!(p.task_file, task_file, "repo-root origin: path unchanged");
-        assert_eq!(p.title, "Fix the bug");
-        assert_eq!(p.priority, "p1");
-        assert!(p.body.contains("plan body for the fork"));
-        assert!(p.fork_conversation_id.is_none());
-        assert!(p.resolved_at.is_none());
-
-        assert_round_persisted(&storage, "conv-fork-root", "fp-root");
-    }
-
-    /// Direct-in-subdir origin: `working_dir` is a subdir of the repo root, so
-    /// the stored `task_file` is prefixed with the subdir offset.
-    #[tokio::test]
-    async fn persist_in_subdir_prefixes_offset() {
-        let (_tmp, root) = init_repo();
-        let subdir = root.join("crate-a");
-        std::fs::create_dir_all(&subdir).unwrap();
-        let (mut rt, storage) = runtime_in_dir("conv-fork-sub", &subdir);
-
-        let task_file = "tasks/00099-p2-ready--sub-thing.md";
-        rt.execute_effect(fork_effect("fp-sub", task_file))
-            .await
-            .expect("PersistForkProposal must succeed");
-
-        let proposals = storage.get_fork_proposals();
-        assert_eq!(proposals.len(), 1);
-        assert_eq!(
-            proposals[0].task_file,
-            format!("crate-a/{task_file}"),
-            "subdir origin: stored path gains the subdir offset"
-        );
-
-        assert_round_persisted(&storage, "conv-fork-sub", "fp-sub");
     }
 }
 

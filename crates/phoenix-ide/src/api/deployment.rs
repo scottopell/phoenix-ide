@@ -15,7 +15,7 @@ use crate::api::process_sample::ProcessObservation;
 use crate::db::approximate_percentiles_from_histogram;
 use axum::{
     extract::{ConnectInfo, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::HeaderMap,
     response::IntoResponse,
     Json,
 };
@@ -433,21 +433,7 @@ pub enum ManagedWorktreeDisposition {
         source_conversation_id: String,
         source_state: String,
         archived: bool,
-        cleanup_allowed: bool,
     },
-}
-
-#[derive(Deserialize, TS)]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct ManagedWorktreeCleanupRequest {
-    pub path: String,
-}
-
-#[derive(Serialize, TS)]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub struct ManagedWorktreeCleanupResponse {
-    pub path: String,
-    pub removed: bool,
 }
 
 /// The four semantically-distinct outcomes of sizing a location. A bare
@@ -529,135 +515,6 @@ pub async fn sqlite_workload_report(
     Query(query): Query<SqliteWorkloadReportQuery>,
 ) -> impl IntoResponse {
     Json(sample_sqlite_workload_report(&state, query.window))
-}
-
-pub async fn cleanup_managed_worktree(
-    State(state): State<AppState>,
-    Json(request): Json<ManagedWorktreeCleanupRequest>,
-) -> impl IntoResponse {
-    match cleanup_managed_worktree_inner(&state, &request.path).await {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
-        Err((status, message)) => {
-            (status, Json(serde_json::json!({ "error": message }))).into_response()
-        }
-    }
-}
-
-async fn cleanup_managed_worktree_inner(
-    state: &AppState,
-    path: &str,
-) -> Result<ManagedWorktreeCleanupResponse, (StatusCode, String)> {
-    let conversations = state
-        .db
-        .managed_worktree_conversations()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let owners: Vec<_> = conversations
-        .iter()
-        .filter(|conv| conv.conv_mode.worktree_path() == Some(path))
-        .collect();
-    if owners.is_empty() {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "worktree path is not known to Phoenix".to_string(),
-        ));
-    }
-    let worktree = Path::new(path);
-    let repo_root = exact_phoenix_worktree_root(worktree).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            "worktree path is not a Phoenix-managed worktree path".to_string(),
-        )
-    })?;
-    for owner in &owners {
-        if crate::runtime::conversation_retains_work_scope_for_reclamation(&state.db, owner)
-            .await
-            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
-        {
-            return Err((
-                StatusCode::CONFLICT,
-                "worktree is still owned by a live conversation".to_string(),
-            ));
-        }
-    }
-    if !worktree.exists() {
-        return Ok(ManagedWorktreeCleanupResponse {
-            path: path.to_string(),
-            removed: false,
-        });
-    }
-
-    let branch_to_delete =
-        crate::runtime::cleanup_branch_for_unretained_work_scope(worktree, owners.iter().copied());
-    let cleanup_repo_root = repo_root.clone();
-    let cleanup_worktree = worktree.to_path_buf();
-    let removed = tokio::task::spawn_blocking(move || {
-        remove_leftover_worktree(&cleanup_repo_root, &cleanup_worktree, branch_to_delete)
-    })
-    .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-    Ok(ManagedWorktreeCleanupResponse {
-        path: path.to_string(),
-        removed,
-    })
-}
-
-fn exact_phoenix_worktree_root(path: &Path) -> Option<PathBuf> {
-    match path.components().next_back()? {
-        Component::Normal(name) if !name.is_empty() => {}
-        Component::Prefix(_)
-        | Component::RootDir
-        | Component::CurDir
-        | Component::ParentDir
-        | Component::Normal(_) => return None,
-    }
-    let parent = path.parent()?;
-    if parent.file_name()? != "worktrees" {
-        return None;
-    }
-    let phoenix_dir = parent.parent()?;
-    if phoenix_dir.file_name()? != ".phoenix" {
-        return None;
-    }
-    phoenix_dir.parent().map(Path::to_path_buf)
-}
-
-fn remove_leftover_worktree(
-    repo_root: &Path,
-    worktree: &Path,
-    branch_to_delete: Option<String>,
-) -> Result<bool, String> {
-    let worktree_str = worktree.to_string_lossy().to_string();
-    let removed = match crate::git_ops::run_git(
-        repo_root,
-        &["worktree", "remove", &worktree_str, "--force"],
-    ) {
-        Ok(_) => true,
-        Err(git_err) => {
-            tracing::debug!(error = %git_err, path = %worktree.display(), "leftover worktree cleanup: git remove failed; trying filesystem removal");
-            match std::fs::remove_dir_all(worktree) {
-                Ok(()) => true,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-    };
-    if removed {
-        let _ = crate::git_ops::run_git(repo_root, &["worktree", "prune"]);
-    }
-
-    if removed {
-        if let Some(branch) = branch_to_delete {
-            if crate::git_ops::find_branch_in_worktree_list(repo_root, &branch).is_none() {
-                if let Err(e) = crate::git_ops::run_git(repo_root, &["branch", "-D", &branch]) {
-                    tracing::debug!(error = %e, branch, "leftover worktree cleanup: branch delete failed after worktree removal");
-                }
-            }
-        }
-    }
-    Ok(removed)
 }
 
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
@@ -1233,7 +1090,6 @@ fn managed_worktree_detail(
                 source_conversation_id: source.id.clone(),
                 source_state: conv_state_name(&source.state).to_string(),
                 archived: source.archived,
-                cleanup_allowed: true,
             },
         },
     }
@@ -2060,46 +1916,6 @@ mod tests {
     }
 
     #[test]
-    fn exact_phoenix_worktree_root_accepts_only_worktree_root() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        let wt = repo.join(".phoenix").join("worktrees").join("conv-1");
-
-        assert_eq!(exact_phoenix_worktree_root(&wt), Some(repo));
-    }
-
-    #[test]
-    fn exact_phoenix_worktree_root_rejects_descendant_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        let descendant = repo
-            .join(".phoenix")
-            .join("worktrees")
-            .join("conv-1")
-            .join("src");
-
-        assert_eq!(exact_phoenix_worktree_root(&descendant), None);
-    }
-
-    #[test]
-    fn exact_phoenix_worktree_root_rejects_parent_dir_leaf() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        let parent_leaf = repo.join(".phoenix").join("worktrees").join("..");
-
-        assert_eq!(exact_phoenix_worktree_root(&parent_leaf), None);
-    }
-
-    #[test]
-    fn remove_leftover_worktree_treats_missing_fallback_as_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = dir.path().join("repo");
-        let missing = repo.join(".phoenix").join("worktrees").join("gone");
-
-        assert_eq!(remove_leftover_worktree(&repo, &missing, None), Ok(false));
-    }
-
-    #[test]
     fn managed_worktrees_aggregate_dedupes_and_sums_existing_dirs() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path().join("repo");
@@ -2233,51 +2049,6 @@ mod tests {
             details[0].disposition,
             ManagedWorktreeDisposition::Leftover { .. }
         ));
-    }
-
-    #[test]
-    fn cleanup_branch_for_leftover_deletes_explore_temp_branch() {
-        let mut conv = conversation(
-            "abcdef123456",
-            "/repo/.phoenix/worktrees/abcdef123456",
-            phoenix_core::domain::sm_state::ConvState::Terminal,
-        );
-        conv.conv_mode = ConvMode::Explore {
-            worktree_path: Some(
-                NonEmptyString::new("/repo/.phoenix/worktrees/abcdef123456").unwrap(),
-            ),
-            next_taskmd_id_hint: None,
-        };
-
-        assert_eq!(
-            crate::runtime::cleanup_branch_for_unretained_work_scope(
-                Path::new("/repo/.phoenix/worktrees/abcdef123456"),
-                [&conv],
-            ),
-            Some("task-pending-abcdef12".to_string())
-        );
-    }
-
-    #[test]
-    fn cleanup_branch_for_leftover_preserves_branch_mode_branch() {
-        let mut conv = conversation(
-            "branchy",
-            "/repo/.phoenix/worktrees/branchy",
-            phoenix_core::domain::sm_state::ConvState::Terminal,
-        );
-        conv.conv_mode = ConvMode::Branch {
-            branch_name: NonEmptyString::new("user-branch").unwrap(),
-            worktree_path: NonEmptyString::new("/repo/.phoenix/worktrees/branchy").unwrap(),
-            base_branch: NonEmptyString::new("main").unwrap(),
-        };
-
-        assert_eq!(
-            crate::runtime::cleanup_branch_for_unretained_work_scope(
-                Path::new("/repo/.phoenix/worktrees/branchy"),
-                [&conv],
-            ),
-            None
-        );
     }
 
     #[test]

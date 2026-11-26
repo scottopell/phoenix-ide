@@ -47,7 +47,6 @@ interface ConversationListProps {
   onProductConversationClick?: (productConversation: ProductConversationListRow) => void;
   onProductConversationRename?: (productConversation: ProductConversationListRow) => void;
   onProductConversationClose?: (productConversation: ProductConversationListRow) => void;
-  onProductConversationDelete?: (productConversation: ProductConversationListRow) => void;
   activeSlug?: string | null;
   sidebarMode?: boolean;
   listDensity?: 'full' | 'mobile' | 'sidebar';
@@ -150,7 +149,6 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   isKeyboardSelected,
   onClick,
   onProductConversationClose,
-  onProductConversationDelete,
   onProductConversationRename,
   isMenuOpen,
   onToggleMenu,
@@ -171,7 +169,6 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
   isKeyboardSelected: boolean;
   onClick: (row: ProductConversationListRow) => void;
   onProductConversationClose?: (row: ProductConversationListRow) => void;
-  onProductConversationDelete?: (row: ProductConversationListRow) => void;
   onProductConversationRename?: (row: ProductConversationListRow) => void;
 }) {
   const unread = row.read_state.state === 'unread';
@@ -200,7 +197,6 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
     : undefined;
   const canRename = !!onProductConversationRename && row.lifecycle.state === 'open'
     && !(closeAction?.availability === 'unavailable' && closeAction.reason === 'active_close_attempt');
-  const canDelete = !!onProductConversationDelete && row.lifecycle.state === 'history';
   return (
     <li
       className={classes}
@@ -264,17 +260,6 @@ const ProductConversationListRowView = memo(function ProductConversationListRowV
               Rename
             </button>
           )}
-          {canDelete && onProductConversationDelete && (
-            <button
-              type="button"
-              className="conv-action-btn danger"
-              onClick={(event) => { event.stopPropagation(); onCloseMenu(); onProductConversationDelete(row); }}
-              aria-label={`Delete conversation ${displayTitle}`}
-              title="Delete permanently"
-            >
-              Delete permanently
-            </button>
-          )}
           {onProductConversationClose && closeAction?.availability === 'available' && (
             <button
               type="button"
@@ -320,7 +305,6 @@ export function ConversationList({
   onProductConversationRename,
   onProductConversationClose,
   activeSlug,
-  onProductConversationDelete,
   sidebarMode,
   listDensity,
   authChip,
@@ -417,7 +401,7 @@ export function ConversationList({
 
   useLayoutEffect(() => {
     if (expandedId && !menuRef.current) setExpandedId(null);
-  }, [expandedId, displayProductList, onProductConversationRename, onProductConversationClose, onProductConversationDelete]);
+  }, [expandedId, displayProductList, onProductConversationRename, onProductConversationClose]);
 
   const keyboardItems = useMemo(
     () => displayProductList.map((row) => ({ id: row.product_conversation_id })),
@@ -574,7 +558,7 @@ export function ConversationList({
                 isKeyboardSelected={selectedId === row.product_conversation_id}
                 onClick={handleProductRowClick}
                 {...(onProductConversationClose ? { onProductConversationClose } : {})}
-                {...(onProductConversationDelete ? { onProductConversationDelete } : {})}
+
                 {...(onProductConversationRename ? { onProductConversationRename } : {})}
               />
             ))}

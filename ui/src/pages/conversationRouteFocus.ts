@@ -65,7 +65,6 @@ function phaseFocusDisposition(state: ConversationState): PhaseFocusDisposition 
 const TRANSIENT_ROUTE_SCOPES = new Set([
   'question-panel',
   'task-approval',
-  'fork-proposal-review',
 ]);
 
 export function decideRouteFocus(inputs: RouteFocusInputs): RouteFocusState {

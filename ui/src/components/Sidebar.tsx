@@ -393,7 +393,7 @@ export function Sidebar({
           onProductConversationClick={handleProductConversationClick}
           onProductConversationRename={productActions.openRename}
           onProductConversationClose={productActions.openClose}
-          onProductConversationDelete={productActions.openDelete}
+
           activeSlug={activeSlug}
           sidebarMode
           listAvailability={listAvailability}

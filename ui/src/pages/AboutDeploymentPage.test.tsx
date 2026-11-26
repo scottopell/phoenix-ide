@@ -15,7 +15,6 @@ const { apiMock } = vi.hoisted(() => ({
     deploymentObservations: vi.fn().mockRejectedValue(new Error('observations unavailable')),
     deploymentResources: vi.fn(),
     deploymentSqliteWorkload: vi.fn(),
-    cleanupManagedWorktree: vi.fn(),
     revealPath: vi.fn(),
     releaseUpdateSnapshot: vi.fn(),
     releaseUpdateTransaction: vi.fn(),
@@ -318,7 +317,6 @@ describe('AboutDeploymentPage disk usage health', () => {
     apiMock.deploymentDiskInfo.mockReset();
     apiMock.deploymentResources.mockReset();
     apiMock.deploymentSqliteWorkload.mockReset().mockResolvedValue(sqliteReport());
-    apiMock.cleanupManagedWorktree.mockReset();
     apiMock.revealPath.mockReset();
     apiMock.releaseUpdateTransaction.mockReset().mockResolvedValue({ kind: 'none' });
     apiMock.releaseUpdateSnapshot.mockReset().mockResolvedValue({
@@ -654,7 +652,6 @@ describe('AboutDeploymentPage disk usage health', () => {
     renderPage(deployment({ local_access: false }));
 
     expect(await screen.findByText(/reveal actions require viewing this page on the Phoenix host/i)).toBeInTheDocument();
-    expect(screen.getByText(/cleanup availability is shown separately per worktree/i)).toBeInTheDocument();
     expect(screen.queryByText(/remote browser remains read-only/i)).not.toBeInTheDocument();
   });
 
@@ -1082,7 +1079,7 @@ describe('AboutDeploymentPage disk usage health', () => {
           size: { kind: 'measured', bytes: 1000 },
           repository: '/repo',
           branch_name: 'task-leftover',
-          disposition: { kind: 'leftover', source_conversation_id: 'old-conv', source_state: 'Terminal', archived: true, cleanup_allowed: true },
+          disposition: { kind: 'leftover', source_conversation_id: 'old-conv', source_state: 'Terminal', archived: true },
         },
       ],
     }));
@@ -1092,6 +1089,6 @@ describe('AboutDeploymentPage disk usage health', () => {
     expect(screen.getByText(/Live: Live task/)).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Open conversation' })).toBeInTheDocument();
     expect(screen.getByText(/Leftover: old-conv/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Clean up leftover' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Clean up leftover' })).not.toBeInTheDocument();
   });
 });

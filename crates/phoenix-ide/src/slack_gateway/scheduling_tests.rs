@@ -22,7 +22,7 @@ fn config() -> Config {
 #[allow(clippy::too_many_lines)] // One fixture follows initialization, capture, deduplication and provider failure.
 async fn channel_discovery_baselines_then_accepts_once_with_shared_allowance() {
     // REQ-SG-020
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let c = Config {
         inbox_channel: Some("CINBOX".into()),
         saved_enabled: true,
@@ -241,7 +241,7 @@ fn configuration_accepts_enterprise_owner_and_requires_a_phoenix_origin() {
 
 #[tokio::test]
 async fn read_access_inspection_shares_the_automatic_gate_allowance_and_backoff() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let c = config();
     let clone = state.clone();
     assert!(Arc::ptr_eq(
@@ -274,7 +274,7 @@ async fn read_access_inspection_shares_the_automatic_gate_allowance_and_backoff(
         matches!(result, crate::api::handlers::AppError::BadRequest(message) if message.contains("allowance is exhausted"))
     );
     // Even a fresh process allowance cannot bypass a persisted provider delay.
-    let fresh = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let fresh = crate::api::handlers::api_test_support::make_test_state().await;
     fresh
         .db
         .slack_baseline_complete(&c.workspace, &c.owner)
@@ -296,7 +296,7 @@ async fn read_access_inspection_shares_the_automatic_gate_allowance_and_backoff(
 
 #[tokio::test]
 async fn changing_accounts_does_not_inherit_the_previous_retry_deadline() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let original = config();
     state
         .db
@@ -337,7 +337,7 @@ async fn changing_accounts_does_not_inherit_the_previous_retry_deadline() {
 
 #[tokio::test]
 async fn startup_recovery_retries_a_database_failure_without_restarting_phoenix() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let mut c = config();
     c.enabled = false;
     let source = phoenix_db::SlackSource {
@@ -433,7 +433,7 @@ async fn startup_recovery_retries_a_database_failure_without_restarting_phoenix(
 #[allow(clippy::too_many_lines)] // Compare exhaustion and throttling against the same ready-return obligation.
 async fn ready_reply_precedes_one_time_eyes_and_failed_acks_do_not_starve_later_discovery() {
     for throttled in [false, true] {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let mut c = config();
         c.enabled = false;
         let conversation = state
@@ -626,7 +626,7 @@ struct Backlog {
     log: Arc<Mutex<Vec<String>>>,
 }
 async fn backlog() -> Backlog {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let c = config();
     state
         .db
@@ -681,7 +681,7 @@ async fn backlog() -> Backlog {
 // REQ-SG-003/004/005/017: an old message gets a new reaction behind six baseline sources.
 #[tokio::test]
 async fn deleted_hit_does_not_block_baseline_or_a_later_page() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let c = config();
     state
         .db
@@ -794,7 +794,7 @@ async fn reaction_backlog_measurement() {
 // REQ-SG-017: repeated local wakeups cannot renew the network allowance.
 #[tokio::test]
 async fn delivery_wakeups_share_one_budget_and_idle_never_searches() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let c = config();
     let used = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -839,7 +839,7 @@ async fn call_window_only_renews_after_sixty_seconds() {
 
 #[tokio::test]
 async fn pass_metrics_exclude_calls_already_charged_to_the_window() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let c = config();
     let budget = Arc::new(std::sync::atomic::AtomicU32::new(6));
     let mut slack = slack::Slack::with_budget(state.mcp_manager.clone(), &c, budget.clone());
@@ -1407,7 +1407,7 @@ async fn failed_fresh_probe_does_not_discard_or_starve_saved_pages() {
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // Exercise initialization, private admission failure and idle recovery through one fixture.
 async fn saved_initialization_capture_and_delivery_remain_private() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let c = Config {
         saved_enabled: true,
         inbox_channel: None,
@@ -1516,7 +1516,7 @@ async fn saved_initialization_capture_and_delivery_remain_private() {
 // REQ-SG-019/017: provider limits are incomplete scans, not successful baselines.
 #[tokio::test]
 async fn saved_page_failure_does_not_block_emoji_and_preserves_readiness() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let c = Config {
         saved_enabled: true,
         inbox_channel: None,
@@ -1588,7 +1588,7 @@ async fn saved_page_failure_does_not_block_emoji_and_preserves_readiness() {
 
 #[tokio::test]
 async fn saved_first_gets_a_real_page_before_fresh_prefix_even_with_complete_emoji_rows() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let c = Config {
         saved_enabled: true,
         inbox_channel: None,
@@ -1632,7 +1632,7 @@ async fn saved_first_gets_a_real_page_before_fresh_prefix_even_with_complete_emo
 
 #[tokio::test]
 async fn saved_collection_resumes_with_shared_budget_and_reports_provider_ceiling() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let c = Config {
         saved_enabled: true,
         inbox_channel: None,

@@ -783,54 +783,18 @@ fn prepare_temp_index(worktree: &Path) -> Option<TempPath> {
     Some(TempPath(temp))
 }
 
-/// How a worktree-create call makes `.phoenix/` ignored in the repo it cuts the
-/// worktree from.
-///
-/// The two strategies are not interchangeable: one mutates and stages a tracked
-/// file, the other writes a local untracked file. Which one is correct depends
-/// on whether the caller is allowed to dirty the origin checkout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PhoenixIgnoreStrategy {
-    /// Append `.phoenix/` to the tracked `.gitignore` and `git add` it. Used by
-    /// Branch / Managed / Explore-gateway worktree creation, where staging the
-    /// ignore rule is the intended, durable behavior.
-    StageGitignore,
-    /// Append `.phoenix/` to the repo's local untracked exclude file
-    /// (`.git/info/exclude`), staging nothing. Used by fork resolution, which
-    /// MUST leave the originating checkout's index and tracked `.gitignore`
-    /// unaffected (REQ-PROJ-035).
-    LocalExclude,
-}
-
 /// Create a git worktree at `.phoenix/worktrees/{conv_id}`.
 ///
 /// If `create_branch` is `Some((new_branch, start_point))`, creates a new branch
 /// (`git worktree add -b <new_branch> <path> <start_point>`).
 /// If `None`, checks out the existing `branch_name` (`git worktree add <path> <branch>`).
 ///
-/// `ignore_strategy` selects how `.phoenix/` is made ignored in `cwd`'s repo —
-/// see [`PhoenixIgnoreStrategy`].
 pub(crate) fn create_worktree(
     cwd: &Path,
     conv_id: &str,
     branch_name: &str,
     create_branch: Option<&str>, // start_point for -b mode
-    ignore_strategy: PhoenixIgnoreStrategy,
 ) -> Result<String, GitOpError> {
-    // For LocalExclude (fork resolution), make `.phoenix/` ignored via the repo's
-    // `.git/info/exclude` BEFORE creating the `.phoenix/worktrees` dir or running
-    // `git worktree add`. If the add later fails (occupied deterministic path, FS
-    // error), the exclude is already in place, so the partial `.phoenix/` dir never
-    // surfaces as `?? .phoenix/` in the originating checkout — the decoupling this
-    // strategy preserves (REQ-PROJ-035). StageGitignore keeps its post-add ordering
-    // below (staging a tracked file before the worktree exists has no benefit and
-    // would dirty the index on a failed add).
-    if ignore_strategy == PhoenixIgnoreStrategy::LocalExclude {
-        if let Err(e) = ensure_local_exclude_has_phoenix(cwd) {
-            tracing::warn!(error = %e, "Failed to ignore .phoenix/ via local exclude before worktree add (non-fatal)");
-        }
-    }
-
     // 1. Create .phoenix/worktrees/ directory
     let phoenix_dir = cwd.join(".phoenix").join("worktrees");
     std::fs::create_dir_all(&phoenix_dir)
@@ -880,15 +844,6 @@ pub(crate) fn create_worktree(
     }
 
     prewarm_new_worktree(cwd, &worktree_path);
-
-    // 3. Stage `.phoenix/` into the tracked `.gitignore` for StageGitignore.
-    //    LocalExclude already wrote its exclude entry BEFORE the add (above), so
-    //    `.phoenix/` is ignored even if the add failed; nothing to do here.
-    if ignore_strategy == PhoenixIgnoreStrategy::StageGitignore {
-        if let Err(e) = ensure_gitignore_has_phoenix(cwd) {
-            tracing::warn!(error = %e, "Failed to ignore .phoenix/ (non-fatal)");
-        }
-    }
 
     Ok(worktree_path_str)
 }
@@ -1077,129 +1032,6 @@ pub(crate) fn repo_root_from_phoenix_worktree(path: &Path) -> Option<std::path::
         .map(std::path::Path::to_path_buf)
 }
 
-/// True when `git check-ignore` reports `.phoenix/` already ignored in `dir` —
-/// by `.git/info/exclude`, a parent `.gitignore`, or any other mechanism. The
-/// `-q` form exits 0 when ignored, 1 when not, and >1 on error; we treat only a
-/// clean exit-0 as "already ignored" (an error/missing-git resolves to false so
-/// the caller falls back to its append+stage path).
-///
-/// The query path carries a trailing slash (`.phoenix/`): the canonical exclude
-/// pattern `.phoenix/` is directory-only, and git matches a directory-only
-/// pattern against a pathname only when the path is known to be a directory —
-/// either it exists on disk OR the queried path itself ends in `/`. Querying the
-/// bare `.phoenix` would spuriously report "not ignored" whenever the `.phoenix`
-/// directory does not yet exist.
-fn phoenix_is_already_ignored(dir: &Path) -> bool {
-    phoenix_core::git::command()
-        .args(["check-ignore", "-q", ".phoenix/"])
-        .current_dir(dir)
-        .status()
-        .is_ok_and(|status| status.success())
-}
-
-/// Ensure `.phoenix/` is ignored in the given directory, appending + staging the
-/// tracked `.gitignore` only when it is NOT already ignored by some other
-/// mechanism. Creates `.gitignore` if it doesn't exist.
-///
-/// No-op when `git check-ignore` already reports `.phoenix/` ignored — e.g. a
-/// fork/refinement worktree created with `PhoenixIgnoreStrategy::LocalExclude`
-/// shares the main repo's `.git/info/exclude`, so `.phoenix/` is already covered.
-/// Re-staging the tracked `.gitignore` there would sweep an unrelated `.gitignore`
-/// edit onto the task branch when the refinement is later approved (Explore→Work).
-pub(crate) fn ensure_gitignore_has_phoenix(dir: &Path) -> Result<(), String> {
-    use std::io::Write as _;
-
-    // Already covered by `.git/info/exclude` (the fork strategy's shared
-    // exclude), a parent `.gitignore`, or anything else → touch nothing: no
-    // append, no staging.
-    if phoenix_is_already_ignored(dir) {
-        return Ok(());
-    }
-
-    let gitignore_path = dir.join(".gitignore");
-    let needs_update = if gitignore_path.exists() {
-        let content = std::fs::read_to_string(&gitignore_path)
-            .map_err(|e| format!("Failed to read .gitignore: {e}"))?;
-        !content.lines().any(|line| line.trim() == ".phoenix/")
-    } else {
-        true
-    };
-
-    if needs_update {
-        let needs_leading_newline = gitignore_path.exists()
-            && std::fs::read(&gitignore_path)
-                .ok()
-                .is_some_and(|bytes| !bytes.is_empty() && !bytes.ends_with(b"\n"));
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&gitignore_path)
-            .map_err(|e| format!("Failed to open .gitignore: {e}"))?;
-        if needs_leading_newline {
-            writeln!(f).map_err(|e| format!("Failed to write .gitignore: {e}"))?;
-        }
-        writeln!(f, ".phoenix/").map_err(|e| format!("Failed to write .gitignore: {e}"))?;
-        run_git(dir, &["add", ".gitignore"])?;
-        tracing::info!(dir = %dir.display(), "Added .phoenix/ to .gitignore");
-    }
-
-    Ok(())
-}
-
-/// Ensure `.phoenix/` is ignored via the repo's LOCAL untracked exclude file
-/// (`<git-common-dir>/info/exclude`), staging nothing and never touching the
-/// tracked `.gitignore`. Used by fork resolution so cutting a fork's worktree
-/// leaves the originating checkout's index and tracked files unaffected
-/// (REQ-PROJ-035).
-///
-/// `dir` may be the main checkout or a linked worktree; the exclude file lives
-/// in the MAIN repository's git dir, so the real common dir is resolved via
-/// `git rev-parse --git-common-dir` rather than assuming `dir/.git` is a
-/// directory (in a linked worktree `.git` is a file pointing elsewhere).
-pub(crate) fn ensure_local_exclude_has_phoenix(dir: &Path) -> Result<(), String> {
-    use std::io::Write as _;
-
-    let common_dir = run_git(dir, &["rev-parse", "--git-common-dir"])?;
-    let common_dir = {
-        let p = Path::new(common_dir.trim());
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            dir.join(p)
-        }
-    };
-
-    let info_dir = common_dir.join("info");
-    let exclude_path = info_dir.join("exclude");
-
-    let already_present = exclude_path.exists()
-        && std::fs::read_to_string(&exclude_path)
-            .map_err(|e| format!("Failed to read git exclude file: {e}"))?
-            .lines()
-            .any(|line| line.trim() == ".phoenix/");
-    if already_present {
-        return Ok(());
-    }
-
-    std::fs::create_dir_all(&info_dir)
-        .map_err(|e| format!("Failed to create git info dir: {e}"))?;
-    let needs_leading_newline = exclude_path.exists()
-        && std::fs::read(&exclude_path)
-            .ok()
-            .is_some_and(|bytes| !bytes.is_empty() && !bytes.ends_with(b"\n"));
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&exclude_path)
-        .map_err(|e| format!("Failed to open git exclude file: {e}"))?;
-    if needs_leading_newline {
-        writeln!(f).map_err(|e| format!("Failed to write git exclude file: {e}"))?;
-    }
-    writeln!(f, ".phoenix/").map_err(|e| format!("Failed to write git exclude file: {e}"))?;
-    tracing::info!(dir = %dir.display(), "Added .phoenix/ to .git/info/exclude");
-
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -1244,6 +1076,37 @@ mod tests {
         std::fs::write(dir.join(name), content).unwrap();
         run_git_for_test(dir, &["add", name]).unwrap();
         run_git_for_test(dir, &["commit", "-q", "-m", message]).unwrap();
+    }
+
+    fn creation_state(dir: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>, Vec<u8>) {
+        let read_if_present = |path: &Path| {
+            path.exists().then(|| std::fs::read(path).unwrap())
+        };
+        (
+            read_if_present(&dir.join(".gitignore")),
+            read_if_present(&dir.join(".git/info/exclude")),
+            std::fs::read(dir.join(".git/index")).unwrap(),
+        )
+    }
+
+    fn assert_creation_state_unchanged(
+        dir: &Path,
+        before: &(Option<Vec<u8>>, Option<Vec<u8>>, Vec<u8>),
+    ) {
+        assert_eq!(creation_state(dir), *before);
+    }
+
+    fn prepare_creation_state(dir: &Path) {
+        let exclude = dir.join(".git/info/exclude");
+        if exclude.exists() {
+            std::fs::remove_file(exclude).unwrap();
+        }
+        let gitignore = dir.join(".gitignore");
+        if gitignore.exists() {
+            std::fs::remove_file(gitignore).unwrap();
+        }
+        std::fs::write(dir.join("staged-before-worktree.txt"), "keep staged\n").unwrap();
+        run_git_for_test(dir, &["add", "staged-before-worktree.txt"]).unwrap();
     }
 
     fn clone_repo(source: &Path, dest: &Path) {
@@ -1466,10 +1329,12 @@ mod tests {
     }
 
     #[test]
-    fn create_worktree_invokes_prewarm_after_successful_add() {
+    fn create_worktree_success_preserves_ignore_files_and_staged_index() {
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         commit_file(tmp.path(), "tracked.txt", "content\n", "add tracked file");
+        prepare_creation_state(tmp.path());
+        let before = creation_state(tmp.path());
 
         let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let calls_for_hook = std::rc::Rc::clone(&calls);
@@ -1487,7 +1352,6 @@ mod tests {
                     conv_id,
                     "task-pending-feedface",
                     Some("main"),
-                    PhoenixIgnoreStrategy::StageGitignore,
                 )
             },
         )
@@ -1500,6 +1364,7 @@ mod tests {
             calls.borrow().as_slice(),
             &[(tmp.path().to_path_buf(), expected_worktree)]
         );
+        assert_creation_state_unchanged(tmp.path(), &before);
     }
 
     #[test]
@@ -1516,7 +1381,6 @@ mod tests {
             conv_id,
             "task-pending-warm",
             Some("main"),
-            PhoenixIgnoreStrategy::StageGitignore,
         )
         .unwrap();
 
@@ -1578,12 +1442,15 @@ mod tests {
     }
 
     #[test]
-    fn create_worktree_failure_leaves_no_leaked_branch() {
+    fn create_worktree_failure_preserves_ignore_files_and_staged_index() {
         // End-to-end: force `git worktree add -b` to fail by pre-creating a
         // colliding child path, then assert no `task-pending-*` ref survives.
         let tmp = TempDir::new().unwrap();
         init_repo(tmp.path());
         commit_file(tmp.path(), "tracked.txt", "content\n", "add tracked file");
+
+        prepare_creation_state(tmp.path());
+        let before = creation_state(tmp.path());
 
         // Occupy the worktree target with a non-empty dir so `add` aborts.
         let conv_id = "feedface-0000-0000-0000-000000000000";
@@ -1596,7 +1463,6 @@ mod tests {
             conv_id,
             "task-pending-feedface",
             Some("main"),
-            PhoenixIgnoreStrategy::StageGitignore,
         );
         assert!(res.is_err(), "add into a non-empty dir should fail");
 
@@ -1606,47 +1472,7 @@ mod tests {
             "",
             "no task-pending branch may leak: {branches:?}"
         );
-    }
-
-    #[test]
-    fn local_exclude_fork_failure_leaves_no_untracked_phoenix_in_origin() {
-        // F2: for the LocalExclude (fork) strategy, the `.git/info/exclude` entry
-        // is written BEFORE `git worktree add`. So even when the add FAILS (here,
-        // the deterministic target path is pre-occupied by a non-empty dir), the
-        // partial `.phoenix/` dir is already ignored and never surfaces as
-        // `?? .phoenix/` in the origin checkout — the decoupling forks must keep.
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        commit_file(tmp.path(), "tracked.txt", "content\n", "add tracked file");
-
-        let conv_id = "feedface-1111-1111-1111-111111111111";
-        let target = tmp.path().join(".phoenix/worktrees").join(conv_id);
-        std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(target.join("squatter"), "blocks the add\n").unwrap();
-
-        let res = create_worktree(
-            tmp.path(),
-            conv_id,
-            "task-pending-feedface",
-            Some("main"),
-            PhoenixIgnoreStrategy::LocalExclude,
-        );
-        assert!(res.is_err(), "add into a non-empty dir should fail");
-
-        // The exclude entry was written first, so `.phoenix/` is ignored.
-        let exclude =
-            std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap_or_default();
-        assert!(
-            exclude.lines().any(|l| l.trim() == ".phoenix/"),
-            "`.phoenix/` must be in .git/info/exclude even on a failed add: {exclude:?}"
-        );
-
-        // The origin status shows NO untracked `.phoenix/` (and nothing staged).
-        let status = run_git(tmp.path(), &["status", "--porcelain"]).unwrap();
-        assert!(
-            !status.contains(".phoenix"),
-            "a failed fork worktree add must not leave `?? .phoenix/` in the origin: {status:?}"
-        );
+        assert_creation_state_unchanged(tmp.path(), &before);
     }
 
     #[test]
@@ -1845,71 +1671,6 @@ mod tests {
         assert_eq!(effective_base_ref(clone.path(), "feature"), "feature");
     }
 
-    /// Bug 2: when `.phoenix/` is ALREADY ignored (here via `.git/info/exclude`,
-    /// the shared exclude a fork/refinement worktree inherits), a later
-    /// Explore→Work approval that calls `ensure_gitignore_has_phoenix` must NOT
-    /// touch the tracked `.gitignore` — no append, no `git add`. Otherwise an
-    /// unrelated `.gitignore` edit is swept onto the task branch.
-    #[test]
-    fn ensure_gitignore_is_noop_when_phoenix_already_ignored_via_exclude() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        // Ignore `.phoenix/` via the local exclude (the fork strategy's path),
-        // not via the tracked `.gitignore`.
-        let info_dir = tmp.path().join(".git/info");
-        std::fs::create_dir_all(&info_dir).unwrap();
-        std::fs::write(info_dir.join("exclude"), ".phoenix/\n").unwrap();
-
-        // Stage an UNRELATED edit to a tracked `.gitignore` (not yet committed),
-        // to detect any accidental re-staging by the call below.
-        std::fs::write(tmp.path().join(".gitignore"), "*.log\n").unwrap();
-        run_git(tmp.path(), &["add", ".gitignore"]).unwrap();
-        run_git(tmp.path(), &["commit", "-q", "-m", "add gitignore"]).unwrap();
-        std::fs::write(tmp.path().join(".gitignore"), "*.log\nbuild/\n").unwrap();
-        let before = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-
-        ensure_gitignore_has_phoenix(tmp.path()).unwrap();
-
-        // Content unchanged: no `.phoenix/` appended.
-        let after = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-        assert_eq!(
-            before, after,
-            "`.gitignore` must not be modified when `.phoenix/` is already ignored"
-        );
-        assert!(
-            !after.contains(".phoenix"),
-            "no `.phoenix/` line should be appended: {after:?}"
-        );
-        // The unrelated working-tree edit must NOT have been staged.
-        let staged = run_git(tmp.path(), &["diff", "--cached", "--name-only"]).unwrap();
-        assert!(
-            staged.trim().is_empty(),
-            "nothing should be staged (the unrelated .gitignore edit must not be swept): {staged:?}"
-        );
-    }
-
-    /// Bug 2 complement: when `.phoenix/` is NOT yet ignored (a plain
-    /// Explore/Branch worktree), `ensure_gitignore_has_phoenix` keeps its
-    /// append + stage behaviour.
-    #[test]
-    fn ensure_gitignore_appends_and_stages_when_not_yet_ignored() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-
-        ensure_gitignore_has_phoenix(tmp.path()).unwrap();
-
-        let content = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
-        assert!(
-            content.lines().any(|l| l.trim() == ".phoenix/"),
-            "`.phoenix/` must be appended: {content:?}"
-        );
-        let staged = run_git(tmp.path(), &["diff", "--cached", "--name-only"]).unwrap();
-        assert_eq!(
-            staged.trim(),
-            ".gitignore",
-            "the new `.gitignore` must be staged: {staged:?}"
-        );
-    }
 
     // ---- find_branch_in_worktree_list: porcelain parsing ----
 
@@ -2144,52 +1905,6 @@ mod tests {
         );
     }
 
-    // ---- ensure_local_exclude_has_phoenix: .git/info/exclude mutation ----
-
-    #[test]
-    fn ensure_local_exclude_appends_phoenix_when_absent() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
-        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
-        assert!(
-            exclude.lines().any(|l| l.trim() == ".phoenix/"),
-            "exclude was {exclude:?}"
-        );
-    }
-
-    #[test]
-    fn ensure_local_exclude_is_idempotent() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
-        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
-        let exclude = std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap();
-        let count = exclude.lines().filter(|l| l.trim() == ".phoenix/").count();
-        assert_eq!(count, 1, "the entry must not be duplicated: {exclude:?}");
-    }
-
-    #[test]
-    fn ensure_local_exclude_separates_from_unterminated_existing_content() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        let exclude_path = tmp.path().join(".git/info/exclude");
-        std::fs::create_dir_all(exclude_path.parent().unwrap()).unwrap();
-        // Pre-existing entry with NO trailing newline.
-        std::fs::write(&exclude_path, "*.tmp").unwrap();
-
-        ensure_local_exclude_has_phoenix(tmp.path()).unwrap();
-
-        let exclude = std::fs::read_to_string(&exclude_path).unwrap();
-        assert!(
-            exclude.contains("*.tmp\n.phoenix/"),
-            "entries must be newline-separated: {exclude:?}"
-        );
-        assert_eq!(
-            exclude.lines().filter(|l| l.trim() == ".phoenix/").count(),
-            1
-        );
-    }
 }
 
 #[cfg(test)]

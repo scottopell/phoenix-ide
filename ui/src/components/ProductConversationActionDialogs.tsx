@@ -20,17 +20,6 @@ export function ProductConversationActionDialogs({
         {...(actions.closeError ? { error: actions.closeError } : {})}
         onCancel={actions.cancelClose}
       />
-      <ConfirmDialog
-        visible={actions.deleteTarget !== null}
-        title="Delete Conversation"
-        message="Permanently delete this conversation and all of its transcripts? This cannot be undone."
-        confirmText="Delete"
-        danger
-        onConfirm={() => void actions.confirmDelete()}
-        submitting={actions.deleteSubmitting}
-        {...(actions.deleteError ? { error: actions.deleteError } : {})}
-        onCancel={actions.cancelDelete}
-      />
       {!actions.renameTarget && actions.renameError && (
         <div role="alert" className="error-message">{actions.renameError}</div>
       )}

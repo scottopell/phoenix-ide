@@ -196,7 +196,6 @@ fn final_cancellation_preserves_source_order_for_every_last_receipt_kind() {
                 | Effect::NotifyContextExhausted { .. }
                 | Effect::ApproveTask { .. }
                 | Effect::ApproveTaskFreshHandoff { .. }
-                | Effect::PersistForkProposal { .. }
                 | Effect::ResolveTask { .. }
                 | Effect::CommitSteeringDrain { .. } => None,
             })

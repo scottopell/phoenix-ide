@@ -1288,14 +1288,13 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
       });
     }
     // Known event types that don't belong in the ring by construction:
-    // init is per-stream (never broadcast); terminal/delete events post-
-    // date any in-flight turn (the broadcaster anchor resets on each
-    // persisted Message, and these types arrive after the final message).
+    // init is per-stream (never broadcast); terminal events post-date an
+    // in-flight turn (the broadcaster anchor resets on each persisted
+    // Message, and these types arrive after the final message).
     // Drop silently — surfacing them as warnings would be noise during
     // forward-compatible server changes, not signal.
     case 'init':
     case 'conversation_became_terminal':
-    case 'conversation_hard_deleted':
       return atom;
     // Truly unknown discriminator (new Rust-side variant the client
     // hasn't been updated for). Warn in DEV so the drift is observable.

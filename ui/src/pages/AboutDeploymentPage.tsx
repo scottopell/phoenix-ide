@@ -892,9 +892,7 @@ export function AboutDeploymentPage() {
   const [diskError, setDiskError] = useState<string | null>(null);
   const [diskLoading, setDiskLoading] = useState(true);
   const [expandedWorktrees, setExpandedWorktrees] = useState(false);
-  const [cleanupError, setCleanupError] = useState<string | null>(null);
   const [pendingDeploymentSignal, setPendingDeploymentSignal] = useState(0);
-  const [cleanupPath, setCleanupPath] = useState<string | null>(null);
   const [resources, setResources] = useState<ResourceState>(EMPTY_RESOURCES);
   const [sqlite, setSqlite] = useState<SqliteState>(EMPTY_SQLITE);
   const resourcesInFlightRef = useRef(false);
@@ -1119,15 +1117,6 @@ export function AboutDeploymentPage() {
     };
   }, [loadSqlite]);
 
-  const handleCleanup = useCallback((path: string) => {
-    setCleanupPath(path);
-    setCleanupError(null);
-    api.cleanupManagedWorktree(path)
-      .then(() => loadDisk())
-      .catch((e) => setCleanupError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setCleanupPath(null));
-  }, [loadDisk]);
-
   const loadDeployment = useCallback(() => {
     setLoading(true);
     setError(null);
@@ -1344,15 +1333,6 @@ export function AboutDeploymentPage() {
                                           <button type="button" className="deploy-reveal-btn" onClick={() => navigate(`/c/${disposition.slug ?? disposition.conversation_id}`)}>
                                             Open conversation
                                           </button>
-                                        ) : disposition.cleanup_allowed ? (
-                                          <button
-                                            type="button"
-                                            className="deploy-reveal-btn"
-                                            onClick={() => handleCleanup(wt.path)}
-                                            disabled={cleanupPath === wt.path}
-                                          >
-                                            {cleanupPath === wt.path ? 'Cleaning…' : 'Clean up leftover'}
-                                          </button>
                                         ) : null}
                                       </td>
                                     </tr>
@@ -1364,10 +1344,9 @@ export function AboutDeploymentPage() {
                         </tbody>
                       </table>
                       {revealError && <div className="settings-section__error">{revealError}</div>}
-                      {cleanupError && <div className="settings-section__error">{cleanupError}</div>}
                       {info && !info.local_access && (
                         <div className="settings-section__hint">
-                          Reveal actions require viewing this page on the Phoenix host. Cleanup availability is shown separately per worktree.
+                          Reveal actions require viewing this page on the Phoenix host.
                         </div>
                       )}
                     </>

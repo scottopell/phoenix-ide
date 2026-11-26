@@ -805,31 +805,24 @@ async fn native_definite_closure_failure_is_non_resumable_and_keeps_admission() 
 }
 
 #[tokio::test]
-async fn native_queued_behind_fork_command_cancellation_cutoff_is_not_sqlite_uncertainty() {
+async fn native_spawn_cancelled_before_admission_is_not_sqlite_uncertainty() {
     let (manager, mut runtime, request) = pending_native_spawn().await;
     let control = Arc::clone(&request.control);
     let mut issue_attempt = control.subscribe_issue_attempt();
     let barrier = Arc::new(tokio::sync::Barrier::new(2));
-    *manager.fork_command_barrier.lock().await = Some(Arc::clone(&barrier));
-    manager.start_sub_agent_handler().await;
-    let (reply, reply_rx) = oneshot::channel();
-    manager
-        .fork_cmd_tx
-        .send(crate::runtime::fork_resolve::ForkCommand::Dismiss {
-            proposal_id: "block-native-consumer".into(),
-            reply,
-        })
-        .await
-        .unwrap();
+    *manager.native_admission_prewrite_barrier.lock().await = Some(Arc::clone(&barrier));
+    let manager_task = tokio::spawn({
+        let manager = Arc::clone(&manager);
+        async move { manager.handle_spawn_request(request).await }
+    });
     barrier.wait().await;
-    manager.spawn_tx.send(request).await.unwrap();
     cancel(&mut runtime).await;
     runtime.handle_cancelling_tool_timeout().await;
     let fenced_without_any_admission = manager
         .fatal_local_authority_fence
         .fatal_authority_loss_is_latched();
     barrier.wait().await;
-    let _dismissal = reply_rx.await.unwrap();
+    manager_task.await.unwrap();
     assert!(
         !fenced_without_any_admission,
         "an exactly owned unissued batch can be revoked without inventing unknown SQLite authority"

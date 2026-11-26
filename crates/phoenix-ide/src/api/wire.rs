@@ -401,15 +401,6 @@ pub enum SseWireEvent {
         #[ts(type = "unknown")]
         error: UserFacingError,
     },
-    /// REQ-BED-032 step 6: a conversation has just been hard-deleted (its
-    /// row is gone from `SQLite`, all per-conversation resources cleaned
-    /// up). UI consumers refresh sidebar / navigation in response. Emitted
-    /// once per hard-delete, after every cascade step.
-    ConversationHardDeleted {
-        sequence_id: i64,
-        conversation_id: String,
-        deleted_conversation_ids: Vec<String>,
-    },
     /// Browser session liveness changed for the conversation this SSE
     /// stream represents. `active = true` is fired exactly once when a
     /// browser session is created in `BrowserSessionManager`; `false`
@@ -468,7 +459,6 @@ impl SseWireEvent {
             SseWireEvent::ConversationBecameTerminal { .. } => "conversation_became_terminal",
             SseWireEvent::ConversationUpdate { .. } => "conversation_update",
             SseWireEvent::Error { .. } => "error",
-            SseWireEvent::ConversationHardDeleted { .. } => "conversation_hard_deleted",
             SseWireEvent::BrowserSessionState { .. } => "browser_session_state",
             SseWireEvent::BashToolProgress { .. } => "bash_tool_progress",
             SseWireEvent::SteerMessageQueued { .. } => "steer_message_queued",
@@ -641,15 +631,6 @@ impl SseWireEvent {
                     error,
                 }
             }
-            SseEvent::ConversationHardDeleted {
-                sequence_id,
-                conversation_id,
-                deleted_conversation_ids,
-            } => SseWireEvent::ConversationHardDeleted {
-                sequence_id,
-                conversation_id,
-                deleted_conversation_ids,
-            },
             SseEvent::BrowserSessionState {
                 sequence_id,
                 active,

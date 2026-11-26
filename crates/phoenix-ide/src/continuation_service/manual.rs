@@ -468,7 +468,6 @@ async fn continue_with_operation(
             | DbError::FederationPeerNotFound
             | DbError::FederationPeerAmbiguous
             | DbError::FederationSteeringDuplicate
-            | DbError::ForkProposalConflict(_)
             | DbError::GitRepositoryWorkScopeProjectConflict { .. }
             | DbError::DormantGitRepositoryCatchupPermitTargetMismatch
             | DbError::DormantGitRepositoryCatchupStaleOperation

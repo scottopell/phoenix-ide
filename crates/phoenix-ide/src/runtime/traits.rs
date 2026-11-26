@@ -399,20 +399,6 @@ pub trait MessageStore: Send + Sync {
         content: &str,
     ) -> Result<i64, String>;
 
-    /// Atomically persist a fork proposal together with the originating turn's
-    /// tool round (REQ-PROJ-033): the assistant message, each synthetic
-    /// tool-result message, and the `fork_proposals` row commit in a single
-    /// transaction. The caller pre-builds the message rows (seq-allocated and
-    /// content-mapped) so the broadcast seq ordering matches the persisted
-    /// rows.
-    async fn persist_fork_proposal_with_tool_round(
-        &self,
-        origin_conv_id: &str,
-        assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
-        proposal: &crate::db::ForkProposal,
-    ) -> Result<(), String>;
-
     async fn prepare_self_goal_tool(
         &self,
         transcript: &str,
@@ -430,9 +416,8 @@ pub trait MessageStore: Send + Sync {
         checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
         replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
         settlement: Option<&ActiveDirectTurnSettlement>,
-        proposal: Option<&crate::db::ForkProposal>,
     ) -> Result<SelfGoalRoundCommit, String> {
-        let _ = (checkpoint, replay, settlement, proposal);
+        let _ = (checkpoint, replay, settlement);
         Err("self-goal checkpoint requires durable runtime storage".into())
     }
 
@@ -1237,23 +1222,6 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
             .await
     }
 
-    async fn persist_fork_proposal_with_tool_round(
-        &self,
-        origin_conv_id: &str,
-        assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
-        proposal: &crate::db::ForkProposal,
-    ) -> Result<(), String> {
-        (**self)
-            .persist_fork_proposal_with_tool_round(
-                origin_conv_id,
-                assistant,
-                tool_results,
-                proposal,
-            )
-            .await
-    }
-
     async fn prepare_self_goal_tool(
         &self,
         transcript: &str,
@@ -1272,10 +1240,9 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
         checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
         replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
         settlement: Option<&ActiveDirectTurnSettlement>,
-        proposal: Option<&crate::db::ForkProposal>,
     ) -> Result<SelfGoalRoundCommit, String> {
         (**self)
-            .persist_self_goal_round(checkpoint, replay, settlement, proposal)
+            .persist_self_goal_round(checkpoint, replay, settlement)
             .await
     }
 
@@ -2525,24 +2492,6 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
-    async fn persist_fork_proposal_with_tool_round(
-        &self,
-        origin_conv_id: &str,
-        assistant: &crate::db::Message,
-        tool_results: &[crate::db::Message],
-        proposal: &crate::db::ForkProposal,
-    ) -> Result<(), String> {
-        self.db
-            .persist_fork_proposal_with_tool_round(
-                origin_conv_id,
-                assistant,
-                tool_results,
-                proposal,
-            )
-            .await
-            .map_err(|e| e.to_string())
-    }
-
     async fn prepare_self_goal_tool(
         &self,
         transcript: &str,
@@ -2571,20 +2520,8 @@ impl MessageStore for DatabaseStorage {
         checkpoint: &phoenix_db::conversation_goals::round::GoalRoundCheckpoint<'_>,
         replay: Option<&phoenix_core::domain::provider_replay::ProviderReplayUpdate>,
         settlement: Option<&ActiveDirectTurnSettlement>,
-        proposal: Option<&crate::db::ForkProposal>,
     ) -> Result<SelfGoalRoundCommit, String> {
-        if let Some(proposal) = proposal {
-            if settlement.is_some() {
-                return Err("fork proposal cannot be committed with terminal settlement".into());
-            }
-            self.db
-                .persist_goal_tool_round_state_replay_and_fork_proposal(
-                    checkpoint, replay, proposal,
-                )
-                .await
-                .map(|committed| SelfGoalRoundCommit::StateProjected(Box::new(committed)))
-                .map_err(|e| e.to_string())
-        } else if let Some(settlement) = settlement {
+        if let Some(settlement) = settlement {
             let obligation = terminal_obligation(settlement, None);
             self.db
                 .persist_goal_tool_round_state_with_terminal_obligation(

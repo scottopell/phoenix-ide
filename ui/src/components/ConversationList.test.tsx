@@ -317,7 +317,7 @@ describe('ProductConversation row actions', () => {
     const row = makeProductConversation('guards', { lifecycle });
     const view = render(<MemoryRouter><ConversationList {...defaultProps} productConversations={history ? [] : [row]}
       archivedProductConversations={history ? [row] : []} showArchived={history}
-      onProductConversationRename={vi.fn()} onProductConversationClose={vi.fn()} onProductConversationDelete={vi.fn()} /></MemoryRouter>);
+      onProductConversationRename={vi.fn()} onProductConversationClose={vi.fn()} /></MemoryRouter>);
     fireEvent.click(view.getByRole('button', { name: 'Actions for conversation Root guards' }));
     expect(!!view.queryByRole('button', { name: 'Rename conversation Root guards' })).toBe(rename);
     expect(!!view.queryByRole('button', { name: /^Close conversation/ })).toBe(close);

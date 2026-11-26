@@ -18,7 +18,7 @@ REQ-CLI-006: Configuration
 REQ-CLI-007: Single File Distribution (uv run)
 REQ-CLI-008: Model Selection (--model, --list-models)
 REQ-CLI-009: Interaction (--respond, --dismiss-question, --dismiss-error, --cancel-steer, --continue)
-REQ-CLI-010: Introspection (--diff, --git-status, --usage, --system-prompt, --tasks, --proposals)
+REQ-CLI-010: Introspection (--diff, --git-status, --usage, --system-prompt, --tasks)
 REQ-CLI-011: Discovery (--list-conversations, --search-conversations)
 REQ-CLI-012: Platform & Config (--version, --deployment, --env, --mcp-status, --usage-overview, --trajectory-export)
 """
@@ -319,14 +319,6 @@ class PhoenixClient:
     def get_tasks(self, conv_id: str) -> dict:
         """Task files in the conversation's working directory."""
         resp = self.http.get(f"{self.base_url}/api/conversations/{conv_id}/tasks")
-        resp.raise_for_status()
-        return resp.json()
-
-    def get_proposals(self, conv_id: str) -> dict:
-        """Fork proposals for the conversation."""
-        resp = self.http.get(
-            f"{self.base_url}/api/conversations/{conv_id}/proposals"
-        )
         resp.raise_for_status()
         return resp.json()
 
@@ -882,32 +874,6 @@ def print_git_status(gs: dict) -> None:
         click.echo(f"  {_render_changed_path(p)}")
 
 
-def print_proposals(proposals: list[dict]) -> None:
-    """Compact fork-proposal listing, including the snapshotted brief body
-    and any resolved fork/refinement conversation ids."""
-    if not proposals:
-        click.echo("No fork proposals found.")
-        return
-    for p in proposals:
-        click.echo(
-            f"  {p.get('id', ''):36s} [{p.get('status', ''):10s}] "
-            f"pri={p.get('priority', ''):4s} {p.get('title', '')}"
-        )
-        if p.get('task_file'):
-            click.echo(f"    task: {p['task_file']}")
-        # The body is the sole snapshot of the brief (it is not in the
-        # transcript), so an agent inspecting proposals needs it to see
-        # what was actually proposed.
-        body = p.get('body') or ''
-        if body:
-            click.echo(f"    body: {body}")
-        # Resolved successor conversations (for spawned/promoted proposals).
-        if p.get('fork_conversation_id'):
-            click.echo(f"    fork_conversation: {p['fork_conversation_id']}")
-        if p.get('refinement_conversation_id'):
-            click.echo(f"    refinement_conversation: {p['refinement_conversation_id']}")
-
-
 def print_tasks(tasks: list[dict]) -> None:
     """Compact task-file listing, including the on-disk path."""
     if not tasks:
@@ -996,8 +962,6 @@ def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
               help='Print the resolved system prompt for --conversation and exit')
 @click.option('--tasks', is_flag=True,
               help='Print task files for --conversation and exit')
-@click.option('--proposals', is_flag=True,
-              help='Print fork proposals for --conversation and exit')
 # Platform & config (REQ-CLI-012)
 @click.option('--version', 'show_version', is_flag=True,
               help='Print server version and exit')
@@ -1018,7 +982,7 @@ def parse_kv_pairs(pairs: tuple[str, ...]) -> dict[str, str]:
 @click.option('--poll', is_flag=True, help='Use polling instead of SSE streaming')
 @click.option('--password', envvar='PHOENIX_PASSWORD', default=None,
               help='Password for authenticated access (or set PHOENIX_PASSWORD)')
-def main(message, conversation, directory, images, model, list_models, list_projects, suggest, list_conversations, search_conversations, search_limit, respond, respond_json, dismiss_question, dismiss_error, cancel_steer, continue_conv, diff, git_status, usage, system_prompt, tasks, proposals, show_version, deployment, show_env, mcp_status, usage_overview, trajectory_export, api_url, timeout, poll_interval, poll, password):
+def main(message, conversation, directory, images, model, list_models, list_projects, suggest, list_conversations, search_conversations, search_limit, respond, respond_json, dismiss_question, dismiss_error, cancel_steer, continue_conv, diff, git_status, usage, system_prompt, tasks, show_version, deployment, show_env, mcp_status, usage_overview, trajectory_export, api_url, timeout, poll_interval, poll, password):
     """Send a message to Phoenix IDE and wait for response.
 
     Uses SSE (Server-Sent Events) for real-time streaming by default.
@@ -1064,7 +1028,6 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         or usage
         or system_prompt
         or tasks
-        or proposals
         or trajectory_export
     )
     if needs_conv and not conversation:
@@ -1088,7 +1051,6 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         ('--usage', usage),
         ('--system-prompt', system_prompt),
         ('--tasks', tasks),
-        ('--proposals', proposals),
     ]
     conv_selected = [name for name, flag in conv_scoped_flags if flag]
     platform_selected = [name for name, flag in [
@@ -1371,11 +1333,6 @@ def main(message, conversation, directory, images, model, list_models, list_proj
         conv = client.get_conversation(conversation)
         print_tasks(client.get_tasks(conv['id']).get('tasks', []))
         return
-    if proposals:
-        conv = client.get_conversation(conversation)
-        print_proposals(client.get_proposals(conv['id']).get('proposals', []))
-        return
-
     if not message:
         raise click.UsageError(
             "Missing argument 'MESSAGE' (required unless using an info flag "

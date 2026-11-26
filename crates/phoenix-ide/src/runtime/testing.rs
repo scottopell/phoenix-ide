@@ -728,7 +728,6 @@ pub struct InMemoryStorage {
     complete_creation_job_started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     complete_creation_job_release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     steering_queues: Mutex<HashMap<String, Vec<crate::state_machine::event::SteerEntry>>>,
-    fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
     clear_watermarks: Mutex<HashMap<String, i64>>,
     last_prompt_tokens: Mutex<HashMap<String, i64>>,
     transcript_generations: Mutex<HashMap<String, i64>>,
@@ -888,7 +887,6 @@ impl InMemoryStorage {
             complete_creation_job_started: Mutex::new(None),
             complete_creation_job_release: Mutex::new(None),
             steering_queues: Mutex::new(HashMap::new()),
-            fork_proposals: Mutex::new(Vec::new()),
             clear_watermarks: Mutex::new(HashMap::new()),
             last_prompt_tokens: Mutex::new(HashMap::new()),
             transcript_generations: Mutex::new(HashMap::new()),
@@ -1228,10 +1226,6 @@ impl InMemoryStorage {
         *self.fail_watermark_write.lock().unwrap() = fail;
     }
 
-    /// Read back the persisted fork proposals (test-only).
-    pub fn get_fork_proposals(&self) -> Vec<crate::db::ForkProposal> {
-        self.fork_proposals.lock().unwrap().clone()
-    }
 
     /// Read back the persisted steering queue for a conversation (test-only).
     pub fn get_steering_queue(
@@ -2324,25 +2318,6 @@ impl MessageStore for InMemoryStorage {
     ) -> Result<phoenix_core::domain::conversation_goal::PendingSelfGoal, String> {
         self.self_goal_read_gate.wait().await?;
         Err("self-goal tools require durable runtime storage".into())
-    }
-
-    async fn persist_fork_proposal_with_tool_round(
-        &self,
-        origin_conv_id: &str,
-        assistant: &Message,
-        tool_results: &[Message],
-        proposal: &crate::db::ForkProposal,
-    ) -> Result<(), String> {
-        {
-            let mut messages = self.messages.lock().unwrap();
-            let bucket = messages.entry(origin_conv_id.to_string()).or_default();
-            bucket.push(assistant.clone());
-            for msg in tool_results {
-                bucket.push(msg.clone());
-            }
-        }
-        self.fork_proposals.lock().unwrap().push(proposal.clone());
-        Ok(())
     }
 
     async fn persist_tool_round_and_state(

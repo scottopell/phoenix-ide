@@ -242,7 +242,7 @@ fn peer(caller: InstanceId, bearer: &[u8]) -> PeerAuthenticated {
 
 #[tokio::test]
 async fn peer_goal_read_is_immediate_and_rechecks_revoked_authority() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     state
         .db
         .create_conversation(

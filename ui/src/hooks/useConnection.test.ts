@@ -33,7 +33,6 @@ const WIRE_EVENT_TYPES: Record<SseWireEvent['type'], true> = {
   conversation_became_terminal: true,
   conversation_update: true,
   error: true,
-  conversation_hard_deleted: true,
   browser_session_state: true,
   bash_tool_progress: true,
   steer_message_queued: true,

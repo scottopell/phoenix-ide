@@ -571,7 +571,6 @@ pub(crate) fn event_messages(event: &crate::runtime::SseEvent) -> Vec<&Message> 
         | SseEvent::ConversationBecameTerminal { .. }
         | SseEvent::ConversationUpdate { .. }
         | SseEvent::Error { .. }
-        | SseEvent::ConversationHardDeleted { .. }
         | SseEvent::BrowserSessionState { .. }
         | SseEvent::BashToolProgress { .. }
         | SseEvent::SteerMessageQueued { .. }

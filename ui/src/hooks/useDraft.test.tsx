@@ -7,7 +7,7 @@ import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
 import { DraftContext } from '../conversation/DraftContext';
 import { DraftStore } from '../conversation/DraftStore';
-import { clearDraftStorage, DraftLifecycle, useDraftRecovery, useDraftValue } from './useDraft';
+import { DraftLifecycle, useDraftRecovery, useDraftValue } from './useDraft';
 
 function wrapperFor(store: DraftStore) {
   return function Wrapper({ children }: { children: ReactNode }) {
@@ -38,32 +38,6 @@ function productDraftWrapper(drafts: DraftStore, conversations: ConversationStor
 const payload = { id: 'one', text: 'raw', images: [], files: [], error: 'missing' };
 
 describe('product composer draft lifecycle', () => {
-  it.each(['unmount', 'timer'] as const)('does not resurrect a hard-deleted product draft from its pending %s flush', mode => {
-    vi.useFakeTimers();
-    localStorage.clear();
-    localStorage.setItem('phoenix:draft:product:pc-1', 'persisted draft');
-    const drafts = new DraftStore();
-    const { result, unmount } = renderHook(() => useDraftValue('product:pc-1'), {
-      wrapper: productDraftWrapper(drafts, new ConversationStore()),
-    });
-    try {
-      expect(result.current).toBe('persisted draft');
-      act(() => drafts.dispatch('product:pc-1', { type: 'set_draft', text: 'not yet persisted' }));
-      act(() => {
-        clearDraftStorage('product:pc-1');
-        drafts.remove('product:pc-1');
-        if (mode === 'unmount') unmount();
-      });
-      act(() => vi.runAllTimers());
-      expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBeNull();
-      expect(drafts.getSnapshot('product:pc-1').draft).toBe('');
-    } finally {
-      unmount();
-      vi.useRealTimers();
-    }
-    expect(localStorage.getItem('phoenix:draft:product:pc-1')).toBeNull();
-  });
-
   it.each(['unmount', 'timer'] as const)('does not overwrite a replacement draft with a retired %s writer', mode => {
     vi.useFakeTimers();
     localStorage.clear();
@@ -74,7 +48,6 @@ describe('product composer draft lifecycle', () => {
     try {
       act(() => drafts.dispatch('product:pc-1', { type: 'set_draft', text: 'retired draft' }));
       act(() => {
-        clearDraftStorage('product:pc-1');
         drafts.remove('product:pc-1');
         drafts.recovery('product:pc-1');
         drafts.dispatch('product:pc-1', { type: 'set_draft', text: 'replacement draft' });

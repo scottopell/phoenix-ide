@@ -1655,7 +1655,6 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
                 | SseEvent::AgentDone { .. }
                 | SseEvent::ConversationBecameTerminal { .. }
                 | SseEvent::ConversationUpdate { .. }
-                | SseEvent::ConversationHardDeleted { .. }
                 | SseEvent::BrowserSessionState { .. }
                 | SseEvent::BashToolProgress { .. }
                 | SseEvent::SteerMessageQueued { .. }

@@ -3730,7 +3730,7 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_local_send_preserves_routing_replay_and_provenance() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let source = state
             .db
             .create_conversation("source", "source", "/tmp/source", true, None, None)
@@ -3818,7 +3818,7 @@ mod tests {
     async fn explicit_local_send_delivers_once_and_preserves_target_restrictions() {
         use phoenix_core::domain::db_schema::MessageContent;
 
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let db = &state.db;
         db.create_conversation("source", "source", "/tmp", true, None, None)
             .await
@@ -3893,7 +3893,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_conversation_message_unknown_or_unconfigured_remote_never_falls_back_locally() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         state
             .db
             .create_conversation("source", "source", "/tmp", true, None, None)
@@ -3961,7 +3961,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_conversation_message_ambiguous_peer_never_falls_back_locally() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         state
             .db
             .create_conversation("source", "source", "/tmp", true, None, None)
@@ -4183,7 +4183,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_conversation_message_explicit_peer_sends_authenticated_attested_request() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let source = state
             .db
             .create_conversation("source", "source", "/tmp", true, None, None)

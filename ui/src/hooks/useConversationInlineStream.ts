@@ -8,7 +8,6 @@ import {
   SseLlmAttemptDataSchema,
   SseLlmFirstByteDataSchema,
   SseConversationBecameTerminalDataSchema,
-  SseConversationHardDeletedDataSchema,
   SseConversationUpdateDataSchema,
   SseBrowserSessionStateDataSchema,
   SseMessageDataSchema,
@@ -336,9 +335,6 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         consumeSequencedEvent(event, SseConversationBecameTerminalDataSchema, dispatch);
       });
 
-      source.addEventListener('conversation_hard_deleted', (event) => {
-        consumeSequencedEvent(event, SseConversationHardDeletedDataSchema, dispatch);
-      });
 
       source.addEventListener('steer_message_queued', (event) => {
         const raw = parseEventData(event);

@@ -23,7 +23,6 @@ pub(crate) mod creation_worker;
 pub mod deny_gate;
 pub(crate) mod direct_turn_worker;
 pub(crate) mod executor;
-pub(crate) mod fork_resolve;
 pub mod pr_status_poll;
 mod recovery;
 #[cfg(test)]
@@ -812,13 +811,10 @@ pub struct RuntimeManager {
     #[cfg(test)]
     runtime_exit_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
-    fork_command_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
-    #[cfg(test)]
     native_admission_prewrite_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     browser_retirement_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
-    hard_delete_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     creation_worker_idle_signal: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
@@ -870,13 +866,6 @@ pub struct RuntimeManager {
     cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
     handoff_tx: mpsc::Sender<TaskApprovalHandoffRequest>,
     handoff_rx: RwLock<Option<mpsc::Receiver<TaskApprovalHandoffRequest>>>,
-    /// Channel to the single serialized fork-resolution consumer. Every fork
-    /// proposal resolution (approve / request-changes) and cleanup (dismiss /
-    /// retire-on-terminal / hard-delete) is a [`fork_resolve::ForkCommand`]
-    /// processed one at a time by that consumer, so mutual exclusion between a
-    /// resolve and a cleanup is structural rather than lock-based.
-    fork_cmd_tx: mpsc::Sender<fork_resolve::ForkCommand>,
-    fork_cmd_rx: RwLock<Option<mpsc::Receiver<fork_resolve::ForkCommand>>>,
     /// Credential helper for recovery settlement (REQ-BED-030).
     credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     /// Receiver for browser session lifecycle edges. Taken once by
@@ -1280,7 +1269,7 @@ struct QueuedBroadcast {
 struct BroadcastGate {
     reserved_until: Option<i64>,
     queued: Vec<QueuedBroadcast>,
-    hard_deleted: bool,
+    publication_closed: bool,
 }
 
 pub struct PersistedMessageReservationAuthority {
@@ -1724,7 +1713,7 @@ impl SseBroadcaster {
             None => QueuedBroadcastAuthority::Unfenced,
         };
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-        if gate.hard_deleted {
+        if gate.publication_closed {
             return Err(());
         }
         if gate
@@ -1746,33 +1735,7 @@ impl SseBroadcaster {
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         gate.queued.clear();
         gate.reserved_until = None;
-        gate.hard_deleted = true;
-    }
-
-    pub fn send_hard_deleted_and_close(
-        &self,
-        conversation_id: String,
-        deleted_conversation_ids: Vec<String>,
-    ) -> Result<usize, ()> {
-        let _fatal_guard = self.fatal_publication_guard()?;
-        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-        if gate.hard_deleted {
-            return Err(());
-        }
-        gate.queued.clear();
-        gate.reserved_until = None;
-        let sequence_id = self.last_seq.load(Ordering::Acquire);
-        let result = self.send_with_ring_unlocked(
-            SseEvent::ConversationHardDeleted {
-                sequence_id,
-                conversation_id,
-                deleted_conversation_ids,
-            },
-            sequence_id,
-            RingOp::BroadcastOnly,
-        );
-        gate.hard_deleted = true;
-        result
+        gate.publication_closed = true;
     }
 
     pub async fn persisted_message_reservation_authority(
@@ -1794,7 +1757,7 @@ impl SseBroadcaster {
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         let mut queued = std::mem::take(&mut gate.queued);
         queued.sort_by_key(|entry| entry.seq);
-        if !gate.hard_deleted {
+        if !gate.publication_closed {
             for QueuedBroadcast {
                 event,
                 seq,
@@ -1857,7 +1820,7 @@ impl SseBroadcaster {
     fn send_broadcast_only(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
         let _fatal_guard = self.fatal_publication_guard()?;
         let gate = self.gate.lock().expect("BroadcastGate mutex");
-        if gate.hard_deleted {
+        if gate.publication_closed {
             return Err(());
         }
         let witnessed_seq = self.last_seq.load(Ordering::Acquire);
@@ -1935,7 +1898,7 @@ impl SseBroadcaster {
         op: RingOp,
     ) -> Result<usize, ()> {
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-        if gate.hard_deleted {
+        if gate.publication_closed {
             return Err(());
         }
         if gate
@@ -2412,17 +2375,6 @@ pub enum SseEvent {
         sequence_id: i64,
         error: user_facing_error::UserFacingError,
     },
-    /// REQ-BED-032 step 6: emitted exactly once after a hard-delete cascade
-    /// completes. UI consumers (sidebar, navigation) use it to refresh
-    /// views. The `conversation_id` field is redundant with the broadcaster
-    /// scope today (the per-conversation channel implies the id) but is
-    /// carried explicitly so a future user-scope broadcaster can
-    /// disambiguate without changing the wire shape.
-    ConversationHardDeleted {
-        sequence_id: i64,
-        conversation_id: String,
-        deleted_conversation_ids: Vec<String>,
-    },
     /// Browser session liveness changed for this conversation. Emitted on
     /// the create edge (`active = true`, fired only on actual `HashMap`
     /// insertion in `BrowserSessionManager::get_session`) and the destroy
@@ -2599,47 +2551,6 @@ async fn accepts_browser_scope_event(
         .is_ok_and(|authority| authority.authority == crate::work_scope::ResourceAuthority::Work)
 }
 
-fn deterministic_explore_branch_for_worktree(worktree_path: &std::path::Path) -> Option<String> {
-    let owner_id = worktree_path.file_name()?.to_str()?;
-    let id_prefix: String = owner_id.chars().take(8).collect();
-    Some(format!("task-pending-{id_prefix}"))
-}
-
-pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
-    worktree_path: &std::path::Path,
-    conversations: impl IntoIterator<Item = &'a crate::db::Conversation>,
-) -> Option<String> {
-    use phoenix_core::domain::db_schema::ConvMode;
-
-    let conversations: Vec<_> = conversations.into_iter().collect();
-    if let Some(branch) = conversations.iter().find_map(|conv| match &conv.conv_mode {
-        ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
-        ConvMode::Explore { .. }
-        | ConvMode::AttachedWorkChild
-        | ConvMode::Direct
-        | ConvMode::Branch { .. }
-        | ConvMode::DetachedProductCreation { .. }
-        | ConvMode::DetachedApprovedTask { .. } => None,
-    }) {
-        if crate::git_ops::run_git(worktree_path, &["symbolic-ref", "-q", "HEAD"]).is_err() {
-            return None;
-        }
-        return Some(branch);
-    }
-    if !conversations.iter().any(|conv| {
-        matches!(
-            conv.conv_mode,
-            ConvMode::Explore {
-                worktree_path: Some(_),
-                ..
-            }
-        )
-    }) {
-        return None;
-    }
-    deterministic_explore_branch_for_worktree(worktree_path)
-}
-
 impl RuntimeManager {
     pub(crate) fn live_materialized_handle_count(&self) -> Option<u64> {
         self.runtimes
@@ -2698,7 +2609,6 @@ impl RuntimeManager {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
         let (handoff_tx, handoff_rx) = mpsc::channel(32);
-        let (fork_cmd_tx, fork_cmd_rx) = mpsc::channel(32);
         // Browser session lifecycle channel. Unbounded because the volume is
         // O(user-clicks-on-browser-tools) — a tightly bounded channel could
         // drop edges and desync the UI's "session live" indicator. The
@@ -2771,13 +2681,10 @@ impl RuntimeManager {
             #[cfg(test)]
             runtime_exit_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
-            fork_command_barrier: AsyncMutex::new(None),
-            #[cfg(test)]
             native_admission_prewrite_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             browser_retirement_barrier: AsyncMutex::new(None),
             #[cfg(test)]
-            hard_delete_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             creation_worker_idle_signal: Mutex::new(None),
             #[cfg(test)]
@@ -2812,8 +2719,6 @@ impl RuntimeManager {
             cancel_rx: RwLock::new(Some(cancel_rx)),
             handoff_tx,
             handoff_rx: RwLock::new(Some(handoff_rx)),
-            fork_cmd_tx,
-            fork_cmd_rx: RwLock::new(Some(fork_cmd_rx)),
             credential_helper,
             browser_lifecycle_rx: RwLock::new(Some(browser_lifecycle_rx)),
             bash_lifecycle_rx: RwLock::new(Some(bash_lifecycle_rx)),
@@ -3944,18 +3849,6 @@ impl RuntimeManager {
     }
 
     #[cfg(test)]
-    pub(crate) async fn install_hard_delete_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
-        *self.hard_delete_barrier.lock().await = Some(barrier);
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_at_hard_delete_barrier(&self) {
-        if let Some(barrier) = self.hard_delete_barrier.lock().await.take() {
-            barrier.wait().await;
-            barrier.wait().await;
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn fatal_authority_owners_at_first_close(&self) -> Option<usize> {
         self.fatal_local_authority_fence.owners_at_first_close()
@@ -4791,14 +4684,9 @@ impl RuntimeManager {
         let spawn_rx = self.spawn_rx.write().await.take();
         let cancel_rx = self.cancel_rx.write().await.take();
         let handoff_rx = self.handoff_rx.write().await.take();
-        let fork_cmd_rx = self.fork_cmd_rx.write().await.take();
 
-        if let (
-            Some(mut spawn_rx),
-            Some(mut cancel_rx),
-            Some(mut handoff_rx),
-            Some(mut fork_cmd_rx),
-        ) = (spawn_rx, cancel_rx, handoff_rx, fork_cmd_rx)
+        if let (Some(mut spawn_rx), Some(mut cancel_rx), Some(mut handoff_rx)) =
+            (spawn_rx, cancel_rx, handoff_rx)
         {
             tokio::spawn(async move {
                 loop {
@@ -4814,16 +4702,10 @@ impl RuntimeManager {
                         Some(req) = handoff_rx.recv() => {
                             manager.handle_task_handoff_request(req).await;
                         }
-                        // Single serialized fork-resolution consumer: each command
-                        // is handled to completion before the next is taken, so two
-                        // fork critical sections cannot interleave (REQ-PROJ-034/035).
-                        Some(cmd) = fork_cmd_rx.recv() => {
-                            manager.handle_fork_command(cmd).await;
-                        }
                         else => break,
                     }
                 }
-                tracing::info!("Sub-agent/task-handoff/fork-resolution handler stopped");
+                tracing::info!("Sub-agent/task-handoff handler stopped");
             });
         }
     }
@@ -5768,18 +5650,8 @@ impl RuntimeManager {
                 state: projection.state.clone(),
                 state_updated_at: projection.state_updated_at,
             });
-            executor::emit_terminal_lifecycle_event(
-                conversation_id,
-                Some(&self.fork_cmd_tx),
-                &broadcaster,
-            )
-            .await;
-        } else {
-            executor::complete_terminal_lifecycle_without_broadcast(
-                conversation_id,
-                Some(&self.fork_cmd_tx),
-            )
-            .await;
+            let _ = broadcaster
+                .send_seq(|seq| SseEvent::ConversationBecameTerminal { sequence_id: seq });
         }
     }
 
@@ -5847,20 +5719,6 @@ impl RuntimeManager {
                     .await
                     .remove(&reconciliation.conversation_id);
             }
-        }
-        let conversations = crate::reconcile_worktrees_with_terminalized(&self.db, || {
-            self.acquire_local_authority_pass()
-        })
-        .await;
-        for conversation in conversations {
-            let Ok(_owner) = self.acquire_local_authority_pass() else {
-                return Ok(());
-            };
-            executor::complete_terminal_lifecycle_without_broadcast(
-                &conversation.id,
-                Some(&self.fork_cmd_tx),
-            )
-            .await;
         }
         let repo = self.db.workflow_repository();
         let mut consumed_action_ids = HashSet::new();
@@ -5960,11 +5818,6 @@ impl RuntimeManager {
                                     DatabaseTerminalRecoveryError::Retryable(error.to_string())
                                 })?;
                             }
-                            executor::complete_terminal_lifecycle_without_broadcast(
-                                &conversation_id,
-                                Some(&self.fork_cmd_tx),
-                            )
-                            .await;
                             self.db
                                 .delete_startup_parent_action(
                                     &conversation_id,
@@ -6842,14 +6695,6 @@ impl RuntimeManager {
         };
 
         // Fork proposals are bound to top-level (parent) origins; sub-agents
-        // never hold any. Give parent runtimes the fork-resolution consumer
-        // sender so a terminal transition retires their still-pending proposals
-        // through the serialized consumer (REQ-PROJ-035).
-        let runtime = if is_sub_agent {
-            runtime
-        } else {
-            runtime.with_fork_command_sender(self.fork_cmd_tx.clone())
-        };
         let runtime = if let Some((job_id, claim)) = startup_creation_completion {
             runtime.with_startup_creation_completion(job_id, claim)
         } else {
@@ -7860,11 +7705,6 @@ impl RuntimeManager {
     /// Peek at the runtime handle for a conversation without starting one.
     /// Returns `None` if no runtime is currently registered for `conversation_id`.
     ///
-    /// REQ-BED-032: the hard-delete cascade uses this to broadcast the
-    /// `ConversationHardDeleted` event onto the existing per-conversation
-    /// channel — if any. Spinning up a runtime for a conversation that's
-    /// about to be deleted would be wasted work (the executor would
-    /// observe the row gone seconds later).
     pub async fn try_get_handle(&self, conversation_id: &str) -> Option<ConversationHandle> {
         let runtimes = self.runtimes.read().await;
         runtimes.get(conversation_id).map(|h| ConversationHandle {
@@ -8005,45 +7845,8 @@ impl RuntimeManager {
         }
     }
 
-    /// Remove and return the evicted broadcaster for `conversation_id`, if any.
-    ///
-    /// An evicted broadcaster exists in the window between `evict_runtime` (model
-    /// upgrade) and the next `get_or_create` call for the same conversation. During
-    /// this window the broadcaster is not reachable via `try_get_handle`, so any
-    /// caller that needs to push a final event — most notably the hard-delete cascade
-    /// — must also check here.
-    pub async fn take_evicted_broadcaster(&self, conversation_id: &str) -> Option<SseBroadcaster> {
-        // The model-upgrade marker is normally consumed by the next
-        // get_or_create. The hard-delete cascade is the one path that takes
-        // the evicted broadcaster without a subsequent get_or_create, so the
-        // marker would leak forever for a conversation deleted before
-        // re-access. Drop it here too — these are the same lifecycle.
-        self.evicted_model_upgrades
-            .write()
-            .await
-            .remove(conversation_id);
-        self.evicted_broadcasters
-            .write()
-            .await
-            .remove(conversation_id)
-    }
-
     pub fn subscribe_aggregate_events(&self) -> broadcast::Receiver<SseEvent> {
         self.aggregate_event_tx.subscribe()
-    }
-
-    pub fn publish_aggregate_hard_deleted(
-        &self,
-        product_conversation_id: String,
-        deleted_conversation_ids: Vec<String>,
-    ) {
-        let _ = self
-            .aggregate_event_tx
-            .send(SseEvent::ConversationHardDeleted {
-                sequence_id: 0,
-                conversation_id: product_conversation_id,
-                deleted_conversation_ids,
-            });
     }
 
     /// Determine the resume state for a conversation.
@@ -8845,84 +8648,6 @@ mod broadcaster_tests {
             events.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
-    }
-
-    #[test]
-    fn hard_delete_is_the_final_publication() {
-        let broadcaster = SseBroadcaster::new(16, 0);
-        let mut events = broadcaster.subscribe();
-        broadcaster
-            .send_seq(|sequence_id| SseEvent::Token {
-                sequence_id,
-                text: "before".to_string(),
-                request_id: "before-request".to_string(),
-            })
-            .unwrap();
-        broadcaster
-            .send_hard_deleted_and_close(
-                "deleted-conversation".to_string(),
-                vec!["deleted-conversation".to_string()],
-            )
-            .unwrap();
-
-        assert!(matches!(events.try_recv(), Ok(SseEvent::Token { .. })));
-        assert!(matches!(
-            events.try_recv(),
-            Ok(SseEvent::ConversationHardDeleted { ref conversation_id, .. })
-                if conversation_id == "deleted-conversation"
-        ));
-        assert!(broadcaster
-            .send_seq(|sequence_id| SseEvent::Token {
-                sequence_id,
-                text: "after".to_string(),
-                request_id: "after-request".to_string(),
-            })
-            .is_err());
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn hard_delete_discards_publications_queued_behind_a_reserved_range() {
-        let broadcaster = SseBroadcaster::new(16, 0);
-        let mut events = broadcaster.subscribe();
-        let (reserved, reserved_sequence) = broadcaster
-            .persisted_message_reservation_authority()
-            .await
-            .reserve_next_after(0)
-            .expect("reserve one persisted sequence");
-        broadcaster
-            .send_seq(|sequence_id| SseEvent::Token {
-                sequence_id,
-                text: "queued".to_string(),
-                request_id: "queued-request".to_string(),
-            })
-            .unwrap();
-        broadcaster
-            .send_hard_deleted_and_close(
-                "deleted-conversation".to_string(),
-                vec!["deleted-conversation".to_string()],
-            )
-            .unwrap();
-        drop(reserved);
-
-        assert!(matches!(
-            events.try_recv(),
-            Ok(SseEvent::ConversationHardDeleted { .. })
-        ));
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-        assert!(broadcaster
-            .send_reserved_seq(reserved_sequence, |sequence_id| SseEvent::Token {
-                sequence_id,
-                text: "late-reserved".to_string(),
-                request_id: "late-reserved-request".to_string(),
-            })
-            .is_err());
     }
 
     /// Regression for task 02679: when a caller pre-allocates a message's
@@ -10368,9 +10093,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn second_startup_worktree_scan_retires_top_level_fork_proposals() {
-        use crate::db::{ForkProposal, ForkProposalStatus};
-
+    async fn startup_obligation_recovery_leaves_unrelated_missing_worktree_alone() {
         let mgr = Arc::new(test_manager().await);
         mgr.start_sub_agent_handler().await;
         let root = tempfile::tempdir().unwrap();
@@ -10378,20 +10101,6 @@ mod scope_liveness_tests {
         let conversation_id = "missing-top-level-worktree";
         create_handleless_work_conv(&mgr, conversation_id, worktree_path.to_str().unwrap(), None)
             .await;
-        let proposal = ForkProposal {
-            id: "missing-worktree-proposal".to_string(),
-            origin_conversation_id: conversation_id.to_string(),
-            task_file: "tasks/12345-p1-ready--missing.md".to_string(),
-            title: "Missing".to_string(),
-            priority: "p1".to_string(),
-            body: "# Missing".to_string(),
-            status: ForkProposalStatus::Pending,
-            fork_conversation_id: None,
-            refinement_conversation_id: None,
-            created_at: chrono::Utc::now(),
-            resolved_at: None,
-        };
-        mgr.db().insert_fork_proposal(&proposal).await.unwrap();
         assert!(mgr
             .db()
             .list_startup_parent_actions()
@@ -10401,7 +10110,7 @@ mod scope_liveness_tests {
 
         mgr.reconcile_startup_obligated_parents().await.unwrap();
 
-        assert!(matches!(
+        assert!(!matches!(
             mgr.db()
                 .get_conversation(conversation_id)
                 .await
@@ -10409,15 +10118,6 @@ mod scope_liveness_tests {
                 .state,
             ConvState::Terminal
         ));
-        assert_eq!(
-            mgr.db()
-                .get_fork_proposal(&proposal.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            ForkProposalStatus::Dismissed
-        );
     }
 
     fn stale_creation_event() -> Event {
