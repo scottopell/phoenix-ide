@@ -2681,6 +2681,7 @@ where
         self
     }
 
+    #[cfg(test)]
     fn retain_handoff_completion_authority(
         &mut self,
         completion: Option<&Event>,

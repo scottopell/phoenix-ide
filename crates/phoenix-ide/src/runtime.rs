@@ -5352,6 +5352,7 @@ impl RuntimeManager {
         self.get_or_create_inner(conversation_id, None).await
     }
 
+    #[cfg(test)]
     async fn get_or_create_with_authority(
         self: &Arc<Self>,
         conversation_id: &str,
