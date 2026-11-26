@@ -2161,15 +2161,11 @@ pub(super) async fn require_initial_identity_tx(
             "expected initial Close intent".into(),
         ));
     };
-    crate::executing_source::require_executing_source(
-        live_source,
-        command.source(),
-        "close_conversation",
-        &command.intent().source_input(),
-    )
-    .map_err(|_| {
-        DbError::CloseFoundationPrecondition("Close requires its current executing source".into())
-    })?;
+    command
+        .verify_executing_source(live_source, command.source())
+        .map_err(|_| {
+            DbError::CloseFoundationPrecondition("Close requires its current executing source".into())
+        })?;
     if receipt.request_id != command.request_id()
         || receipt.admitted.target != *target
         || receipt.admitted.run_ordinal != CloseRunOrdinal::INITIAL

@@ -190,6 +190,115 @@ fn discovered_request() -> LlmRequest {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn nested_request_union_is_preserved_in_hosted_and_codex_discovery_declarations() {
+    // Local wire regression only: this does not establish external provider acceptance.
+    // Keep the fixture here rather than depending on the IDE's tool implementation.
+    let target = json!({"type":"string", "minLength":1});
+    let attempt = json!({"type":"string", "minLength":1});
+    let ordinal = json!({"type":"integer", "minimum":1, "maximum":i64::MAX});
+    let schema = json!({
+        "type":"object",
+        "properties": {
+            "request": {"oneOf": [
+                {
+                    "type":"object",
+                    "properties": {
+                        "action":{"type":"string", "enum":["initial"]},
+                        "product_conversation_id":target
+                    },
+                    "required":["action", "product_conversation_id"],
+                    "additionalProperties":false
+                },
+                {
+                    "type":"object",
+                    "properties": {
+                        "action":{"type":"string", "enum":["observe"]},
+                        "product_conversation_id":target,
+                        "attempt_id":attempt,
+                        "run_ordinal":ordinal
+                    },
+                    "required":["action", "product_conversation_id", "attempt_id", "run_ordinal"],
+                    "additionalProperties":false
+                },
+                {
+                    "type":"object",
+                    "properties": {
+                        "action":{"type":"string", "enum":["explicit_retry"]},
+                        "product_conversation_id":target,
+                        "attempt_id":attempt,
+                        "failed_run_ordinal":ordinal
+                    },
+                    "required":["action", "product_conversation_id", "attempt_id", "failed_run_ordinal"],
+                    "additionalProperties":false
+                }
+            ]}
+        },
+        "required":["request"],
+        "additionalProperties":false
+    });
+    let tool = ToolDefinition {
+        name: "close_conversation".into(),
+        description: "Close, observe, or explicitly retry an exact operation".into(),
+        input_schema: schema.clone(),
+        defer_loading: true,
+    };
+    for codex in [false, true] {
+        let mode = if codex {
+            ToolDiscoveryMode::OpenAiClient
+        } else {
+            ToolDiscoveryMode::OpenAiHosted
+        };
+        let mut request = if codex {
+            discovered_request()
+        } else {
+            request(mode)
+        };
+        let results = if codex {
+            let mut result = request.tool_availability.discovery_results()[0].clone();
+            result.tools = vec![tool.clone()];
+            vec![result]
+        } else {
+            vec![]
+        };
+        request.tool_availability =
+            ToolAvailability::all(vec![tool_search_definition(), tool.clone()])
+                .with_discovery(mode, results)
+                .unwrap();
+        validate_results(&request).unwrap();
+        let wire = serde_json::to_value(super::super::translate_to_backend_request(
+            "gpt-6.2-sol",
+            &request,
+            codex,
+            true,
+        ))
+        .unwrap();
+        let declaration = if codex {
+            let output = wire["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["type"] == "tool_search_output")
+                .unwrap();
+            assert_eq!(output["execution"], "client");
+            &output["tools"][0]
+        } else {
+            &wire["tools"][0]
+        };
+        // Exact equality catches flattening, nullable padding, and promotion of
+        // action-specific coordinates into a single all-required object.
+        assert_eq!(
+            declaration,
+            &json!({
+                "type":"function", "name":tool.name, "description":tool.description,
+                "parameters":schema, "defer_loading":true
+            }),
+            "codex={codex}"
+        );
+    }
+}
+
+#[test]
 fn native_client_result_uses_authenticated_schema_after_private_settlement() {
     let mut request = discovered_request();
     validate_results(&request).unwrap();

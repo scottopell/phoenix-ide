@@ -148,10 +148,10 @@ mod tests {
                 message_id: "exit-source-message".into(),
                 tool_use_id: "exit-source-tool".into(),
             };
-            let input = json!({
-                "action": "initial",
-                "product_conversation_id": target.as_str()
-            });
+            let input = NativeCloseIntent::Initial {
+                target: target.clone(),
+            }
+            .source_input();
             let state = ConvState::ToolExecuting {
                 current_tool: ToolCall::new(
                     &source.tool_use_id,

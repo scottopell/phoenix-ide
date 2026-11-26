@@ -14,7 +14,7 @@ fn initial_result_round(
         content: MessageContent::Agent(vec![ContentBlock::ToolUse {
             id: command.source().tool_use_id.clone(),
             name: "close_conversation".into(),
-            input: command.intent().source_input(),
+            input: command.source_input(),
         }]),
         display_data: None,
         usage_data: None,

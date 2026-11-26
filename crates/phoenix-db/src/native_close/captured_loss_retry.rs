@@ -209,7 +209,7 @@ impl Database {
                 "captured loss origin requires exactly one initial receipt",
             ));
         };
-        let initial_command = NativeCloseCommand::new(
+        let initial_command = NativeCloseCommand::new_from_retained_fingerprint(
             receipt.try_get("source_transcript_id")?,
             SourceToolCall {
                 message_id: receipt.try_get("source_message_id")?,
@@ -218,6 +218,7 @@ impl Database {
             NativeCloseIntent::Initial {
                 target: target.clone(),
             },
+            &receipt.try_get::<String, _>("request_fingerprint")?,
         )
         .map_err(decode_error)?;
         if receipt.try_get::<String, _>("request_id")? != initial_command.request_id().to_string()
