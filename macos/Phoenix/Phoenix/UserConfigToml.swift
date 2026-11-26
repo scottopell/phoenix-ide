@@ -129,6 +129,87 @@ enum UserConfigTomlError: LocalizedError, Equatable {
     }
 }
 
+enum TomlMultilineDelimiter: Equatable {
+    case basic   // """
+    case literal // '''
+}
+
+struct TomlMultilineTracker {
+    private(set) var activeString: TomlMultilineDelimiter?
+
+    var isInsideMultilineString: Bool {
+        activeString != nil
+    }
+
+    mutating func consume(line: String) {
+        var index = line.startIndex
+        var inSingleBasic = false
+        var inSingleLiteral = false
+        while index < line.endIndex {
+            let ch = line[index]
+            if let delimiter = activeString {
+                if delimiter == .basic && ch == "\\" {
+                    index = line.index(after: index)
+                    if index < line.endIndex { index = line.index(after: index) }
+                    continue
+                }
+                let quoteChar: Character = delimiter == .basic ? "\"" : "'"
+                if ch == quoteChar {
+                    var runEnd = index
+                    var runLength = 0
+                    while runEnd < line.endIndex && line[runEnd] == quoteChar {
+                        runEnd = line.index(after: runEnd)
+                        runLength += 1
+                    }
+                    if runLength >= 3 {
+                        activeString = nil
+                        index = runEnd
+                        continue
+                    }
+                    index = runEnd
+                    continue
+                }
+                index = line.index(after: index)
+                continue
+            }
+            if inSingleBasic {
+                if ch == "\\" {
+                    index = line.index(after: index)
+                    if index < line.endIndex { index = line.index(after: index) }
+                    continue
+                }
+                if ch == "\"" { inSingleBasic = false }
+                index = line.index(after: index)
+                continue
+            }
+            if inSingleLiteral {
+                if ch == "'" { inSingleLiteral = false }
+                index = line.index(after: index)
+                continue
+            }
+            if ch == "#" {
+                break
+            }
+            if line[index...].hasPrefix("\"\"\"") {
+                activeString = .basic
+                index = line.index(index, offsetBy: 3)
+                continue
+            }
+            if line[index...].hasPrefix("'''") {
+                activeString = .literal
+                index = line.index(index, offsetBy: 3)
+                continue
+            }
+            if ch == "\"" {
+                inSingleBasic = true
+            } else if ch == "'" {
+                inSingleLiteral = true
+            }
+            index = line.index(after: index)
+        }
+    }
+}
+
 enum UserConfigTomlParser {
     private static let allowedLLMScalarKeys: Set<String> = [
         "api_key_helper",
@@ -185,6 +266,7 @@ enum UserConfigTomlParser {
         var sawExplicitSection = false
         var rawModelsBlocks: [String] = []
         var activeModelsBlock: [String]?
+        var multiline = TomlMultilineTracker()
 
         let lines = normalized.components(separatedBy: "\n")
 
@@ -200,18 +282,37 @@ enum UserConfigTomlParser {
 
         for (zeroIndex, rawLine) in lines.enumerated() {
             let lineNumber = zeroIndex + 1
+
+            if multiline.isInsideMultilineString {
+                multiline.consume(line: rawLine)
+                if activeModelsBlock != nil {
+                    activeModelsBlock?.append(rawLine)
+                }
+                continue
+            }
+
             let cleaned = stripComment(rawLine).trimmingCharacters(in: .whitespaces)
 
             if activeModelsBlock != nil {
-                if cleaned.hasPrefix("[") && !cleaned.hasPrefix("[[models]]") && !cleaned.hasPrefix("[models.") {
+                if cleaned.hasPrefix("[[") && cleaned.hasSuffix("]]") {
+                    let inner = String(cleaned.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespaces)
+                    let segments = (try? parseKeyPath(inner, line: lineNumber)) ?? [inner]
+                    flushModelsBlock()
+                    if segments == ["models"] {
+                        activeModelsBlock = [rawLine]
+                        continue
+                    }
+                } else if cleaned.hasPrefix("[") && cleaned.hasSuffix("]") {
+                    let inner = String(cleaned.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
+                    let segments = (try? parseKeyPath(inner, line: lineNumber)) ?? [inner]
+                    if segments.first == "models" {
+                        activeModelsBlock?.append(rawLine)
+                        continue
+                    }
                     flushModelsBlock()
                 } else {
-                    if cleaned == "[[models]]" {
-                        flushModelsBlock()
-                        activeModelsBlock = [rawLine]
-                    } else {
-                        activeModelsBlock?.append(rawLine)
-                    }
+                    multiline.consume(line: rawLine)
+                    activeModelsBlock?.append(rawLine)
                     continue
                 }
             }
@@ -223,8 +324,9 @@ enum UserConfigTomlParser {
                     throw UserConfigTomlError.invalidSyntax(line: lineNumber, detail: "unterminated array table header")
                 }
                 let header = String(cleaned.dropFirst(2).dropLast(2)).trimmingCharacters(in: .whitespaces)
+                let segments = (try? parseKeyPath(header, line: lineNumber)) ?? [header]
                 sawExplicitSection = true
-                if header == "models" {
+                if segments == ["models"] {
                     currentSection = .models
                     activeModelsBlock = [rawLine]
                     continue
@@ -240,6 +342,13 @@ enum UserConfigTomlParser {
                 let header = String(cleaned.dropFirst().dropLast()).trimmingCharacters(in: .whitespaces)
                 sawExplicitSection = true
                 currentSection = try parseSectionHeader(header, line: lineNumber)
+                continue
+            }
+
+            // Skip unrelated sections (e.g. [agents.*], [tiers.*]) without rejecting
+            // multiline arrays, inline tables, or multiline strings inside them.
+            if case .other = currentSection {
+                multiline.consume(line: rawLine)
                 continue
             }
 
@@ -823,76 +932,20 @@ enum UserConfigStore {
             case drop
         }
 
-        enum MultilineDelimiter {
-            case basic   // """
-            case literal // '''
-        }
-
-        func updateMultilineState(_ line: String, active: inout MultilineDelimiter?) {
-            var index = line.startIndex
-            var inSingleBasic = false
-            var inSingleLiteral = false
-            while index < line.endIndex {
-                let ch = line[index]
-                if let delimiter = active {
-                    if delimiter == .basic && ch == "\\" {
-                        index = line.index(after: index)
-                        if index < line.endIndex { index = line.index(after: index) }
-                        continue
-                    }
-                    let token = delimiter == .basic ? "\"\"\"" : "'''"
-                    if line[index...].hasPrefix(token) {
-                        active = nil
-                        index = line.index(index, offsetBy: 3)
-                        continue
-                    }
-                    index = line.index(after: index)
-                    continue
-                }
-                if inSingleBasic {
-                    if ch == "\\" {
-                        index = line.index(after: index)
-                        if index < line.endIndex { index = line.index(after: index) }
-                        continue
-                    }
-                    if ch == "\"" { inSingleBasic = false }
-                    index = line.index(after: index)
-                    continue
-                }
-                if inSingleLiteral {
-                    if ch == "'" { inSingleLiteral = false }
-                    index = line.index(after: index)
-                    continue
-                }
-                if ch == "#" {
-                    break
-                }
-                if line[index...].hasPrefix("\"\"\"") {
-                    active = .basic
-                    index = line.index(index, offsetBy: 3)
-                    continue
-                }
-                if line[index...].hasPrefix("'''") {
-                    active = .literal
-                    index = line.index(index, offsetBy: 3)
-                    continue
-                }
-                if ch == "\"" {
-                    inSingleBasic = true
-                } else if ch == "'" {
-                    inSingleLiteral = true
-                }
-                index = line.index(after: index)
-            }
-        }
-
         var mode: KeepMode = .root
-        var activeMultiline: MultilineDelimiter?
+        var droppingRootAssignment = false
+        var multiline = TomlMultilineTracker()
 
         for (zeroIndex, line) in lines.enumerated() {
             let lineNumber = zeroIndex + 1
-            if activeMultiline != nil {
-                updateMultilineState(line, active: &activeMultiline)
+            if multiline.isInsideMultilineString {
+                multiline.consume(line: line)
+                if droppingRootAssignment {
+                    if !multiline.isInsideMultilineString {
+                        droppingRootAssignment = false
+                    }
+                    continue
+                }
                 switch mode {
                 case .root: preservedHeaderLines.append(line)
                 case .keep: preservedOtherSections.append(line)
@@ -900,6 +953,7 @@ enum UserConfigStore {
                 }
                 continue
             }
+            droppingRootAssignment = false
 
             let cleaned = UserConfigTomlParser.stripComment(line).trimmingCharacters(in: .whitespaces)
             if cleaned.hasPrefix("[[") && cleaned.hasSuffix("]]") {
@@ -927,14 +981,20 @@ enum UserConfigStore {
                 continue
             }
 
-            updateMultilineState(line, active: &activeMultiline)
+            multiline.consume(line: line)
 
             switch mode {
             case .root:
                 if let (rawKey, _) = UserConfigTomlParser.splitKeyValue(cleaned),
-                   let segments = try? UserConfigTomlParser.parseKeyPath(rawKey, line: lineNumber),
-                   segments == ["version"] {
-                    hasVersionLine = true
+                   let segments = try? UserConfigTomlParser.parseKeyPath(rawKey, line: lineNumber) {
+                    if segments == ["version"] {
+                        hasVersionLine = true
+                    } else if segments.first == "llm" || (replaceModels && segments.first == "models") {
+                        if multiline.isInsideMultilineString {
+                            droppingRootAssignment = true
+                        }
+                        continue
+                    }
                 }
                 preservedHeaderLines.append(line)
             case .keep:

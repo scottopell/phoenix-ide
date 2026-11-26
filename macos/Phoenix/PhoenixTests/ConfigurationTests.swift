@@ -2225,6 +2225,67 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(merged.components(separatedBy: "version = 1").count - 1, 1)
     }
 
+    func testUserConfigStoreMergeDropsRootDottedLLMKeysAndLoadSkipsUnrelatedMultilineSections() throws {
+        let dottedExisting = """
+        version = 1
+        llm.api_key_helper = "old-helper"
+        llm.auth_header = "api_key"
+        llm.custom_headers.X-Old = "gone"
+
+        [agents.reviewer]
+        description = "Review changes"
+        instructions = \"\"\"
+        Line one of instructions.
+        [llm]
+        api_key_helper = "fake-inside-string"
+        Line two with no equals sign.
+        \"\"\"
+        execution = [
+          { model = "gpt-5.6-sol", connection = "codex", reasoning_effort = "high" },
+        ]
+        """
+
+        // Loading existing config must ignore multiline strings and arrays in [agents.reviewer]
+        // and accurately extract the root-level dotted llm.* settings.
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let fileURL = tempDir.appendingPathComponent("config.toml")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        try Data(dottedExisting.utf8).write(to: fileURL)
+
+        let loadedBefore = try XCTUnwrap(try UserConfigStore.loadExistingLLMConfig(at: fileURL))
+        XCTAssertEqual(loadedBefore.apiKeyHelper, "old-helper")
+        XCTAssertEqual(loadedBefore.authHeader, .apiKey)
+        XCTAssertEqual(loadedBefore.customHeaders, ["X-Old": "gone"])
+
+        // Merging a replacement [llm] table must drop the root-level dotted llm.* keys
+        // so there is no duplicate `llm` declaration.
+        let updated = UserLLMConfig(
+            apiKeyHelper: "new-helper",
+            authHeader: .bearer,
+            openaiChatCompletionsBaseURL: "https://gateway.example.test/v1/chat/completions"
+        )
+        try UserConfigStore.mergeAndWrite(llm: updated, to: fileURL)
+        let merged = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertFalse(merged.contains("old-helper"))
+        XCTAssertFalse(merged.contains("llm.api_key_helper"))
+        XCTAssertFalse(merged.contains("llm.auth_header"))
+        XCTAssertFalse(merged.contains("X-Old"))
+        XCTAssertTrue(merged.contains("[llm]\napi_key_helper = \"new-helper\""))
+        XCTAssertTrue(merged.contains("[agents.reviewer]"))
+        XCTAssertTrue(merged.contains("fake-inside-string"))
+        XCTAssertTrue(merged.contains("gpt-5.6-sol"))
+
+        let loadedAfter = try XCTUnwrap(try UserConfigStore.loadExistingLLMConfig(at: fileURL))
+        XCTAssertEqual(loadedAfter, updated)
+
+        // Clearing [llm] removes the table and leaves no stale llm keys behind.
+        try UserConfigStore.mergeAndWrite(llm: nil, to: fileURL)
+        XCTAssertNil(try UserConfigStore.loadExistingLLMConfig(at: fileURL))
+        let cleared = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertTrue(cleared.contains("[agents.reviewer]"))
+    }
+
     func testPendingUserConfigRestartStateSurvivesFailedApplyUntilBundledApplySucceeds() throws {
         var restartState = PendingUserConfigRestartState()
         XCTAssertFalse(restartState.shouldForceRestart(for: .bundled, tomlEdited: false))
