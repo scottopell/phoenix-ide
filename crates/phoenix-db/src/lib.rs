@@ -13659,8 +13659,13 @@ impl Database {
 
         // Skip conversations whose state is preserved across restarts; their
         // history is frozen and shouldn't be amended with synthetic results.
-        let conv_rows: Vec<String> = sqlx::query(
-            "SELECT c.id FROM conversations AS c
+        let conv_rows: Vec<(String, Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT c.id,
+                    CASE WHEN r.terminal_cause IN ('submit_result', 'submit_error')
+                        THEN c.state END,
+                    r.terminal_cause, r.terminal_at_unix_micros
+             FROM conversations AS c
+             LEFT JOIN sub_agent_runs AS r ON r.child_conversation_id = c.id
              WHERE c.state_kind NOT IN
                  ('context_exhausted', 'handed_off', 'terminal',
                   'awaiting_continuation', 'recoverable_continuation_failure',
@@ -13679,33 +13684,31 @@ impl Database {
                      )
                )",
         )
-        .try_map(|row: SqliteRow| row.try_get("id"))
         .fetch_all(&self.pool)
         .await?;
 
-        for conv_id in conv_rows {
+        for (conv_id, terminal_state, terminal_cause, terminal_at) in conv_rows {
             // Get all messages for this conversation in order
-            let messages: Vec<(String, i64, String, String)> = sqlx::query(
-                "SELECT message_id, sequence_id, message_type, content
+            let messages: Vec<OrphanToolHistoryRow> = sqlx::query_as(
+                "SELECT message_id, sequence_id, message_type, content, created_at
                  FROM messages WHERE conversation_id = ?1 ORDER BY sequence_id ASC",
             )
             .bind(&conv_id)
-            .try_map(|row: SqliteRow| {
-                Ok((
-                    row.try_get("message_id")?,
-                    row.try_get("sequence_id")?,
-                    row.try_get("message_type")?,
-                    row.try_get("content")?,
-                ))
-            })
             .fetch_all(&self.pool)
             .await?;
 
+            let terminal_acknowledgement = recover_sub_agent_terminal_acknowledgement(
+                &messages,
+                terminal_state.as_deref(),
+                terminal_cause.as_deref(),
+                terminal_at,
+            );
+
             // Find orphaned tool_use IDs
-            let mut pending_tool_ids: Vec<String> = Vec::new();
+            let mut pending_tool_ids = Vec::new();
             let mut max_sequence_id: i64 = 0;
 
-            for (_, seq_id, msg_type, content) in &messages {
+            for (message_id, seq_id, msg_type, content, _) in &messages {
                 max_sequence_id = *seq_id;
 
                 if msg_type == "agent" {
@@ -13713,27 +13716,42 @@ impl Database {
                     if let Ok(blocks) = serde_json::from_str::<Vec<ContentBlock>>(content) {
                         for block in blocks {
                             if let ContentBlock::ToolUse { id, .. } = block {
-                                pending_tool_ids.push(id);
+                                pending_tool_ids.push((message_id, id));
                             }
                         }
                     }
                 } else if msg_type == "tool" {
                     // Parse tool content to find tool_use_id
                     if let Ok(tool_content) = serde_json::from_str::<ToolContent>(content) {
-                        pending_tool_ids.retain(|id| id != &tool_content.tool_use_id);
+                        pending_tool_ids.retain(|(_, id)| id != &tool_content.tool_use_id);
                     }
                 }
             }
 
             // Insert synthetic tool_result for any remaining orphaned tool_use
-            for tool_id in pending_tool_ids {
+            for (assistant_id, tool_id) in pending_tool_ids {
                 max_sequence_id += 1;
-                let msg_id = uuid::Uuid::new_v4().to_string();
-                let tool_content = ToolContent::new(
-                    &tool_id,
-                    "[Tool execution interrupted by server restart]",
-                    true,
-                );
+                let (msg_id, tool_content) = match &terminal_acknowledgement {
+                    Some((message_id, accepted_id, receipt))
+                        if *message_id == assistant_id.as_str() && accepted_id == &tool_id =>
+                    {
+                        (
+                            phoenix_core::domain::tool_result_identity::tool_result_message_id(
+                                assistant_id,
+                                &tool_id,
+                            ),
+                            ToolContent::new(&tool_id, *receipt, false),
+                        )
+                    }
+                    _ => (
+                        uuid::Uuid::new_v4().to_string(),
+                        ToolContent::new(
+                            &tool_id,
+                            "[Tool execution interrupted by server restart]",
+                            true,
+                        ),
+                    ),
+                };
                 let content_json =
                     serde_json::to_string(&tool_content).unwrap_or_else(|_| "{}".to_string());
 
@@ -16435,6 +16453,64 @@ impl MaterializedToolResult<'_> {
             Self::Interrupted(result) => result,
         }
     }
+}
+
+type OrphanToolHistoryRow = (String, i64, String, String, String);
+
+fn recover_sub_agent_terminal_acknowledgement<'a>(
+    messages: &'a [OrphanToolHistoryRow],
+    terminal_state: Option<&str>,
+    terminal_cause: Option<&str>,
+    terminal_at: Option<i64>,
+) -> Option<(&'a str, String, &'static str)> {
+    use phoenix_core::domain::llm_types::ContentBlock;
+    use phoenix_core::domain::sm_state::{SubmitErrorInput, SubmitResultInput};
+
+    let terminal_at = terminal_at?;
+    let state: ConvState = serde_json::from_str(terminal_state?).ok()?;
+    let cause = SubAgentTerminalCause::from_db_str(terminal_cause?).ok()?;
+    let (message_id, _, _, content, created_at) = messages
+        .iter()
+        .rfind(|(_, _, message_type, _, _)| message_type == "agent")?;
+    if DateTime::parse_from_rfc3339(created_at)
+        .ok()?
+        .timestamp_micros()
+        > terminal_at
+    {
+        return None;
+    }
+    let blocks = serde_json::from_str::<Vec<ContentBlock>>(content).ok()?;
+    let mut calls = blocks
+        .iter()
+        .filter(|block| matches!(block, ContentBlock::ToolUse { .. }));
+    let ContentBlock::ToolUse { id, name, input } = calls.next()? else {
+        return None;
+    };
+    if calls.next().is_some() {
+        return None;
+    }
+    let receipt = match (cause, &state, name.as_str()) {
+        (SubAgentTerminalCause::SubmitResult, ConvState::Completed { result }, "submit_result")
+            if serde_json::from_value::<SubmitResultInput>(input.clone())
+                .is_ok_and(|submitted| submitted.result == *result) =>
+        {
+            "Sub-agent result recorded."
+        }
+        (
+            SubAgentTerminalCause::SubmitError,
+            ConvState::Failed {
+                error,
+                error_kind: ErrorKind::SubAgentError,
+            },
+            "submit_error",
+        ) if serde_json::from_value::<SubmitErrorInput>(input.clone())
+            .is_ok_and(|submitted| submitted.error == *error) =>
+        {
+            "Sub-agent error report recorded."
+        }
+        _ => return None,
+    };
+    Some((message_id, id.clone(), receipt))
 }
 
 /// Build the materialized message rows for an in-flight tool round recovered
