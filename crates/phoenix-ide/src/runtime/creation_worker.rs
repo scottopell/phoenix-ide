@@ -231,7 +231,7 @@ async fn process_claimed_product_creation(
                 );
             }
             let had_materialization_authority = persisted_ownership_token.is_some();
-            let (worktree, ownership_token) = tokio::task::spawn_blocking({
+            let staged_checkout = tokio::task::spawn_blocking({
             let repo_root = repo_root.clone();
             let planned_path = planned_path.clone();
             let oid = oid.clone();
@@ -276,14 +276,23 @@ async fn process_claimed_product_creation(
                     write_product_creation_owner_marker(&path, &ownership_token)?;
                     ownership_token
                 };
-                Ok::<(String, String), String>((
+                let checkout_fingerprint = product_creation_checkout_fingerprint(&path)?;
+                let staged_token = read_product_creation_owner_marker(&path)?;
+                if staged_token.as_deref() != Some(ownership_token.as_str())
+                    || product_creation_checkout_fingerprint(&path)? != checkout_fingerprint
+                {
+                    return Err("staging checkout changed after verification".to_string());
+                }
+                Ok::<_, String>((
                     path.to_string_lossy().to_string(),
                     ownership_token,
+                    checkout_fingerprint,
                 ))
             }
         })
         .await
         .map_err(|error| format!("worktree materialization join failed: {error}"))??;
+            let (worktree, ownership_token, checkout_fingerprint) = staged_checkout;
             let non_empty = NonEmptyString::new(worktree.clone())
                 .map_err(|_| "materialized worktree path was empty".to_string())?;
             if reservation.status == "reserved" {
@@ -323,6 +332,7 @@ async fn process_claimed_product_creation(
                     exact_checkout_oid: oid,
                     repository_root: repo_root,
                     ownership_token,
+                    checkout_fingerprint,
                 }),
             )
         } else {
@@ -977,11 +987,13 @@ fn verify_existing_product_creation_staging(
 ) -> Result<String, String> {
     let expected = persisted_ownership_token
         .ok_or_else(|| "existing staging occupant lacked durable ownership".to_string())?;
+    let before = product_creation_checkout_fingerprint(path)?;
     verify_product_creation_checkout(repo_root, path, expected_oid)?;
-    match read_product_creation_owner_marker(path)? {
-        Some(actual) if actual == expected => Ok(expected.to_string()),
-        _ => Err("existing staging occupant did not match durable ownership".to_string()),
+    let token = read_product_creation_owner_marker(path)?;
+    if token.as_deref() != Some(expected) || product_creation_checkout_fingerprint(path)? != before {
+        return Err("existing staging occupant did not match durable ownership".to_string());
     }
+    Ok(expected.to_string())
 }
 
 fn verify_product_creation_checkout(
@@ -1033,24 +1045,39 @@ fn write_product_creation_owner_marker(
     worktree_path: &Path,
     ownership_token: &str,
 ) -> Result<(), String> {
-    if ownership_token.trim().is_empty() {
-        return Err("product creation ownership token was empty".to_string());
+    use std::io::Write as _;
+
+    if ownership_token.trim().is_empty() || ownership_token.contains('\n') {
+        return Err("product creation ownership token was invalid".to_string());
     }
-    std::fs::write(
-        product_creation_owner_marker_path(worktree_path)?,
-        ownership_token.as_bytes(),
-    )
-    .map_err(|error| format!("could not write product creation owner marker: {error}"))
+    let fingerprint = product_creation_checkout_fingerprint(worktree_path)?;
+    let marker = product_creation_owner_marker_path(worktree_path)?;
+    let mut file = std::fs::File::create_new(marker)
+        .map_err(|error| format!("could not create product creation owner marker: {error}"))?;
+    write!(file, "{ownership_token}\n{fingerprint}")
+        .map_err(|error| format!("could not write product creation owner marker: {error}"))
+}
+
+fn product_creation_checkout_fingerprint(worktree_path: &Path) -> Result<String, String> {
+    phoenix_core::git::observe_linked_worktree_fingerprint(worktree_path)
+        .ok_or_else(|| "could not identify the exact linked checkout marker".to_string())
 }
 
 fn read_product_creation_owner_marker(worktree_path: &Path) -> Result<Option<String>, String> {
-    match std::fs::read_to_string(product_creation_owner_marker_path(worktree_path)?) {
-        Ok(token) => Ok(Some(token)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(format!(
-            "could not read product creation owner marker: {error}"
-        )),
+    let marker = product_creation_owner_marker_path(worktree_path)?;
+    let bytes = match phoenix_core::git::read_worktree_registration_file(&marker) {
+        Ok((_, bytes)) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not read product creation owner marker: {error}")),
+    };
+    let record = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
+    let Some((token, expected_fingerprint)) = record.split_once('\n') else {
+        return Ok(None);
+    };
+    if product_creation_checkout_fingerprint(worktree_path)? != expected_fingerprint {
+        return Ok(None);
     }
+    Ok(Some(token.to_string()))
 }
 
 fn product_worktree_path(repo_root: &Path, id: &str) -> Result<PathBuf, String> {
@@ -4396,6 +4423,31 @@ mod product_creation_staging_ownership_tests {
             git(&["worktree", "list", "--porcelain", "-z"]),
             registrations
         );
+        assert!(moved.join(".git").is_file());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adoption_rejects_a_copied_pointer_even_with_the_same_backpointer() {
+        let repo = initialized_repo();
+        let original = product_worktree_path(repo.path(), "recorded").unwrap();
+        let moved = original.with_file_name("moved");
+        add_detached_worktree(repo.path(), &original);
+        write_product_creation_owner_marker(&original, "owner-token").unwrap();
+        let root = repo.path().to_str().unwrap();
+        let oid = crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        std::fs::copy(moved.join(".git"), original.join(".git")).unwrap();
+
+        assert!(verify_product_creation_checkout(root, &original, &oid).is_ok());
+        assert!(verify_existing_product_creation_staging(
+            root,
+            &original,
+            &oid,
+            Some("owner-token"),
+        )
+        .is_err());
         assert!(moved.join(".git").is_file());
     }
 

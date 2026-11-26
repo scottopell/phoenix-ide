@@ -437,6 +437,10 @@ impl DisposableGit {
                 exact_checkout_oid: oid,
                 repository_root: cwd,
                 ownership_token: "fixture-owner".to_string(),
+                checkout_fingerprint: phoenix_core::git::observe_linked_worktree_fingerprint(
+                    &self.worktree,
+                )
+                .unwrap(),
             },
         )
         .await;
