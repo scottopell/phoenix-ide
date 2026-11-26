@@ -252,7 +252,10 @@ jobs:
           timeout --kill-after=10s 120s gdb -nx -iex 'set auto-load off' --batch \
             -ex 'set disable-randomization off' -ex 'set pagination off' \
             -ex 'set print frame-arguments none' -ex 'set print entry-values no' \
-            -ex 'handle SIGSEGV stop print nopass' -ex run -ex 'bt 64' -ex 'info threads' \
+            -ex 'handle SIGSEGV stop print nopass' \
+            -ex 'tbreak crates/phoenix-db/src/lib.rs:14232' -ex run \
+            -ex 'echo Prompt-tail entry native-stack sample:\n' -ex 'bt 64' \
+            -ex 'frame apply 40 -q info frame' -ex continue -ex 'bt 64' -ex 'info threads' \
             -ex 'info registers rip rsp rbp' -ex 'print $_siginfo' -ex 'info proc mappings' \
             -ex 'frame apply 40 -q info frame' -ex 'frame 0' -ex 'x/32i $pc' \
             -ex 'print $_exitcode' -ex 'print $_exitsignal' \

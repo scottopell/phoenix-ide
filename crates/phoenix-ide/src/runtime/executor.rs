@@ -3357,28 +3357,17 @@ where
         let mut admitted_native_close_retry: Option<native_close_retry::AdmittedRetryCursor> = None;
         // Fatal authority exits must not release a continuation's source authority
         // or target gate while its owned preparation worker is still running.
-        // Keep Close-only SQLx/worker observation futures out of this event-loop
-        // future's inline state; boxing changes layout, not polling or custody order.
+        // Outline repeated Close cleanup bodies: native poll-stack measurements,
+        // unlike future layout, include their construction temporaries even on
+        // ordinary dispatch. Keep loop control and continuation custody here.
         macro_rules! join_pending_native_close_before_fatal {
             () => {
-                // Do not wait on the source mutex: unknown release deliberately
-                // retains it. Join workers, then let process-wide fatal handling
-                // fail-stop without unlocking or publishing a new source state.
-                if let Some(controller) = self.native_close_source_entry.as_mut() {
-                    controller.close_admission_for_fatal_exit();
-                }
-                if let Some(continuation) = pending_native_close_retry.take() {
-                    Box::pin(continuation.join_before_exit()).await;
-                }
-                if let Some(cursor) = admitted_native_close_retry.take() {
-                    Box::pin(cursor.join_before_exit()).await;
-                }
-                if let Some(continuation) = pending_native_close_initial.take() {
-                    // Fatal retention is not completion evidence: preserve the
-                    // entire owner and its gates until process fail-stop, even
-                    // when uncertainty is durable rather than a pending worker.
-                    std::mem::forget(continuation);
-                }
+                Box::pin(self.join_pending_native_close_before_fatal(
+                    &mut pending_native_close_initial,
+                    &mut pending_native_close_retry,
+                    &mut admitted_native_close_retry,
+                ))
+                .await;
             };
         }
         let mut queued_acknowledged_request: Option<AcknowledgedRuntimeRequest> = None;
@@ -3408,34 +3397,21 @@ where
 
         macro_rules! defer_exit_until_native_close_observed {
             ($event_loop:lifetime, $disposition:expr) => {{
-                self.revoke_native_close_source_entry().await;
-                if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
-                    join_pending_native_close_before_fatal!();
-                    return self.fatal_local_authority_exit();
-                }
-                self.cancellation_custody.refuse_pending_during_exit();
-                if pending_native_close_retry.is_some()
-                    || admitted_native_close_retry.is_some()
-                    || pending_native_close_initial.is_some()
+                let disposition = $disposition;
+                match Box::pin(self.prepare_native_close_exit(
+                    &mut pending_native_close_initial,
+                    &mut pending_native_close_retry,
+                    &mut admitted_native_close_retry,
+                    disposition,
+                ))
+                .await
                 {
-                    // Exit observation will no longer poll foreground tasks or deadlines.
-                    self.abort_external_effects().await;
+                    Some(exit) => return exit,
+                    None => {
+                        deferred_native_close_exit = Some(disposition);
+                        continue $event_loop;
+                    }
                 }
-                if let Some(continuation) = pending_native_close_retry.take() {
-                    Box::pin(continuation.join_before_exit()).await;
-                }
-                if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
-                    join_pending_native_close_before_fatal!();
-                    return self.fatal_local_authority_exit();
-                }
-                if let Some(continuation) = pending_native_close_initial.as_mut() {
-                    continuation.begin_exit_interruption();
-                }
-                if pending_native_close_initial.is_some() || admitted_native_close_retry.is_some() {
-                    deferred_native_close_exit = Some($disposition);
-                    continue $event_loop;
-                }
-                return $disposition;
             }};
         }
 
@@ -7820,6 +7796,79 @@ where
             self.pending_direct_turn_terminal = Some(Box::new(
                 crate::runtime::traits::ActiveDirectTurnTerminal::Completed,
             ));
+        }
+    }
+
+    async fn join_pending_native_close_before_fatal(
+        &mut self,
+        pending_native_close_initial: &mut Option<native_close::NativeCloseInitialContinuation>,
+        pending_native_close_retry: &mut Option<native_close_retry::NativeCloseRetryContinuation>,
+        admitted_native_close_retry: &mut Option<native_close_retry::AdmittedRetryCursor>,
+    ) {
+        // Do not wait on the source mutex: unknown release deliberately
+        // retains it. Join workers, then let process-wide fatal handling
+        // fail-stop without unlocking or publishing a new source state.
+        if let Some(controller) = self.native_close_source_entry.as_mut() {
+            controller.close_admission_for_fatal_exit();
+        }
+        if let Some(continuation) = pending_native_close_retry.take() {
+            Box::pin(continuation.join_before_exit()).await;
+        }
+        if let Some(cursor) = admitted_native_close_retry.take() {
+            Box::pin(cursor.join_before_exit()).await;
+        }
+        if let Some(continuation) = pending_native_close_initial.take() {
+            // Fatal retention is not completion evidence: preserve the
+            // entire owner and its gates until process fail-stop, even
+            // when uncertainty is durable rather than a pending worker.
+            std::mem::forget(continuation);
+        }
+    }
+
+    async fn prepare_native_close_exit(
+        &mut self,
+        pending_native_close_initial: &mut Option<native_close::NativeCloseInitialContinuation>,
+        pending_native_close_retry: &mut Option<native_close_retry::NativeCloseRetryContinuation>,
+        admitted_native_close_retry: &mut Option<native_close_retry::AdmittedRetryCursor>,
+        disposition: RuntimeExitDisposition,
+    ) -> Option<RuntimeExitDisposition> {
+        self.revoke_native_close_source_entry().await;
+        if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+            Box::pin(self.join_pending_native_close_before_fatal(
+                pending_native_close_initial,
+                pending_native_close_retry,
+                admitted_native_close_retry,
+            ))
+            .await;
+            return Some(self.fatal_local_authority_exit());
+        }
+        self.cancellation_custody.refuse_pending_during_exit();
+        if pending_native_close_retry.is_some()
+            || admitted_native_close_retry.is_some()
+            || pending_native_close_initial.is_some()
+        {
+            // Exit observation will no longer poll foreground tasks or deadlines.
+            self.abort_external_effects().await;
+        }
+        if let Some(continuation) = pending_native_close_retry.take() {
+            Box::pin(continuation.join_before_exit()).await;
+        }
+        if self.fatal_local_authority_fence.fatal_authority_loss_is_latched() {
+            Box::pin(self.join_pending_native_close_before_fatal(
+                pending_native_close_initial,
+                pending_native_close_retry,
+                admitted_native_close_retry,
+            ))
+            .await;
+            return Some(self.fatal_local_authority_exit());
+        }
+        if let Some(continuation) = pending_native_close_initial.as_mut() {
+            continuation.begin_exit_interruption();
+        }
+        if pending_native_close_initial.is_some() || admitted_native_close_retry.is_some() {
+            None
+        } else {
+            Some(disposition)
         }
     }
 

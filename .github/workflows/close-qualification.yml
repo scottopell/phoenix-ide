@@ -609,7 +609,9 @@ jobs:
             fi
             grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' "evidence/$name.log" || failed=1
           done
-          grep -Fx 'test lineage::tests::goal_tools_tests::canonical_goal_tools_prefixes_upgrade_reopen_and_remain_idempotent ... ok' evidence/lineage-tests-goal_tools_tests-.log || failed=1
+          for prefix in 142 143 144 145 146 147 148 149 150 151 152 153 155 156 158; do
+            grep -Fx "test lineage::tests::goal_tools_tests::canonical_goal_tools_prefix_${prefix}_upgrades_reopens_and_remains_idempotent ... ok" evidence/lineage-tests-goal_tools_tests-.log || failed=1
+          done
           test "$failed" -eq 0
       - name: Require captured-loss admission and migration regression execution
         if: success() || failure()
