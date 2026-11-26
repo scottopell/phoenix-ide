@@ -81,12 +81,7 @@ struct ConversationListView: View {
             }
             .navigationTitle("Conversations")
             .navigationDestination(for: String.self) { conversationId in
-                if model.deletedProductHistoryIds.contains(conversationId) {
-                    ContentUnavailableView(
-                        "Conversation deleted",
-                        systemImage: "trash",
-                        description: Text("This Product History is no longer available."))
-                } else if let history = model.listStore.conversations.first(where: {
+                if let history = model.listStore.conversations.first(where: {
                     $0.archived == true && $0.aggregateIdentity == conversationId
                 }) {
                     ProductHistoryView(productConversationId: history.aggregateIdentity)

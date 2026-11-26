@@ -24125,12 +24125,11 @@ mod tests {
         assert_eq!(run_through_for_test(db.pool(), 192).await.unwrap(), 1);
         assert_eq!(run_through_for_test(db.pool(), 192).await.unwrap(), 0);
 
-        let proposals: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT id, status, body, resolved_at FROM fork_proposals ORDER BY id",
-        )
-        .fetch_all(db.pool())
-        .await
-        .unwrap();
+        let proposals: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as("SELECT id, status, body, resolved_at FROM fork_proposals ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
         assert_eq!(proposals.len(), 2);
         assert_eq!(proposals[0].0, "pending-proposal");
         assert_eq!(proposals[0].1, "dismissed");

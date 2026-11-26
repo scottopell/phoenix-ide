@@ -310,10 +310,10 @@ describe('ProductConversation row actions', () => {
   });
 
   it.each([
-    ['open', { state: 'open', close_action: { availability: 'available' } }, false, true, true, false],
-    ['history', { state: 'history' }, true, false, false, true],
-    ['closing', { state: 'open', close_action: { availability: 'unavailable', reason: 'active_close_attempt' } }, false, false, true, false],
-  ] as const)('preserves %s lifecycle action guards', (_name, lifecycle, history, rename, close, remove) => {
+    ['open', { state: 'open', close_action: { availability: 'available' } }, false, true, true],
+    ['history', { state: 'history' }, true, false, false],
+    ['closing', { state: 'open', close_action: { availability: 'unavailable', reason: 'active_close_attempt' } }, false, false, true],
+  ] as const)('preserves %s lifecycle action guards without offering Delete', (_name, lifecycle, history, rename, close) => {
     const row = makeProductConversation('guards', { lifecycle });
     const view = render(<MemoryRouter><ConversationList {...defaultProps} productConversations={history ? [] : [row]}
       archivedProductConversations={history ? [row] : []} showArchived={history}
@@ -321,7 +321,7 @@ describe('ProductConversation row actions', () => {
     fireEvent.click(view.getByRole('button', { name: 'Actions for conversation Root guards' }));
     expect(!!view.queryByRole('button', { name: 'Rename conversation Root guards' })).toBe(rename);
     expect(!!view.queryByRole('button', { name: /^Close conversation/ })).toBe(close);
-    expect(!!view.queryByRole('button', { name: 'Delete conversation Root guards' })).toBe(remove);
+    expect(view.queryByRole('button', { name: 'Delete conversation Root guards' })).toBeNull();
     if (_name === 'closing') expect(view.getByRole('button', { name: /^Close conversation/ })).toBeDisabled();
   });
 

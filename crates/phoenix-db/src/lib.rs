@@ -30896,16 +30896,17 @@ mod tests {
             .unwrap();
         db.delete_conversation("origin").await.unwrap();
 
-        sqlx::query(
-            "UPDATE conversations SET spawned_from_conversation_id = ?1 WHERE id = ?2",
-        )
-        .bind("origin")
-        .bind("child")
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE conversations SET spawned_from_conversation_id = ?1 WHERE id = ?2")
+            .bind("origin")
+            .bind("child")
+            .execute(&db.pool)
+            .await
+            .unwrap();
         let child = db.get_conversation("child").await.unwrap();
-        assert_eq!(child.spawned_from_conversation_id.as_deref(), Some("origin"));
+        assert_eq!(
+            child.spawned_from_conversation_id.as_deref(),
+            Some("origin")
+        );
     }
 
     #[tokio::test]
@@ -31937,7 +31938,10 @@ mod tests {
             .await
             .unwrap();
         let child = db.get_conversation("child-10").await.unwrap();
-        assert_eq!(child.spawned_from_conversation_id.as_deref(), Some("origin-10"));
+        assert_eq!(
+            child.spawned_from_conversation_id.as_deref(),
+            Some("origin-10")
+        );
     }
 
     async fn retirement_fixture(
