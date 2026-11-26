@@ -4296,12 +4296,12 @@ fn read_bounded_regular_file_nofollow(path: &Path, limit: u64) -> std::io::Resul
             os::{fd::FromRawFd as _, unix::ffi::OsStrExt as _},
         };
 
-        let parent = path.parent().ok_or_else(|| {
-            std::io::Error::other("target HEAD reflog has no parent directory")
-        })?;
-        let basename = path.file_name().ok_or_else(|| {
-            std::io::Error::other("target HEAD reflog has no basename")
-        })?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("target HEAD reflog has no parent directory"))?;
+        let basename = path
+            .file_name()
+            .ok_or_else(|| std::io::Error::other("target HEAD reflog has no basename"))?;
         let parent = CString::new(parent.as_os_str().as_bytes())
             .map_err(|_| std::io::Error::other("target HEAD reflog parent contains NUL"))?;
         let basename = CString::new(basename.as_bytes())
@@ -4371,7 +4371,9 @@ fn parse_target_head_reflog_roots(
                 .map_err(|error| format!("malformed target HEAD reflog object ID: {error}"))?;
             if !oid.bytes().all(|byte| byte == b'0') && !roots.contains(oid) {
                 if roots.len() == MAX_ROOTS {
-                    return Err("target HEAD reflog exceeds the 1024 distinct-root limit".to_string());
+                    return Err(
+                        "target HEAD reflog exceeds the 1024 distinct-root limit".to_string()
+                    );
                 }
                 roots.insert(oid.to_string());
             }
@@ -18203,15 +18205,15 @@ mod tests {
             "b".repeat(40)
         );
         let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
-        assert!(super::parse_target_head_reflog_roots(log.as_bytes(), expired)
-            .unwrap_err()
-            .contains("exceeded its deadline"));
+        assert!(
+            super::parse_target_head_reflog_roots(log.as_bytes(), expired)
+                .unwrap_err()
+                .contains("exceeded its deadline")
+        );
 
         let zero = "0".repeat(40);
         let log = (1..=1025)
-            .map(|oid| {
-                format!("{oid:040x} {zero} User <user@example.test> 1 +0000\tcheckout\n")
-            })
+            .map(|oid| format!("{oid:040x} {zero} User <user@example.test> 1 +0000\tcheckout\n"))
             .collect::<String>();
         let error = super::parse_target_head_reflog_roots(
             log.as_bytes(),
