@@ -626,8 +626,11 @@ fn publication_registration_matches(
         && registered_common.canonicalize().ok()?.as_path() == common
         && read_record(&admin.join("HEAD"))? == facts.exact_checkout_oid
         && owner.split_once('\n')?
-            == (facts.ownership_token.as_str(), facts.checkout_fingerprint.as_str()))
-    .then_some(())
+            == (
+                facts.ownership_token.as_str(),
+                facts.checkout_fingerprint.as_str(),
+            ))
+        .then_some(())
 }
 
 #[derive(Debug, Clone)]
@@ -4056,7 +4059,9 @@ mod product_creation_tests {
 
     fn fixture_checkout_fingerprint(path: &str, oid: &str) -> String {
         let checkout = std::path::Path::new(path);
-        let admin = checkout.with_extension("git").join("worktrees/registration");
+        let admin = checkout
+            .with_extension("git")
+            .join("worktrees/registration");
         std::fs::create_dir_all(checkout).unwrap();
         std::fs::create_dir_all(&admin).unwrap();
         let dot_git = checkout.join(".git");
