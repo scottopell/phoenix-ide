@@ -2494,4 +2494,61 @@ final class ServerManagerHelpersTests: XCTestCase {
 
         XCTAssertFalse(ProcessTreeTerminator.isProcessAlive(spawnedPID), "Cancelling helper test must terminate descendant processes too")
     }
+
+    func testUserConfigTomlLoadsLLMWhenSharedRootModelsArrayExistsAndReplacesMultilineModelsCompletely() throws {
+        let existingWithEmptyModels = """
+        version = 1
+        models = []
+
+        [llm]
+        api_key_helper = "ddtool auth token"
+        auth_header = "bearer"
+        """
+        let parsedEmpty = try UserConfigTomlParser.parseSnippet(existingWithEmptyModels)
+        XCTAssertEqual(parsedEmpty.llm.apiKeyHelper, "ddtool auth token")
+        XCTAssertEqual(parsedEmpty.llm.authHeader, .bearer)
+
+        let existingWithMultilineModels = """
+        version = 1
+        models = [ # existing models array
+          { id = "old-model", backend = "openai_chat_completions", description = "Old", context_window = 1000, max_output_tokens = 100, recommended = false, supports_tool_search = false },
+        ]
+
+        [llm]
+        api_key_helper = "old-helper"
+
+        [agents.reviewer]
+        description = "Review"
+        instructions = "Keep"
+        """
+        let parsedMultiline = try UserConfigTomlParser.parseSnippet(existingWithMultilineModels)
+        XCTAssertEqual(parsedMultiline.llm.apiKeyHelper, "old-helper")
+
+        let replacementBlock = """
+        [[models]]
+        id = "new-model"
+        backend = "openai_chat_completions"
+        description = "New"
+        context_window = 1000
+        max_output_tokens = 100
+        recommended = false
+        supports_tool_search = false
+        """
+        let merged = UserConfigStore.mergeDocument(
+            existing: existingWithMultilineModels,
+            llm: UserLLMConfig(apiKeyHelper: "new-helper"),
+            rawModelsBlocks: [replacementBlock]
+        )
+        XCTAssertFalse(merged.contains("old-model"))
+        XCTAssertFalse(merged.contains("models = ["))
+        XCTAssertFalse(merged.contains("old-helper"))
+        XCTAssertTrue(merged.contains("id = \"new-model\""))
+        XCTAssertTrue(merged.contains("api_key_helper = \"new-helper\""))
+        XCTAssertTrue(merged.contains("[agents.reviewer]"))
+
+        // Verify the merged document itself parses cleanly without leftover brackets or duplicate keys.
+        let reparsed = try UserConfigTomlParser.parseSnippet(merged)
+        XCTAssertEqual(reparsed.llm.apiKeyHelper, "new-helper")
+        XCTAssertEqual(reparsed.rawModelsBlocks.count, 1)
+    }
 }

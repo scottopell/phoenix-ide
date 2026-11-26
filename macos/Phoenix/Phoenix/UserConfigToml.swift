@@ -136,9 +136,15 @@ enum TomlMultilineDelimiter: Equatable {
 
 struct TomlMultilineTracker {
     private(set) var activeString: TomlMultilineDelimiter?
+    private(set) var bracketDepth: Int = 0
+    private(set) var braceDepth: Int = 0
 
     var isInsideMultilineString: Bool {
         activeString != nil
+    }
+
+    var isInsideMultilineValue: Bool {
+        activeString != nil || bracketDepth > 0 || braceDepth > 0
     }
 
     mutating func consume(line: String) {
@@ -204,6 +210,14 @@ struct TomlMultilineTracker {
                 inSingleBasic = true
             } else if ch == "'" {
                 inSingleLiteral = true
+            } else if ch == "[" {
+                bracketDepth += 1
+            } else if ch == "]" {
+                bracketDepth = max(0, bracketDepth - 1)
+            } else if ch == "{" {
+                braceDepth += 1
+            } else if ch == "}" {
+                braceDepth = max(0, braceDepth - 1)
             }
             index = line.index(after: index)
         }
@@ -301,6 +315,10 @@ enum UserConfigTomlParser {
                     }
                     return
                 }
+                // Ignore other valid top-level shared config.toml fields (models, agents, tiers).
+                if let first = keySegments.first, ["models", "agents", "tiers"].contains(first) {
+                    return
+                }
                 // Allow bare [llm] snippets without an explicit [llm] header
                 if !sawExplicitSection, let first = keySegments.first,
                    allowedLLMScalarKeys.contains(first) || first == "custom_headers" || first == "request_tags" || first == "request_models" || first == "anthropic_api_key" || first == "openai_api_key" {
@@ -367,13 +385,13 @@ enum UserConfigTomlParser {
         for (zeroIndex, rawLine) in lines.enumerated() {
             let lineNumber = zeroIndex + 1
 
-            if multiline.isInsideMultilineString {
+            if multiline.isInsideMultilineValue {
                 multiline.consume(line: rawLine)
                 if activeModelsBlock != nil {
                     activeModelsBlock?.append(rawLine)
                 } else if bufferedStatementLines != nil {
                     bufferedStatementLines?.append(rawLine)
-                    if !multiline.isInsideMultilineString, let buffered = bufferedStatementLines {
+                    if !multiline.isInsideMultilineValue, let buffered = bufferedStatementLines {
                         bufferedStatementLines = nil
                         try processStatement(buffered.joined(separator: "\n"), lineNumber: bufferedStatementStartLine)
                     }
@@ -443,7 +461,7 @@ enum UserConfigTomlParser {
             }
 
             multiline.consume(line: rawLine)
-            if multiline.isInsideMultilineString {
+            if multiline.isInsideMultilineValue {
                 bufferedStatementLines = [rawLine]
                 bufferedStatementStartLine = lineNumber
                 continue
@@ -452,8 +470,8 @@ enum UserConfigTomlParser {
             try processStatement(rawLine, lineNumber: lineNumber)
         }
 
-        if bufferedStatementLines != nil || multiline.isInsideMultilineString {
-            throw UserConfigTomlError.invalidSyntax(line: bufferedStatementStartLine, detail: "unterminated multiline string")
+        if bufferedStatementLines != nil || multiline.isInsideMultilineValue {
+            throw UserConfigTomlError.invalidSyntax(line: bufferedStatementStartLine, detail: "unterminated multiline value")
         }
 
         flushModelsBlock()
@@ -816,71 +834,93 @@ enum UserConfigTomlParser {
         return result
     }
 
-    static func stripComment(_ line: String) -> String {
-        var index = line.startIndex
+    static func stripComment(_ text: String) -> String {
+        var result = ""
+        var index = text.startIndex
         var activeMultiline: TomlMultilineDelimiter?
         var inDouble = false
         var inSingle = false
-        while index < line.endIndex {
-            let ch = line[index]
+        while index < text.endIndex {
+            let ch = text[index]
             if let delimiter = activeMultiline {
                 if delimiter == .basic && ch == "\\" {
-                    index = line.index(after: index)
-                    if index < line.endIndex { index = line.index(after: index) }
+                    result.append(ch)
+                    index = text.index(after: index)
+                    if index < text.endIndex {
+                        result.append(text[index])
+                        index = text.index(after: index)
+                    }
                     continue
                 }
                 let quoteChar: Character = delimiter == .basic ? "\"" : "'"
                 if ch == quoteChar {
                     var runEnd = index
                     var runLength = 0
-                    while runEnd < line.endIndex && line[runEnd] == quoteChar {
-                        runEnd = line.index(after: runEnd)
+                    while runEnd < text.endIndex && text[runEnd] == quoteChar {
+                        runEnd = text.index(after: runEnd)
                         runLength += 1
                     }
+                    result.append(contentsOf: text[index..<runEnd])
                     if runLength >= 3 {
                         activeMultiline = nil
                     }
                     index = runEnd
                     continue
                 }
-                index = line.index(after: index)
+                result.append(ch)
+                index = text.index(after: index)
                 continue
             }
             if inDouble {
                 if ch == "\\" {
-                    index = line.index(after: index)
-                    if index < line.endIndex { index = line.index(after: index) }
+                    result.append(ch)
+                    index = text.index(after: index)
+                    if index < text.endIndex {
+                        result.append(text[index])
+                        index = text.index(after: index)
+                    }
                     continue
                 }
                 if ch == "\"" { inDouble = false }
-                index = line.index(after: index)
+                result.append(ch)
+                index = text.index(after: index)
                 continue
             }
             if inSingle {
                 if ch == "'" { inSingle = false }
-                index = line.index(after: index)
+                result.append(ch)
+                index = text.index(after: index)
                 continue
             }
-            if line[index...].hasPrefix("\"\"\"") {
+            if text[index...].hasPrefix("\"\"\"") {
                 activeMultiline = .basic
-                index = line.index(index, offsetBy: 3)
+                result.append("\"\"\"")
+                index = text.index(index, offsetBy: 3)
                 continue
             }
-            if line[index...].hasPrefix("'''") {
+            if text[index...].hasPrefix("'''") {
                 activeMultiline = .literal
-                index = line.index(index, offsetBy: 3)
+                result.append("'''")
+                index = text.index(index, offsetBy: 3)
                 continue
             }
             if ch == "\"" {
                 inDouble = true
+                result.append(ch)
             } else if ch == "'" {
                 inSingle = true
+                result.append(ch)
             } else if ch == "#" {
-                return String(line[..<index])
+                while index < text.endIndex && text[index] != "\n" {
+                    index = text.index(after: index)
+                }
+                continue
+            } else {
+                result.append(ch)
             }
-            index = line.index(after: index)
+            index = text.index(after: index)
         }
-        return line
+        return result
     }
 
     static func splitKeyValue(_ line: String) -> (String, String)? {
@@ -1070,10 +1110,10 @@ enum UserConfigStore {
 
         for (zeroIndex, line) in lines.enumerated() {
             let lineNumber = zeroIndex + 1
-            if multiline.isInsideMultilineString {
+            if multiline.isInsideMultilineValue {
                 multiline.consume(line: line)
                 if droppingRootAssignment {
-                    if !multiline.isInsideMultilineString {
+                    if !multiline.isInsideMultilineValue {
                         droppingRootAssignment = false
                     }
                     continue
@@ -1122,7 +1162,7 @@ enum UserConfigStore {
                     if segments == ["version"] {
                         hasVersionLine = true
                     } else if segments.first == "llm" || (replaceModels && segments.first == "models") {
-                        if multiline.isInsideMultilineString {
+                        if multiline.isInsideMultilineValue {
                             droppingRootAssignment = true
                         }
                         continue
