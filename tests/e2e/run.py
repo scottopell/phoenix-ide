@@ -1322,7 +1322,9 @@ def scenario_coordinator_home(_base_url: str) -> None:
             assert sentinel.read_text() == 'separate-worker-bytes'
             closed_worker = _get_conv(base_url, worker['id'])
             retired_delete = httpx.post(f"{base_url}/api/conversations/{worker['id']}/delete", timeout=10)
-            assert retired_delete.status_code == 404, retired_delete.text
+            absent_route = httpx.post(f"{base_url}/api/conversations/{worker['id']}/unknown-route", timeout=10)
+            assert retired_delete.status_code == absent_route.status_code != 200, retired_delete.text
+            assert retired_delete.json() == absent_route.json()
             retained_worker = _get_conv(base_url, worker['id'])
             assert retained_worker['conversation']['archived']
             assert retained_worker['messages'] == closed_worker['messages']

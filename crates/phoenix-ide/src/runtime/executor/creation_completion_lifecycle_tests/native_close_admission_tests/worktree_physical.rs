@@ -436,6 +436,7 @@ impl DisposableGit {
             phoenix_db::ProductCreationGitPublicationFacts {
                 exact_checkout_oid: oid,
                 repository_root: cwd,
+                ownership_token: "fixture-owner".to_string(),
             },
         )
         .await;
@@ -506,6 +507,50 @@ impl DisposableGit {
             .unwrap()
             .trim()
             .to_owned();
+        assert!(matches!(
+            fixture
+                .db
+                .pin_product_creation_once(request_id, &claimed.claim, &oid, "main", "fresh")
+                .await
+                .unwrap(),
+            phoenix_db::ProductCreationPinOutcome::Pinned(_)
+        ));
+        let path = self.worktree.to_string_lossy();
+        let now = chrono::Utc::now();
+        assert!(fixture
+            .db
+            .reserve_product_creation_resource(
+                request_id,
+                request_id,
+                &claimed.claim,
+                cwd,
+                &path,
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(fixture
+            .db
+            .record_product_creation_resource_ownership(
+                request_id,
+                &claimed.claim,
+                &path,
+                "fixture-owner",
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(fixture
+            .db
+            .mark_product_creation_resource_present(
+                request_id,
+                &claimed.claim,
+                &path,
+                "fixture-owner",
+                now,
+            )
+            .await
+            .unwrap());
         assert!(fixture
             .db
             .record_product_creation_staging(

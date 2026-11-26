@@ -100,8 +100,7 @@ async fn process_claimed_product_creation(
         authority_kind,
         environment,
         logical_base,
-        staging_repo,
-        staging_oid,
+        git_publication,
     ) = if let Some(repo_root) = repo_root {
         let repo_root = repo_root.trim().to_string();
         checkpoint_product_creation_stage(
@@ -155,10 +154,15 @@ async fn process_claimed_product_creation(
         )
         .await?;
         let planned_path = match job.staging_path.as_deref() {
-            Some(path) if job.staging_exact_oid.as_deref() == Some(oid.as_str()) => {
+            Some(path)
+                if job.staging_exact_oid.as_deref() == Some(oid.as_str())
+                    && job.staging_repo_root.as_deref() == Some(repo_root.as_str()) =>
+            {
                 PathBuf::from(path)
             }
-            Some(_) => return Err("staged worktree does not match the durable pin".to_string()),
+            Some(_) => {
+                return Err("staged worktree does not match the durable repository and pin".to_string());
+            }
             None => {
                 product_worktree_path(Path::new(&repo_root), job.product_conversation_id.as_str())?
             }
@@ -316,8 +320,11 @@ async fn process_claimed_product_creation(
                 base_branch: Some(logical_base.clone()),
             },
             Some(logical_base),
-            Some(repo_root),
-            Some(oid),
+            Some(crate::db::ProductCreationGitPublicationFacts {
+                exact_checkout_oid: oid,
+                repository_root: repo_root,
+                ownership_token,
+            }),
         )
     } else {
         checkpoint_product_creation_stage(
@@ -339,7 +346,6 @@ async fn process_claimed_product_creation(
             ConvMode::Direct,
             phoenix_core::work_scope::AuthorityKind::Direct,
             phoenix_core::work_scope::EnvironmentContext::UnownedCwd { cwd },
-            None,
             None,
             None,
         )
@@ -388,15 +394,6 @@ async fn process_claimed_product_creation(
         llm_language: job.intent.llm_language,
         spawned_from_conversation_id: None,
     };
-    let git_publication =
-        staging_repo
-            .zip(staging_oid)
-            .map(|(repository_root, exact_checkout_oid)| {
-                crate::db::ProductCreationGitPublicationFacts {
-                    exact_checkout_oid,
-                    repository_root,
-                }
-            });
     checkpoint_product_creation_stage(manager, claimed, &mut current_stage, Stage::CommitMetadata)
         .await?;
     let published = manager
@@ -2158,10 +2155,7 @@ async fn checkpoint_creation_stage(
 #[cfg(test)]
 mod product_creation_delivery_replay_tests {
     use super::*;
-    use crate::db::{
-        Database, ProductCreationGitPublicationFacts, ProductCreationIntent,
-        ProductCreationPublishInput,
-    };
+    use crate::db::{Database, ProductCreationIntent, ProductCreationPublishInput};
     use crate::platform::PlatformCapability;
     use crate::runtime::RuntimeManager;
     use crate::tools::mcp::McpClientManager;
@@ -4104,10 +4098,7 @@ mod product_creation_delivery_replay_tests {
                 environment: EnvironmentContext::UnownedCwd {
                     cwd: intent.cwd.clone(),
                 },
-                git_publication: Some(ProductCreationGitPublicationFacts {
-                    exact_checkout_oid: "repo-id".to_string(),
-                    repository_root: intent.cwd.clone(),
-                }),
+                git_publication: None,
             })
             .await
             .unwrap());

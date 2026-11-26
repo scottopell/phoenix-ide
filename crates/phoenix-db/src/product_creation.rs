@@ -594,6 +594,7 @@ pub struct ProductCreationCleanupJob {
 pub struct ProductCreationGitPublicationFacts {
     pub exact_checkout_oid: String,
     pub repository_root: String,
+    pub ownership_token: String,
 }
 
 #[derive(Debug, Clone)]
@@ -2165,15 +2166,69 @@ impl Database {
                 "Coordinator home is not an ordinary creation environment".to_string(),
             ));
         }
-        let git_facts_match_environment = !matches!(
-            (&input.environment, &input.git_publication),
-            (EnvironmentContext::AllocatedWorktree { .. }, None)
-                | (EnvironmentContext::None, Some(_))
-        );
-        if !git_facts_match_environment {
+        let durable_proof = match (&input.environment, &input.git_publication) {
+            (
+                EnvironmentContext::AllocatedWorktree {
+                    worktree_path,
+                    base_branch,
+                    ..
+                },
+                Some(facts),
+            ) => {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM product_creation_jobs j
+                        WHERE j.request_id = ?1
+                          AND j.pin_exact_checkout_oid = ?2
+                          AND j.pin_logical_base = ?6
+                          AND j.staging_path = ?3
+                          AND j.staging_repo_root = ?4
+                          AND j.staging_exact_oid = ?2
+                          AND EXISTS (
+                              SELECT 1 FROM product_creation_resource_reservations r
+                              WHERE r.request_id = j.request_id
+                                AND r.generation = j.claim_generation
+                                AND r.repository_identity = ?4
+                                AND r.resource_identity = ?3
+                                AND r.status = 'present'
+                                AND r.ownership_token = ?5
+                          )
+                    )",
+                )
+                .bind(&input.request_id)
+                .bind(&facts.exact_checkout_oid)
+                .bind(worktree_path)
+                .bind(&facts.repository_root)
+                .bind(&facts.ownership_token)
+                .bind(base_branch.as_deref())
+                .fetch_one(&mut *tx)
+                .await?
+            }
+            (EnvironmentContext::UnownedCwd { .. } | EnvironmentContext::None, None) => {
+                sqlx::query_scalar::<_, bool>(
+                    "SELECT NOT EXISTS (
+                        SELECT 1 FROM product_creation_jobs j
+                        WHERE j.request_id = ?1
+                          AND (j.pin_exact_checkout_oid IS NOT NULL
+                               OR j.staging_repo_root IS NOT NULL
+                               OR j.staging_exact_oid IS NOT NULL
+                               OR EXISTS (
+                                   SELECT 1 FROM product_creation_resource_reservations r
+                                   WHERE r.request_id = j.request_id AND r.status <> 'released'
+                               ))
+                    )",
+                )
+                .bind(&input.request_id)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+            _ => false,
+        };
+        if !durable_proof {
             tx.rollback().await?;
             return Err(DbError::Serialization(
-                "allocated-worktree publication requires Git publication facts".to_string(),
+                "publication does not match durable creation pin, staging, and reservation proof"
+                    .to_string(),
             ));
         }
         let conversation_exists: i64 =
@@ -2701,9 +2756,9 @@ impl Database {
             .max(now.timestamp_micros());
         let updated = sqlx::query(
             "UPDATE product_creation_resource_reservations
-             SET status = 'present', ownership_token = ?7, updated_at_unix_micros = ?1
+             SET status = 'present', updated_at_unix_micros = ?1
              WHERE request_id = ?2 AND generation = ?3 AND resource_identity = ?4
-               AND status = 'reserved'
+               AND status = 'reserved' AND ownership_token = ?7
                AND EXISTS (
                    SELECT 1 FROM product_creation_jobs j
                    WHERE j.request_id = ?2 AND j.status = 'claimed'
@@ -3947,6 +4002,45 @@ mod product_creation_tests {
                 .await
                 .unwrap();
         assert_eq!(count, 0);
+    }
+
+    async fn record_git_publication_fixture(
+        db: &Database,
+        request_id: &str,
+        claim: &ProductCreationClaim,
+        repo: &str,
+        worktree: &str,
+        oid: &str,
+    ) {
+        let now = Utc::now();
+        assert!(matches!(
+            db.pin_product_creation_once(request_id, claim, oid, "main", "fresh")
+                .await
+                .unwrap(),
+            ProductCreationPinOutcome::Pinned(_)
+        ));
+        assert!(db
+            .record_product_creation_staging(request_id, claim, worktree, repo, oid)
+            .await
+            .unwrap());
+        assert!(db
+            .reserve_product_creation_resource(request_id, request_id, claim, repo, worktree, now)
+            .await
+            .unwrap());
+        assert!(db
+            .record_product_creation_resource_ownership(
+                request_id,
+                claim,
+                worktree,
+                "fixture-owner",
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(db
+            .mark_product_creation_resource_present(request_id, claim, worktree, "fixture-owner", now)
+            .await
+            .unwrap());
     }
 
     async fn advance_to_metadata(db: &Database, request_id: &str, claim: &ProductCreationClaim) {
@@ -6712,6 +6806,95 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    async fn git_publication_rejects_unproven_staging_before_writing_scope_or_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.accept_product_creation("unproven-publication", &intent("/repo", "publish"))
+            .await
+            .unwrap();
+        let claimed = db
+            .claim_product_creation(
+                "unproven-publication",
+                "worker",
+                "claim-token",
+                Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        advance_to_metadata(&db, "unproven-publication", &claimed.claim).await;
+        let conversation = published_conversation(
+            "unproven-conversation",
+            claimed.job.product_conversation_id,
+            WorkScopeId::new(),
+            "/repo/worktree",
+        );
+        let scope_id = conversation.attached_work_scope_id.clone().unwrap();
+        let mut input = ProductCreationPublishInput {
+            request_id: "unproven-publication".to_string(),
+            claim: claimed.claim,
+            conversation,
+            authority_kind: AuthorityKind::RestrictedExplore,
+            environment: EnvironmentContext::AllocatedWorktree {
+                cwd: "/repo/worktree".to_string(),
+                worktree_path: "/repo/worktree".to_string(),
+                branch_name: None,
+                base_branch: Some("main".to_string()),
+            },
+            git_publication: Some(ProductCreationGitPublicationFacts {
+                exact_checkout_oid: "unpersisted-oid".to_string(),
+                repository_root: "/repo".to_string(),
+                ownership_token: "unrecorded-owner".to_string(),
+            }),
+        };
+        assert!(matches!(
+            db.publish_product_creation_atomically(&input).await,
+            Err(DbError::Serialization(message)) if message.contains("durable creation pin")
+        ));
+        record_git_publication_fixture(
+            &db,
+            &input.request_id,
+            &input.claim,
+            "/repo",
+            "/repo/worktree",
+            "unpersisted-oid",
+        )
+        .await;
+        assert!(matches!(
+            db.publish_product_creation_atomically(&input).await,
+            Err(DbError::Serialization(message)) if message.contains("durable creation pin")
+        ));
+        let mut direct = input.clone();
+        direct.environment = EnvironmentContext::UnownedCwd {
+            cwd: "/repo".into(),
+        };
+        direct.git_publication = None;
+        assert!(matches!(
+            db.publish_product_creation_atomically(&direct).await,
+            Err(DbError::Serialization(message)) if message.contains("durable creation pin")
+        ));
+        assert!(db.get_conversation("unproven-conversation").await.is_err());
+        let scope_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM work_scopes WHERE id = ?1",
+        )
+        .bind(scope_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(scope_count, 0);
+        assert_eq!(
+            db.get_product_creation_job("unproven-publication")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "claimed"
+        );
+        input.git_publication.as_mut().unwrap().ownership_token = "fixture-owner".into();
+        assert!(db.publish_product_creation_atomically(&input).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn publication_allocates_duplicate_human_names_without_publishing_input_slugs() {
         let db = Database::open_in_memory().await.unwrap();
         for (request, expected) in [("name-one", "über-東京"), ("name-two", "über-東京-2")] {
@@ -7630,10 +7813,7 @@ mod product_creation_tests {
                 environment: EnvironmentContext::UnownedCwd {
                     cwd: "/repo/a".to_string(),
                 },
-                git_publication: Some(ProductCreationGitPublicationFacts {
-                    exact_checkout_oid: "repo-id".to_string(),
-                    repository_root: "/repo/a".to_string(),
-                }),
+                git_publication: None,
             })
             .await
             .unwrap());
@@ -7739,10 +7919,7 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/a".to_string(),
             },
-            git_publication: Some(ProductCreationGitPublicationFacts {
-                exact_checkout_oid: "repo-id".to_string(),
-                repository_root: "/repo/a".to_string(),
-            }),
+            git_publication: None,
         })
         .await
         .unwrap();
@@ -8123,6 +8300,16 @@ mod product_creation_tests {
             .await
             .unwrap());
         assert!(db
+            .record_product_creation_resource_ownership(
+                "req-conflict",
+                &claimed.claim,
+                "/repo/a/.phoenix/worktrees/conflict",
+                "owner-token",
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(db
             .mark_product_creation_resource_present(
                 "req-conflict",
                 &claimed.claim,
@@ -8374,10 +8561,7 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/a".to_string(),
             },
-            git_publication: Some(ProductCreationGitPublicationFacts {
-                exact_checkout_oid: "repo-id".to_string(),
-                repository_root: "/repo/a".to_string(),
-            }),
+            git_publication: None,
         })
         .await
         .unwrap();
@@ -8463,10 +8647,7 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/a".to_string(),
             },
-            git_publication: Some(ProductCreationGitPublicationFacts {
-                exact_checkout_oid: "repo-id".to_string(),
-                repository_root: "/repo/a".to_string(),
-            }),
+            git_publication: None,
         })
         .await
         .unwrap();
@@ -8757,10 +8938,7 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/a".to_string(),
             },
-            git_publication: Some(ProductCreationGitPublicationFacts {
-                repository_root: "/repo/a".to_string(),
-                exact_checkout_oid: "abc123".to_string(),
-            }),
+            git_publication: None,
         })
         .await
         .unwrap();
@@ -8883,10 +9061,7 @@ mod product_creation_tests {
                 environment: EnvironmentContext::UnownedCwd {
                     cwd: "/repo/federated".into(),
                 },
-                git_publication: Some(ProductCreationGitPublicationFacts {
-                    repository_root: "/repo/federated".into(),
-                    exact_checkout_oid: "abc123".into(),
-                }),
+                git_publication: None,
             })
             .await
             .unwrap();
@@ -9005,10 +9180,7 @@ mod product_creation_tests {
                             environment: EnvironmentContext::UnownedCwd {
                                 cwd: "/repo/recovery".into(),
                             },
-                            git_publication: Some(ProductCreationGitPublicationFacts {
-                                repository_root: "/repo/recovery".into(),
-                                exact_checkout_oid: "abc123".into(),
-                            }),
+                            git_publication: None,
                         })
                         .await
                         .unwrap());
@@ -9082,10 +9254,7 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/a".to_string(),
             },
-            git_publication: Some(ProductCreationGitPublicationFacts {
-                repository_root: "/repo/a".to_string(),
-                exact_checkout_oid: "abc123".to_string(),
-            }),
+            git_publication: None,
         })
         .await
         .unwrap();
@@ -9248,10 +9417,7 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/delivery".to_string(),
             },
-            git_publication: Some(ProductCreationGitPublicationFacts {
-                repository_root: "/repo/delivery".to_string(),
-                exact_checkout_oid: "abc123".to_string(),
-            }),
+            git_publication: None,
         })
         .await
         .unwrap();
@@ -9323,10 +9489,7 @@ mod product_creation_tests {
             environment: EnvironmentContext::UnownedCwd {
                 cwd: "/repo/published".to_string(),
             },
-            git_publication: Some(ProductCreationGitPublicationFacts {
-                repository_root: "/repo/published".to_string(),
-                exact_checkout_oid: "def456".to_string(),
-            }),
+            git_publication: None,
         })
         .await
         .unwrap();
@@ -9642,6 +9805,15 @@ mod product_creation_tests {
             "/repo/hidden",
         );
         advance_to_metadata(&db, "req-cascade", &claim.claim).await;
+        record_git_publication_fixture(
+            &db,
+            "req-cascade",
+            &claim.claim,
+            "/repo/hidden",
+            "/repo/hidden/.phoenix/worktrees/conv-cascade",
+            "0123456789abcdef",
+        )
+        .await;
         assert!(db
             .publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: "req-cascade".to_string(),
@@ -9657,6 +9829,7 @@ mod product_creation_tests {
                 git_publication: Some(ProductCreationGitPublicationFacts {
                     exact_checkout_oid: "0123456789abcdef".to_string(),
                     repository_root: "/repo/hidden".to_string(),
+                    ownership_token: "fixture-owner".to_string(),
                 }),
             })
             .await
@@ -9881,6 +10054,15 @@ mod product_creation_tests {
             .unwrap();
         let conversation_id = "conv-current-root";
         advance_to_metadata(&db, "req-current-root", &claim.claim).await;
+        record_git_publication_fixture(
+            &db,
+            "req-current-root",
+            &claim.claim,
+            "/repo/stale",
+            "/repo/stale/.phoenix/worktrees/one",
+            "stale-oid",
+        )
+        .await;
         db.publish_product_creation_atomically(&ProductCreationPublishInput {
             request_id: "req-current-root".to_string(),
             claim: claim.claim,
@@ -9895,11 +10077,12 @@ mod product_creation_tests {
                 cwd: "/repo/stale/.phoenix/worktrees/one".to_string(),
                 worktree_path: "/repo/stale/.phoenix/worktrees/one".into(),
                 branch_name: None,
-                base_branch: None,
+                base_branch: Some("main".into()),
             },
             git_publication: Some(ProductCreationGitPublicationFacts {
                 exact_checkout_oid: "stale-oid".to_string(),
                 repository_root: "/repo/stale".to_string(),
+                ownership_token: "fixture-owner".to_string(),
             }),
         })
         .await
@@ -9964,17 +10147,24 @@ mod product_creation_tests {
                 cwd,
             );
             advance_to_metadata(&db, &req, &claim.claim).await;
+            let oid = format!("oid-{idx}");
+            let worktree = format!("{cwd}/checkout-{idx}");
+            record_git_publication_fixture(&db, &req, &claim.claim, cwd, &worktree, &oid).await;
             db.publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: req,
                 claim: claim.claim,
                 conversation: conv,
                 authority_kind: AuthorityKind::Work,
-                environment: EnvironmentContext::UnownedCwd {
-                    cwd: cwd.to_string(),
+                environment: EnvironmentContext::AllocatedWorktree {
+                    cwd: worktree.clone(),
+                    worktree_path: worktree,
+                    branch_name: None,
+                    base_branch: Some("main".into()),
                 },
                 git_publication: Some(ProductCreationGitPublicationFacts {
-                    exact_checkout_oid: format!("oid-{idx}"),
+                    exact_checkout_oid: oid,
                     repository_root: cwd.to_string(),
+                    ownership_token: "fixture-owner".to_string(),
                 }),
             })
             .await
