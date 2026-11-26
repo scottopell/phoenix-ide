@@ -16313,9 +16313,6 @@ mod tests {
                     }
                     calls.push(operation.to_string());
                     let stdout = match operation {
-                        "Git status inspection"
-                        | "exact ignored-path inspection"
-                        | "hidden-index inspection" => Vec::new(),
                         "Git index path inspection" => b".git/index\n".to_vec(),
                         "detached head inspection" => {
                             if command
@@ -16384,26 +16381,14 @@ mod tests {
             canonical.extend_from_slice(&index);
             canonical.push(0);
             assert_eq!(results[0], snapshot_for(&canonical));
-            let mut native_canonical = b"HEAD_SYMBOLIC\0refs/heads/main\0HEAD\0".to_vec();
-            native_canonical.extend_from_slice(b"1111111111111111111111111111111111111111\0");
-            native_canonical.extend_from_slice(b"DETACHED_HISTORY\0\0SUBMODULE_GITLINK_INDEX\0\0");
-            native_canonical.extend_from_slice(&index);
-            native_canonical.push(0);
-            assert_eq!(results[1], snapshot_for(&native_canonical));
+            assert_eq!(results[1], snapshot_for(&canonical));
             snapshots.push(results.pop().unwrap());
         }
         assert_ne!(
             snapshots[0], snapshots[1],
             "clean status alone is not a snapshot"
         );
-        assert_eq!(
-            std::fs::read(temp.path().join(".git/index")).unwrap(),
-            b"synthetic-index"
-        );
-        assert_eq!(
-            std::fs::read_dir(temp.path().join(".git")).unwrap().count(),
-            2
-        );
+        assert_synthetic_index_unchanged(temp.path());
     }
 
     #[cfg(unix)]
@@ -16474,19 +16459,12 @@ mod tests {
                 deadline,
                 &mut |command: std::process::Command, leaf_deadline, operation: &str| {
                     assert_eq!(leaf_deadline, deadline);
-                    assert!(!stopped, "inspection continued after unsupported state");
-                    assert!(!command
-                        .get_envs()
-                        .any(|(key, value)| key == "GIT_INDEX_FILE" && value.is_some()));
-                    assert!(!command.get_args().any(|arg| arg == "update-index"));
+                    assert_unsupported_inspection_is_read_only(&command, stopped);
                     stopped = operation == refusal_stage;
                     if operation == stop {
                         return Ok(synthetic_inspection_output(stdout.to_vec(), success));
                     }
                     let stdout = match operation {
-                        "Git status inspection"
-                        | "exact ignored-path inspection"
-                        | "gitlink inspection" => Vec::new(),
                         "hidden-index inspection" => b"H tracked\0".to_vec(),
                         "detached head inspection" => {
                             if command
@@ -16516,6 +16494,15 @@ mod tests {
             assert!(error.contains(reason), "{error}");
             assert_synthetic_index_unchanged(temp.path());
         }
+    }
+
+    #[cfg(unix)]
+    fn assert_unsupported_inspection_is_read_only(command: &std::process::Command, stopped: bool) {
+        assert!(!stopped, "inspection continued after unsupported state");
+        assert!(!command
+            .get_envs()
+            .any(|(key, value)| key == "GIT_INDEX_FILE" && value.is_some()));
+        assert!(!command.get_args().any(|arg| arg == "update-index"));
     }
 
     #[cfg(unix)]
@@ -16549,7 +16536,6 @@ mod tests {
                     assert_eq!(leaf_deadline, deadline);
                     let stdout = match operation {
                         "Git status inspection" => b" M tracked\0".to_vec(),
-                        "exact ignored-path inspection" => Vec::new(),
                         "Git index path inspection" => b".git/index\n".to_vec(),
                         "hidden-index inspection" => b"H tracked\0".to_vec(),
                         "detached head inspection" => {
@@ -16637,7 +16623,6 @@ mod tests {
                         return Err("supplied leaf refused".to_string());
                     }
                     let stdout = match operation {
-                        "Git status inspection" | "exact ignored-path inspection" => Vec::new(),
                         "hidden-index inspection" => b"H tracked\0".to_vec(),
                         "detached head inspection" => {
                             if command
@@ -16692,7 +16677,6 @@ mod tests {
                     });
                 }
                 let stdout = match operation {
-                    "Git status inspection" | "exact ignored-path inspection" => Vec::new(),
                     "hidden-index inspection" => b"H tracked\0".to_vec(),
                     _ => Vec::new(),
                 };
@@ -16773,8 +16757,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn recursive_worktree_inspections_share_each_git_leaf_and_deadline() {
-        use std::os::unix::process::ExitStatusExt as _;
-
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path();
         let module = root.join("module");
@@ -16797,9 +16779,6 @@ mod tests {
                 "gitlink inspection" if repository == module => {
                     format!("160000 {oid} 0\tnested\0").into_bytes()
                 }
-                "gitlink inspection"
-                | "dirty index inspection"
-                | "exact ignored-path inspection" => Vec::new(),
                 "Git status inspection" => b"?? untracked\0".to_vec(),
                 "Git index path inspection" => b".git/missing-index\n".to_vec(),
                 "Git submodule HEAD inspection" => {
@@ -16831,17 +16810,8 @@ mod tests {
                 }
                 _ => Vec::new(),
             };
-            Ok(std::process::Output {
-                status: std::process::ExitStatus::from_raw(
-                    if synthetic_inspection_succeeds(&command, operation) {
-                        0
-                    } else {
-                        1 << 8
-                    },
-                ),
-                stdout,
-                stderr: Vec::new(),
-            })
+            let success = synthetic_inspection_succeeds(&command, operation);
+            Ok(synthetic_inspection_output(stdout, success))
         };
         let mut observation = Vec::new();
         super::observe_initialized_submodules_with_leaf_until(
@@ -18199,12 +18169,16 @@ mod tests {
 
     #[test]
     fn target_head_reflog_root_parsing_observes_deadline_and_distinct_root_cap() {
+        use std::fmt::Write as _;
+
         let log = format!(
             "{} {} User <user@example.test> 1 +0000\tcheckout\n",
             "a".repeat(40),
             "b".repeat(40)
         );
-        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
         assert!(
             super::parse_target_head_reflog_roots(log.as_bytes(), expired)
                 .unwrap_err()
@@ -18212,9 +18186,10 @@ mod tests {
         );
 
         let zero = "0".repeat(40);
-        let log = (1..=1025)
-            .map(|oid| format!("{oid:040x} {zero} User <user@example.test> 1 +0000\tcheckout\n"))
-            .collect::<String>();
+        let mut log = String::new();
+        for oid in 1..=1025 {
+            writeln!(log, "{oid:040x} {zero} User <user@example.test> 1 +0000\tcheckout").unwrap();
+        }
         let error = super::parse_target_head_reflog_roots(
             log.as_bytes(),
             std::time::Instant::now() + std::time::Duration::from_secs(5),
