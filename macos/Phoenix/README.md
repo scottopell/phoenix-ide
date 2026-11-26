@@ -6,13 +6,13 @@ The app icon is derived from the canonical `ui/public/phoenix.svg` bird/flame ma
 
 ## Server modes
 
-On first launch Phoenix.app stays disconnected until the user explicitly chooses either **Managed deployment** or **Bundled Phoenix** in Settings and clicks **Apply and Connect**. Draft edits in Settings remain local to that window until apply; simply closing Settings never changes the next launch target.
+On first launch Phoenix.app presents an inline local-first setup view in the main window with three provider options (**Auth Helper** via `~/.config/phoenix-ide/config.toml` with TOML paste and live helper testing, **Codex / ChatGPT** in-app sign-in, or **API Keys** stored in Keychain), plus a secondary **Connect to an existing server…** link for managed deployments. Draft edits in Settings remain local to that window until **Apply and Connect**; simply closing Settings never changes the next launch target.
 
 ### Managed deployment
 
-Connects to a configured canonical HTTP(S) origin. Phoenix.app verifies the public `GET /api/version` identity, loads Phoenix's ordinary login flow in WKWebView, and verifies authenticated `GET /api/deployment` through that same WebKit cookie session. HTTP attached origins are accepted only for localhost or loopback hosts; remote attached deployments must use HTTPS.
+Connects to a configured canonical HTTP(S) origin (default `http://localhost:8031`). Phoenix.app verifies the public `GET /api/version` identity, loads Phoenix's ordinary login flow in WKWebView, and verifies authenticated `GET /api/deployment` through that same WebKit cookie session. HTTP attached origins are accepted only for localhost or loopback hosts; remote attached deployments must use HTTPS.
 
-Only `launchd_managed` grants the expected managed-production classification. Other ownership values are shown but never grant process-management authority. Attached mode has no controls for the server process, database, LLM credentials, logs, or backend updates.
+Any authenticated Phoenix deployment (`launchd_managed`, `systemd_managed`, `bare_supervisor_managed`, `development`, etc.) is accepted as ready and its reported ownership is displayed in Connection Status. Attached mode has no controls for the server process, database, LLM credentials, logs, or backend updates.
 
 ### Bundled Phoenix
 
@@ -22,8 +22,10 @@ Launches only `Phoenix.app/Contents/Helpers/phoenix_ide` (or a clearly marked De
 - `PHOENIX_TLS=off`
 - the real user `HOME` and working directory, so terminals, Git, SSH, skills, and `~` behave normally
 - a private runtime root under `~/Library/Application Support/Phoenix/sidecar-home` used only for Phoenix/Codex-owned mutable state
-- private `PHOENIX_STATE_DIR`, `PHOENIX_DATA_DIR`, `CODEX_HOME`, and database paths beneath that runtime root
+- private `PHOENIX_STATE_DIR`, `PHOENIX_DATA_DIR`, `CODEX_HOME`, `PHOENIX_TMP_DIR`, database, `PHOENIX_LOG_FILE`, and `PHOENIX_FATAL_LOG_FILE` paths beneath that runtime root (with `PHOENIX_LOG_STDOUT=false`)
 - a fixed configured loopback port
+- a login-shell-captured `PATH` merged ahead of standard macOS/Homebrew directories so credential helpers and developer CLIs work even when launched from Finder
+- allowlisted inherited Phoenix LLM/gateway/config environment variables (`LLM_API_KEY_HELPER`, `LLM_API_KEY_HELPER_TTL_MS`, `ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`, `OPENAI_RESPONSES_BASE_URL`, `OPENAI_CHAT_COMPLETIONS_BASE_URL`, `LLM_CUSTOM_HEADERS`, `LLM_REQUEST_TAGS`, `LLM_AUTH_HEADER`, `PHOENIX_LLM_MODELS`, `PHOENIX_LLM_REQUEST_MODELS`, `DEFAULT_MODEL`, and `XDG_CONFIG_HOME`) when present in the launcher environment; non-secret provider/gateway configuration also loads directly from `$XDG_CONFIG_HOME/phoenix-ide/config.toml` (default `~/.config/phoenix-ide/config.toml`) `[llm]`
 
 An advisory file lock prevents concurrent Phoenix.app owners from opening that private runtime. This is state isolation, not a filesystem sandbox: the sidecar and its terminals retain ordinary access to the user's files. Phoenix.app creates the private runtime/data directories before taking that lock so the lock itself remains outside the managed data tree and cleanup still works after launch-preparation failures. A busy port is a bind failure; the app never adopts or kills a listener discovered by port. Any transition away from bundled mode first stops the exact child Phoenix.app launched, coalesces overlapping reconnect requests, and only then connects the latest candidate mode. Readiness accepts only a deployment whose echoed `instance_id` matches the exact child Phoenix.app launched. Quit sends SIGTERM to the exact child, allows 35 seconds for Phoenix's 30-second graceful drain, then escalates to SIGKILL.
 
@@ -74,7 +76,7 @@ Run a signed Finder-launched build, not only Xcode:
 - Managed launchd deployment: login, shared Safari/iOS conversation history, reconnect, and quit without process changes.
 - Bundled sidecar: private history, verified loopback/non-TLS/non-socket-activated deployment, second-owner refusal, occupied-port failure, intentional restart, graceful quit, and force-stop fallback.
 - Web transports: fetch, SSE, terminal WebSocket, browser-view WebSocket, downloads, clipboard, drag/drop, notifications, voice input, default-browser OAuth handoff, and Web Inspector.
-- Failures: offline, wrong service, auth required, TLS trust failure, unknown/unmanaged/ambiguous ownership, no models, sidecar crash, missing sidecar, and hotkey conflict.
+- Failures: offline, wrong service, auth required, TLS trust failure, no models, sidecar crash, missing sidecar, and hotkey conflict.
 - Deep links: an existing conversation UUID opens in the authenticated app; malformed and unknown UUIDs do not navigate or mutate server state. `phoenix://new` remains unsupported.
 - Security: no key/token/password/custom secret header in preferences, diagnostics, app logs, error text, or process arguments.
 

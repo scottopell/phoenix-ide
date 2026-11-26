@@ -19,24 +19,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingConversationValidationTask: Task<Void, Never>?
     private var isPrimaryWebViewAuthenticated = false
     private var hotkeyError: HotkeyError?
+    private var needsOnboarding = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if case .failure(let error) = hotkey.register(action: { [weak self] in self?.showWindow() }) {
             hotkeyError = error
             NSLog("Phoenix hotkey registration failed: \(error.localizedDescription)")
         }
+        let hasSavedModeSelection = persistence.loadConnectionDraft().hasSavedModeSelection
+        needsOnboarding = FirstRunDecision.shouldShowOnboarding(hasSavedModeSelection: hasSavedModeSelection)
         serverManager.$state
             .receive(on: DispatchQueue.main)
             .sink { [weak self] state in self?.updateWindowContent(for: state) }
             .store(in: &cancellables)
         showWindow()
-        let hasSavedModeSelection = persistence.loadConnectionDraft().hasSavedModeSelection
-        if hasSavedModeSelection {
+        if !needsOnboarding {
             serverManager.connect()
-        } else if FirstRunDecision.shouldOpenSettings(hasSavedModeSelection: hasSavedModeSelection) {
-            DispatchQueue.main.async {
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-            }
+        }
+    }
+
+    func finishOnboardingAndConnect() {
+        needsOnboarding = false
+        serverManager.connect()
+        showWindow()
+    }
+
+    func settingsDidApply() {
+        if needsOnboarding {
+            needsOnboarding = false
+            updateWindowContent(for: serverManager.state)
+        }
+        showWindow()
+    }
+
+    func switchAttachedOriginAndReconnect(_ origin: PhoenixOrigin) {
+        do {
+            var draft = persistence.loadConnectionDraft().draft
+            draft.mode = .attached
+            draft.attachedOrigin = origin.description
+            let persisted = try persistence.persist(draft: draft)
+            try serverManager.reconnect(to: persisted.candidate)
+        } catch {
+            serverManager.showFailure(message: error.localizedDescription)
         }
     }
 
@@ -224,8 +248,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         webView = nil
         isPrimaryWebViewAuthenticated = false
+        if needsOnboarding {
+            window.contentView = NSHostingView(rootView: OnboardingView { [weak self] _ in
+                self?.finishOnboardingAndConnect()
+            })
+            return
+        }
+
         if let failure = state.failureViewModel {
-            window.contentView = NSHostingView(rootView: ErrorView(message: failure.message) { [weak self] in
+            window.contentView = NSHostingView(rootView: ErrorView(
+                origin: serverManager.webOrigin?.description,
+                message: failure.message,
+                suggestedOrigin: failure.suggestedOrigin,
+                onSwitchOrigin: { [weak self] suggested in
+                    self?.switchAttachedOriginAndReconnect(suggested)
+                }
+            ) { [weak self] in
                 guard failure.allowsReconnect else { return }
                 self?.serverManager.reconnect()
             })

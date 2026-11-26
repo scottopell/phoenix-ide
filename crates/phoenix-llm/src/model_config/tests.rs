@@ -188,3 +188,87 @@ fn toml_cannot_override_a_builtin_model() {
     assert_eq!(kept.source, crate::ModelSource::BuiltIn);
     assert_eq!(kept.default_request_name, builtin.default_request_name);
 }
+
+#[test]
+fn toml_llm_section_parses_all_fields_and_coexists_with_agents_tiers_and_models() {
+    let content = format!(
+        r#"
+version = 1
+
+[llm]
+api_key_helper = "ddtool auth token"
+api_key_helper_ttl_ms = 3600000
+auth_header = "bearer"
+default_model = "google/gemini-4-neon"
+anthropic_base_url = "https://gateway.example.test/v1/messages"
+openai_base_url = "https://gateway.example.test/v1/responses"
+openai_responses_base_url = "https://gateway.example.test/v1/responses"
+openai_chat_completions_base_url = "https://gateway.example.test/v1/chat/completions"
+
+[llm.custom_headers]
+X-Org = "eng"
+X-Client = "phoenix"
+
+[llm.request_tags]
+team = "ide"
+env = "dev"
+
+[llm.request_models.openai_chat_completions]
+"google/gemini-4-neon" = "google/gemini-4-neon"
+
+{MODEL}
+[agents.reviewer]
+description = "Review"
+instructions = "Find defects"
+
+[tiers.fast]
+execution = [{{ model = "local-open-weight", connection = "openai_chat_completions" }}]
+"#
+    );
+
+    let workers = phoenix_agents::parse_config(&content).unwrap();
+    assert_eq!(workers.agents[0].name, "reviewer");
+    assert_eq!(workers.tiers["fast"][0].model, "local-open-weight");
+
+    let (models, llm) = parse_user_config(&content).unwrap();
+    assert_eq!(models.unwrap()[0].id, "local-open-weight");
+    let llm = llm.unwrap();
+    assert_eq!(llm.api_key_helper.as_deref(), Some("ddtool auth token"));
+    assert_eq!(llm.api_key_helper_ttl_ms, Some(3_600_000));
+    assert_eq!(llm.auth_header, Some(UserAuthHeader::Bearer));
+    assert_eq!(llm.default_model.as_deref(), Some("google/gemini-4-neon"));
+    assert_eq!(
+        llm.anthropic_base_url.as_deref(),
+        Some("https://gateway.example.test/v1/messages")
+    );
+    assert_eq!(
+        llm.openai_chat_completions_base_url.as_deref(),
+        Some("https://gateway.example.test/v1/chat/completions")
+    );
+    assert_eq!(llm.custom_headers["X-Org"], "eng");
+    assert_eq!(llm.request_tags["team"], "ide");
+    assert_eq!(
+        llm.request_models.unwrap()["openai_chat_completions"]["google/gemini-4-neon"],
+        "google/gemini-4-neon"
+    );
+}
+
+#[test]
+fn toml_llm_section_rejects_static_api_keys_blank_fields_and_unknown_keys() {
+    for invalid in [
+        "version = 1\n[llm]\nanthropic_api_key = 'sk-ant-nope'\n",
+        "version = 1\n[llm]\nopenai_api_key = 'sk-nope'\n",
+        "version = 1\n[llm]\nunknown_key = 'x'\n",
+        "version = 1\n[llm]\napi_key_helper = '   '\n",
+        "version = 1\n[llm]\napi_key_helper_ttl_ms = 0\n",
+        "version = 1\n[llm]\nauth_header = 'basic'\n",
+        "version = 1\n[llm]\nanthropic_base_url = ''\n",
+        "version = 1\n[llm.custom_headers]\n' ' = 'v'\n",
+        "version = 1\n[llm.request_tags]\n'' = 'v'\n",
+    ] {
+        assert!(
+            parse_user_config(invalid).is_err(),
+            "Accepted invalid [llm] config: {invalid}"
+        );
+    }
+}

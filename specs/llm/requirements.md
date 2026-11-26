@@ -115,6 +115,20 @@ precedence while startup loading supports a simple edit-and-restart workflow.
 
 ---
 
+### REQ-LLM-003d: Provider and gateway settings in user configuration
+
+WHEN Phoenix initializes `LlmConfig`
+THE SYSTEM SHALL read an optional `[llm]` table from the version-1 user file defined by `specs/agents/requirements.md` REQ-AG-010
+supporting `api_key_helper`, `api_key_helper_ttl_ms`, `auth_header` (`bearer` or `api_key`), `default_model`, `anthropic_base_url`, `openai_base_url`, `openai_responses_base_url`, `openai_chat_completions_base_url`, `custom_headers`, `request_tags`, and `request_models`
+AND SHALL reject unknown fields (including static API keys such as `anthropic_api_key` or `openai_api_key`), blank string values, non-positive TTLs, and invalid `request_models` entries with a path-specific diagnostic
+
+WHEN an environment variable corresponding to a `[llm]` field is set and non-empty
+THE SYSTEM SHALL prefer the environment variable for that field while continuing to read unset fields from `[llm]`
+
+**Rationale:** GUI-launched deployments such as `Phoenix.app` do not inherit interactive shell exports. Placing non-secret provider and gateway settings in the same version-1 XDG TOML file lets desktop, CLI, and managed installs share one readable configuration while preserving per-field environment overrides and keeping static secrets out of plaintext TOML.
+
+---
+
 ### REQ-LLM-003a: Model Discovery
 
 WHEN deriving a model-list URL from a provider-compatible exact endpoint

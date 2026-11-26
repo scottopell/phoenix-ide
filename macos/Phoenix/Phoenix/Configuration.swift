@@ -119,6 +119,24 @@ struct ConnectionReapplyDecision: Equatable {
 }
 
 
+struct PendingUserConfigRestartState: Equatable {
+    private(set) var pendingRestart = false
+
+    mutating func markConfigWritten() {
+        pendingRestart = true
+    }
+
+    func shouldForceRestart(for mode: PendingServerModeKind?, tomlEdited: Bool) -> Bool {
+        mode == .bundled && (tomlEdited || pendingRestart)
+    }
+
+    mutating func markApplyCompleted(for mode: PendingServerModeKind?) {
+        if mode == .bundled {
+            pendingRestart = false
+        }
+    }
+}
+
 struct ServerReconnectRequest: Equatable {
     let candidate: ServerMode
     let requiresReconnect: Bool
@@ -129,6 +147,7 @@ struct ServerReconnectRequest: Equatable {
         currentState: ConnectionState,
         candidate: ServerMode,
         changedBundledSecrets: Bool,
+        changedUserConfig: Bool = false,
         intent: ReconnectIntent = .applySettings
     ) -> ServerReconnectRequest {
         let reapply = ConnectionReapplyDecision.evaluate(
@@ -137,7 +156,7 @@ struct ServerReconnectRequest: Equatable {
             candidate: candidate,
             intent: intent
         )
-        let requiresForceRestart = candidate.kind == .bundled && changedBundledSecrets
+        let requiresForceRestart = candidate.kind == .bundled && (changedBundledSecrets || changedUserConfig)
         return ServerReconnectRequest(
             candidate: candidate,
             requiresReconnect: reapply.requiresReconnect || requiresForceRestart,
@@ -195,23 +214,43 @@ struct SidecarLaunchEnvironment {
         return entries.joined(separator: ":")
     }
 
-    static let safeInheritedKeys = ["SHELL", "USER", "LOGNAME", "SSH_AUTH_SOCK"]
+    static let safeInheritedKeys = ["SHELL", "USER", "LOGNAME", "SSH_AUTH_SOCK", "XDG_CONFIG_HOME"]
+    static let llmConfigurationInheritedKeys = [
+        "LLM_API_KEY_HELPER",
+        "LLM_API_KEY_HELPER_TTL_MS",
+        "ANTHROPIC_BASE_URL",
+        "OPENAI_BASE_URL",
+        "OPENAI_RESPONSES_BASE_URL",
+        "OPENAI_CHAT_COMPLETIONS_BASE_URL",
+        "LLM_CUSTOM_HEADERS",
+        "LLM_REQUEST_TAGS",
+        "LLM_AUTH_HEADER",
+        "PHOENIX_LLM_MODELS",
+        "PHOENIX_LLM_REQUEST_MODELS",
+        "DEFAULT_MODEL",
+    ]
 
     static func build(
         inherited: [String: String],
         userHome: URL,
         instanceID: UUID,
         publicEnvironment: [String: String],
-        sidecarSecrets: [String: String]
+        sidecarSecrets: [String: String],
+        loginShellPath: String? = nil
     ) -> [String: String] {
+        let resolvedPath = LoginShellPathResolver.mergedSearchPath(
+            loginShellPath: loginShellPath,
+            inheritedPath: inherited["PATH"],
+            userHome: userHome
+        )
         var environment = [
-            "PATH": executableSearchPath(inherited: inherited["PATH"]),
+            "PATH": resolvedPath,
             "TMPDIR": inherited["TMPDIR"] ?? NSTemporaryDirectory(),
             "LANG": inherited["LANG"] ?? "en_US.UTF-8",
             "HOME": userHome.path,
             "PHOENIX_INSTANCE_ID": instanceID.uuidString,
         ]
-        for key in safeInheritedKeys {
+        for key in safeInheritedKeys + llmConfigurationInheritedKeys {
             if let value = inherited[key], !value.isEmpty {
                 environment[key] = value
             }
@@ -219,6 +258,26 @@ struct SidecarLaunchEnvironment {
         for (key, value) in publicEnvironment { environment[key] = value }
         for (key, value) in sidecarSecrets { environment[key] = value }
         return environment
+    }
+
+    static func sensitiveValuesForRedaction(
+        environment: [String: String],
+        sidecarSecrets: [String: String]
+    ) -> [String] {
+        var values = Array(sidecarSecrets.values.filter { !$0.isEmpty })
+        if let rawHeaders = environment["LLM_CUSTOM_HEADERS"], !rawHeaders.isEmpty {
+            let normalized = rawHeaders.replacingOccurrences(of: "\\n", with: "\n")
+            for line in normalized.split(whereSeparator: \.isNewline) {
+                let trimmedLine = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let colon = trimmedLine.firstIndex(of: ":") else { continue }
+                let headerValue = trimmedLine[trimmedLine.index(after: colon)...]
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !headerValue.isEmpty {
+                    values.append(headerValue)
+                }
+            }
+        }
+        return values
     }
 }
 
@@ -396,40 +455,16 @@ struct LogRecordBounds {
     }
 }
 
-private extension DeploymentInfo {
-    func originExactlyMatches(_ origin: PhoenixOrigin) -> Bool {
-        origin.exactlyMatches(originURL)
-    }
-
-    var originURL: URL {
-        let originString = currentMode?.webOrigin ?? networkOriginString
-        return URL(string: originString) ?? fallbackNetworkOriginURL
-    }
-
-    var networkOriginString: String {
-        let hostPort = network.bindAddress
-        let scheme = network.tls.enabled ? "https" : "http"
-        if hostPort.hasPrefix("[") {
-            return "\(scheme)://\(hostPort)"
-        }
-        let parts = hostPort.split(separator: ":", maxSplits: 1).map(String.init)
-        if parts.count == 2, parts[0].contains(":") {
-            return "\(scheme)://[\(parts[0])]:\(parts[1])"
-        }
-        return "\(scheme)://\(hostPort)"
-    }
-
-    var fallbackNetworkOriginURL: URL {
-        URL(string: networkOriginString)!
-    }
-}
-
 struct ReopenDecision {
     static func shouldShowMainWindow(mainWindowIsVisible: Bool) -> Bool {
         !mainWindowIsVisible
     }
 }
 enum FirstRunDecision {
+    static func shouldShowOnboarding(hasSavedModeSelection: Bool) -> Bool {
+        !hasSavedModeSelection
+    }
+
     static func shouldOpenSettings(hasSavedModeSelection: Bool) -> Bool {
         !hasSavedModeSelection
     }
@@ -1159,6 +1194,17 @@ struct PhoenixOrigin: Equatable, Codable, CustomStringConvertible {
         return URL(string: relative, relativeTo: url.appendingPathComponent("/"))!.absoluteURL
     }
 
+    var alternateLoopbackSchemeOrigin: PhoenixOrigin? {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let scheme = components.scheme?.lowercased(),
+              LoopbackAddressPolicy.allowsCleartextAttachedOrigin(host: components.host) else {
+            return nil
+        }
+        components.scheme = (scheme == "http") ? "https" : "http"
+        guard let flipped = components.url else { return nil }
+        return try? PhoenixOrigin(flipped.absoluteString)
+    }
+
     func exactlyMatches(_ candidate: URL) -> Bool {
         guard let lhs = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let rhs = URLComponents(url: candidate, resolvingAgainstBaseURL: false) else { return false }
@@ -1203,6 +1249,7 @@ struct BundledServerConfiguration: Equatable {
     let dataDirectoryURL: URL
     let databaseURL: URL
     let phoenixLogURL: URL
+    let fatalLogURL: URL
     let launcherLogURL: URL
     let ownerLockURL: URL
     let rustLogLevel: String
@@ -1219,6 +1266,9 @@ struct BundledServerConfiguration: Equatable {
             "PHOENIX_TLS": "off",
             "PHOENIX_PORT": String(origin.url.port!),
             "PHOENIX_DB_PATH": databaseURL.path,
+            "PHOENIX_LOG_FILE": phoenixLogURL.path,
+            "PHOENIX_FATAL_LOG_FILE": fatalLogURL.path,
+            "PHOENIX_LOG_STDOUT": "false",
             "RUST_LOG": rustLogLevel,
         ]
     }
@@ -1244,7 +1294,7 @@ enum ServerMode: Equatable {
 }
 
 enum ConfigurationStore {
-    static let defaultAttachedOrigin = "https://localhost:8031"
+    static let defaultAttachedOrigin = "http://localhost:8031"
     static let defaultBundledPort = 8420
 
     static func load(bundle: Bundle = .main, defaults: UserDefaults = .standard) throws -> ServerMode {
@@ -1293,6 +1343,7 @@ enum ConfigurationStore {
                 dataDirectoryURL: dataDir,
                 databaseURL: dataDir.appendingPathComponent("phoenix.db"),
                 phoenixLogURL: dataDir.appendingPathComponent("phoenix.log"),
+                fatalLogURL: dataDir.appendingPathComponent("phoenix-fatal.log"),
                 launcherLogURL: dataDir.appendingPathComponent("launcher.log"),
                 ownerLockURL: runtimeRoot.appendingPathComponent("owner.lock"),
                 rustLogLevel: rustLogLevel
@@ -1490,27 +1541,15 @@ struct VersionInfo: Codable, Equatable {
 struct DeploymentInfo: Codable, Equatable {
     let build: BuildInfo
     let network: NetworkInfo
-    let currentMode: CurrentModeInfo?
     let instanceID: String?
     let localAccess: Bool
     let installationOwnership: InstallationOwnership
 
     enum CodingKeys: String, CodingKey {
         case build, network
-        case currentMode = "current_mode"
         case instanceID = "instance_id"
         case localAccess = "local_access"
         case installationOwnership = "installation_ownership"
-    }
-}
-
-struct CurrentModeInfo: Codable, Equatable {
-    let serverMode: String?
-    let webOrigin: String?
-
-    enum CodingKeys: String, CodingKey {
-        case serverMode = "server_mode"
-        case webOrigin = "web_origin"
     }
 }
 

@@ -47,7 +47,7 @@ export function LlmStatusBanner({ models }: LlmStatusBannerProps) {
           >
             Sign in with Codex
           </button>
-          {', '}or set <code>ANTHROPIC_API_KEY</code> / <code>OPENAI_API_KEY</code> and restart.
+          {', '}configure <code>[llm]</code> in <code>~/.config/phoenix-ide/config.toml</code>, or set API keys and restart.
         </span>
       </div>
     );

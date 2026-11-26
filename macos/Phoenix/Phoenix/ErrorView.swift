@@ -1,8 +1,25 @@
 import SwiftUI
 
 struct ErrorView: View {
+    let origin: String?
     let message: String
+    let suggestedOrigin: PhoenixOrigin?
+    let onSwitchOrigin: ((PhoenixOrigin) -> Void)?
     let onRestart: () -> Void
+
+    init(
+        origin: String? = nil,
+        message: String,
+        suggestedOrigin: PhoenixOrigin? = nil,
+        onSwitchOrigin: ((PhoenixOrigin) -> Void)? = nil,
+        onRestart: @escaping () -> Void
+    ) {
+        self.origin = origin
+        self.message = message
+        self.suggestedOrigin = suggestedOrigin
+        self.onSwitchOrigin = onSwitchOrigin
+        self.onRestart = onRestart
+    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -10,9 +27,17 @@ struct ErrorView: View {
                 .font(.system(size: 40))
                 .foregroundStyle(.orange)
 
-            Text("Phoenix Connection")
-                .font(.title2)
-                .fontWeight(.semibold)
+            VStack(spacing: 4) {
+                Text("Phoenix Connection")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                if let origin {
+                    Text(origin)
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
+            }
 
             ScrollView {
                 Text(message)
@@ -24,17 +49,27 @@ struct ErrorView: View {
                     .background(.quaternary)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             }
-            .frame(maxHeight: 300)
+            .frame(maxWidth: 560, maxHeight: 260)
 
-            HStack {
+            HStack(spacing: 10) {
                 Button("Open Settings") {
                     NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
                 }
 
-                Button("Retry") {
-                    onRestart()
+                if let suggestedOrigin, let onSwitchOrigin {
+                    Button("Retry") {
+                        onRestart()
+                    }
+                    Button("Switch to \(suggestedOrigin.description)") {
+                        onSwitchOrigin(suggestedOrigin)
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else {
+                    Button("Retry") {
+                        onRestart()
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
             }
         }
         .padding(32)

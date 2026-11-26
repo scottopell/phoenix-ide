@@ -5,6 +5,13 @@ import Darwin
 struct FailureState: Equatable {
     let version: VersionInfo?
     let message: String
+    let suggestedOrigin: PhoenixOrigin?
+
+    init(version: VersionInfo?, message: String, suggestedOrigin: PhoenixOrigin? = nil) {
+        self.version = version
+        self.message = message
+        self.suggestedOrigin = suggestedOrigin
+    }
 }
 
 struct ConnectionLogBuffer: Equatable {
@@ -160,6 +167,13 @@ func isCertificateURLError(_ code: URLError.Code) -> Bool {
 struct ConnectionErrorViewModel: Equatable {
     let message: String
     let allowsReconnect: Bool
+    let suggestedOrigin: PhoenixOrigin?
+
+    init(message: String, allowsReconnect: Bool, suggestedOrigin: PhoenixOrigin? = nil) {
+        self.message = message
+        self.allowsReconnect = allowsReconnect
+        self.suggestedOrigin = suggestedOrigin
+    }
 }
 
 @MainActor
@@ -176,7 +190,6 @@ enum ConnectionState: Equatable {
     case unavailable(FailureState)
     case tlsFailure(FailureState)
     case wrongService(FailureState)
-    case unsupportedOwnership(VersionInfo, DeploymentInfo, String)
     case failed(FailureState)
 
     var displayName: String {
@@ -193,14 +206,13 @@ enum ConnectionState: Equatable {
         case .unavailable: "Unavailable"
         case .tlsFailure: "TLS trust failure"
         case .wrongService: "Wrong service"
-        case .unsupportedOwnership: "Read-only deployment"
         case .failed: "Failed"
         }
     }
 
     var canDisplayWebView: Bool {
         switch self {
-        case .identityVerified, .authenticationRequired, .ready, .unsupportedOwnership: true
+        case .identityVerified, .authenticationRequired, .ready: true
         default: false
         }
     }
@@ -208,9 +220,11 @@ enum ConnectionState: Equatable {
     var failureViewModel: ConnectionErrorViewModel? {
         switch self {
         case .failed(let failure), .unavailable(let failure), .tlsFailure(let failure), .wrongService(let failure):
-            return ConnectionErrorViewModel(message: failure.message, allowsReconnect: true)
-        case .unsupportedOwnership(_, _, let message):
-            return ConnectionErrorViewModel(message: message, allowsReconnect: false)
+            return ConnectionErrorViewModel(
+                message: failure.message,
+                allowsReconnect: true,
+                suggestedOrigin: failure.suggestedOrigin
+            )
         default:
             return nil
         }
@@ -220,7 +234,6 @@ enum ConnectionState: Equatable {
         switch self {
         case .identityVerified(let value), .authenticationRequired(let value), .verifyingDeployment(let value): value
         case .ready(let value, _): value
-        case .unsupportedOwnership(let value, _, _): value
         case .failed(let failure), .unavailable(let failure), .tlsFailure(let failure), .wrongService(let failure): failure.version
         default: nil
         }
@@ -228,7 +241,7 @@ enum ConnectionState: Equatable {
 
     var deploymentInfo: DeploymentInfo? {
         switch self {
-        case .ready(_, let deployment), .unsupportedOwnership(_, let deployment, _): deployment
+        case .ready(_, let deployment): deployment
         default: nil
         }
     }
@@ -249,6 +262,9 @@ struct ServerStatusSnapshot {
     let processID: Int32?
     let executablePath: String?
     let databasePath: String?
+    let userConfigPath: String?
+    let phoenixLogPath: String?
+    let fatalLogPath: String?
     let logPath: String?
     let recentLogLines: [String]
 }
@@ -262,13 +278,6 @@ func deploymentMatchesBundledInstance(_ deployment: DeploymentInfo?, instanceID:
     guard let instanceID,
           let reported = deployment?.instanceID.flatMap(UUID.init(uuidString:)) else { return false }
     return reported == instanceID
-}
-
-func attachedDeploymentOwnershipViolation(_ ownership: InstallationOwnership) -> String? {
-    guard ownership.grantsManagedAuthority else {
-        return "Attached Phoenix is \(ownership.label). Phoenix.app manages only launchd-owned deployments; this deployment remains viewable but read-only."
-    }
-    return nil
 }
 
 actor SidecarLogRecorder {
@@ -735,6 +744,7 @@ final class ServerManager: ObservableObject {
     private var outputPipe: Pipe?
     private var exitDrainInProgress = false
     private var readinessTask: Task<Void, Never>?
+    private var launchPreparationTask: Task<Void, Never>?
     private var stopDeadline: DispatchSourceTimer?
     private var stopCompletions: [() -> Void] = []
     private var bundledReconnectQueue = BundledReconnectQueue()
@@ -761,6 +771,8 @@ final class ServerManager: ObservableObject {
         guard !terminationInProgress else { return }
         resetBrowserOwnedStateForOperationTransition()
         bundledReconnectQueue.cancel()
+        launchPreparationTask?.cancel()
+        launchPreparationTask = nil
         readinessTask?.cancel()
         let operation = operationAuthority.replace()
         logPublicationOperation = nil
@@ -775,7 +787,7 @@ final class ServerManager: ObservableObject {
                     await self?.verifyIdentity(for: selected, operation: operation, allowIntermediateFailureState: true)
                 }
             case .bundled(let configuration):
-                try startBundled(configuration, operation: operation)
+                prepareAndStartBundled(configuration, operation: operation)
             }
         } catch {
             state = .failed(FailureState(version: currentVersion, message: error.localizedDescription))
@@ -847,12 +859,7 @@ final class ServerManager: ObservableObject {
         }
         let nextState: ConnectionState
         if let violation = deploymentViolation(deployment, for: selected, version: version) {
-            switch selected {
-            case .attached:
-                nextState = .unsupportedOwnership(version, deployment, violation)
-            case .bundled:
-                nextState = .failed(FailureState(version: version, message: violation))
-            }
+            nextState = .failed(FailureState(version: version, message: violation))
         } else {
             nextState = .ready(version, deployment)
         }
@@ -879,6 +886,8 @@ final class ServerManager: ObservableObject {
     func stop(completion: (() -> Void)? = nil, preservedState: ConnectionState? = nil, isTransitionStop: Bool = false) {
         if let completion { stopCompletions.append(completion) }
         if !isTransitionStop, preservedState == nil { bundledReconnectQueue.cancel() }
+        launchPreparationTask?.cancel()
+        launchPreparationTask = nil
         readinessTask?.cancel()
         readinessTask = nil
         _ = operationAuthority.invalidate(operationAuthority.id)
@@ -930,6 +939,9 @@ final class ServerManager: ObservableObject {
             processID: process?.processIdentifier,
             executablePath: bundled?.executableURL.path,
             databasePath: bundled?.databaseURL.path,
+            userConfigPath: bundled == nil ? nil : UserConfigStore.configURL().path,
+            phoenixLogPath: bundled?.phoenixLogURL.path,
+            fatalLogPath: bundled?.fatalLogURL.path,
             logPath: bundled?.launcherLogURL.path,
             recentLogLines: recentLogLines
         )
@@ -955,7 +967,33 @@ final class ServerManager: ObservableObject {
         stop(completion: nil, preservedState: .failed(failure))
     }
 
-    private func startBundled(_ configuration: BundledServerConfiguration, operation: UUID) throws {
+    private func prepareAndStartBundled(_ configuration: BundledServerConfiguration, operation: UUID) {
+        state = .startingSidecar
+        recentLogLines = []
+        logPublicationOperation = operation
+
+        let inherited = ProcessInfo.processInfo.environment
+        let userHome = FileManager.default.homeDirectoryForCurrentUser
+
+        launchPreparationTask = Task { [weak self] in
+            let loginShellPath = await Task.detached(priority: .userInitiated) {
+                LoginShellPathResolver.captureLoginShellPath(inherited: inherited, userHome: userHome)
+            }.value
+            guard let self,
+                  !Task.isCancelled,
+                  !self.terminationInProgress,
+                  self.operationAuthority.id == operation else { return }
+            self.launchPreparationTask = nil
+            do {
+                try self.startBundled(configuration, operation: operation, loginShellPath: loginShellPath)
+            } catch {
+                guard self.operationAuthority.id == operation else { return }
+                self.state = .failed(FailureState(version: self.currentVersion, message: error.localizedDescription))
+            }
+        }
+    }
+
+    private func startBundled(_ configuration: BundledServerConfiguration, operation: UUID, loginShellPath: String?) throws {
         state = .startingSidecar
         recentLogLines = []
         logPublicationOperation = operation
@@ -966,13 +1004,6 @@ final class ServerManager: ObservableObject {
             try acquireOwnerLock(configuration.ownerLockURL)
             launchedBundledInstance = LaunchedBundledInstance(configuration: configuration, instanceID: UUID())
             let sidecarSecrets = try keychain.sidecarEnvironment()
-            let logRecorder = SidecarLogRecorder(
-                writer: currentLogWriter,
-                exactSecretValues: Array(sidecarSecrets.values),
-                snapshotSink: { [logSnapshotSink] lines in
-                    await logSnapshotSink.publish(lines, operation: operation)
-                }
-            )
             let inherited = ProcessInfo.processInfo.environment
             guard let instanceID = launchedBundledInstance?.instanceID else {
                 throw ConfigurationError.bundledBinaryMissing
@@ -982,7 +1013,18 @@ final class ServerManager: ObservableObject {
                 userHome: FileManager.default.homeDirectoryForCurrentUser,
                 instanceID: instanceID,
                 publicEnvironment: configuration.publicEnvironment,
-                sidecarSecrets: sidecarSecrets
+                sidecarSecrets: sidecarSecrets,
+                loginShellPath: loginShellPath
+            )
+            let logRecorder = SidecarLogRecorder(
+                writer: currentLogWriter,
+                exactSecretValues: SidecarLaunchEnvironment.sensitiveValuesForRedaction(
+                    environment: environment,
+                    sidecarSecrets: sidecarSecrets
+                ),
+                snapshotSink: { [logSnapshotSink] lines in
+                    await logSnapshotSink.publish(lines, operation: operation)
+                }
             )
 
             let launched = Process()
@@ -1092,17 +1134,88 @@ final class ServerManager: ObservableObject {
         } catch {
             guard operation == operationAuthority.id else { return }
             if allowIntermediateFailureState {
-                applyIdentityFailure(classifyServerIdentityError(error), version: currentVersion)
+                let classified = classifyServerIdentityError(error)
+                if case .attached = selected {
+                    let mismatch = await detectLoopbackSchemeMismatch(for: selected.origin, initialError: error)
+                    guard operation == operationAuthority.id else { return }
+                    if let mismatch {
+                        applyIdentityFailure(mismatch.error, version: currentVersion, suggestedOrigin: mismatch.suggestedOrigin)
+                        return
+                    }
+                }
+                guard operation == operationAuthority.id else { return }
+                applyIdentityFailure(
+                    contextualizedIdentityError(classified, origin: selected.origin),
+                    version: currentVersion
+                )
             }
         }
     }
 
-    private func applyIdentityFailure(_ error: ServerIdentityError, version: VersionInfo?) {
+    private func detectLoopbackSchemeMismatch(
+        for origin: PhoenixOrigin,
+        initialError: Error
+    ) async -> (error: ServerIdentityError, suggestedOrigin: PhoenixOrigin)? {
+        guard let alternate = origin.alternateLoopbackSchemeOrigin,
+              let urlError = initialError as? URLError else {
+            return nil
+        }
+        let scheme = origin.url.scheme?.lowercased() ?? ""
+        let couldBeSchemeMismatch: Bool
+        if scheme == "http" {
+            couldBeSchemeMismatch = [
+                .networkConnectionLost,
+                .badServerResponse,
+                .cannotParseResponse,
+                .zeroByteResource,
+            ].contains(urlError.code)
+        } else {
+            couldBeSchemeMismatch = [
+                .secureConnectionFailed,
+                .networkConnectionLost,
+                .badServerResponse,
+            ].contains(urlError.code)
+        }
+        guard couldBeSchemeMismatch else { return nil }
+
+        let outcome = await LocalDeploymentDetector.probeVersion(at: alternate, timeoutSeconds: 1.5)
+        switch outcome {
+        case .found(let version):
+            let protocolLabel = alternate.url.scheme?.uppercased() ?? "HTTPS"
+            return (
+                .unavailable("Could not connect to \(origin.description). Phoenix v\(version.version) at this port is serving \(protocolLabel) — switch to \(alternate.description)."),
+                alternate
+            )
+        case .tlsTrustFailure:
+            return (
+                .tls("Could not connect to \(origin.description). This port is serving HTTPS, and macOS does not yet trust its certificate. Trust the Phoenix local CA in Keychain, then switch to \(alternate.description)."),
+                alternate
+            )
+        case .unavailable:
+            return nil
+        }
+    }
+
+    private func contextualizedIdentityError(_ error: ServerIdentityError, origin: PhoenixOrigin) -> ServerIdentityError {
+        let prefix = "Could not connect to \(origin.description): "
+        switch error {
+        case .tls(let message):
+            return .tls(message.hasPrefix("Could not connect") ? message : prefix + message)
+        case .wrongService(let message):
+            return .wrongService(message.hasPrefix("Could not connect") ? message : prefix + message)
+        case .unavailable(let message):
+            return .unavailable(message.hasPrefix("Could not connect") ? message : prefix + message)
+        case .redirected(let message):
+            return .redirected(message.hasPrefix("Could not connect") ? message : prefix + message)
+        }
+    }
+
+    private func applyIdentityFailure(_ error: ServerIdentityError, version: VersionInfo?, suggestedOrigin: PhoenixOrigin? = nil) {
         let failure = FailureState(version: version, message: {
             switch error {
             case .tls(let message), .wrongService(let message), .unavailable(let message), .redirected(let message): return message
             }
-        }())
+        }(), suggestedOrigin: suggestedOrigin)
         switch error {
         case .tls:
             state = .tlsFailure(failure)
@@ -1164,13 +1277,13 @@ final class ServerManager: ObservableObject {
         }
     }
 
-    private func deploymentViolation(_ deployment: DeploymentInfo, for selected: ServerMode, version: VersionInfo) -> String? {
+    func deploymentViolation(_ deployment: DeploymentInfo, for selected: ServerMode, version: VersionInfo) -> String? {
         guard deployment.build.version == version.version, deployment.build.gitSHA == version.gitSHA else {
             return "Phoenix reported conflicting build identity between /api/version and /api/deployment."
         }
         switch selected {
         case .attached:
-            return attachedDeploymentOwnershipViolation(deployment.installationOwnership)
+            return nil
         case .bundled:
             guard LoopbackAddressPolicy.bundledBindAddressIsLoopback(deployment.network.bindAddress) else {
                 return "Bundled Phoenix reported a non-loopback listener: \(deployment.network.bindAddress)"

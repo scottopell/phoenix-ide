@@ -31,6 +31,37 @@ configured backend slots: `codex`, `anthropic`, `openai_responses`,
 `openai_chat_completions`, or `mock`. The file selects connections; it does not
 configure credentials or create provider connections.
 
+## Provider and gateway settings (`[llm]`)
+
+Configure a credential helper, provider endpoints, custom headers, request tags,
+or default model in the same file using an optional `[llm]` table:
+
+```toml
+version = 1
+
+[llm]
+api_key_helper = "my-auth-helper token"
+api_key_helper_ttl_ms = 7200000
+auth_header = "bearer" # "bearer" or "api_key"
+default_model = "google/gemini-4-neon"
+anthropic_base_url = "https://gateway.example.test/anthropic/v1/messages"
+openai_chat_completions_base_url = "https://gateway.example.test/openai/v1/chat/completions"
+
+[llm.custom_headers]
+X-Org = "eng"
+
+[llm.request_tags]
+team = "ide"
+
+[llm.request_models.openai_chat_completions]
+"google/gemini-4-neon" = "google/gemini-4-neon"
+```
+
+Environment variables (`LLM_API_KEY_HELPER`, `ANTHROPIC_BASE_URL`, `DEFAULT_MODEL`,
+etc.) override `[llm]` per field when set and non-empty. Static API keys
+(`anthropic_api_key`, `openai_api_key`) are rejected in TOML; store them in
+macOS Keychain (via `Phoenix.app`) or environment variables.
+
 ## External model definitions
 
 Add third-party models independently of the built-in catalog with top-level

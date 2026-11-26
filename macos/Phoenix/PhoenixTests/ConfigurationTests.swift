@@ -959,6 +959,10 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertTrue(bad.signingMismatch)
     }
 
+    func testDefaultAttachedOriginUsesHTTPForLoopbackProduction() {
+        XCTAssertEqual(ConfigurationStore.defaultAttachedOrigin, "http://localhost:8031")
+    }
+
     func testBundledEnvironmentIsLoopbackTLSOffAndPrivate() throws {
         let root = URL(fileURLWithPath: "/tmp/Phoenix Tests")
         let configuration = BundledServerConfiguration(
@@ -968,6 +972,7 @@ final class ConfigurationTests: XCTestCase {
             dataDirectoryURL: root.appendingPathComponent(".phoenix-ide"),
             databaseURL: root.appendingPathComponent(".phoenix-ide/phoenix.db"),
             phoenixLogURL: root.appendingPathComponent(".phoenix-ide/phoenix.log"),
+            fatalLogURL: root.appendingPathComponent(".phoenix-ide/phoenix-fatal.log"),
             launcherLogURL: root.appendingPathComponent(".phoenix-ide/launcher.log"),
             ownerLockURL: root.appendingPathComponent("owner.lock"),
             rustLogLevel: "phoenix_ide=debug"
@@ -981,6 +986,9 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_TLS"], "off")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_PORT"], "8420")
         XCTAssertEqual(configuration.publicEnvironment["PHOENIX_DB_PATH"], "/tmp/Phoenix Tests/.phoenix-ide/phoenix.db")
+        XCTAssertEqual(configuration.publicEnvironment["PHOENIX_LOG_FILE"], "/tmp/Phoenix Tests/.phoenix-ide/phoenix.log")
+        XCTAssertEqual(configuration.publicEnvironment["PHOENIX_FATAL_LOG_FILE"], "/tmp/Phoenix Tests/.phoenix-ide/phoenix-fatal.log")
+        XCTAssertEqual(configuration.publicEnvironment["PHOENIX_LOG_STDOUT"], "false")
         XCTAssertNil(configuration.publicEnvironment["ANTHROPIC_API_KEY"])
         XCTAssertNil(configuration.publicEnvironment["PHOENIX_PASSWORD"])
     }
@@ -1002,6 +1010,7 @@ final class ConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.dataDirectoryURL.deletingLastPathComponent(), configuration.runtimeRootURL)
         XCTAssertEqual(configuration.launcherLogURL.lastPathComponent, "launcher.log")
         XCTAssertEqual(configuration.phoenixLogURL.lastPathComponent, "phoenix.log")
+        XCTAssertEqual(configuration.fatalLogURL.lastPathComponent, "phoenix-fatal.log")
     }
 
     func testOwnershipDecoderFailsClosedForFutureKind() throws {
@@ -1061,6 +1070,7 @@ final class ConfigurationTests: XCTestCase {
             dataDirectoryURL: root.appendingPathComponent(".phoenix-ide"),
             databaseURL: root.appendingPathComponent(".phoenix-ide/phoenix.db"),
             phoenixLogURL: root.appendingPathComponent(".phoenix-ide/phoenix.log"),
+            fatalLogURL: root.appendingPathComponent(".phoenix-ide/phoenix-fatal.log"),
             launcherLogURL: root.appendingPathComponent(".phoenix-ide/launcher.log"),
             ownerLockURL: root.appendingPathComponent("owner.lock"),
             rustLogLevel: "info"
@@ -1478,7 +1488,6 @@ final class ServerManagerHelpersTests: XCTestCase {
         let matching = DeploymentInfo(
             build: BuildInfo(version: "1.2.3", gitSHA: "abc123"),
             network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
-            currentMode: nil,
             instanceID: instanceID.uuidString,
             localAccess: true,
             installationOwnership: .development
@@ -1486,7 +1495,6 @@ final class ServerManagerHelpersTests: XCTestCase {
         let mismatched = DeploymentInfo(
             build: matching.build,
             network: matching.network,
-            currentMode: nil,
             instanceID: UUID().uuidString,
             localAccess: matching.localAccess,
             installationOwnership: matching.installationOwnership
@@ -1498,27 +1506,12 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertFalse(deploymentMatchesBundledInstance(matching, instanceID: nil))
     }
 
-    func testDeploymentViolationCanLeaveAttachedDeploymentViewableButReadOnly() throws {
+    func testAttachedModeAcceptsAnyValidDeploymentOwnership() throws {
+        let manager = ServerManager(keychain: ScriptedSecretStore())
         let version = VersionInfo(version: "1.2.3", gitSHA: "abc123")
-        let deployment = DeploymentInfo(
-            build: BuildInfo(version: "1.2.3", gitSHA: "abc123"),
-            network: NetworkInfo(bindAddress: "127.0.0.1:8031", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
-            currentMode: nil,
-            instanceID: nil,
-            localAccess: true,
-            installationOwnership: .systemdManaged
-        )
-        let state = ConnectionState.unsupportedOwnership(version, deployment, "read-only")
-        XCTAssertTrue(state.canDisplayWebView)
-        XCTAssertEqual(state.versionInfo, version)
-        XCTAssertEqual(state.deploymentInfo, deployment)
-        XCTAssertEqual(state.failureViewModel, ConnectionErrorViewModel(message: "read-only", allowsReconnect: false))
-    }
-
-    func testAttachedDeploymentManagementRequiresLaunchdOwnership() {
-        XCTAssertNil(attachedDeploymentOwnershipViolation(.launchdManaged))
-
-        let unsupportedOwnerships: [InstallationOwnership] = [
+        let attached = ServerMode.attached(AttachedServerConfiguration(origin: try PhoenixOrigin("http://localhost:8031")))
+        let ownerships: [InstallationOwnership] = [
+            .launchdManaged,
             .systemdManaged,
             .bareSupervisorManaged,
             .development,
@@ -1527,10 +1520,15 @@ final class ServerManagerHelpersTests: XCTestCase {
             .unsupported("linux"),
             .unknown("future_managed_kind"),
         ]
-        for ownership in unsupportedOwnerships {
-            let violation = attachedDeploymentOwnershipViolation(ownership)
-            XCTAssertNotNil(violation, "\(ownership) must remain viewable but read-only")
-            XCTAssertTrue(violation?.contains("viewable but read-only") == true)
+        for ownership in ownerships {
+            let deployment = DeploymentInfo(
+                build: BuildInfo(version: version.version, gitSHA: version.gitSHA),
+                network: NetworkInfo(bindAddress: "127.0.0.1:8031", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+                instanceID: nil,
+                localAccess: true,
+                installationOwnership: ownership
+            )
+            XCTAssertNil(manager.deploymentViolation(deployment, for: attached, version: version), "\(ownership) should be accepted in attached mode")
         }
     }
 
@@ -1540,7 +1538,6 @@ final class ServerManagerHelpersTests: XCTestCase {
         let deployment = DeploymentInfo(
             build: BuildInfo(version: version.version, gitSHA: version.gitSHA),
             network: NetworkInfo(bindAddress: "0.0.0.0:8031", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
-            currentMode: CurrentModeInfo(serverMode: "attached", webOrigin: "https://phoenix.example.test:8031"),
             instanceID: nil,
             localAccess: false,
             installationOwnership: .launchdManaged
@@ -1557,6 +1554,7 @@ final class ServerManagerHelpersTests: XCTestCase {
             dataDirectoryURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide", isDirectory: true),
             databaseURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.db"),
             phoenixLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.log"),
+            fatalLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix-fatal.log"),
             launcherLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/launcher.log"),
             ownerLockURL: URL(fileURLWithPath: "/tmp/runtime/owner.lock"),
             rustLogLevel: "phoenix_ide=info"
@@ -1569,7 +1567,6 @@ final class ServerManagerHelpersTests: XCTestCase {
                 DeploymentInfo(
                     build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
                     network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
-                    currentMode: CurrentModeInfo(serverMode: "bundled", webOrigin: "http://127.0.0.1:8420"),
                     instanceID: UUID().uuidString,
                     localAccess: true,
                     installationOwnership: .development
@@ -1589,7 +1586,6 @@ final class ServerManagerHelpersTests: XCTestCase {
                 DeploymentInfo(
                     build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
                     network: NetworkInfo(bindAddress: "phoenix.example.test:443", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
-                    currentMode: CurrentModeInfo(serverMode: "attached", webOrigin: "https://phoenix.example.test"),
                     instanceID: nil,
                     localAccess: false,
                     installationOwnership: .launchdManaged
@@ -1608,7 +1604,6 @@ final class ServerManagerHelpersTests: XCTestCase {
                 DeploymentInfo(
                     build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
                     network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
-                    currentMode: CurrentModeInfo(serverMode: "bundled", webOrigin: "http://127.0.0.1:8420"),
                     instanceID: UUID().uuidString,
                     localAccess: true,
                     installationOwnership: .development
@@ -1814,7 +1809,6 @@ final class ServerManagerHelpersTests: XCTestCase {
         let healthyDeployment = DeploymentInfo(
             build: BuildInfo(version: version.version, gitSHA: version.gitSHA),
             network: NetworkInfo(bindAddress: "phoenix.example.test:8031", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
-            currentMode: nil,
             instanceID: nil,
             localAccess: false,
             installationOwnership: .launchdManaged
@@ -1822,7 +1816,6 @@ final class ServerManagerHelpersTests: XCTestCase {
         let wrongOriginDeployment = DeploymentInfo(
             build: healthyDeployment.build,
             network: NetworkInfo(bindAddress: "other.example.test:8031", socketActivated: false, tls: TLSInfo(enabled: true, mode: nil)),
-            currentMode: nil,
             instanceID: nil,
             localAccess: false,
             installationOwnership: .launchdManaged
@@ -1830,7 +1823,7 @@ final class ServerManagerHelpersTests: XCTestCase {
 
         XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, healthyDeployment), candidate: candidate, intent: .applySettings).requiresReconnect)
         XCTAssertFalse(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, wrongOriginDeployment), candidate: candidate, intent: .applySettings).requiresReconnect)
-        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .unsupportedOwnership(version, healthyDeployment, "read-only"), candidate: candidate, intent: .applySettings).requiresReconnect)
+        XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .unavailable(FailureState(version: version, message: "offline")), candidate: candidate, intent: .applySettings).requiresReconnect)
         XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: nil, currentState: .stopped, candidate: candidate, intent: .applySettings).requiresReconnect)
         XCTAssertTrue(ConnectionReapplyDecision.evaluate(currentMode: candidate, currentState: .ready(version, healthyDeployment), candidate: candidate, intent: .statusReconnect).requiresReconnect)
     }
@@ -1857,6 +1850,19 @@ final class ServerManagerHelpersTests: XCTestCase {
                 "USER": "scott",
                 "LOGNAME": "scott",
                 "SSH_AUTH_SOCK": "/tmp/ssh.sock",
+                "XDG_CONFIG_HOME": "/Users/public/.xdg",
+                "LLM_API_KEY_HELPER": "/usr/local/bin/dd-helper",
+                "LLM_API_KEY_HELPER_TTL_MS": "3600000",
+                "ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic",
+                "OPENAI_BASE_URL": "https://gateway.example.test/openai",
+                "OPENAI_RESPONSES_BASE_URL": "https://gateway.example.test/responses",
+                "OPENAI_CHAT_COMPLETIONS_BASE_URL": "https://gateway.example.test/chat",
+                "LLM_CUSTOM_HEADERS": "X-Gateway-Key: gw-secret-1\\nX-Team: core",
+                "LLM_REQUEST_TAGS": "env=dev,team=ide",
+                "LLM_AUTH_HEADER": "bearer",
+                "PHOENIX_LLM_MODELS": "[{\"id\":\"custom\"}]",
+                "PHOENIX_LLM_REQUEST_MODELS": "{\"claude\":\"custom\"}",
+                "DEFAULT_MODEL": "claude-sonnet-4-6",
                 "SECRET_TOKEN": "nope",
             ],
             userHome: URL(fileURLWithPath: "/Users/public"),
@@ -1870,8 +1876,29 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertEqual(environment["USER"], "scott")
         XCTAssertEqual(environment["LOGNAME"], "scott")
         XCTAssertEqual(environment["SSH_AUTH_SOCK"], "/tmp/ssh.sock")
+        XCTAssertEqual(environment["XDG_CONFIG_HOME"], "/Users/public/.xdg")
+        XCTAssertEqual(environment["LLM_API_KEY_HELPER"], "/usr/local/bin/dd-helper")
+        XCTAssertEqual(environment["LLM_API_KEY_HELPER_TTL_MS"], "3600000")
+        XCTAssertEqual(environment["ANTHROPIC_BASE_URL"], "https://gateway.example.test/anthropic")
+        XCTAssertEqual(environment["OPENAI_BASE_URL"], "https://gateway.example.test/openai")
+        XCTAssertEqual(environment["OPENAI_RESPONSES_BASE_URL"], "https://gateway.example.test/responses")
+        XCTAssertEqual(environment["OPENAI_CHAT_COMPLETIONS_BASE_URL"], "https://gateway.example.test/chat")
+        XCTAssertEqual(environment["LLM_CUSTOM_HEADERS"], "X-Gateway-Key: gw-secret-1\\nX-Team: core")
+        XCTAssertEqual(environment["LLM_REQUEST_TAGS"], "env=dev,team=ide")
+        XCTAssertEqual(environment["LLM_AUTH_HEADER"], "bearer")
+        XCTAssertEqual(environment["PHOENIX_LLM_MODELS"], "[{\"id\":\"custom\"}]")
+        XCTAssertEqual(environment["PHOENIX_LLM_REQUEST_MODELS"], "{\"claude\":\"custom\"}")
+        XCTAssertEqual(environment["DEFAULT_MODEL"], "claude-sonnet-4-6")
         XCTAssertNil(environment["SECRET_TOKEN"])
         XCTAssertEqual(environment["ANTHROPIC_API_KEY"], "secret")
+
+        let redactedValues = SidecarLaunchEnvironment.sensitiveValuesForRedaction(
+            environment: environment,
+            sidecarSecrets: ["ANTHROPIC_API_KEY": "secret"]
+        )
+        XCTAssertTrue(redactedValues.contains("secret"))
+        XCTAssertTrue(redactedValues.contains("gw-secret-1"))
+        XCTAssertTrue(redactedValues.contains("core"))
     }
 
     func testDeepLinkConversationValidationParsesRouteResponse() throws {
@@ -1895,5 +1922,633 @@ final class ServerManagerHelpersTests: XCTestCase {
         XCTAssertTrue(LoopbackAddressPolicy.bundledBindAddressIsLoopback("127.0.0.2:8420"))
         XCTAssertTrue(LoopbackAddressPolicy.bundledBindAddressIsLoopback("[::1]:8420"))
         XCTAssertFalse(LoopbackAddressPolicy.bundledBindAddressIsLoopback("192.168.1.10:8420"))
+    }
+
+    func testUserConfigTomlParsesSlackFencedSmartQuotedSnippetAndRoundTrips() throws {
+        let slackPaste = """
+        ```toml
+        [llm]
+        api_key_helper = “ddtool auth token --scope ai”
+        api_key_helper_ttl_ms = 3_600_000
+        auth_header = “bearer”
+        default_model = “google/gemini-4-neon”
+        anthropic_base_url = “https://gateway.example.test/anthropic/v1/messages”
+        openai_chat_completions_base_url = “https://gateway.example.test/openai/v1/chat/completions”
+
+        [llm.custom_headers]
+        X-Org = “eng”
+
+        [llm.request_tags]
+        team = “ide”
+
+        [llm.request_models.openai_chat_completions]
+        “google/gemini-4-neon” = “google/gemini-4-neon”
+        ```
+        """
+
+        let parsed = try UserConfigTomlParser.parseSnippet(slackPaste)
+        XCTAssertEqual(parsed.llm.apiKeyHelper, "ddtool auth token --scope ai")
+        XCTAssertEqual(parsed.llm.apiKeyHelperTTLMs, 3_600_000)
+        XCTAssertEqual(parsed.llm.authHeader, .bearer)
+        XCTAssertEqual(parsed.llm.defaultModel, "google/gemini-4-neon")
+        XCTAssertEqual(parsed.llm.anthropicBaseURL, "https://gateway.example.test/anthropic/v1/messages")
+        XCTAssertEqual(parsed.llm.openaiChatCompletionsBaseURL, "https://gateway.example.test/openai/v1/chat/completions")
+        XCTAssertEqual(parsed.llm.customHeaders, ["X-Org": "eng"])
+        XCTAssertEqual(parsed.llm.requestTags, ["team": "ide"])
+        XCTAssertEqual(parsed.llm.requestModels["openai_chat_completions"]?["google/gemini-4-neon"], "google/gemini-4-neon")
+        XCTAssertTrue(parsed.warnings.isEmpty)
+
+        let serialized = UserConfigTomlParser.serializeLLMBlock(parsed.llm)
+        let reparsed = try UserConfigTomlParser.parseSnippet(serialized)
+        XCTAssertEqual(reparsed.llm, parsed.llm)
+    }
+
+    func testUserConfigTomlAcceptsBareLLMKeysAndInlineTablesAndWarnsOnPathlessURL() throws {
+        let snippet = """
+        api_key_helper = "my-helper"
+        openai_chat_completions_base_url = "https://gateway.example.test"
+        custom_headers = { X-Team = "core", "X-Env" = "dev" }
+        request_tags = { service = "phoenix" }
+        """
+        let parsed = try UserConfigTomlParser.parseSnippet(snippet)
+        XCTAssertEqual(parsed.llm.apiKeyHelper, "my-helper")
+        XCTAssertEqual(parsed.llm.customHeaders, ["X-Team": "core", "X-Env": "dev"])
+        XCTAssertEqual(parsed.llm.requestTags, ["service": "phoenix"])
+        XCTAssertEqual(parsed.warnings.count, 1)
+    }
+
+    func testUserConfigTomlRejectsStaticAPIKeysUnknownFieldsAndInvalidValues() {
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\nanthropic_api_key = \"sk-ant\"")) { error in
+            XCTAssertEqual(error as? UserConfigTomlError, .staticAPIKeyNotAllowed("anthropic_api_key"))
+        }
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\nopenai_api_key = \"sk-123\"")) { error in
+            XCTAssertEqual(error as? UserConfigTomlError, .staticAPIKeyNotAllowed("openai_api_key"))
+        }
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\nbogus = \"x\""))
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\nauth_header = \"basic\""))
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\napi_key_helper_ttl_ms = 0"))
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("[llm]\nanthropic_base_url = \"not-a-url\""))
+        XCTAssertThrowsError(try UserConfigTomlParser.parseSnippet("version = 2\n[llm]\napi_key_helper = \"x\""))
+    }
+
+    func testUserConfigStoreMergePreservesAgentsTiersAndExistingModels() throws {
+        let existing = """
+        version = 1
+
+        [llm]
+        api_key_helper = "old-helper"
+
+        [[models]]
+        id = "custom-model"
+        backend = "openai_chat_completions"
+        description = "Kept"
+        context_window = 1000
+        max_output_tokens = 100
+        recommended = false
+        supports_tool_search = false
+
+        [agents.reviewer]
+        description = "Review"
+        instructions = "Find bugs"
+        """
+        let updated = UserLLMConfig(
+            apiKeyHelper: "new-helper",
+            authHeader: .bearer,
+            openaiChatCompletionsBaseURL: "https://gw.example.test/v1/chat/completions"
+        )
+        let merged = UserConfigStore.mergeDocument(existing: existing, llm: updated)
+        XCTAssertTrue(merged.contains("version = 1"))
+        XCTAssertTrue(merged.contains("api_key_helper = \"new-helper\""))
+        XCTAssertFalse(merged.contains("old-helper"))
+        XCTAssertTrue(merged.contains("id = \"custom-model\""))
+        XCTAssertTrue(merged.contains("[agents.reviewer]"))
+
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let fileURL = tempDir.appendingPathComponent("phoenix-ide/config.toml")
+        try UserConfigStore.mergeAndWrite(llm: updated, to: fileURL)
+        let loaded = try UserConfigStore.loadExistingLLMConfig(at: fileURL)
+        XCTAssertEqual(loaded, updated)
+    }
+
+    func testLoginShellPathResolverExtractsSentinelMergesAndResolvesCommands() {
+        let noisy = "Welcome to zsh!\n__PHOENIX_PATH_BEGIN__/opt/datadog/bin:/Users/test/.local/bin:/usr/bin__PHOENIX_PATH_END__\nbye\n"
+        XCTAssertEqual(
+            LoginShellPathResolver.extractSentinelPath(from: noisy),
+            "/opt/datadog/bin:/Users/test/.local/bin:/usr/bin"
+        )
+
+        let merged = LoginShellPathResolver.mergedSearchPath(
+            loginShellPath: "/opt/datadog/bin:/usr/bin",
+            inheritedPath: "/usr/bin:/custom/bin",
+            userHome: URL(fileURLWithPath: "/Users/test")
+        )
+        XCTAssertTrue(merged.hasPrefix("/opt/datadog/bin:/usr/bin:/custom/bin:/Users/test/.local/bin"))
+        XCTAssertEqual(merged.split(separator: ":").filter { $0 == "/usr/bin" }.count, 1)
+
+        let resolution = LoginShellPathResolver.resolveCommandExecutable(
+            "FOO=bar ddtool auth token",
+            searchPath: "/opt/datadog/bin:/usr/bin",
+            userHome: URL(fileURLWithPath: "/Users/test"),
+            fileExistsExecutable: { $0 == "/opt/datadog/bin/ddtool" }
+        )
+        XCTAssertEqual(resolution, .found(executable: "ddtool", resolvedPath: "/opt/datadog/bin/ddtool"))
+
+        let missing = LoginShellPathResolver.resolveCommandExecutable(
+            "missing-tool --flag",
+            searchPath: "/usr/bin:/bin",
+            userHome: URL(fileURLWithPath: "/Users/test"),
+            fileExistsExecutable: { _ in false }
+        )
+        XCTAssertEqual(missing, .notFound(executable: "missing-tool"))
+
+        let builtin = LoginShellPathResolver.resolveCommandExecutable(
+            "echo test-token",
+            searchPath: "/usr/bin:/bin",
+            userHome: URL(fileURLWithPath: "/Users/test"),
+            fileExistsExecutable: { _ in false }
+        )
+        XCTAssertEqual(builtin, .shellBuiltin("echo"))
+    }
+
+    func testAuthHelperTestRunnerVerifiesMultiLineHelperWithoutExposingCredential() async throws {
+        let runner = AuthHelperTestRunner()
+        runner.run(command: "printf 'Visit https://sso.example.test/login\\nsuper-secret-token-value\\n'")
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            if case .succeeded(let length, _, let lines) = runner.status {
+                XCTAssertEqual(length, "super-secret-token-value".count)
+                XCTAssertEqual(lines, ["Visit https://sso.example.test/login"])
+                XCTAssertFalse(lines.joined(separator: "\n").contains("super-secret-token-value"))
+                return
+            }
+            if case .failed(let message, _) = runner.status {
+                XCTFail("Expected helper test to succeed, got failure: \(message)")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTFail("Timed out waiting for AuthHelperTestRunner; final status: \(runner.status)")
+    }
+
+    func testAuthHelperTestRunnerReportsMissingExecutableClearly() async throws {
+        let runner = AuthHelperTestRunner()
+        runner.run(command: "definitely-nonexistent-phoenix-helper-xyz-99999 token")
+
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            if case .failed(let message, _) = runner.status {
+                XCTAssertTrue(message.contains("definitely-nonexistent-phoenix-helper-xyz-99999"))
+                XCTAssertTrue(message.contains("not found"))
+                return
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTFail("Timed out waiting for missing-command failure; final status: \(runner.status)")
+    }
+
+    func testServerReconnectRequestForcesRestartWhenUserConfigChangesInBundledMode() throws {
+        let bundled = ServerMode.bundled(BundledServerConfiguration(
+            origin: try PhoenixOrigin("http://127.0.0.1:8420"),
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            runtimeRootURL: URL(fileURLWithPath: "/tmp/runtime", isDirectory: true),
+            dataDirectoryURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide", isDirectory: true),
+            databaseURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.db"),
+            phoenixLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.log"),
+            fatalLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix-fatal.log"),
+            launcherLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/launcher.log"),
+            ownerLockURL: URL(fileURLWithPath: "/tmp/runtime/owner.lock"),
+            rustLogLevel: "phoenix_ide=info"
+        ))
+        let ready = ConnectionState.ready(
+            VersionInfo(version: "1.0.0", gitSHA: "abc123"),
+            DeploymentInfo(
+                build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
+                network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+                instanceID: UUID().uuidString,
+                localAccess: true,
+                installationOwnership: .development
+            )
+        )
+        let request = ServerReconnectRequest.evaluate(
+            currentMode: bundled,
+            currentState: ready,
+            candidate: bundled,
+            changedBundledSecrets: false,
+            changedUserConfig: true
+        )
+        XCTAssertTrue(request.requiresReconnect)
+        XCTAssertTrue(request.forceRestart)
+    }
+
+    func testPhoenixOriginAlternateLoopbackSchemeFlipsOnlyLoopbackOrigins() throws {
+        XCTAssertEqual(
+            try PhoenixOrigin("http://localhost:8031").alternateLoopbackSchemeOrigin?.description,
+            "https://localhost:8031"
+        )
+        XCTAssertEqual(
+            try PhoenixOrigin("https://127.0.0.1:8031").alternateLoopbackSchemeOrigin?.description,
+            "http://127.0.0.1:8031"
+        )
+        XCTAssertNil(try PhoenixOrigin("https://phoenix.example.test:8031").alternateLoopbackSchemeOrigin)
+    }
+
+    func testLocalDeploymentDetectorParsesLaunchdPlistPortAndTLS() throws {
+        let httpsPlist = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+        <plist version="1.0">
+        <dict>
+          <key>EnvironmentVariables</key>
+          <dict>
+            <key>PHOENIX_PORT</key>
+            <string>9443</string>
+            <key>PHOENIX_TLS</key>
+            <string>auto</string>
+          </dict>
+          <key>Sockets</key>
+          <dict>
+            <key>Listeners</key>
+            <dict>
+              <key>SockServiceName</key>
+              <string>9443</string>
+            </dict>
+          </dict>
+        </dict>
+        </plist>
+        """
+        let hint = try XCTUnwrap(LocalDeploymentDetector.parseLaunchdPlist(data: Data(httpsPlist.utf8)))
+        XCTAssertEqual(hint, LaunchdPlistHint(port: 9443, tlsEnabled: true))
+        XCTAssertEqual(
+            LocalDeploymentDetector.candidateOrigins(hint: hint).map(\.description),
+            ["https://localhost:9443", "http://localhost:9443"]
+        )
+
+        let httpHint = LaunchdPlistHint(port: 8031, tlsEnabled: false)
+        XCTAssertEqual(
+            LocalDeploymentDetector.candidateOrigins(hint: httpHint).map(\.description),
+            ["http://localhost:8031", "https://localhost:8031"]
+        )
+    }
+
+    func testUserConfigStoreMergeHandlesCommentedHeadersAndMultilineStrings() {
+        let existing = """
+        # version = 999
+        version = 1 # schema version
+
+        [llm] # gateway config
+        api_key_helper = "old-helper"
+
+        [llm.custom_headers] # old headers
+        X-Old = "gone"
+
+        [agents.reviewer] # keep this section
+        description = "Review"
+        instructions = \"\"\"
+        Ignore literal bracket lines inside strings:
+        [llm]
+        keep_me = true
+        \"\"\"
+        """
+        let updated = UserLLMConfig(
+            apiKeyHelper: "new-helper",
+            authHeader: .bearer
+        )
+        let merged = UserConfigStore.mergeDocument(existing: existing, llm: updated)
+        XCTAssertEqual(merged.components(separatedBy: "[llm]").count - 1, 2) // new [llm] + literal inside instructions
+        XCTAssertFalse(merged.contains("old-helper"))
+        XCTAssertFalse(merged.contains("X-Old"))
+        XCTAssertTrue(merged.contains("api_key_helper = \"new-helper\""))
+        XCTAssertTrue(merged.contains("[agents.reviewer] # keep this section"))
+        XCTAssertTrue(merged.contains("keep_me = true"))
+        XCTAssertEqual(merged.components(separatedBy: "version = 1").count - 1, 1)
+    }
+
+    func testUserConfigStoreMergeDropsRootDottedLLMKeysAndLoadSkipsUnrelatedMultilineSections() throws {
+        let dottedExisting = """
+        version = 1
+        llm.api_key_helper = "old-helper"
+        llm.auth_header = "api_key"
+        llm.custom_headers.X-Old = "gone"
+
+        [agents.reviewer]
+        description = "Review changes"
+        instructions = \"\"\"
+        Line one of instructions.
+        [llm]
+        api_key_helper = "fake-inside-string"
+        Line two with no equals sign.
+        \"\"\"
+        execution = [
+          { model = "gpt-5.6-sol", connection = "codex", reasoning_effort = "high" },
+        ]
+        """
+
+        // Loading existing config must ignore multiline strings and arrays in [agents.reviewer]
+        // and accurately extract the root-level dotted llm.* settings.
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let fileURL = tempDir.appendingPathComponent("config.toml")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        try Data(dottedExisting.utf8).write(to: fileURL)
+
+        let loadedBefore = try XCTUnwrap(try UserConfigStore.loadExistingLLMConfig(at: fileURL))
+        XCTAssertEqual(loadedBefore.apiKeyHelper, "old-helper")
+        XCTAssertEqual(loadedBefore.authHeader, .apiKey)
+        XCTAssertEqual(loadedBefore.customHeaders, ["X-Old": "gone"])
+
+        // Merging a replacement [llm] table must drop the root-level dotted llm.* keys
+        // so there is no duplicate `llm` declaration.
+        let updated = UserLLMConfig(
+            apiKeyHelper: "new-helper",
+            authHeader: .bearer,
+            openaiChatCompletionsBaseURL: "https://gateway.example.test/v1/chat/completions"
+        )
+        try UserConfigStore.mergeAndWrite(llm: updated, to: fileURL)
+        let merged = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertFalse(merged.contains("old-helper"))
+        XCTAssertFalse(merged.contains("llm.api_key_helper"))
+        XCTAssertFalse(merged.contains("llm.auth_header"))
+        XCTAssertFalse(merged.contains("X-Old"))
+        XCTAssertTrue(merged.contains("[llm]\napi_key_helper = \"new-helper\""))
+        XCTAssertTrue(merged.contains("[agents.reviewer]"))
+        XCTAssertTrue(merged.contains("fake-inside-string"))
+        XCTAssertTrue(merged.contains("gpt-5.6-sol"))
+
+        let loadedAfter = try XCTUnwrap(try UserConfigStore.loadExistingLLMConfig(at: fileURL))
+        XCTAssertEqual(loadedAfter, updated)
+
+        // Clearing [llm] removes the table and leaves no stale llm keys behind.
+        try UserConfigStore.mergeAndWrite(llm: nil, to: fileURL)
+        XCTAssertNil(try UserConfigStore.loadExistingLLMConfig(at: fileURL))
+        let cleared = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertTrue(cleared.contains("[agents.reviewer]"))
+    }
+
+    func testPendingUserConfigRestartStateSurvivesFailedApplyUntilBundledApplySucceeds() throws {
+        var restartState = PendingUserConfigRestartState()
+        XCTAssertFalse(restartState.shouldForceRestart(for: .bundled, tomlEdited: false))
+        XCTAssertTrue(restartState.shouldForceRestart(for: .bundled, tomlEdited: true))
+
+        // Simulate config.toml written, then persistence.persist fails (e.g. Keychain error)
+        restartState.markConfigWritten()
+        // On retry, tomlEdited is false because savedLlmTomlText already matches disk,
+        // but pendingRestart keeps forceRestart true.
+        XCTAssertTrue(restartState.shouldForceRestart(for: .bundled, tomlEdited: false))
+
+        let bundled = ServerMode.bundled(BundledServerConfiguration(
+            origin: try PhoenixOrigin("http://127.0.0.1:8420"),
+            executableURL: URL(fileURLWithPath: "/bin/sh"),
+            runtimeRootURL: URL(fileURLWithPath: "/tmp/runtime", isDirectory: true),
+            dataDirectoryURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide", isDirectory: true),
+            databaseURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.db"),
+            phoenixLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix.log"),
+            fatalLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/phoenix-fatal.log"),
+            launcherLogURL: URL(fileURLWithPath: "/tmp/runtime/.phoenix-ide/launcher.log"),
+            ownerLockURL: URL(fileURLWithPath: "/tmp/runtime/owner.lock"),
+            rustLogLevel: "phoenix_ide=info"
+        ))
+        let ready = ConnectionState.ready(
+            VersionInfo(version: "1.0.0", gitSHA: "abc123"),
+            DeploymentInfo(
+                build: BuildInfo(version: "1.0.0", gitSHA: "abc123"),
+                network: NetworkInfo(bindAddress: "127.0.0.1:8420", socketActivated: false, tls: TLSInfo(enabled: false, mode: nil)),
+                instanceID: UUID().uuidString,
+                localAccess: true,
+                installationOwnership: .development
+            )
+        )
+        let retryRequest = ServerReconnectRequest.evaluate(
+            currentMode: bundled,
+            currentState: ready,
+            candidate: bundled,
+            changedBundledSecrets: false,
+            changedUserConfig: restartState.shouldForceRestart(for: .bundled, tomlEdited: false)
+        )
+        XCTAssertTrue(retryRequest.requiresReconnect)
+        XCTAssertTrue(retryRequest.forceRestart)
+
+        // Switching to attached does not clear pending bundled restart.
+        restartState.markApplyCompleted(for: .attached)
+        XCTAssertTrue(restartState.shouldForceRestart(for: .bundled, tomlEdited: false))
+
+        // Completing bundled apply clears it.
+        restartState.markApplyCompleted(for: .bundled)
+        XCTAssertFalse(restartState.shouldForceRestart(for: .bundled, tomlEdited: false))
+    }
+
+    func testUserConfigTomlDecodesSingleLineAndMultilineTripleQuotedStrings() throws {
+        let snippet = """
+        [llm]
+        api_key_helper = '''ddtool auth token --scope 'ai' # not a comment''' # trailing comment
+        default_model = \"\"\"google/gemini-4-neon\"\"\"
+        anthropic_base_url = \"\"\"
+        https://gateway.example.test/\\
+          anthropic/v1/messages\"\"\"
+
+        [llm.custom_headers]
+        X-Org = '''engineering'''
+        X-Multi = '''
+        line-one
+        line-two'''
+        """
+        let parsed = try UserConfigTomlParser.parseSnippet(snippet)
+        XCTAssertEqual(parsed.llm.apiKeyHelper, "ddtool auth token --scope 'ai' # not a comment")
+        XCTAssertEqual(parsed.llm.defaultModel, "google/gemini-4-neon")
+        XCTAssertEqual(parsed.llm.anthropicBaseURL, "https://gateway.example.test/anthropic/v1/messages")
+        XCTAssertEqual(parsed.llm.customHeaders["X-Org"], "engineering")
+        XCTAssertEqual(parsed.llm.customHeaders["X-Multi"], "line-one\nline-two")
+    }
+
+    func testSidecarLaunchEnvironmentUsesSameFallbackPathAsHelperTestsWhenCaptureIsNil() {
+        let home = URL(fileURLWithPath: "/Users/example")
+        let environment = SidecarLaunchEnvironment.build(
+            inherited: ["PATH": "/usr/bin:/bin"],
+            userHome: home,
+            instanceID: UUID(),
+            publicEnvironment: [:],
+            sidecarSecrets: [:],
+            loginShellPath: nil
+        )
+        let expected = LoginShellPathResolver.mergedSearchPath(
+            loginShellPath: nil,
+            inheritedPath: "/usr/bin:/bin",
+            userHome: home
+        )
+        XCTAssertEqual(environment["PATH"], expected)
+        XCTAssertTrue(environment["PATH"]?.contains("/Users/example/.local/bin") == true)
+        XCTAssertTrue(environment["PATH"]?.contains("/Users/example/bin") == true)
+    }
+
+    func testAuthHelperTestRunnerPreservesStandaloneDeviceCodeOnStderrWhileRunning() async throws {
+        let runner = AuthHelperTestRunner()
+        runner.run(command: "printf 'Open https://sso.example.test/device\\nABCD-EFGH\\n' >&2; sleep 0.25; printf 'final-secret-token\\n'")
+
+        var sawDeviceCodeWhileRunning = false
+        var sawURLWhileRunning = false
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            switch runner.status {
+            case .running(let lines, let urls):
+                if lines.contains("ABCD-EFGH") {
+                    sawDeviceCodeWhileRunning = true
+                }
+                if urls.contains(URL(string: "https://sso.example.test/device")!) {
+                    sawURLWhileRunning = true
+                }
+            case .succeeded(let length, _, _):
+                XCTAssertEqual(length, "final-secret-token".count)
+                XCTAssertTrue(sawDeviceCodeWhileRunning, "Standalone device code on stderr must stay visible while helper is running")
+                XCTAssertTrue(sawURLWhileRunning, "Sign-in URL on stderr must be detected while helper is running")
+                return
+            case .failed(let message, _):
+                XCTFail("Expected helper test to succeed, got failure: \(message)")
+                return
+            case .idle:
+                break
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Timed out waiting for AuthHelperTestRunner; final status: \(runner.status)")
+    }
+
+    func testOnboardingAPIKeysClearsExistingAPIKeyHelperWhilePreservingOtherLLMFields() {
+        let onlyHelper = UserLLMConfig(apiKeyHelper: "ddtool auth token")
+        let clearedAll = OnboardingAuthHelperConflict.configAfterChoosingAPIKeys(existing: onlyHelper)
+        XCTAssertTrue(clearedAll.shouldWrite)
+        XCTAssertNil(clearedAll.updated)
+
+        let helperAndEndpoint = UserLLMConfig(
+            apiKeyHelper: "ddtool auth token",
+            defaultModel: "claude-sonnet-4-6",
+            anthropicBaseURL: "https://gateway.example.test/v1/messages"
+        )
+        let keptEndpoint = OnboardingAuthHelperConflict.configAfterChoosingAPIKeys(existing: helperAndEndpoint)
+        XCTAssertTrue(keptEndpoint.shouldWrite)
+        XCTAssertNil(keptEndpoint.updated?.apiKeyHelper)
+        XCTAssertEqual(keptEndpoint.updated?.defaultModel, "claude-sonnet-4-6")
+        XCTAssertEqual(keptEndpoint.updated?.anthropicBaseURL, "https://gateway.example.test/v1/messages")
+
+        let noHelper = UserLLMConfig(defaultModel: "claude-sonnet-4-6")
+        let untouched = OnboardingAuthHelperConflict.configAfterChoosingAPIKeys(existing: noHelper)
+        XCTAssertFalse(untouched.shouldWrite)
+    }
+
+    func testUserConfigStoreMergeAndWritePropagatesUnreadableExistingFileWithoutOverwriting() throws {
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        let fileURL = tempDir.appendingPathComponent("config.toml")
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+            try? FileManager.default.removeItem(at: tempDir)
+        }
+
+        let original = """
+        version = 1
+
+        [agents.reviewer]
+        description = "Keep me"
+        instructions = "Never silently delete me"
+        """
+        try Data(original.utf8).write(to: fileURL)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: fileURL.path)
+
+        // Guard against environments running as root where mode 0000 is still readable.
+        guard (try? String(contentsOf: fileURL, encoding: .utf8)) == nil else {
+            return
+        }
+
+        let replacement = UserLLMConfig(apiKeyHelper: "new-helper")
+        XCTAssertThrowsError(try UserConfigStore.mergeAndWrite(llm: replacement, to: fileURL))
+
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: fileURL.path)
+        let preserved = try String(contentsOf: fileURL, encoding: .utf8)
+        XCTAssertEqual(preserved, original)
+    }
+
+    func testAuthHelperTestRunnerCancelTerminatesDescendantProcesses() async throws {
+        let tempDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let pidFile = tempDir.appendingPathComponent("child.pid")
+
+        let runner = AuthHelperTestRunner()
+        runner.run(command: "sleep 30 & echo $! > '\(pidFile.path)'; wait")
+
+        var childPID: Int32?
+        let waitDeadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < waitDeadline {
+            if let text = try? String(contentsOf: pidFile, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
+               let parsed = Int32(text), parsed > 0 {
+                childPID = parsed
+                break
+            }
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        let spawnedPID = try XCTUnwrap(childPID, "Expected helper shell to spawn background child")
+        XCTAssertTrue(ProcessTreeTerminator.isProcessAlive(spawnedPID))
+
+        runner.cancel()
+        await runner.waitForTeardown()
+
+        XCTAssertFalse(ProcessTreeTerminator.isProcessAlive(spawnedPID), "Cancelling helper test must terminate descendant processes too")
+    }
+
+    func testUserConfigTomlLoadsLLMWhenSharedRootModelsArrayExistsAndReplacesMultilineModelsCompletely() throws {
+        let existingWithEmptyModels = """
+        version = 1
+        models = []
+
+        [llm]
+        api_key_helper = "ddtool auth token"
+        auth_header = "bearer"
+        """
+        let parsedEmpty = try UserConfigTomlParser.parseSnippet(existingWithEmptyModels)
+        XCTAssertEqual(parsedEmpty.llm.apiKeyHelper, "ddtool auth token")
+        XCTAssertEqual(parsedEmpty.llm.authHeader, .bearer)
+
+        let existingWithMultilineModels = """
+        version = 1
+        models = [ # existing models array
+          { id = "old-model", backend = "openai_chat_completions", description = "Old", context_window = 1000, max_output_tokens = 100, recommended = false, supports_tool_search = false },
+        ]
+
+        [llm]
+        api_key_helper = "old-helper"
+
+        [agents.reviewer]
+        description = "Review"
+        instructions = "Keep"
+        """
+        let parsedMultiline = try UserConfigTomlParser.parseSnippet(existingWithMultilineModels)
+        XCTAssertEqual(parsedMultiline.llm.apiKeyHelper, "old-helper")
+
+        let replacementBlock = """
+        [[models]]
+        id = "new-model"
+        backend = "openai_chat_completions"
+        description = "New"
+        context_window = 1000
+        max_output_tokens = 100
+        recommended = false
+        supports_tool_search = false
+        """
+        let merged = UserConfigStore.mergeDocument(
+            existing: existingWithMultilineModels,
+            llm: UserLLMConfig(apiKeyHelper: "new-helper"),
+            rawModelsBlocks: [replacementBlock]
+        )
+        XCTAssertFalse(merged.contains("old-model"))
+        XCTAssertFalse(merged.contains("models = ["))
+        XCTAssertFalse(merged.contains("old-helper"))
+        XCTAssertTrue(merged.contains("id = \"new-model\""))
+        XCTAssertTrue(merged.contains("api_key_helper = \"new-helper\""))
+        XCTAssertTrue(merged.contains("[agents.reviewer]"))
+
+        // Verify the merged document itself parses cleanly without leftover brackets or duplicate keys.
+        let reparsed = try UserConfigTomlParser.parseSnippet(merged)
+        XCTAssertEqual(reparsed.llm.apiKeyHelper, "new-helper")
+        XCTAssertEqual(reparsed.rawModelsBlocks.count, 1)
     }
 }
