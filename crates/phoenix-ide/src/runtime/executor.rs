@@ -2462,6 +2462,8 @@ where
     required_settlement_authority: Option<RequiredSettlementScope>,
     // Actor-only controller; background Close workers receive no reopening API.
     native_close_source_entry: Option<native_close::source_entry::SourceEntryController>,
+    #[cfg(test)]
+    staged_native_close_source_entry: Option<native_close::source_entry::SourceEntryController>,
     handoff_completion_timestamp: Option<DateTime<Utc>>,
     continuation_effect_disposition: ContinuationEffectDisposition,
     recovery_disposition: RuntimeRecoveryDisposition,
@@ -2693,6 +2695,8 @@ where
             handoff_completion_authority: None,
             required_settlement_authority: None,
             native_close_source_entry: None,
+            #[cfg(test)]
+            staged_native_close_source_entry: None,
             handoff_completion_timestamp: None,
             continuation_effect_disposition: ContinuationEffectDisposition::Continue,
             recovery_disposition: RuntimeRecoveryDisposition::Continue,

@@ -154,6 +154,10 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         &mut self,
         write: impl Future<Output = Result<(), String>> + Send,
     ) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(controller) = self.staged_native_close_source_entry.take() {
+            self.native_close_source_entry = Some(controller);
+        }
         tokio::pin!(write);
         loop {
             let observe = self.foreground_dispatch.has_open_batch_controls()

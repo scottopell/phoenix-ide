@@ -224,9 +224,9 @@ async fn stop_keeps_batch_commit_and_cutoff_live_while_close_holds_source_custod
     *tools.fast_release.lock().unwrap() = Some(release_fast.clone());
     let (write_entered, release_write) = runtime.storage.gate_state_update();
 
-    // Retain an entered Close leaf at the custody seam, independently of the
-    // foreground batch state. The real lease, not an artificial wait in Stop,
-    // must exclude semantic cancellation until released.
+    // Retain an entered Close leaf at the custody seam, but stage its controller
+    // until the actor reaches its ordinary batch commit. The real lease, not an
+    // artificial wait in Stop, must exclude semantic cancellation until released.
     let command = NativeCloseCommand::new(
         "ordinary-batch".into(),
         SourceToolCall {
@@ -273,7 +273,7 @@ async fn stop_keeps_batch_commit_and_cutoff_live_while_close_holds_source_custod
     let WorkerEntryResult::Ran(lease) = worker.try_acquire_first_effect(&command) else {
         panic!("Close leaf must hold source custody before Stop");
     };
-    runtime.native_close_source_entry = Some(controller);
+    runtime.staged_native_close_source_entry = Some(controller);
 
     let (_manager, handle, actor, mut states) = register_actor(runtime).await;
     for _ in 0..2 {
