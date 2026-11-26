@@ -20,10 +20,7 @@ jobs:
           test -f Cargo.lock
           cargo tree --locked -e features > resolved-features.txt
           cargo metadata --locked --format-version 1 > metadata.json
-          /usr/bin/time -v cargo build --locked --release 2>&1 | tee build.txt
-          wc -c target/release/gix-close-history-probe
-      - run: timeout 60s bash compare.sh "$PWD/target/release/gix-close-history-probe"
-      - run: timeout 90s bash measure.sh "$PWD/target/release/gix-close-history-probe" 2>&1 | tee runtime.txt
+          /usr/bin/time -v cargo build --locked --release --bin typed-head 2>&1 | tee build.txt
       - run: timeout 120s bash decoder-build.sh 2>&1 | tee decoder-build.txt
       - run: timeout 60s bash decoder-compare.sh 2>&1 | tee decoder-compare.txt
       - run: timeout 60s bash head-compare.sh 2>&1 | tee head-compare.txt
@@ -37,7 +34,6 @@ jobs:
             scripts/qualification/gix-close-history/resolved-features.txt
             scripts/qualification/gix-close-history/metadata.json
             scripts/qualification/gix-close-history/build.txt
-            scripts/qualification/gix-close-history/runtime.txt
             scripts/qualification/gix-close-history/decoder-*.txt
             scripts/qualification/gix-close-history/decoder-build/Cargo.lock
             scripts/qualification/gix-close-history/head-compare.txt

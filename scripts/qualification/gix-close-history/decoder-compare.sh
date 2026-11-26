@@ -42,7 +42,16 @@ for format in sha1 sha256; do
     git commit -qm new --allow-empty
     new=$(git rev-parse HEAD)
     target=$(git rev-parse --git-path logs/HEAD)
-    cp "$target" bytes
+    "$probe_dir/release/capture" "$target" > bytes
+    ln -s "$target" symlink
+    mkfifo fifo
+    for unsafe_path in symlink fifo; do
+        if "$probe_dir/release/capture" "$unsafe_path" > unsafe-bytes 2> unsafe-error; then
+            echo "capture unexpectedly accepted $unsafe_path" >&2
+            exit 1
+        fi
+        test ! -s unsafe-bytes
+    done
     compare "$format real linked-worktree capture" accept
     zero=${seed//?/0}
     printf '\n%s %s %s\told\n\n%s %s %s\tnew' "$old" "$zero" "$actor" "$zero" "$new" "$actor" > bytes

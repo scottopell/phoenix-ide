@@ -17,10 +17,17 @@ rust-version = "1.95"
 [features]
 candidate = ["dep:gix-ref"]
 hex-only = ["dep:gix-hash"]
+capture = ["dep:libc"]
 
 [dependencies]
 gix-ref = { version = "=0.70.0", optional = true, default-features = false, features = ["sha1", "sha256"] }
 gix-hash = { version = "=0.29.0", optional = true, default-features = false, features = ["sha1", "sha256"] }
+libc = { version = "=0.2.191", optional = true }
+
+[[bin]]
+name = "capture"
+path = "src/capture.rs"
+required-features = ["capture"]
 MANIFEST
 # Extract the exact baseline from this checkout, not a second handwritten parser.
 {
@@ -41,9 +48,12 @@ for mode in baseline candidate hex-only; do
     flags=()
     if [[ $mode != baseline ]]; then flags+=(--features "$mode"); fi
     cargo tree --offline --locked "${flags[@]}" --prefix none --format '{p}' | sed 's/ (\*)$//' | sort -u > "$probe/decoder-$mode-deps.txt"
-    CARGO_TARGET_DIR="target/$mode" /usr/bin/time -f "$mode build_s=%e peak_rss_kib=%M" cargo build --offline --locked --release "${flags[@]}"
+    CARGO_TARGET_DIR="target/$mode" /usr/bin/time -f "$mode build_s=%e peak_rss_kib=%M" cargo build --offline --locked --release --bin decode-probe "${flags[@]}"
     wc -c "target/$mode/release/decode-probe"
 done
+cp "$probe/capture.rs" src/capture.rs
+sed -n '/^fn read_bounded_regular_file_nofollow(/,/^}/p' "$root/crates/phoenix-ide/src/runtime/close_retirement.rs" > src/capture-baseline.rs
+cargo build --offline --locked --release --features capture --bin capture
 cp "$probe/head-cli.rs" src/head-cli.rs
 sed -n '/^enum InspectedHead {/,/^}/p; /^fn inspect_head_with_leaf_until(/,/^}/p; /^fn verify_unborn_head_with_leaf_until(/,/^}/p' "$root/crates/phoenix-ide/src/runtime/close_retirement.rs" > src/head-baseline.rs
 sed -i '/^fn parse_target_head_reflog_roots(/,$d' src/baseline.rs
