@@ -5563,8 +5563,7 @@ where
                                         result
                                     }
                                     effect => {
-                                        self.execute_authoritative_effect(effect, admitted)
-                                            .await
+                                        self.execute_authoritative_effect(effect, admitted).await
                                     }
                                 },
                                 ClassifiedEffect::Control(_) => unreachable!(
