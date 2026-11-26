@@ -990,7 +990,8 @@ fn verify_existing_product_creation_staging(
     let before = product_creation_checkout_fingerprint(path)?;
     verify_product_creation_checkout(repo_root, path, expected_oid)?;
     let token = read_product_creation_owner_marker(path)?;
-    if token.as_deref() != Some(expected) || product_creation_checkout_fingerprint(path)? != before {
+    if token.as_deref() != Some(expected) || product_creation_checkout_fingerprint(path)? != before
+    {
         return Err("existing staging occupant did not match durable ownership".to_string());
     }
     Ok(expected.to_string())
@@ -1068,7 +1069,11 @@ fn read_product_creation_owner_marker(worktree_path: &Path) -> Result<Option<Str
     let bytes = match phoenix_core::git::read_worktree_registration_file(&marker) {
         Ok((_, bytes)) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("could not read product creation owner marker: {error}")),
+        Err(error) => {
+            return Err(format!(
+                "could not read product creation owner marker: {error}"
+            ))
+        }
     };
     let record = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
     let Some((token, expected_fingerprint)) = record.split_once('\n') else {
