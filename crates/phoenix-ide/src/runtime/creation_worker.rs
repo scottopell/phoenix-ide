@@ -245,7 +245,7 @@ async fn process_claimed_product_creation(
                         return Err(format!("could not inspect staging path {}: {error}", path.display()));
                     }
                 };
-                let ownership_token = if already_present {
+                let (ownership_token, checkout_fingerprint) = if already_present {
                     verify_existing_product_creation_staging(
                         &repo_root,
                         &path,
@@ -272,11 +272,11 @@ async fn process_claimed_product_creation(
                         ],
                         Duration::from_secs(30),
                     )?;
+                    let fingerprint = product_creation_checkout_fingerprint(&path)?;
                     verify_product_creation_checkout(&repo_root, &path, &oid)?;
-                    write_product_creation_owner_marker(&path, &ownership_token)?;
-                    ownership_token
+                    write_product_creation_owner_marker(&path, &ownership_token, &fingerprint)?;
+                    (ownership_token, fingerprint)
                 };
-                let checkout_fingerprint = product_creation_checkout_fingerprint(&path)?;
                 let staged_token = read_product_creation_owner_marker(&path)?;
                 if staged_token.as_deref() != Some(ownership_token.as_str())
                     || product_creation_checkout_fingerprint(&path)? != checkout_fingerprint
@@ -405,6 +405,16 @@ async fn process_claimed_product_creation(
     };
     checkpoint_product_creation_stage(manager, claimed, &mut current_stage, Stage::CommitMetadata)
         .await?;
+    let publication_lock = if let Some(facts) = git_publication.clone() {
+        let path = PathBuf::from(&conversation.cwd);
+        Some(
+            tokio::task::spawn_blocking(move || lock_product_creation_publication(&path, &facts))
+                .await
+                .map_err(|error| format!("checkout verification join failed: {error}"))??,
+        )
+    } else {
+        None
+    };
     let published = manager
         .db()
         .publish_product_creation_atomically(&crate::db::ProductCreationPublishInput {
@@ -417,6 +427,7 @@ async fn process_claimed_product_creation(
         })
         .await
         .map_err(|error| error.to_string())?;
+    drop(publication_lock);
     if !published {
         return Err("product creation publication claim was lost".to_string());
     }
@@ -984,7 +995,7 @@ fn verify_existing_product_creation_staging(
     path: &Path,
     expected_oid: &str,
     persisted_ownership_token: Option<&str>,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     let expected = persisted_ownership_token
         .ok_or_else(|| "existing staging occupant lacked durable ownership".to_string())?;
     let before = product_creation_checkout_fingerprint(path)?;
@@ -994,7 +1005,25 @@ fn verify_existing_product_creation_staging(
     {
         return Err("existing staging occupant did not match durable ownership".to_string());
     }
-    Ok(expected.to_string())
+    Ok((expected.to_string(), before))
+}
+
+fn lock_product_creation_publication(
+    path: &Path,
+    facts: &crate::db::ProductCreationGitPublicationFacts,
+) -> Result<RepositoryMutationLock, String> {
+    let lock = RepositoryMutationLock::acquire(Path::new(&facts.repository_root))
+        .map_err(|(error, _)| error)?;
+    let (_, observed) = verify_existing_product_creation_staging(
+        &facts.repository_root,
+        path,
+        &facts.exact_checkout_oid,
+        Some(&facts.ownership_token),
+    )?;
+    if observed != facts.checkout_fingerprint {
+        return Err("staging checkout changed before publication".to_string());
+    }
+    Ok(lock)
 }
 
 fn verify_product_creation_checkout(
@@ -1026,7 +1055,9 @@ fn verify_product_creation_checkout(
             "existing staging has no exact Git registration in the reserved repository".to_string(),
         );
     }
-    let registered = std::fs::read_to_string(backpointer).map_err(|error| error.to_string())?;
+    let (_, registered) = phoenix_core::git::read_worktree_registration_file(&backpointer)
+        .map_err(|error| error.to_string())?;
+    let registered = std::str::from_utf8(&registered).map_err(|error| error.to_string())?;
     let registered = admin_dir.join(registered.trim_end_matches(['\r', '\n']));
     if canonicalize(&registered)? != canonicalize(&dot_git)? {
         return Err("existing staging registration points to another checkout".to_string());
@@ -1045,18 +1076,27 @@ fn product_creation_owner_marker_path(worktree_path: &Path) -> Result<PathBuf, S
 fn write_product_creation_owner_marker(
     worktree_path: &Path,
     ownership_token: &str,
+    fingerprint: &str,
 ) -> Result<(), String> {
     use std::io::Write as _;
 
     if ownership_token.trim().is_empty() || ownership_token.contains('\n') {
         return Err("product creation ownership token was invalid".to_string());
     }
-    let fingerprint = product_creation_checkout_fingerprint(worktree_path)?;
     let marker = product_creation_owner_marker_path(worktree_path)?;
+    if product_creation_checkout_fingerprint(worktree_path)? != fingerprint {
+        return Err("staging checkout changed before writing ownership".to_string());
+    }
     let mut file = std::fs::File::create_new(marker)
         .map_err(|error| format!("could not create product creation owner marker: {error}"))?;
     write!(file, "{ownership_token}\n{fingerprint}")
         .map_err(|error| format!("could not write product creation owner marker: {error}"))
+}
+
+#[cfg(test)]
+fn write_test_owner_marker(path: &Path, token: &str) {
+    let fingerprint = product_creation_checkout_fingerprint(path).unwrap();
+    write_product_creation_owner_marker(path, token, &fingerprint).unwrap();
 }
 
 fn product_creation_checkout_fingerprint(worktree_path: &Path) -> Result<String, String> {
@@ -2456,7 +2496,7 @@ mod product_creation_delivery_replay_tests {
             .await
             .unwrap());
         git(&["worktree", "add", "--detach", location, &oid]);
-        write_product_creation_owner_marker(&path, "owner-token").unwrap();
+        write_test_owner_marker(&path, "owner-token");
         let common = git_common_dir_for_repository_root(Path::new(root)).unwrap();
         std::fs::write(Path::new(&common).join("info/exclude"), "late-data\n").unwrap();
         let registrations = git(&["worktree", "list", "--porcelain", "-z"]);
@@ -4398,7 +4438,7 @@ mod product_creation_staging_ownership_tests {
         let original = repo.path().join(".phoenix/worktrees/recorded");
         let moved = original.with_file_name("moved");
         add_detached_worktree(repo.path(), &original);
-        write_product_creation_owner_marker(&original, "owner-token").unwrap();
+        write_test_owner_marker(&original, "owner-token");
         let git = |args: &[&str]| crate::git_ops::run_git(repo.path(), args).unwrap();
         let oid = git(&["rev-parse", "HEAD"]);
         let can_adopt_original = || {
@@ -4438,7 +4478,7 @@ mod product_creation_staging_ownership_tests {
         let original = product_worktree_path(repo.path(), "recorded").unwrap();
         let moved = original.with_file_name("moved");
         add_detached_worktree(repo.path(), &original);
-        write_product_creation_owner_marker(&original, "owner-token").unwrap();
+        write_test_owner_marker(&original, "owner-token");
         let root = repo.path().to_str().unwrap();
         let oid = crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap();
         std::fs::rename(&original, &moved).unwrap();
@@ -4456,12 +4496,34 @@ mod product_creation_staging_ownership_tests {
         assert!(moved.join(".git").is_file());
     }
 
+    #[test]
+    fn publication_rejects_attached_head_with_unchanged_checkout_marker() {
+        let repo = initialized_repo();
+        let path = product_worktree_path(repo.path(), "staged").unwrap();
+        add_detached_worktree(repo.path(), &path);
+        write_test_owner_marker(&path, "owner-token");
+        let facts = crate::db::ProductCreationGitPublicationFacts {
+            repository_root: repo.path().to_str().unwrap().to_string(),
+            exact_checkout_oid: crate::git_ops::run_git(&path, &["rev-parse", "HEAD"]).unwrap(),
+            ownership_token: "owner-token".to_string(),
+            checkout_fingerprint: product_creation_checkout_fingerprint(&path).unwrap(),
+        };
+        assert!(lock_product_creation_publication(&path, &facts).is_ok());
+        crate::git_ops::run_git(&path, &["switch", "-c", "attached-after-staging"]).unwrap();
+        assert_eq!(
+            product_creation_checkout_fingerprint(&path).unwrap(),
+            facts.checkout_fingerprint
+        );
+        assert!(lock_product_creation_publication(&path, &facts).is_err());
+        assert!(path.join(".git").is_file());
+    }
+
     #[tokio::test]
     async fn even_clean_owned_staging_and_registration_are_retained() {
         let repo = initialized_repo();
         let path = repo.path().join(".phoenix/worktrees/owned");
         add_detached_worktree(repo.path(), &path);
-        write_product_creation_owner_marker(&path, "owner-token").unwrap();
+        write_test_owner_marker(&path, "owner-token");
 
         let outcome = reconcile_unpublished_staging(path.to_str(), true).await;
 
@@ -4480,7 +4542,7 @@ mod product_creation_staging_ownership_tests {
         let repo = initialized_repo();
         let path = product_worktree_path(repo.path(), "owned").unwrap();
         add_detached_worktree(repo.path(), &path);
-        write_product_creation_owner_marker(&path, "owner-token").unwrap();
+        write_test_owner_marker(&path, "owner-token");
         let common = git_common_dir_for_repository_root(repo.path()).unwrap();
         let exclude = Path::new(&common).join("info/exclude");
         std::fs::write(&exclude, "ignored-data\n").unwrap();
@@ -4505,7 +4567,7 @@ mod product_creation_staging_ownership_tests {
             let repo = initialized_repo();
             let path = product_worktree_path(repo.path(), "owned").unwrap();
             add_detached_worktree(repo.path(), &path);
-            write_product_creation_owner_marker(&path, "owner-token").unwrap();
+            write_test_owner_marker(&path, "owner-token");
             crate::git_ops::run_git(&path, &["update-index", flag, "README"]).unwrap();
             std::fs::write(path.join("README"), "preserve me").unwrap();
 
@@ -4537,7 +4599,7 @@ mod product_creation_staging_ownership_tests {
         let repo = initialized_repo();
         let path = repo.path().join(".phoenix/worktrees/replaced");
         add_detached_worktree(repo.path(), &path);
-        write_product_creation_owner_marker(&path, "original-owner").unwrap();
+        write_test_owner_marker(&path, "original-owner");
         crate::git_ops::run_git(
             repo.path(),
             &[

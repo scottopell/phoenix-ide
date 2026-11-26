@@ -6836,6 +6836,16 @@ mod product_creation_tests {
         assert_eq!(expired.claim_generation, claimed.claim.generation);
     }
 
+    async fn assert_unproven_publication_left_no_rows(db: &Database, scope_id: &WorkScopeId) {
+        assert!(db.get_conversation("unproven-conversation").await.is_err());
+        let scope_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes WHERE id = ?1")
+            .bind(scope_id.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(scope_count, 0);
+    }
+
     #[tokio::test]
     async fn git_publication_rejects_unproven_staging_before_writing_scope_or_conversation() {
         let dir = tempfile::tempdir().unwrap();
@@ -6909,13 +6919,7 @@ mod product_creation_tests {
             db.publish_product_creation_atomically(&direct).await,
             Err(DbError::Serialization(message)) if message.contains("durable creation pin")
         ));
-        assert!(db.get_conversation("unproven-conversation").await.is_err());
-        let scope_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes WHERE id = ?1")
-            .bind(scope_id.as_str())
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(scope_count, 0);
+        assert_unproven_publication_left_no_rows(&db, &scope_id).await;
         assert_eq!(
             db.get_product_creation_job("unproven-publication")
                 .await
@@ -6933,13 +6937,7 @@ mod product_creation_tests {
             db.publish_product_creation_atomically(&input).await,
             Err(DbError::Serialization(message)) if message.contains("checkout identity changed")
         ));
-        assert!(db.get_conversation("unproven-conversation").await.is_err());
-        let scope_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM work_scopes WHERE id = ?1")
-            .bind(scope_id.as_str())
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
-        assert_eq!(scope_count, 0);
+        assert_unproven_publication_left_no_rows(&db, &scope_id).await;
         std::fs::rename(&original, &marker).unwrap();
         assert!(db
             .publish_product_creation_atomically(&input)
