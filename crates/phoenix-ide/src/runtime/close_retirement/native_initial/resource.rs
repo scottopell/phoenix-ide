@@ -621,7 +621,7 @@ impl NativeInitialPreparedEntry {
 }
 
 impl RuntimeManager {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) async fn set_native_bash_stage2_test_hook(
         &self,
         hook: super::bash::BashStage2TestHook,
