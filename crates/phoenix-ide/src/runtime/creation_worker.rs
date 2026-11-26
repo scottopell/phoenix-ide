@@ -1,6 +1,6 @@
-use crate::api::handlers::{generate_slug, slugify_label, title_from_text};
 #[cfg(test)]
 use crate::api::handlers::AppError;
+use crate::api::handlers::{generate_slug, slugify_label, title_from_text};
 use crate::db::{
     ConvMode, ConversationCreationMetadataUpdate, CreationClaimOutcome, ErrorKind, NonEmptyString,
 };
@@ -61,9 +61,9 @@ fn staging_cleanup_blocker(outcome: StagingCleanupOutcome) -> Option<&'static st
         StagingCleanupOutcome::OwnedCheckoutRetained => {
             Some("unpublished worktree retained: ownership does not exclude external writers")
         }
-        StagingCleanupOutcome::CheckoutCustodyUnverified => {
-            Some("unpublished worktree custody is unverified; inspect its repository and registration")
-        }
+        StagingCleanupOutcome::CheckoutCustodyUnverified => Some(
+            "unpublished worktree custody is unverified; inspect its repository and registration",
+        ),
         StagingCleanupOutcome::OwnershipConflict(conflict) => {
             Some(staging_ownership_conflict_diagnostic(conflict))
         }
@@ -222,7 +222,9 @@ async fn process_claimed_product_creation(
             product_worktree_path(Path::new(&repo_root), job.product_conversation_id.as_str())?;
         if let Some(staged_path) = job.staging_path.as_deref() {
             if Path::new(staged_path) != planned_path {
-                return Err("worktree identity changed after recording creation staging".to_string());
+                return Err(
+                    "worktree identity changed after recording creation staging".to_string()
+                );
             }
         }
         let reservation_id = format!("{}:worktree", job.request_id);
@@ -839,7 +841,9 @@ async fn cleanup_unpublished_product_staging_path(
         return Ok(Ok(StagingCleanupOutcome::AlreadyAbsent));
     };
     let Some(repo_root) = staging_repo_root.map(ToOwned::to_owned) else {
-        return Ok(Err("unpublished worktree has no durable repository identity".into()));
+        return Ok(Err(
+            "unpublished worktree has no durable repository identity".into(),
+        ));
     };
     let ownership_token = ownership_token.map(ToOwned::to_owned);
     tokio::task::spawn_blocking(move || {
@@ -920,7 +924,10 @@ async fn reconcile_product_creation_cleanup(
             reservation.ownership_token.as_deref(),
         )
         .await;
-        if !matches!(cleanup_outcome, Ok(Ok(StagingCleanupOutcome::AlreadyAbsent))) {
+        if !matches!(
+            cleanup_outcome,
+            Ok(Ok(StagingCleanupOutcome::AlreadyAbsent))
+        ) {
             let cleanup_error = staging_cleanup_diagnostic(&cleanup_outcome);
             if !manager
                 .db()
@@ -2513,8 +2520,11 @@ mod product_creation_delivery_replay_tests {
         let manager = test_runtime_manager(db.clone());
         let request_id = "failed-owned-creation";
         let claimed = accept_and_claim_product_at(&db, request_id, Path::new(root)).await;
-        let path = product_worktree_path(Path::new(root), claimed.job.product_conversation_id.as_str())
-            .unwrap();
+        let path = product_worktree_path(
+            Path::new(root),
+            claimed.job.product_conversation_id.as_str(),
+        )
+        .unwrap();
         let location = path.to_str().unwrap();
         let git = |args: &[&str]| crate::git_ops::run_git(Path::new(root), args).unwrap();
         let oid = git(&["rev-parse", "HEAD"]);
@@ -2548,9 +2558,11 @@ mod product_creation_delivery_replay_tests {
         let common = git_common_dir_for_repository_root(Path::new(root)).unwrap();
         std::fs::write(Path::new(&common).join("info/exclude"), "late-data\n").unwrap();
         let registrations = git(&["worktree", "list", "--porcelain", "-z"]);
-        assert!(crate::git_ops::run_git(&path, &["status", "--porcelain", "--ignored"])
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::git_ops::run_git(&path, &["status", "--porcelain", "--ignored"])
+                .unwrap()
+                .is_empty()
+        );
         let ignored = path.join("late-data");
         std::fs::write(&ignored, "preserve me").unwrap();
 
@@ -2564,13 +2576,26 @@ mod product_creation_delivery_replay_tests {
         .await
         .unwrap();
 
-        let job = db.get_product_creation_job(request_id).await.unwrap().unwrap();
+        let job = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(job.status, "cleanup_ambiguous");
         assert_eq!(job.staging_path.as_deref(), Some(location));
-        let reservations = db.get_product_creation_resource_reservations(request_id).await.unwrap();
+        let reservations = db
+            .get_product_creation_resource_reservations(request_id)
+            .await
+            .unwrap();
         assert_eq!(reservations.len(), 1);
-        assert_eq!(reservations[0].ownership_token.as_deref(), Some("owner-token"));
-        assert_eq!(git(&["worktree", "list", "--porcelain", "-z"]), registrations);
+        assert_eq!(
+            reservations[0].ownership_token.as_deref(),
+            Some("owner-token")
+        );
+        assert_eq!(
+            git(&["worktree", "list", "--porcelain", "-z"]),
+            registrations
+        );
         assert_eq!(std::fs::read_to_string(ignored).unwrap(), "preserve me");
         assert!(db
             .claim_product_creation(
@@ -4394,7 +4419,9 @@ mod product_creation_staging_ownership_tests {
         assert_eq!(outcome, StagingCleanupOutcome::OwnedCheckoutRetained);
         assert!(path.join(".git").is_file());
         assert_eq!(
-            read_product_creation_owner_marker(&path).unwrap().as_deref(),
+            read_product_creation_owner_marker(&path)
+                .unwrap()
+                .as_deref(),
             Some("owner-token"),
         );
     }
@@ -4419,7 +4446,10 @@ mod product_creation_staging_ownership_tests {
         .await
         .expect("join staging cleanup");
 
-        assert_eq!(outcome.unwrap(), StagingCleanupOutcome::OwnedCheckoutRetained);
+        assert_eq!(
+            outcome.unwrap(),
+            StagingCleanupOutcome::OwnedCheckoutRetained
+        );
         assert_eq!(std::fs::read_to_string(ignored).unwrap(), "preserve me");
         assert_eq!(std::fs::read_to_string(exclude).unwrap(), "ignored-data\n");
         assert!(
@@ -4447,7 +4477,10 @@ mod product_creation_staging_ownership_tests {
             .await
             .expect("join staging cleanup");
 
-            assert_eq!(outcome.unwrap(), StagingCleanupOutcome::OwnedCheckoutRetained);
+            assert_eq!(
+                outcome.unwrap(),
+                StagingCleanupOutcome::OwnedCheckoutRetained
+            );
             assert_eq!(
                 std::fs::read_to_string(path.join("README")).unwrap(),
                 "preserve me"
@@ -4462,7 +4495,10 @@ mod product_creation_staging_ownership_tests {
         let path = product_worktree_path(repo.path(), "owned").unwrap();
         for (token, expected) in [
             (None, StagingCleanupOutcome::AlreadyAbsent),
-            (Some("owner-token"), StagingCleanupOutcome::CheckoutCustodyUnverified),
+            (
+                Some("owner-token"),
+                StagingCleanupOutcome::CheckoutCustodyUnverified,
+            ),
         ] {
             let outcome = cleanup_unpublished_product_staging_path(
                 path.to_str(),
