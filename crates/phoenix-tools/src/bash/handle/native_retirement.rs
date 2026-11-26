@@ -48,10 +48,16 @@ impl std::error::Error for NativeBashSignalError {}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
+    // Physical stages are Linux-only; portable tests exercise the attempt boundary.
+    #[cfg(any(target_os = "linux", test))]
     Prepared,
+    #[cfg(any(target_os = "linux", test))]
     StopAttempted,
+    #[cfg(target_os = "linux")]
     StopRequested,
+    #[cfg(any(target_os = "linux", test))]
     StopObserved,
+    #[cfg(any(target_os = "linux", test))]
     GroupAttempted,
     Resumed,
 }
@@ -170,6 +176,7 @@ impl Handle {
 
 // The same attempt-once/deadline boundary is used by BOTH physical leaves.
 // An OS error consumes this attempt, but expiry before entry performs no effect.
+#[cfg(any(target_os = "linux", test))]
 fn attempt_once<T>(
     phase: &mut Phase,
     expected: Phase,
