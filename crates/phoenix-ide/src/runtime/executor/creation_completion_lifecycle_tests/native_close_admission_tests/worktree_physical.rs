@@ -555,11 +555,18 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         let ancestor = git.run(&git.worktree, &["rev-parse", "HEAD"]);
         std::fs::write(git.worktree.join("tracked.txt"), b"reflog-only commit\n").unwrap();
         git.run(&git.worktree, &["add", "--", "tracked.txt"]);
-        git.run(&git.worktree, &["commit", "-m", "Detached reflog-only fixture"]);
+        git.run(
+            &git.worktree,
+            &["commit", "-m", "Detached reflog-only fixture"],
+        );
         let commit = git.run(&git.worktree, &["rev-parse", "HEAD"]);
         git.run(
             &git.worktree,
-            &["checkout", "--detach", std::str::from_utf8(&ancestor).unwrap().trim()],
+            &[
+                "checkout",
+                "--detach",
+                std::str::from_utf8(&ancestor).unwrap().trim(),
+            ],
         );
         assert_eq!(
             git.run(&git.worktree, &["rev-parse", "HEAD"]),
@@ -568,10 +575,10 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         );
         let commit = std::str::from_utf8(&commit).unwrap().trim().to_owned();
         let reflog = git.run(&git.worktree, &["reflog", "--format=%H"]);
-        assert!(String::from_utf8_lossy(&reflog).lines().any(|line| line == commit));
-        Some(
-            phoenix_core::domain::close::GitOidIdentity::parse_hex(&commit).unwrap(),
-        )
+        assert!(String::from_utf8_lossy(&reflog)
+            .lines()
+            .any(|line| line == commit));
+        Some(phoenix_core::domain::close::GitOidIdentity::parse_hex(&commit).unwrap())
     } else {
         None
     };
@@ -968,8 +975,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         if let Some(commit) = &reflog_only_commit {
             assert!(losses.iter().any(|loss| {
                 loss.scope == scope
-                    && loss.item
-                        == CloseLossItem::DetachedUnreachableCommit(commit.clone())
+                    && loss.item == CloseLossItem::DetachedUnreachableCommit(commit.clone())
             }));
         }
         if public_captured_retry {
@@ -1043,8 +1049,14 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
                 git.run(&git.repo, &["rev-parse", "refs/heads/main"]),
                 "blocked reflog-only loss leaves detached HEAD at ancestor A"
             );
-            assert!(git.admin.is_dir(), "the exact target admin remains registered");
-            assert!(git.worktree.is_dir(), "the exact target checkout remains present");
+            assert!(
+                git.admin.is_dir(),
+                "the exact target admin remains registered"
+            );
+            assert!(
+                git.worktree.is_dir(),
+                "the exact target checkout remains present"
+            );
         }
         let before_replay = durable_native_close_rows(&fixture, &run).await;
         let replay = tokio::time::timeout(Duration::from_secs(10), tool.run(input, context))

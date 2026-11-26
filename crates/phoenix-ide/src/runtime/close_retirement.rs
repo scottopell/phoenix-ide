@@ -4015,9 +4015,8 @@ fn observe_detached_head_and_submodules_with_leaf_until(
         }
         let head_oid = head.stdout.trim_ascii().to_vec();
         result.push((b"HEAD".to_vec(), head_oid.clone()));
-        let evidence = detached_reachability_evidence_with_leaf_until(
-            path, &head_oid, deadline, git_leaf,
-        )?;
+        let evidence =
+            detached_reachability_evidence_with_leaf_until(path, &head_oid, deadline, git_leaf)?;
         if !symbolic.status.success() {
             result.push((b"DETACHED".to_vec(), evidence.clone()));
         }
@@ -4077,7 +4076,10 @@ fn append_detached_and_submodule_observation(
             return Err("detached worktree has no resolved HEAD".to_string());
         }
         if tag == b"DETACHED_HISTORY" {
-            for oid in value.split(|byte| *byte == b'\n').filter(|oid| !oid.is_empty()) {
+            for oid in value
+                .split(|byte| *byte == b'\n')
+                .filter(|oid| !oid.is_empty())
+            {
                 observation.extend_from_slice(b"DETACHED_UNREACHABLE\0");
                 observation.extend_from_slice(oid);
                 observation.push(0);
@@ -4275,30 +4277,60 @@ fn target_head_reflog_roots_with_leaf_until(
     if std::time::Instant::now() >= deadline {
         return Err("detached commit reachability exceeded its deadline".to_string());
     }
-    parse_target_head_reflog_roots(&reflog)
+    parse_target_head_reflog_roots(&reflog, deadline)
 }
 
-fn read_bounded_regular_file_nofollow(
-    path: &Path,
-    limit: u64,
-) -> std::io::Result<Vec<u8>> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
+fn read_bounded_regular_file_nofollow(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     #[cfg(not(unix))]
     {
+        let _ = (path, limit);
         return Err(std::io::Error::other(
             "safe no-follow file opening is unavailable on this platform",
         ));
     }
     #[cfg(unix)]
     {
-        use std::io::Read as _;
-        let file = options.open(path)?;
+        use std::{
+            ffi::CString,
+            io::Read as _,
+            os::{fd::FromRawFd as _, unix::ffi::OsStrExt as _},
+        };
+
+        let parent = path.parent().ok_or_else(|| {
+            std::io::Error::other("target HEAD reflog has no parent directory")
+        })?;
+        let basename = path.file_name().ok_or_else(|| {
+            std::io::Error::other("target HEAD reflog has no basename")
+        })?;
+        let parent = CString::new(parent.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::other("target HEAD reflog parent contains NUL"))?;
+        let basename = CString::new(basename.as_bytes())
+            .map_err(|_| std::io::Error::other("target HEAD reflog basename contains NUL"))?;
+        let parent_fd = unsafe {
+            libc::open(
+                parent.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_DIRECTORY
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+            )
+        };
+        if parent_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let parent_file = unsafe { std::fs::File::from_raw_fd(parent_fd) };
+        let file_fd = unsafe {
+            libc::openat(
+                std::os::fd::AsRawFd::as_raw_fd(&parent_file),
+                basename.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if file_fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let file = unsafe { std::fs::File::from_raw_fd(file_fd) };
         let metadata = file.metadata()?;
         if !metadata.is_file() || metadata.len() > limit {
             return Err(std::io::Error::other(
@@ -4308,15 +4340,27 @@ fn read_bounded_regular_file_nofollow(
         let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
         file.take(limit + 1).read_to_end(&mut bytes)?;
         if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
-            return Err(std::io::Error::other("target HEAD reflog exceeded its capture limit"));
+            return Err(std::io::Error::other(
+                "target HEAD reflog exceeded its capture limit",
+            ));
         }
         Ok(bytes)
     }
 }
 
-fn parse_target_head_reflog_roots(reflog: &[u8]) -> Result<Vec<String>, String> {
-    let mut roots = Vec::new();
-    for record in reflog.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
+fn parse_target_head_reflog_roots(
+    reflog: &[u8],
+    deadline: std::time::Instant,
+) -> Result<Vec<String>, String> {
+    const MAX_ROOTS: usize = 1024;
+    let mut roots = BTreeSet::new();
+    for record in reflog
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        if std::time::Instant::now() >= deadline {
+            return Err("detached commit reachability exceeded its deadline".to_string());
+        }
         let fields = record.splitn(3, |byte| *byte == b' ').collect::<Vec<_>>();
         if fields.len() != 3 {
             return Err("malformed target HEAD reflog record".to_string());
@@ -4325,14 +4369,15 @@ fn parse_target_head_reflog_roots(reflog: &[u8]) -> Result<Vec<String>, String> 
             let oid = std::str::from_utf8(oid).map_err(|error| error.to_string())?;
             GitOidIdentity::parse_hex(oid)
                 .map_err(|error| format!("malformed target HEAD reflog object ID: {error}"))?;
-            if !oid.bytes().all(|byte| byte == b'0')
-                && !roots.iter().any(|root: &String| root == oid)
-            {
-                roots.push(oid.to_string());
+            if !oid.bytes().all(|byte| byte == b'0') && !roots.contains(oid) {
+                if roots.len() == MAX_ROOTS {
+                    return Err("target HEAD reflog exceeds the 1024 distinct-root limit".to_string());
+                }
+                roots.insert(oid.to_string());
             }
         }
     }
-    Ok(roots)
+    Ok(roots.into_iter().collect())
 }
 
 #[cfg(test)]
@@ -4358,9 +4403,8 @@ fn detached_reachability_evidence_with_leaf_until(
     if std::time::Instant::now() >= deadline {
         return Err("detached reachability evidence exceeded its deadline".to_string());
     }
-    let unreachable = detached_unreachable_commits_with_leaf_until(
-        repository, head_oid, deadline, git_leaf,
-    )?;
+    let unreachable =
+        detached_unreachable_commits_with_leaf_until(repository, head_oid, deadline, git_leaf)?;
     let mut evidence = Vec::new();
     for oid in unreachable {
         evidence.extend_from_slice(&oid);
@@ -5114,7 +5158,11 @@ fn observe_initialized_submodules_with_leaf_until(
             git_leaf,
         )?;
         observation.push((
-            [b"SUBMODULE_DETACHED_HISTORY\0".as_slice(), relative_path.as_slice()].concat(),
+            [
+                b"SUBMODULE_DETACHED_HISTORY\0".as_slice(),
+                relative_path.as_slice(),
+            ]
+            .concat(),
             submodule_history.clone(),
         ));
         let gitlink_changed = gitlink.stage_zero_oid.as_deref() != Some(submodule_head_oid);
@@ -5128,7 +5176,10 @@ fn observe_initialized_submodules_with_leaf_until(
                 Vec::new(),
             ));
         }
-        for oid in submodule_history.split(|byte| *byte == b'\n').filter(|oid| !oid.is_empty()) {
+        for oid in submodule_history
+            .split(|byte| *byte == b'\n')
+            .filter(|oid| !oid.is_empty())
+        {
             observation.push((
                 [b"SUBMODULE_LOSS\0detached\0".as_slice(), oid].concat(),
                 Vec::new(),
@@ -16265,7 +16316,10 @@ mod tests {
                         | "hidden-index inspection" => Vec::new(),
                         "Git index path inspection" => b".git/index\n".to_vec(),
                         "detached head inspection" => {
-                            if command.get_args().any(|argument| argument == "symbolic-ref") {
+                            if command
+                                .get_args()
+                                .any(|argument| argument == "symbolic-ref")
+                            {
                                 b"refs/heads/main\n".to_vec()
                             } else {
                                 b"1111111111111111111111111111111111111111\n".to_vec()
@@ -16277,7 +16331,7 @@ mod tests {
                             } else {
                                 Vec::new()
                             }
-                        },
+                        }
                         "gitlink inspection" => index.clone(),
                         _ => Vec::new(),
                     };
@@ -16433,7 +16487,10 @@ mod tests {
                         | "gitlink inspection" => Vec::new(),
                         "hidden-index inspection" => b"H tracked\0".to_vec(),
                         "detached head inspection" => {
-                            if command.get_args().any(|argument| argument == "symbolic-ref") {
+                            if command
+                                .get_args()
+                                .any(|argument| argument == "symbolic-ref")
+                            {
                                 b"refs/heads/main\n".to_vec()
                             } else {
                                 b"1111111111111111111111111111111111111111\n".to_vec()
@@ -16445,7 +16502,7 @@ mod tests {
                             } else {
                                 Vec::new()
                             }
-                        },
+                        }
                         _ => Vec::new(),
                     };
                     let success = synthetic_inspection_succeeds(&command, operation);
@@ -16494,7 +16551,10 @@ mod tests {
                         "Git index path inspection" => b".git/index\n".to_vec(),
                         "hidden-index inspection" => b"H tracked\0".to_vec(),
                         "detached head inspection" => {
-                            if command.get_args().any(|argument| argument == "symbolic-ref") {
+                            if command
+                                .get_args()
+                                .any(|argument| argument == "symbolic-ref")
+                            {
                                 b"refs/heads/main\n".to_vec()
                             } else {
                                 b"1111111111111111111111111111111111111111\n".to_vec()
@@ -16506,7 +16566,7 @@ mod tests {
                             } else {
                                 Vec::new()
                             }
-                        },
+                        }
                         "gitlink inspection" => index.to_vec(),
                         "dirty index inspection" => {
                             dirty_index_observed = true;
@@ -16578,7 +16638,10 @@ mod tests {
                         "Git status inspection" | "exact ignored-path inspection" => Vec::new(),
                         "hidden-index inspection" => b"H tracked\0".to_vec(),
                         "detached head inspection" => {
-                            if command.get_args().any(|argument| argument == "symbolic-ref") {
+                            if command
+                                .get_args()
+                                .any(|argument| argument == "symbolic-ref")
+                            {
                                 b"refs/heads/main\n".to_vec()
                             } else {
                                 b"1111111111111111111111111111111111111111\n".to_vec()
@@ -16590,7 +16653,7 @@ mod tests {
                             } else {
                                 Vec::new()
                             }
-                        },
+                        }
                         _ => Vec::new(),
                     };
                     let success = synthetic_inspection_succeeds(&command, operation);
@@ -16616,7 +16679,9 @@ mod tests {
             deadline,
             &mut |command: std::process::Command, _, operation: &str| {
                 if operation == "detached head inspection"
-                    && command.get_args().any(|argument| argument == "symbolic-ref")
+                    && command
+                        .get_args()
+                        .any(|argument| argument == "symbolic-ref")
                 {
                     return Ok(std::process::Output {
                         status: std::process::ExitStatus::from_raw(128 << 8),
@@ -16746,30 +16811,32 @@ mod tests {
                     }
                 }
                 "detached head inspection" => {
-                    if command.get_args().any(|argument| argument == "symbolic-ref") {
+                    if command
+                        .get_args()
+                        .any(|argument| argument == "symbolic-ref")
+                    {
                         b"refs/heads/main\n".to_vec()
                     } else {
                         b"1111111111111111111111111111111111111111\n".to_vec()
                     }
                 }
                 "detached commit reachability" => {
-                            if command.get_args().any(|argument| argument == "--git-path") {
-                                b".git/logs/HEAD".to_vec()
-                            } else {
-                                Vec::new()
-                            }
-                        },
+                    if command.get_args().any(|argument| argument == "--git-path") {
+                        b".git/logs/HEAD".to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                }
                 _ => Vec::new(),
             };
             Ok(std::process::Output {
-                status: std::process::ExitStatus::from_raw(if synthetic_inspection_succeeds(
-                    &command,
-                    operation,
-                ) {
-                    0
-                } else {
-                    1 << 8
-                }),
+                status: std::process::ExitStatus::from_raw(
+                    if synthetic_inspection_succeeds(&command, operation) {
+                        0
+                    } else {
+                        1 << 8
+                    },
+                ),
                 stdout,
                 stderr: Vec::new(),
             })
@@ -18105,7 +18172,11 @@ mod tests {
         let new = "b".repeat(40);
         let log = format!("{old} {new} User <user@example.test> 1 +0000\tcheckout\n");
 
-        let roots = super::parse_target_head_reflog_roots(log.as_bytes()).unwrap();
+        let roots = super::parse_target_head_reflog_roots(
+            log.as_bytes(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .unwrap();
 
         assert_eq!(roots, vec![old, new]);
     }
@@ -18117,7 +18188,37 @@ mod tests {
             "0".repeat(40)
         );
 
-        assert!(super::parse_target_head_reflog_roots(log.as_bytes()).is_err());
+        assert!(super::parse_target_head_reflog_roots(
+            log.as_bytes(),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn target_head_reflog_root_parsing_observes_deadline_and_distinct_root_cap() {
+        let log = format!(
+            "{} {} User <user@example.test> 1 +0000\tcheckout\n",
+            "a".repeat(40),
+            "b".repeat(40)
+        );
+        let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        assert!(super::parse_target_head_reflog_roots(log.as_bytes(), expired)
+            .unwrap_err()
+            .contains("exceeded its deadline"));
+
+        let zero = "0".repeat(40);
+        let log = (1..=1025)
+            .map(|oid| {
+                format!("{oid:040x} {zero} User <user@example.test> 1 +0000\tcheckout\n")
+            })
+            .collect::<String>();
+        let error = super::parse_target_head_reflog_roots(
+            log.as_bytes(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(error.contains("1024 distinct-root limit"));
     }
 
     #[cfg(unix)]
@@ -18139,7 +18240,10 @@ mod tests {
         let fifo_reader = fifo.clone();
         let reader = std::thread::spawn(move || {
             sender
-                .send(super::read_bounded_regular_file_nofollow(&fifo_reader, 1024))
+                .send(super::read_bounded_regular_file_nofollow(
+                    &fifo_reader,
+                    1024,
+                ))
                 .unwrap();
         });
         match receiver.recv_timeout(std::time::Duration::from_millis(250)) {
@@ -18161,6 +18265,25 @@ mod tests {
         let missing = temp.path().join("missing");
         let error = super::read_bounded_regular_file_nofollow(&missing, 1024).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+
+        let absent_logs = temp.path().join("absent-logs").join("HEAD");
+        let error = super::read_bounded_regular_file_nofollow(&absent_logs, 1024).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+
+        let real_logs = temp.path().join("real-logs");
+        std::fs::create_dir(&real_logs).unwrap();
+        let dangling_logs = temp.path().join("dangling-logs");
+        symlink(temp.path().join("missing-target"), &dangling_logs).unwrap();
+        let error = super::read_bounded_regular_file_nofollow(&dangling_logs.join("HEAD"), 1024)
+            .unwrap_err();
+        assert_ne!(error.kind(), std::io::ErrorKind::NotFound);
+
+        std::fs::write(real_logs.join("HEAD"), b"redirected").unwrap();
+        let redirect_logs = temp.path().join("redirect-logs");
+        symlink(&real_logs, &redirect_logs).unwrap();
+        assert!(
+            super::read_bounded_regular_file_nofollow(&redirect_logs.join("HEAD"), 1024).is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -18181,7 +18304,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("unsupported Git ref storage backend: reftable"));
-        assert_eq!(calls, 1, "unsupported backend must refuse the next Git leaf");
+        assert_eq!(
+            calls, 1,
+            "unsupported backend must refuse the next Git leaf"
+        );
 
         let mut calls = 0;
         let result = super::ensure_files_ref_storage_with_leaf_until(
@@ -18194,7 +18320,10 @@ mod tests {
                 Ok(synthetic_inspection_output(Vec::new(), false))
             },
         );
-        assert!(result.is_ok(), "config exit status 1 means unset and allowed");
+        assert!(
+            result.is_ok(),
+            "config exit status 1 means unset and allowed"
+        );
         assert_eq!(calls, 1);
     }
 
@@ -18209,14 +18338,18 @@ mod tests {
         let detached_oid = super::GitOidIdentity::parse_hex(detached.clone()).unwrap();
         run_git(temp.path(), &["update-ref", "refs/heads/rescue", &detached]);
 
-        let (confirmed, losses) = inspect_worktree(&inspection_identity(temp.path())).await.unwrap();
+        let (confirmed, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
         assert!(!losses.iter().any(|loss| matches!(
             loss,
             CloseLossItem::DetachedUnreachableCommit(oid) if oid == &detached_oid
         )));
 
         run_git(temp.path(), &["update-ref", "-d", "refs/heads/rescue"]);
-        let (fresh, losses) = inspect_worktree(&inspection_identity(temp.path())).await.unwrap();
+        let (fresh, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
         assert_ne!(confirmed.fingerprint(), fresh.fingerprint());
         assert!(losses.iter().any(|loss| matches!(
             loss,
@@ -18242,15 +18375,22 @@ mod tests {
         )
         .unwrap();
 
-        let (_, losses) = inspect_worktree(&inspection_identity(temp.path())).await.unwrap();
+        let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
         assert!(losses.iter().any(|loss| matches!(
             loss,
             CloseLossItem::DetachedUnreachableCommit(oid)
                 if oid == &abandoned_oid
         )));
 
-        run_git(temp.path(), &["update-ref", "refs/heads/rescue", &abandoned_c]);
-        let (_, rescued_losses) = inspect_worktree(&inspection_identity(temp.path())).await.unwrap();
+        run_git(
+            temp.path(),
+            &["update-ref", "refs/heads/rescue", &abandoned_c],
+        );
+        let (_, rescued_losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
         assert!(!rescued_losses.iter().any(|loss| matches!(
             loss,
             CloseLossItem::DetachedUnreachableCommit(oid)
@@ -18269,7 +18409,9 @@ mod tests {
         let detached_oid = super::GitOidIdentity::parse_hex(detached.clone()).unwrap();
         run_git(temp.path(), &["update-ref", "refs/stash/extra", &detached]);
 
-        let (_, losses) = inspect_worktree(&inspection_identity(temp.path())).await.unwrap();
+        let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .unwrap();
         assert!(losses.iter().any(|loss| matches!(
             loss,
             CloseLossItem::DetachedUnreachableCommit(oid)
@@ -18694,7 +18836,9 @@ mod tests {
         let abandoned_oid = super::GitOidIdentity::parse_hex(abandoned).unwrap();
         run_git(&submodule, &["reset", "--quiet", "--hard", &safe_a]);
 
-        let (_, losses) = inspect_worktree(&inspection_identity(&parent)).await.unwrap();
+        let (_, losses) = inspect_worktree(&inspection_identity(&parent))
+            .await
+            .unwrap();
         assert!(losses.iter().any(|loss| matches!(
             loss,
             CloseLossItem::DetachedUnreachableCommit(oid) if oid == &abandoned_oid
