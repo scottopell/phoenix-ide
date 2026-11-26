@@ -229,8 +229,9 @@ jobs:
           ulimit -c 0
           prefix="$RUST_EVIDENCE_DIR/owner-handoff-gdb"
           test_name=continuation_service::native::tests::owner_handoff::native_owner_rejection_continuation_busy_recovery_and_coordinator_retention
-          printf 'run=%s attempt=%s source=%s started=%s outcome=not-inferred\n' \
-            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$(git rev-parse HEAD)" "$(date -u +%FT%TZ)" > "$prefix.receipt"
+          printf 'run=%s attempt=%s source=%s tree=%s parents=%s started=%s outcome=not-inferred\n' \
+            "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT" "$(git rev-parse HEAD)" "$(git rev-parse 'HEAD^{tree}')" \
+            "$(git show -s --format=%P HEAD)" "$(date -u +%FT%TZ)" > "$prefix.receipt"
           {
             id
             printf 'stack_limit_kib=%s core_limit=%s test=%s\n' "$(ulimit -s)" "$(ulimit -c)" "$test_name"
@@ -252,6 +253,8 @@ jobs:
             -ex 'set disable-randomization off' -ex 'set pagination off' \
             -ex 'set print frame-arguments none' -ex 'set print entry-values no' \
             -ex 'handle SIGSEGV stop print nopass' -ex run -ex 'bt 64' -ex 'info threads' \
+            -ex 'info registers rip rsp rbp' -ex 'print $_siginfo' -ex 'info proc mappings' \
+            -ex 'frame apply 40 -q info frame' -ex 'frame 0' -ex 'x/32i $pc' \
             -ex 'print $_exitcode' -ex 'print $_exitsignal' \
             --args "$executable" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "$prefix.log"
           pipeline_status=("${PIPESTATUS[@]}")
