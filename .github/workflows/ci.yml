@@ -1118,6 +1118,7 @@ jobs:
           cd ui
           node scripts/capture-assistant-finalization.mjs
           node scripts/capture-streaming-table.mjs
+          CAPTURE_STORIES=mobile-long-markdown-table MESSAGE_LIST_QA_OUT=qa-artifacts/message-list-two-column node scripts/capture-message-list.mjs
           node scripts/capture-assistant-finalization-transcript.mjs
           node scripts/capture-subagent-task-details.mjs
           node scripts/capture-composer-rejection.mjs

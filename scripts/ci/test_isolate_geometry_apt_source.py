@@ -249,6 +249,7 @@ class FilesystemTests(unittest.TestCase):
         geometry = workflow.read_text().split("  check-finalization-geometry:\n", 1)[1].split("\n  check-fast:", 1)[0]
         self.assertIn("          sudo python3 ../scripts/ci/isolate_geometry_apt_source.py\n"
                       "          pnpm exec playwright install --with-deps chromium\n", geometry)
+        self.assertIn("CAPTURE_STORIES=mobile-long-markdown-table MESSAGE_LIST_QA_OUT=qa-artifacts/message-list-two-column node scripts/capture-message-list.mjs", geometry)
         self.assertIn("python3 -m unittest discover -s ../scripts/ci -p 'test_isolate_geometry_apt_source.py'", geometry)
 
 

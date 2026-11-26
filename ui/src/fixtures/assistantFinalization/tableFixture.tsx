@@ -8,6 +8,18 @@ import reply from './acl-reply.md?raw';
 import './tableFixture.css';
 
 const timestamp = '2026-10-15T12:00:00Z';
+const stressReply = `Narrow viewport stress table with four columns.
+
+| Component | State | Evidence | Notes |
+|---|---|---|---|
+| transcript-row | streaming | sequence-000184 | Long descriptive value that should remain available by scrolling horizontally |
+| markdown-renderer | finalized | viewport-375-touch | Additional content across all columns |
+| table-scroll-region | reachable | final-column-marker | The last cell must be reachable without widening the page |`;
+const stressMessage: Message = {
+  event_presentation: null, message_id: 'streaming-table-stress', conversation_id: 'table-geometry',
+  sequence_id: 2, message_type: 'agent', created_at: timestamp,
+  content: [{ type: 'text', text: stressReply }],
+};
 const toolResults = new Map<string, Message>();
 const tableStart = reply.indexOf('| Path |');
 const tableEnd = reply.indexOf('\n\n', tableStart);
@@ -62,6 +74,10 @@ export function StreamingTableFixture() {
             <section className="virtual-transcript-row" data-table-case="reference">
               <h2>Finalized reference · identical prefix</h2>
               <AgentMessage message={{ ...message, message_id: 'table-reference' }} toolResults={toolResults} isFirstInTurn forceExpandedText />
+            </section>
+            <section className="virtual-transcript-row" data-table-case="stress">
+              <h2>Separate narrow multi-column stress table</h2>
+              <AgentMessage message={stressMessage} toolResults={toolResults} isFirstInTurn forceExpandedText />
             </section>
           </div>
         </main>
