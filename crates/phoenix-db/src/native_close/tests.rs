@@ -226,14 +226,13 @@ fn legacy_fingerprint_bytes_are_unchanged_and_wrapping_is_domain_separated() {
         }
         assert_eq!(
             legacy.fingerprint(),
-            Sha256::digest(&bytes).iter().fold(
-                String::with_capacity(64),
-                |mut output, byte| {
+            Sha256::digest(&bytes)
+                .iter()
+                .fold(String::with_capacity(64), |mut output, byte| {
                     use std::fmt::Write as _;
                     write!(output, "{byte:02x}").expect("writing to String cannot fail");
                     output
-                },
-            )
+                },)
         );
         assert_ne!(legacy.fingerprint(), wrapped.fingerprint());
         assert_eq!(legacy.request_id(), wrapped.request_id());
