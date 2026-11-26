@@ -37,11 +37,11 @@ use super::ValidatedBashSpawnTarget;
 use crate::{ResourceScopeKey, ToolContext, ToolOutput};
 use phoenix_core::domain::bash_progress::{BashProgressLine, BashToolProgress};
 use phoenix_core::domain::tool_wire::{
-    BashErrorResponse, BashKillPendingKernelPayload, BashLaunchError, BashLiveHandleSummary,
-    BashResponse, BashRingLine, BashRingWindow, BashRunTombstonePayload, BashRunningPayload,
-    BashStillRunningPayload, BashTombstonedPayload, BashUnregisteredDescendants,
-    BashUnregisteredRun, BashUnregisteredTerminalPayload, BashUnregisteredUnknownPayload,
-    BashWaiterPanickedPayload,
+    BashCommandEcho, BashErrorResponse, BashKillPendingKernelPayload, BashLaunchError,
+    BashLiveHandleSummary, BashResponse, BashRingLine, BashRingWindow, BashRunTombstonePayload,
+    BashRunningPayload, BashStillRunningPayload, BashTombstonedPayload,
+    BashUnregisteredDescendants, BashUnregisteredRun, BashUnregisteredTerminalPayload,
+    BashUnregisteredUnknownPayload, BashWaiterPanickedPayload,
 };
 #[cfg(test)]
 use phoenix_core::process_identity::current_process_identity;
@@ -1073,12 +1073,18 @@ fn unregistered_tool_output(run: BashUnregisteredRun, cause: Option<&FinalCause>
             error_message: "The command was launched but its outcome is unverified. It may have performed side effects and may still be running. Do not automatically retry. No controllable handle was registered; descendants are unverified.".to_string(),
         }),
     };
-    let value = serde_json::to_value(response).expect("unregistered run response serializes");
-    let serialized = value.to_string();
+    bash_tool_output(&response, BashCommandEcho::Omit, is_error)
+}
+
+/// The tool output for a bash response: the typed wire value is the UI
+/// display; the model receives [`BashResponse::model_text`].
+fn bash_tool_output(typed: &BashResponse, echo: BashCommandEcho, is_error: bool) -> ToolOutput {
+    let value = serde_json::to_value(typed).unwrap_or(Value::Null);
+    let text = typed.model_text(echo);
     if is_error {
-        ToolOutput::error(serialized).with_display(value)
+        ToolOutput::error(text).with_display(value)
     } else {
-        ToolOutput::success(serialized).with_display(value)
+        ToolOutput::success(text).with_display(value)
     }
 }
 
@@ -2021,13 +2027,13 @@ async fn run_wait(
     let response = tokio::select! {
         biased;
         () = ctx.cancel.cancelled() => {
-            still_running_response(&handle, started.elapsed(), &read_args, &handle.cmd).await
+            still_running_response(&handle, started.elapsed(), &read_args, &handle.cmd, BashCommandEcho::Include).await
         }
         Ok(()) = exit_rx.changed() => {
             terminal_or_panic_response(&handle, &read_args, false, false, None).await
         }
         () = tokio::time::sleep(Duration::from_secs(wait_seconds)) => {
-            still_running_response(&handle, Duration::from_secs(wait_seconds), &read_args, &handle.cmd).await
+            still_running_response(&handle, Duration::from_secs(wait_seconds), &read_args, &handle.cmd, BashCommandEcho::Include).await
         }
     };
     response
@@ -2366,9 +2372,7 @@ async fn shape_handle_response(
         }
     };
 
-    let value = serde_json::to_value(&typed).unwrap_or(Value::Null);
-    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
-    ToolOutput::success(serialized).with_display(value)
+    bash_tool_output(&typed, BashCommandEcho::Include, false)
 }
 
 async fn background_run_response(
@@ -2377,7 +2381,7 @@ async fn background_run_response(
     read_args: &ReadArgs,
     cmd: &str,
 ) -> ToolOutput {
-    still_running_response(handle, elapsed, read_args, cmd).await
+    still_running_response(handle, elapsed, read_args, cmd, BashCommandEcho::Omit).await
 }
 
 /// Build a `still_running` response for run/wait/cancel paths. `elapsed`
@@ -2387,6 +2391,7 @@ async fn still_running_response(
     elapsed: Duration,
     read_args: &ReadArgs,
     cmd: &str,
+    echo: BashCommandEcho,
 ) -> ToolOutput {
     let state = handle.state().await;
     let kill_attempt = handle.kill_attempt().await;
@@ -2445,9 +2450,7 @@ async fn still_running_response(
         })
     };
 
-    let value = serde_json::to_value(&typed).unwrap_or(Value::Null);
-    let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
-    ToolOutput::success(serialized).with_display(value)
+    bash_tool_output(&typed, echo, false)
 }
 
 /// Build a response that observed the exit watch (terminal or waiter panic).
@@ -2459,6 +2462,11 @@ async fn terminal_or_panic_response(
     cmd_override: Option<&str>,
 ) -> ToolOutput {
     let _ = cancelled; // unused for now; kept for symmetry with future cancel handling
+    let echo = if run_path {
+        BashCommandEcho::Omit
+    } else {
+        BashCommandEcho::Include
+    };
     let state = handle.state().await;
     let label = handle.label.clone();
     match state.as_ref() {
@@ -2506,9 +2514,7 @@ async fn terminal_or_panic_response(
                 })
             };
 
-            let value = serde_json::to_value(&typed).unwrap_or(Value::Null);
-            let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
-            ToolOutput::success(serialized).with_display(value)
+            bash_tool_output(&typed, echo, false)
         }
         HandleState::Live(_live) => {
             // Live but exit observer fired? Likely waiter panic sentinel.
@@ -2520,9 +2526,7 @@ async fn terminal_or_panic_response(
                     "the waiter task for this handle panicked; the process state is unknown"
                         .to_string(),
             });
-            let value = serde_json::to_value(&typed).unwrap_or(Value::Null);
-            let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
-            ToolOutput::error(serialized).with_display(value)
+            bash_tool_output(&typed, echo, true)
         }
     }
 }
@@ -3303,7 +3307,7 @@ mod tests {
             std::fs::read_to_string(dir.path().join("stdin.txt")).unwrap(),
             "char"
         );
-        assert_eq!(response["lines"][0]["bytes"], "native-fast");
+        assert_eq!(response["lines"][0], "native-fast");
     }
 
     #[cfg(unix)]
@@ -3455,7 +3459,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .filter_map(|line| line["bytes"].as_str())
+            .map(|line| line.as_str().expect("model lines are strings"))
             .collect::<String>();
         assert!(
             combined_output.contains("explore-ok"),
@@ -3494,9 +3498,9 @@ mod tests {
             .as_array()
             .expect("captured output window")
             .iter()
-            .all(|line| !line["bytes"]
+            .all(|line| !line
                 .as_str()
-                .unwrap_or_default()
+                .expect("model lines are strings")
                 .contains("explore-preidentity-executed")));
     }
 
@@ -3596,8 +3600,10 @@ mod tests {
                 "unexpected control/terminal field {key}"
             );
         }
+        // The typed wire value is the display; the model text is its view.
         assert!(matches!(
-            serde_json::from_value::<BashResponse>(response).unwrap(),
+            serde_json::from_value::<BashResponse>(output.display_data().cloned().unwrap())
+                .unwrap(),
             BashResponse::OutcomeUnknown(_)
         ));
     }
@@ -3665,7 +3671,7 @@ mod tests {
         let response = response_json(&settlement.await.unwrap());
         assert_eq!(response["status"], "unregistered_exited");
         assert_eq!(response["exit_code"], 4);
-        assert_eq!(response["lines"][0]["bytes"], "late-tail");
+        assert_eq!(response["lines"][0], "late-tail");
         assert_eq!(response["output_complete"], true);
     }
 
@@ -3818,7 +3824,7 @@ mod tests {
         );
         assert_eq!(response["status"], "unregistered_exited");
         assert_eq!(response["exit_code"], 0);
-        assert_eq!(response["lines"][0]["bytes"], "RCA_LEGACY_SENTINEL");
+        assert_eq!(response["lines"][0], "RCA_LEGACY_SENTINEL");
         assert!(registry.reserve_spawn(&ctx.work_scope).await.is_err());
         let fence = registry
             .begin_teardown(&ctx.work_scope)
@@ -3865,7 +3871,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|line| line["bytes"].as_str().unwrap())
+            .map(|line| line.as_str().unwrap())
             .collect();
         // Separate pipe readers can append in either order, including the partial tail first.
         assert!(
@@ -3910,7 +3916,7 @@ mod tests {
         assert_eq!(response["end_offset"], 128);
         let lines = response["lines"].as_array().unwrap();
         assert_eq!(lines.len(), 8);
-        assert!(lines.iter().all(|line| line["bytes"] == ""));
+        assert!(lines.iter().all(|line| line == ""));
     }
 
     #[cfg(unix)]
@@ -3940,23 +3946,22 @@ mod tests {
         .await;
         let registry = ctx.bash_handle_registry();
         let reservation = registry.reserve_spawn(&ctx.work_scope).await.unwrap();
-        let response = response_json(
-            &settle_unregistered_run(
-                child,
-                reservation,
-                "success",
-                None,
-                RING_BUFFER_BYTES,
-                &ReadArgs::default(),
-                BashLaunchError::IdentityUnavailable,
-            )
-            .await,
-        );
+        let output = settle_unregistered_run(
+            child,
+            reservation,
+            "success",
+            None,
+            RING_BUFFER_BYTES,
+            &ReadArgs::default(),
+            BashLaunchError::IdentityUnavailable,
+        )
+        .await;
+        let response = response_json(&output);
         assert_eq!(response["status"], "unregistered_exited");
         assert_eq!(response["exit_code"], 0);
         assert_eq!(response["output_complete"], true);
         assert_eq!(response["lines"].as_array().unwrap().len(), 1);
-        assert_eq!(response["lines"][0]["bytes"], "success");
+        assert_eq!(response["lines"][0], "success");
         assert!(response.get("handle").is_none());
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3968,8 +3973,10 @@ mod tests {
             std::fs::read_to_string(dir.path().join("count")).unwrap(),
             "once"
         );
-        // The wire contract accepts a terminal result with no handle.
-        let decoded: BashResponse = serde_json::from_value(response).unwrap();
+        // The wire contract (the display value) accepts a terminal result
+        // with no handle.
+        let decoded: BashResponse =
+            serde_json::from_value(output.display_data().cloned().unwrap()).unwrap();
         assert!(matches!(decoded, BashResponse::UnregisteredExited(_)));
     }
 
@@ -4002,7 +4009,7 @@ mod tests {
         assert_eq!(response["status"], "unregistered_exited");
         assert_eq!(response["exit_code"], 7);
         assert_eq!(response["output_complete"], true);
-        assert_eq!(response["lines"][0]["bytes"], "tail");
+        assert_eq!(response["lines"][0], "tail");
     }
 
     #[cfg(unix)]
@@ -4039,7 +4046,7 @@ mod tests {
         assert!(response.get("pid").is_none());
         assert_eq!(response["output_complete"], true);
         assert_eq!(response["lines"].as_array().unwrap().len(), 1);
-        assert_eq!(response["lines"][0]["bytes"], "before");
+        assert_eq!(response["lines"][0], "before");
         assert!(registry.reserve_spawn(&ctx.work_scope).await.is_err());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("count")).unwrap(),
@@ -4154,7 +4161,7 @@ mod tests {
         assert_eq!(response["launch_error"], "registration_failed");
         assert_eq!(response["status"], "unregistered_exited");
         assert_eq!(response["exit_code"], 6);
-        assert_eq!(response["lines"][0]["bytes"], "registered-once");
+        assert_eq!(response["lines"][0], "registered-once");
         assert!(response.get("handle").is_none());
     }
 

@@ -1034,10 +1034,10 @@ async fn scenario_success_output(
                  compute mean/variance/significance yourself. \
                  methodology_warnings is metadata only (not a reduction).",
     });
-    let pretty = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
-    if pretty.len() > OUTPUT_ESCAPE_BYTES {
+    let encoded = serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string());
+    if encoded.len() > OUTPUT_ESCAPE_BYTES {
         let path = format!("/tmp/phoenix-scenario-{}.json", uuid::Uuid::new_v4());
-        if let Err(e) = tokio::fs::write(&path, &pretty).await {
+        if let Err(e) = tokio::fs::write(&path, &encoded).await {
             return ToolOutput::error(format!("Failed to write scenario output: {e}"));
         }
         // Surface the saved-samples path on the structured payload too, so
@@ -1053,7 +1053,7 @@ async fn scenario_success_output(
         ))
         .with_display(escaped_payload)
     } else {
-        ToolOutput::success(pretty).with_display(payload)
+        ToolOutput::success(encoded).with_display(payload)
     }
 }
 
@@ -2245,10 +2245,10 @@ async fn action_why_render(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput 
                             .get("note")
                             .and_then(Value::as_str)
                             .unwrap_or("shallow reference compare");
-                        let pretty = serde_json::to_string_pretty(&parsed)
-                            .unwrap_or_else(|_| "{}".to_string());
+                        let encoded =
+                            serde_json::to_string(&parsed).unwrap_or_else(|_| "{}".to_string());
                         ToolOutput::success(format!(
-                            "why-did-render ({} component(s)). NOTE: {note}\n\n{pretty}",
+                            "why-did-render ({} component(s)). NOTE: {note}\n\n{encoded}",
                             comps.len()
                         ))
                         .with_display(json!({ "why_render": parsed }))

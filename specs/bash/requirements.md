@@ -106,7 +106,7 @@ AND SHALL, after that grace, attempt termination only through the still-owned di
 AND SHALL NOT interpret the caller's `wait_seconds` as this failure-path termination policy.
 
 WHEN direct-child terminal status is verified
-THE SYSTEM SHALL return `status: "unregistered_exited"` or `"unregistered_killed"` with exit/signal information, duration, label, command and ring window
+THE SYSTEM SHALL return `status: "unregistered_exited"` or `"unregistered_killed"` with exit/signal information, duration, label and ring window
 AND SHALL allow a bounded descendant-pipe drain only after direct-child termination.
 
 WHEN bounded direct-child settlement cannot verify termination
@@ -196,6 +196,12 @@ contract and attach that normalized label to the handle
 AND echo the normalized label on every response that carries the handle
 (`still_running`, `exited`, `tombstoned`, `kill_pending_kernel`) and on each
 entry of the `live_handles[]` array in the `handle_cap_reached` error response
+
+THE model-visible result of a `run` call (`exited`, `killed`, `unregistered_*`,
+`outcome_unknown`, or `still_running` returned by that call) SHALL NOT repeat
+the command, which the agent's own call already carries
+AND every `peek`, `wait`, and `kill` response SHALL include the handle's `cmd`
+AND the typed UI display of every response SHALL include `cmd`
 
 THE tool description SHALL state explicitly that `wait_seconds` is **NOT** a
 process-kill timeout: the process is **never** killed when `wait_seconds`
@@ -393,6 +399,11 @@ AND otherwise set it to `false`
 
 EVERY peek/wait/run response SHALL include `start_offset`, `end_offset`, and
 `truncated_before` for the lines returned
+
+THE model-visible response SHALL list the returned complete lines as an array
+of line texts in offset order, so the line at index `i` has offset
+`start_offset + i`
+AND the typed UI display SHALL keep each line's `offset` and `bytes`
 
 WHEN bash is the active in-flight tool operation for a conversation turn
 THE SYSTEM SHALL make a typed, ephemeral projection of the same bounded ring-buffer state available to the conversation UI, keyed by the active `tool_use_id`

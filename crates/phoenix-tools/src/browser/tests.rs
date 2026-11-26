@@ -1644,11 +1644,11 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
         "Ctrl+K event lifecycle missing: {output}"
     );
     assert!(
-        output.contains("\"key\": \"k\"") && output.contains("\"code\": \"KeyK\""),
+        output.contains("\"key\":\"k\"") && output.contains("\"code\":\"KeyK\""),
         "Ctrl+K event identity wrong: {output}"
     );
     assert!(
-        output.contains("\"ctrlKey\": true") && output.contains("\"trusted\": true"),
+        output.contains("\"ctrlKey\":true") && output.contains("\"trusted\":true"),
         "Ctrl+K modifier/trust wrong: {output}"
     );
     assert!(
@@ -1656,7 +1656,7 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
         "Ctrl+K emitted a phantom native key: {output}"
     );
     assert!(
-        output.contains("\"inputValue\": \"\""),
+        output.contains("\"inputValue\":\"\""),
         "Ctrl+K inserted text into the focused input: {output}"
     );
 

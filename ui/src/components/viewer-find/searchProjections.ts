@@ -11,6 +11,7 @@ import { findLiteralMatches, type ViewerFindMatch } from './literalMatch';
 import { formatToolInput, skillResultVisibleText } from '../toolInputDisplay';
 import { buildBrowserProfileVisibleText } from '../BrowserProfileResponseView';
 import { safePrefix } from '../../utils/textBounds';
+import { bashResultLineTexts } from '../bashResultLines';
 
 export interface SearchableSourceMatch<TTarget> {
   sourceId: string;
@@ -821,15 +822,9 @@ function bashVisibleSearchText(
     if (typeof parsed['error'] === 'string') parts.push(parsed['error']);
     if (typeof parsed['error_message'] === 'string') parts.push(parsed['error_message']);
     if (parsed['truncated_before'] === true) parts.push('older output omitted');
-    const lines = Array.isArray(parsed['lines']) ? parsed['lines'] : [];
+    const lines = bashResultLineTexts(parsed['lines']);
     const visibleLines = density === 'full' ? lines : lines.slice(-2);
-    const outputParts: string[] = [];
-    for (const line of visibleLines) {
-      const text = line && typeof line === 'object' && typeof (line as { bytes?: unknown }).bytes === 'string'
-        ? (line as { bytes: string }).bytes
-        : '';
-      if (text) outputParts.push(text);
-    }
+    const outputParts = visibleLines.filter((text) => text);
     if (typeof parsed['partial'] === 'string' && parsed['partial'].length > 0) outputParts.push(parsed['partial']);
     parts.push(density === 'compact' ? compactBashTailText(outputParts) : outputParts.join('\n'));
     return parts.join('\n');
@@ -1111,10 +1106,7 @@ function semanticStructuredResultText(resultText: string, family: 'bash' | 'tmux
       if (typeof record['duration_ms'] === 'number') visible.push(`duration ${Math.round(record['duration_ms'])} ms`);
       if (record['truncated_before'] === true) visible.push('[output truncated before this view]');
       if (Array.isArray(record['lines'])) {
-        visible.push(record['lines'].map((line) =>
-          line && typeof line === 'object' && typeof (line as { bytes?: unknown }).bytes === 'string'
-            ? (line as { bytes: string }).bytes
-            : '').join('\n'));
+        visible.push(bashResultLineTexts(record['lines']).join('\n'));
       }
     } else {
       if (status) visible.push(status);

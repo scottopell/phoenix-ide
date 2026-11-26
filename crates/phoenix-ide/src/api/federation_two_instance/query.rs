@@ -104,10 +104,7 @@ async fn coordinator_inline_research_queries_saved_peer_by_uuid_and_name() {
         let response: Value = serde_json::from_str(output.output()).unwrap();
         assert_eq!(response["destination_instance_id"], receiver_id.to_string());
         assert_eq!(response["caller_instance_id"], caller_id.to_string());
-        assert_eq!(
-            response["result"]["rows"][0][0]["value"],
-            "Receiver Sentinel"
-        );
+        assert_eq!(response["result"]["rows"][0][0], "Receiver Sentinel");
         assert!(!output.output().contains("Caller Sentinel"));
     }
 
@@ -141,12 +138,9 @@ async fn unified_query_routes_by_uuid_and_name_with_typed_attribution_and_no_fal
         assert_eq!(response["caller_instance_id"], caller_id.to_string());
         assert_eq!(
             response["result"]["rows"][0],
-            json!([
-                {"type": "text", "value": "Receiver Sentinel"},
-                {"type": "integer", "value": 7},
-                {"type": "real", "value": {"kind": "finite", "value": 3.5}},
-                {"type": "null"}
-            ])
+            // The model sees native cell values; the peer wire keeps the
+            // tagged cells (REQ-RQD-008).
+            json!(["Receiver Sentinel", 7, 3.5, null])
         );
     }
 
