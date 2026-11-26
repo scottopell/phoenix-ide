@@ -19005,12 +19005,12 @@ mod tests {
 
     #[cfg(unix)]
     fn synthetic_head_inspection_output(
-        command: std::process::Command,
+        command: &std::process::Command,
         deadline: std::time::Instant,
         operation: &str,
         scenario: UnbornHeadScenario,
         reads: &mut HeadReadCounts,
-    ) -> Result<std::process::Output, String> {
+    ) -> std::process::Output {
         assert!(deadline > std::time::Instant::now());
         assert_eq!(operation, "test HEAD inspection");
         let args = command
@@ -19023,7 +19023,7 @@ mod tests {
                 "symbolic-ref" | "rev-parse" | "check-ref-format" | "show-ref"
             )
         });
-        let output = match subcommand {
+        match subcommand {
             Some("symbolic-ref") => {
                 reads.symbolic += 1;
                 let branch =
@@ -19088,8 +19088,7 @@ mod tests {
                 }
             }
             _ => panic!("unexpected HEAD inspection command: {args:?}"),
-        };
-        Ok(output)
+        }
     }
 
     #[cfg(unix)]
@@ -19098,7 +19097,9 @@ mod tests {
         let mut reads = HeadReadCounts::default();
         let mut leaf =
             |command: std::process::Command, deadline: std::time::Instant, operation: &str| {
-                synthetic_head_inspection_output(command, deadline, operation, scenario, &mut reads)
+                Ok(synthetic_head_inspection_output(
+                    &command, deadline, operation, scenario, &mut reads,
+                ))
             };
         let result = super::inspect_head_with_leaf_until(
             temp.path(),
