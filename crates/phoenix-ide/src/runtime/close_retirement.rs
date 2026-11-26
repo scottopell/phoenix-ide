@@ -3872,6 +3872,147 @@ fn inspect_worktree_at_with_git_leaf_until(
     )
 }
 
+#[derive(Debug)]
+enum InspectedHead {
+    Resolved { symbolic: Option<Vec<u8>>, oid: Vec<u8> },
+    Unborn { symbolic: Vec<u8> },
+}
+
+fn inspect_head_with_leaf_until(
+    repository: &Path,
+    deadline: std::time::Instant,
+    operation: &str,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<InspectedHead, String> {
+    let symbolic = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["symbolic-ref", "-q", "HEAD"],
+        None,
+        deadline,
+        operation,
+        git_leaf,
+    )?;
+    let symbolic_ref = if symbolic.status.success() {
+        Some(symbolic.stdout.trim_ascii().to_vec())
+    } else if symbolic.status.code() == Some(1) {
+        None
+    } else {
+        return Err(format!(
+            "cannot determine whether HEAD is detached: {}",
+            String::from_utf8_lossy(&symbolic.stderr).trim()
+        ));
+    };
+    let head = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+        None,
+        deadline,
+        operation,
+        git_leaf,
+    )?;
+    if head.status.success() {
+        let oid = head.stdout.trim_ascii().to_vec();
+        GitOidIdentity::parse_hex(String::from_utf8_lossy(&oid).trim())
+            .map_err(|error| format!("malformed inspected HEAD object ID: {error}"))?;
+        return Ok(InspectedHead::Resolved {
+            symbolic: symbolic_ref,
+            oid,
+        });
+    }
+    if head.status.code() != Some(1) || !head.stdout.is_empty() || !head.stderr.is_empty() {
+        return Err("cannot prove HEAD is unresolved".to_string());
+    }
+    let Some(symbolic_ref) = symbolic_ref else {
+        return Err("detached HEAD is unresolved".to_string());
+    };
+    let reference = std::str::from_utf8(&symbolic_ref)
+        .map_err(|error| format!("malformed symbolic HEAD reference: {error}"))?;
+    if !reference.starts_with("refs/heads/") || reference.trim() != reference {
+        return Err("symbolic HEAD does not name a branch ref".to_string());
+    }
+    let valid_ref = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["check-ref-format", reference],
+        None,
+        deadline,
+        operation,
+        git_leaf,
+    )?;
+    if !valid_ref.status.success() {
+        return Err("symbolic HEAD branch ref is malformed".to_string());
+    }
+    verify_unborn_head_with_leaf_until(
+        repository,
+        reference,
+        &symbolic_ref,
+        deadline,
+        operation,
+        git_leaf,
+    )?;
+    Ok(InspectedHead::Unborn {
+        symbolic: symbolic_ref,
+    })
+}
+
+fn verify_unborn_head_with_leaf_until(
+    repository: &Path,
+    reference: &str,
+    symbolic_ref: &[u8],
+    deadline: std::time::Instant,
+    operation: &str,
+    git_leaf: &mut WorktreeGitLeaf<'_>,
+) -> Result<(), String> {
+    let mut show_ref_leaf = |mut command: std::process::Command,
+                             leaf_deadline,
+                             leaf_operation: &str| {
+        command.env("LC_ALL", "C");
+        git_leaf(command, leaf_deadline, leaf_operation)
+    };
+    let exact_ref = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["show-ref", "--exists", reference],
+        None,
+        deadline,
+        operation,
+        &mut show_ref_leaf,
+    )?;
+    if exact_ref.status.code() != Some(2)
+        || !exact_ref.stdout.is_empty()
+        || exact_ref.stderr != b"error: reference does not exist\n"
+    {
+        return Err("cannot prove symbolic HEAD branch is absent".to_string());
+    }
+    let symbolic_again = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["symbolic-ref", "-q", "HEAD"],
+        None,
+        deadline,
+        operation,
+        git_leaf,
+    )?;
+    if !symbolic_again.status.success()
+        || symbolic_again.stdout.trim_ascii() != symbolic_ref
+        || !symbolic_again.stderr.is_empty()
+    {
+        return Err("symbolic HEAD changed during unborn inspection".to_string());
+    }
+    let head_again = run_bounded_git_command_with_leaf_until(
+        repository,
+        &["rev-parse", "--verify", "--quiet", "HEAD"],
+        None,
+        deadline,
+        operation,
+        git_leaf,
+    )?;
+    if head_again.status.code() != Some(1)
+        || !head_again.stdout.is_empty()
+        || !head_again.stderr.is_empty()
+    {
+        return Err("HEAD changed during unborn inspection".to_string());
+    }
+    Ok(())
+}
+
 fn inspect_worktree_at_with_policy_until(
     identity: &WorktreeIdentity,
     path: &Path,
@@ -3982,42 +4123,30 @@ fn observe_detached_head_and_submodules_with_leaf_until(
         }
         let mut visited = std::collections::HashSet::new();
         visited.insert(path.canonicalize().map_err(|error| error.to_string())?);
-        let symbolic = run_bounded_git_command_with_leaf_until(
+        let head = inspect_head_with_leaf_until(
             path,
-            &["symbolic-ref", "-q", "HEAD"],
-            None,
             deadline,
             "detached head inspection",
             git_leaf,
         )?;
         let mut result = Vec::new();
-        if symbolic.status.success() {
-            result.push((
-                b"HEAD_SYMBOLIC".to_vec(),
-                symbolic.stdout.trim_ascii().to_vec(),
-            ));
-        } else if symbolic.status.code() != Some(1) {
-            return Err(format!(
-                "cannot determine whether HEAD is detached: {}",
-                String::from_utf8_lossy(&symbolic.stderr).trim()
-            ));
+        let (symbolic, head_oid) = match head {
+            InspectedHead::Resolved { symbolic, oid } => (symbolic, Some(oid)),
+            InspectedHead::Unborn { symbolic } => (Some(symbolic), None),
+        };
+        if let Some(symbolic) = symbolic.as_ref() {
+            result.push((b"HEAD_SYMBOLIC".to_vec(), symbolic.clone()));
         }
-        let head = run_bounded_git_command_with_leaf_until(
+        if let Some(head_oid) = head_oid.as_ref() {
+            result.push((b"HEAD".to_vec(), head_oid.clone()));
+        }
+        let evidence = detached_reachability_evidence_with_leaf_until(
             path,
-            &["rev-parse", "--verify", "HEAD"],
-            None,
+            head_oid.as_deref(),
             deadline,
-            "detached head inspection",
             git_leaf,
         )?;
-        if !head.status.success() {
-            return Err(String::from_utf8_lossy(&head.stderr).trim().to_string());
-        }
-        let head_oid = head.stdout.trim_ascii().to_vec();
-        result.push((b"HEAD".to_vec(), head_oid.clone()));
-        let evidence =
-            detached_reachability_evidence_with_leaf_until(path, &head_oid, deadline, git_leaf)?;
-        if !symbolic.status.success() {
+        if symbolic.is_none() {
             result.push((b"DETACHED".to_vec(), evidence.clone()));
         }
         result.push((b"DETACHED_HISTORY".to_vec(), evidence));
@@ -4136,7 +4265,7 @@ fn detached_unreachable_commits_until(
 ) -> Result<Vec<Vec<u8>>, String> {
     detached_unreachable_commits_with_leaf_until(
         repository,
-        head_oid,
+        Some(head_oid),
         deadline,
         &mut run_bounded_spawned_git,
     )
@@ -4144,23 +4273,28 @@ fn detached_unreachable_commits_until(
 
 fn detached_unreachable_commits_with_leaf_until(
     repository: &Path,
-    head_oid: &[u8],
+    head_oid: Option<&[u8]>,
     deadline: std::time::Instant,
     git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<Vec<Vec<u8>>, String> {
     if std::time::Instant::now() >= deadline {
         return Err("detached commit reachability exceeded its deadline".to_string());
     }
-    let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
-    GitOidIdentity::parse_hex(head_text.trim())
-        .map_err(|error| format!("malformed inspected HEAD object ID: {error}"))?;
-
+    let mut roots = Vec::new();
+    if let Some(head_oid) = head_oid {
+        let head_text = std::str::from_utf8(head_oid).map_err(|error| error.to_string())?;
+        GitOidIdentity::parse_hex(head_text.trim())
+            .map_err(|error| format!("malformed inspected HEAD object ID: {error}"))?;
+        roots.push(head_text.to_string());
+    }
     // Only the target worktree's HEAD reflog contributes candidate history.
     // Other worktree HEADs, custom refs, and reflogs are not durable roots.
-    let mut roots = vec![head_text.to_string()];
     roots.extend(target_head_reflog_roots_with_leaf_until(
         repository, deadline, git_leaf,
     )?);
+    if roots.is_empty() {
+        return Ok(Vec::new());
+    }
     if std::time::Instant::now() >= deadline {
         return Err("detached commit reachability exceeded its deadline".to_string());
     }
@@ -4177,7 +4311,10 @@ fn detached_unreachable_commits_with_leaf_until(
     )?;
     let stash_exists = if stash.status.success() {
         true
-    } else if stash.status.code() == Some(1) {
+    } else if stash.status.code() == Some(1)
+        && stash.stdout.is_empty()
+        && stash.stderr.is_empty()
+    {
         false
     } else {
         return Err(String::from_utf8_lossy(&stash.stderr).trim().to_string());
@@ -4390,7 +4527,7 @@ fn detached_reachability_evidence_until(
 ) -> Result<Vec<u8>, String> {
     detached_reachability_evidence_with_leaf_until(
         repository,
-        head_oid,
+        Some(head_oid),
         deadline,
         &mut run_bounded_spawned_git,
     )
@@ -4398,7 +4535,7 @@ fn detached_reachability_evidence_until(
 
 fn detached_reachability_evidence_with_leaf_until(
     repository: &Path,
-    head_oid: &[u8],
+    head_oid: Option<&[u8]>,
     deadline: std::time::Instant,
     git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<Vec<u8>, String> {
@@ -5108,54 +5245,46 @@ fn observe_initialized_submodules_with_leaf_until(
             submodule_status,
         ));
 
-        let symbolic_head = run_bounded_git_command_with_leaf_until(
+        let submodule_head = inspect_head_with_leaf_until(
             &submodule_path,
-            &["symbolic-ref", "-q", "HEAD"],
-            None,
             deadline,
             "Git submodule HEAD inspection",
             git_leaf,
-        )?;
-        let submodule_head = run_bounded_git_command_with_leaf_until(
-            &submodule_path,
-            &["rev-parse", "--verify", "HEAD"],
-            None,
-            deadline,
-            "Git submodule HEAD inspection",
-            git_leaf,
-        )?;
-        if !submodule_head.status.success() && symbolic_head.status.success() {
+        )
+        .map_err(|detail| {
+            format!(
+                "cannot inspect initialized submodule gitlink {}: {detail}",
+                String::from_utf8_lossy(&relative_path)
+            )
+        })?;
+        let (symbolic_head, submodule_head_oid) = match submodule_head {
+            InspectedHead::Resolved { symbolic, oid } => (symbolic, Some(oid)),
+            InspectedHead::Unborn { symbolic } => (Some(symbolic), None),
+        };
+        if let Some(symbolic_head) = symbolic_head.as_ref() {
             observation.push((
                 [
                     b"SUBMODULE_HEAD_SYMBOLIC\0".as_slice(),
                     relative_path.as_slice(),
                 ]
                 .concat(),
-                symbolic_head.stdout.trim_ascii().to_vec(),
-            ));
-            visited.remove(&canonical);
-            continue;
-        }
-        if !submodule_head.status.success() {
-            return Err(format!(
-                "cannot inspect initialized submodule gitlink {}: {}",
-                String::from_utf8_lossy(&relative_path),
-                String::from_utf8_lossy(&submodule_head.stderr).trim()
+                symbolic_head.clone(),
             ));
         }
-        let submodule_head_oid = submodule_head.stdout.trim_ascii();
-        observation.push((
-            [b"SUBMODULE_GITLINK\0".as_slice(), relative_path.as_slice()].concat(),
-            [
-                gitlink.stage_zero_oid.as_deref().unwrap_or_default(),
-                b"\0",
-                submodule_head_oid,
-            ]
-            .concat(),
-        ));
+        if let Some(submodule_head_oid) = submodule_head_oid.as_ref() {
+            observation.push((
+                [b"SUBMODULE_GITLINK\0".as_slice(), relative_path.as_slice()].concat(),
+                [
+                    gitlink.stage_zero_oid.as_deref().unwrap_or_default(),
+                    b"\0",
+                    submodule_head_oid,
+                ]
+                .concat(),
+            ));
+        }
         let submodule_history = detached_reachability_evidence_with_leaf_until(
             &submodule_path,
-            submodule_head_oid,
+            submodule_head_oid.as_deref(),
             deadline,
             git_leaf,
         )?;
@@ -5167,7 +5296,7 @@ fn observe_initialized_submodules_with_leaf_until(
             .concat(),
             submodule_history.clone(),
         ));
-        let gitlink_changed = gitlink.stage_zero_oid.as_deref() != Some(submodule_head_oid);
+        let gitlink_changed = gitlink.stage_zero_oid.as_deref() != submodule_head_oid.as_deref();
         if gitlink_changed || gitlink.has_unmerged_stage {
             observation.push((
                 [
@@ -16274,11 +16403,24 @@ mod tests {
 
     #[cfg(unix)]
     fn synthetic_inspection_output(stdout: Vec<u8>, success: bool) -> std::process::Output {
+        synthetic_inspection_output_raw(
+            stdout,
+            Vec::new(),
+            if success { 0 } else { 1 << 8 },
+        )
+    }
+
+    #[cfg(unix)]
+    fn synthetic_inspection_output_raw(
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        raw_status: i32,
+    ) -> std::process::Output {
         use std::os::unix::process::ExitStatusExt as _;
         std::process::Output {
-            status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 << 8 }),
+            status: std::process::ExitStatus::from_raw(raw_status),
             stdout,
-            stderr: Vec::new(),
+            stderr,
         }
     }
 
@@ -18768,7 +18910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unborn_symbolic_head_has_no_detached_commit_loss() {
+    async fn empty_unborn_symbolic_head_has_no_detached_commit_loss() {
         let temp = tempfile::tempdir().unwrap();
         run_git(temp.path(), &["init", "--quiet"]);
 
@@ -18779,6 +18921,229 @@ mod tests {
         assert!(!losses
             .iter()
             .any(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_))));
+    }
+
+    #[tokio::test]
+    async fn unborn_symbolic_head_retains_old_only_head_reflog_commit_as_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        initialize_repository(temp.path());
+        run_git(temp.path(), &["tag", "close-test-safe-base"]);
+        std::fs::write(temp.path().join("tracked"), "unreachable history\n").unwrap();
+        run_git(temp.path(), &["commit", "--quiet", "-am", "reflog-only commit"]);
+        let old_head = run_git_output(temp.path(), &["rev-parse", "HEAD"]);
+        let branch = run_git_output(temp.path(), &["symbolic-ref", "--short", "HEAD"]);
+        let branch_ref = format!("refs/heads/{branch}");
+        run_git(temp.path(), &["update-ref", "-d", &branch_ref]);
+        run_git(temp.path(), &["symbolic-ref", "HEAD", "refs/heads/unborn-close-test"]);
+        std::fs::write(
+            temp.path().join(".git/logs/HEAD"),
+            format!(
+                "{old_head} {} Synthetic <test@example.com> 0 +0000\tcheckout: old-only\n",
+                "0".repeat(old_head.len())
+            ),
+        )
+        .unwrap();
+
+        let (_, losses) = inspect_worktree(&inspection_identity(temp.path()))
+            .await
+            .expect("unborn symbolic HEAD remains inspectable");
+        let old_oid = super::GitOidIdentity::parse_hex(old_head).unwrap();
+
+        let old_only_losses = losses
+            .iter()
+            .filter(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(old_only_losses.len(), 1);
+        assert!(matches!(
+            old_only_losses[0],
+            CloseLossItem::DetachedUnreachableCommit(oid) if oid == &old_oid
+        ));
+    }
+
+    #[test]
+    fn unborn_head_requires_an_absent_branch_ref_not_arbitrary_symbolic_ref() {
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init", "--quiet"]);
+        run_git(
+            temp.path(),
+            &["symbolic-ref", "HEAD", "refs/remotes/missing-close-test"],
+        );
+
+        let error = super::inspect_head_with_leaf_until(
+            temp.path(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            "test HEAD inspection",
+            &mut super::run_bounded_spawned_git,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("does not name a branch ref"));
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum UnbornHeadScenario {
+        GenuineUnborn,
+        FatalHead,
+        SignaledHead,
+        DiagnosticMissingHead,
+        DiagnosticAbsentRef,
+        DanglingBranchRef,
+        ReboundSymbolicHead,
+        NewlyResolvedHead,
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct HeadReadCounts {
+        symbolic: usize,
+        head: usize,
+    }
+
+    #[cfg(unix)]
+    fn synthetic_head_inspection_output(
+        command: std::process::Command,
+        deadline: std::time::Instant,
+        operation: &str,
+        scenario: UnbornHeadScenario,
+        reads: &mut HeadReadCounts,
+    ) -> Result<std::process::Output, String> {
+        assert!(deadline > std::time::Instant::now());
+        assert_eq!(operation, "test HEAD inspection");
+        let args = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let subcommand = args.iter().map(String::as_str).find(|argument| {
+            matches!(
+                *argument,
+                "symbolic-ref" | "rev-parse" | "check-ref-format" | "show-ref"
+            )
+        });
+        let output = match subcommand {
+            Some("symbolic-ref") => {
+                reads.symbolic += 1;
+                let branch = if scenario == UnbornHeadScenario::ReboundSymbolicHead
+                    && reads.symbolic > 1
+                {
+                    b"refs/heads/other\n".to_vec()
+                } else {
+                    b"refs/heads/main\n".to_vec()
+                };
+                synthetic_inspection_output(branch, true)
+            }
+            Some("rev-parse") => {
+                reads.head += 1;
+                match scenario {
+                    UnbornHeadScenario::FatalHead if reads.head == 1 => {
+                        synthetic_inspection_output_raw(
+                            Vec::new(),
+                            b"fatal: broken repository\n".to_vec(),
+                            128 << 8,
+                        )
+                    }
+                    UnbornHeadScenario::SignaledHead if reads.head == 1 => {
+                        synthetic_inspection_output_raw(Vec::new(), Vec::new(), 9)
+                    }
+                    UnbornHeadScenario::DiagnosticMissingHead if reads.head == 1 => {
+                        synthetic_inspection_output_raw(
+                            Vec::new(),
+                            b"warning: uncertain\n".to_vec(),
+                            1 << 8,
+                        )
+                    }
+                    UnbornHeadScenario::NewlyResolvedHead if reads.head > 1 => {
+                        synthetic_inspection_output_raw(
+                            b"1111111111111111111111111111111111111111\n".to_vec(),
+                            Vec::new(),
+                            0,
+                        )
+                    }
+                    _ => synthetic_inspection_output_raw(Vec::new(), Vec::new(), 1 << 8),
+                }
+            }
+            Some("check-ref-format") => synthetic_inspection_output(Vec::new(), true),
+            Some("show-ref") => {
+                assert!(deadline > std::time::Instant::now());
+                assert!(command.get_envs().any(|(name, value)| {
+                    name == "LC_ALL" && value == Some(std::ffi::OsStr::new("C"))
+                }));
+                match scenario {
+                    UnbornHeadScenario::DanglingBranchRef => {
+                        synthetic_inspection_output_raw(Vec::new(), Vec::new(), 0)
+                    }
+                    UnbornHeadScenario::DiagnosticAbsentRef => synthetic_inspection_output_raw(
+                        Vec::new(),
+                        b"error: reference does not exist\nwarning: incomplete ref lookup\n".to_vec(),
+                        2 << 8,
+                    ),
+                    _ => synthetic_inspection_output_raw(
+                        Vec::new(),
+                        b"error: reference does not exist\n".to_vec(),
+                        2 << 8,
+                    ),
+                }
+            }
+            _ => panic!("unexpected HEAD inspection command: {args:?}"),
+        };
+        Ok(output)
+    }
+
+    #[cfg(unix)]
+    fn assert_unborn_head_scenario(scenario: UnbornHeadScenario) {
+        let (temp, _) = synthetic_inspection_repository();
+        let mut reads = HeadReadCounts::default();
+        let mut leaf = |command: std::process::Command,
+                        deadline: std::time::Instant,
+                        operation: &str| {
+            synthetic_head_inspection_output(command, deadline, operation, scenario, &mut reads)
+        };
+        let result = super::inspect_head_with_leaf_until(
+            temp.path(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            "test HEAD inspection",
+            &mut leaf,
+        );
+        if scenario == UnbornHeadScenario::GenuineUnborn {
+            assert!(matches!(result, Ok(super::InspectedHead::Unborn { .. })));
+        } else {
+            assert!(result.is_err(), "{scenario:?} must not be classified as unborn");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unborn_head_classification_fails_closed_on_uncertain_or_changed_state() {
+        for scenario in [
+            UnbornHeadScenario::GenuineUnborn,
+            UnbornHeadScenario::FatalHead,
+            UnbornHeadScenario::SignaledHead,
+            UnbornHeadScenario::DiagnosticMissingHead,
+            UnbornHeadScenario::DiagnosticAbsentRef,
+            UnbornHeadScenario::DanglingBranchRef,
+            UnbornHeadScenario::ReboundSymbolicHead,
+            UnbornHeadScenario::NewlyResolvedHead,
+        ] {
+            assert_unborn_head_scenario(scenario);
+        }
+    }
+
+    #[test]
+    fn detached_or_unreadable_head_failure_is_not_classified_as_unborn() {
+        let temp = tempfile::tempdir().unwrap();
+        run_git(temp.path(), &["init", "--quiet"]);
+        std::fs::write(temp.path().join(".git/HEAD"), "not-a-symbolic-ref\n").unwrap();
+
+        let error = super::inspect_head_with_leaf_until(
+            temp.path(),
+            std::time::Instant::now() + std::time::Duration::from_secs(5),
+            "test HEAD inspection",
+            &mut super::run_bounded_spawned_git,
+        )
+        .unwrap_err();
+
+        assert!(!error.contains("branch ref is absent"));
+        assert!(!error.contains("does not name a branch ref"));
     }
 
     #[tokio::test]
@@ -18810,16 +19175,32 @@ mod tests {
         std::fs::write(submodule.join("tracked"), "abandoned symbolic commit\n").unwrap();
         run_git(&submodule, &["commit", "--quiet", "-am", "abandoned C"]);
         let abandoned = run_git_output(&submodule, &["rev-parse", "HEAD"]);
-        let abandoned_oid = super::GitOidIdentity::parse_hex(abandoned).unwrap();
+        let abandoned_oid = super::GitOidIdentity::parse_hex(abandoned.clone()).unwrap();
         run_git(&submodule, &["reset", "--quiet", "--hard", &safe_a]);
+        std::fs::write(
+            std::path::PathBuf::from(run_git_output(
+                &submodule,
+                &["rev-parse", "--absolute-git-dir"],
+            ))
+            .join("logs/HEAD"),
+            format!(
+                "{abandoned} {safe_a} Synthetic <test@example.com> 0 +0000\treset: old-only\n"
+            ),
+        )
+        .unwrap();
 
         let (_, losses) = inspect_worktree(&inspection_identity(&parent))
             .await
             .unwrap();
-        assert!(losses.iter().any(|loss| matches!(
-            loss,
+        let old_only_losses = losses
+            .iter()
+            .filter(|loss| matches!(loss, CloseLossItem::DetachedUnreachableCommit(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(old_only_losses.len(), 1);
+        assert!(matches!(
+            old_only_losses[0],
             CloseLossItem::DetachedUnreachableCommit(oid) if oid == &abandoned_oid
-        )));
+        ));
     }
 
     #[tokio::test]

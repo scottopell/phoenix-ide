@@ -406,27 +406,246 @@ impl DisposableGit {
             .unwrap()
     }
 
-    async fn register(&self, fixture: &CloseFixture) -> (WorkScopeId, WorktreeIdentity) {
-        let scope = fixture
-            .db
-            .get_conversation(TARGET_ID)
-            .await
-            .unwrap()
-            .attached_work_scope_id
-            .expect("target already owns its original WorkScope");
-        // Use the supported detached ProductCreation mode -> allocated_worktree
-        // conversion rather than inventing a scope or injecting its identity.
-        let mode = phoenix_core::domain::db_schema::ConvMode::DetachedProductCreation {
-            worktree_path: NonEmptyString::new(self.worktree.to_str().unwrap()).unwrap(),
-            base_branch: NonEmptyString::new("main").unwrap(),
+    async fn register(&self, fixture: &mut CloseFixture) -> (WorkScopeId, WorktreeIdentity) {
+        use phoenix_core::llm_language::LlmLanguage;
+        use phoenix_db::ProductCreationIntent;
+
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let cwd = self.repo.to_string_lossy().into_owned();
+        let intent = ProductCreationIntent {
+            cwd: cwd.clone(),
+            objective: "physical close fixture objective".into(),
+            origin: phoenix_db::ProductCreationOrigin::UserApi,
+            model: Some("test-model".into()),
+            effort: None,
+            llm_language: LlmLanguage::default(),
+            images: Vec::new(),
         };
+        let (claimed, oid) = self
+            .accept_claim_and_stage(fixture, &request_id, &intent, &cwd)
+            .await;
+        let scope = WorkScopeId::new();
+        let product_id = claimed.job.product_conversation_id.clone();
+        let conversation = self.conversation(product_id.clone(), scope.clone());
+        self.publish_and_deliver(
+            fixture,
+            &request_id,
+            &intent,
+            &claimed,
+            conversation,
+            phoenix_db::ProductCreationGitPublicationFacts {
+                exact_checkout_oid: oid,
+                repository_root: cwd,
+            },
+        )
+        .await;
+        fixture.target = product_id;
+        fixture.state = executing_state(
+            &fixture.source,
+            &NativeCloseIntent::Initial {
+                target: fixture.target.clone(),
+            },
+        );
+        fixture.command = NativeCloseCommand::new(
+            fixture.source_transcript_id.clone(),
+            fixture.source.clone(),
+            NativeCloseIntent::Initial {
+                target: fixture.target.clone(),
+            },
+        )
+        .unwrap();
         fixture
             .db
-            .update_conversation_mode_and_cwd(TARGET_ID, &mode, self.worktree.to_str().unwrap())
+            .update_conversation_state(&fixture.source_transcript_id, &fixture.state)
             .await
             .unwrap();
+        let identity = self.bind_and_assert(fixture, &scope).await;
+        (scope, identity)
+    }
+
+    async fn accept_claim_and_stage(
+        &self,
+        fixture: &CloseFixture,
+        request_id: &str,
+        intent: &phoenix_db::ProductCreationIntent,
+        cwd: &str,
+    ) -> (phoenix_db::ClaimedProductCreationJob, String) {
+        use phoenix_db::ProductCreationProvisioningStage as Stage;
+
+        fixture.db.delete_conversation(TARGET_ID).await.unwrap();
+        fixture
+            .db
+            .accept_product_creation(request_id, intent)
+            .await
+            .unwrap();
+        let claimed = fixture
+            .db
+            .claim_product_creation(
+                request_id,
+                "physical-close-fixture",
+                "physical-close-token",
+                chrono::Utc::now(),
+                chrono::Duration::minutes(5),
+            )
+            .await
+            .unwrap()
+            .expect("accepted physical fixture is claimable");
+        for stage in [
+            Stage::ResolveRepository,
+            Stage::ResolveStartingPin,
+            Stage::MaterializeWorktree,
+            Stage::FinalizeAttachments,
+        ] {
+            assert!(fixture
+                .db
+                .advance_product_creation_provisioning_stage(request_id, &claimed.claim, stage)
+                .await
+                .unwrap());
+        }
+        let oid = String::from_utf8(self.run(&self.worktree, &["rev-parse", "HEAD"]))
+            .unwrap()
+            .trim()
+            .to_owned();
+        assert!(fixture
+            .db
+            .record_product_creation_staging(
+                request_id,
+                &claimed.claim,
+                &self.worktree.to_string_lossy(),
+                cwd,
+                &oid,
+            )
+            .await
+            .unwrap());
+        assert!(fixture
+            .db
+            .advance_product_creation_provisioning_stage(
+                request_id,
+                &claimed.claim,
+                Stage::CommitMetadata,
+            )
+            .await
+            .unwrap());
+        (claimed, oid)
+    }
+
+    fn conversation(
+        &self,
+        product_id: ProductConversationId,
+        scope: WorkScopeId,
+    ) -> phoenix_core::domain::db_schema::Conversation {
+        use phoenix_core::domain::db_schema::{ConvMode, Conversation};
+        use phoenix_core::domain::llm_types::ServiceTier;
+        use phoenix_core::domain::sm_state::ConvState;
+        use phoenix_core::llm_language::LlmLanguage;
+        use phoenix_core::work_scope::RuntimeRole;
+
+        Conversation {
+            id: TARGET_ID.into(),
+            product_conversation_id: product_id,
+            slug: Some(TARGET_ID.into()),
+            title: Some("physical Close fixture".into()),
+            cwd: self.worktree.to_string_lossy().into_owned(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::Idle,
+            state_updated_at: chrono::Utc::now(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            archived: false,
+            model: Some("test-model".into()),
+            effort: None,
+            service_tier: ServiceTier::Standard,
+            project_id: None,
+            conv_mode: ConvMode::DetachedProductCreation {
+                worktree_path: NonEmptyString::new(self.worktree.to_string_lossy()).unwrap(),
+                base_branch: NonEmptyString::new("main").unwrap(),
+            },
+            runtime_role: RuntimeRole::User,
+            attached_work_scope_id: Some(scope),
+            desired_base_branch: Some("main".into()),
+            message_count: 0,
+            transcript_generation: 1,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+            llm_language: LlmLanguage::default(),
+            spawned_from_conversation_id: None,
+        }
+    }
+
+    async fn publish_and_deliver(
+        &self,
+        fixture: &CloseFixture,
+        request_id: &str,
+        intent: &phoenix_db::ProductCreationIntent,
+        claimed: &phoenix_db::ClaimedProductCreationJob,
+        conversation: phoenix_core::domain::db_schema::Conversation,
+        git_publication: phoenix_db::ProductCreationGitPublicationFacts,
+    ) {
+        use phoenix_core::work_scope::{AuthorityKind, EnvironmentContext};
+
+        assert!(fixture
+            .db
+            .publish_product_creation_atomically(&phoenix_db::ProductCreationPublishInput {
+                request_id: request_id.to_owned(),
+                claim: claimed.claim.clone(),
+                conversation,
+                authority_kind: AuthorityKind::RestrictedExplore,
+                environment: EnvironmentContext::AllocatedWorktree {
+                    cwd: self.worktree.to_string_lossy().into_owned(),
+                    worktree_path: self.worktree.to_string_lossy().into_owned(),
+                    branch_name: None,
+                    base_branch: Some("main".into()),
+                },
+                git_publication: Some(git_publication),
+            })
+            .await
+            .unwrap());
+        let delivery = phoenix_db::ClaimedProductCreationJob {
+            claim: claimed.claim.clone(),
+            job: fixture
+                .db
+                .get_product_creation_job(request_id)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        let entry = phoenix_core::domain::sm_event::SteerEntry {
+            text: intent.objective.clone(),
+            origin: intent.origin.input_origin(),
+            message_id: request_id.to_owned(),
+            llm_text: None,
+            images: Vec::new(),
+            files: Vec::new(),
+            user_agent: None,
+            skill_invocation: None,
+        };
+        let fingerprint = format!("product-create:{request_id}");
+        fixture
+            .db
+            .append_product_creation_steering_entry(&delivery, &entry, &fingerprint)
+            .await
+            .unwrap();
+        assert!(fixture
+            .db
+            .complete_product_creation_delivery(
+                request_id,
+                &claimed.claim,
+                &phoenix_db::SteeringAcceptanceFingerprint::Exact(fingerprint),
+                intent,
+            )
+            .await
+            .unwrap());
+    }
+
+    async fn bind_and_assert(
+        &self,
+        fixture: &CloseFixture,
+        scope: &WorkScopeId,
+    ) -> WorktreeIdentity {
         let (kind, id, fingerprint): (String, String, String) = sqlx::query_as(
-            "SELECT environment_kind, worktree_id, worktree_fingerprint
+            "SELECT environment_kind, worktree_id, worktree_fingerprint \
              FROM work_scopes WHERE id = ?1",
         )
         .bind(scope.as_str())
@@ -435,16 +654,9 @@ impl DisposableGit {
         .unwrap();
         assert_eq!(kind, "allocated_worktree");
         assert_eq!(fingerprint, self.fingerprint);
-        assert_eq!(
-            fixture
-                .db
-                .get_conversation(TARGET_ID)
-                .await
-                .unwrap()
-                .attached_work_scope_id
-                .as_ref(),
-            Some(&scope)
-        );
+        let target = fixture.db.get_conversation(TARGET_ID).await.unwrap();
+        assert_eq!(target.attached_work_scope_id.as_ref(), Some(scope));
+        assert_eq!(target.product_conversation_id, fixture.target);
         assert_eq!(
             fixture
                 .db
@@ -454,12 +666,11 @@ impl DisposableGit {
                 .1,
             WorkScopeLifecycle::Active
         );
-        let identity = WorktreeIdentity::from_parts(
+        WorktreeIdentity::from_parts(
             WorktreeId::parse(id).unwrap(),
             WorktreeFingerprint::parse(fingerprint).unwrap(),
             GitPathIdentity::from_bytes(self.worktree.as_os_str().as_bytes().to_vec()),
-        );
-        (scope, identity)
+        )
     }
 
     fn reuse_original_path_after_stop(&mut self) -> ReusedWorktreePath {
@@ -586,8 +797,8 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         journey,
         WorktreeJourney::StopBeforeAdmission | WorktreeJourney::StopBeforeAdmissionWithReusedPath
     );
-    let fixture = CloseFixture::new().await;
-    let (scope, original_worktree) = git.register(&fixture).await;
+    let mut fixture = CloseFixture::new().await;
+    let (scope, original_worktree) = git.register(&mut fixture).await;
     let retry_loss_classification = matches!(journey, WorktreeJourney::RetryLossClassification);
     let public_captured_retry = matches!(
         journey,
