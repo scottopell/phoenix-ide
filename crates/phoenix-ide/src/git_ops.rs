@@ -53,8 +53,6 @@ pub(crate) enum GitOpError {
     Git(String),
     /// Branch not found locally or at origin.
     BranchNotFound(String),
-    /// Filesystem error.
-    Io(String),
 }
 
 impl std::fmt::Display for GitOpError {
@@ -64,7 +62,6 @@ impl std::fmt::Display for GitOpError {
             Self::BranchNotFound(branch) => {
                 write!(f, "branch '{branch}' not found locally or at origin")
             }
-            Self::Io(msg) => write!(f, "IO error: {msg}"),
         }
     }
 }
@@ -783,186 +780,6 @@ fn prepare_temp_index(worktree: &Path) -> Option<TempPath> {
     Some(TempPath(temp))
 }
 
-/// Create a git worktree at `.phoenix/worktrees/{conv_id}`.
-///
-/// If `create_branch` is `Some((new_branch, start_point))`, creates a new branch
-/// (`git worktree add -b <new_branch> <path> <start_point>`).
-/// If `None`, checks out the existing `branch_name` (`git worktree add <path> <branch>`).
-///
-pub(crate) fn create_worktree(
-    cwd: &Path,
-    conv_id: &str,
-    branch_name: &str,
-    create_branch: Option<&str>, // start_point for -b mode
-) -> Result<String, GitOpError> {
-    // 1. Create .phoenix/worktrees/ directory
-    let phoenix_dir = cwd.join(".phoenix").join("worktrees");
-    std::fs::create_dir_all(&phoenix_dir)
-        .map_err(|e| GitOpError::Io(format!("Failed to create .phoenix/worktrees/: {e}")))?;
-
-    let worktree_path = phoenix_dir.join(conv_id);
-    let worktree_path_str = worktree_path.to_string_lossy().to_string();
-
-    // 2. git worktree add (with or without -b)
-    if let Some(start_point) = create_branch {
-        run_git(
-            cwd,
-            &[
-                "worktree",
-                "add",
-                "-b",
-                branch_name,
-                // `--` ends option parsing so the positional path and start-point
-                // (the latter caller-influenced) can never be read as flags.
-                "--",
-                &worktree_path_str,
-                start_point,
-            ],
-        )
-        .map_err(|e| {
-            // `git worktree add -b` creates the branch ref before checking out
-            // files. A mid-checkout failure (commonly ENOSPC) rolls back the
-            // worktree dir + admin entry but leaves the branch we created behind.
-            // Roll it back so a retry isn't permanently poisoned by a stale ref.
-            cleanup_failed_worktree(cwd, &worktree_path, Some(branch_name));
-            GitOpError::Git(format!(
-                "Failed to create worktree with new branch '{branch_name}' from '{start_point}': {e}"
-            ))
-        })?;
-    } else {
-        run_git(
-            cwd,
-            &["worktree", "add", "--", &worktree_path_str, branch_name],
-        )
-        .map_err(|e| {
-            // Branch pre-existed; clean only the partial worktree, never the branch.
-            cleanup_failed_worktree(cwd, &worktree_path, None);
-            GitOpError::Git(format!(
-                "Failed to create worktree for branch '{branch_name}': {e}"
-            ))
-        })?;
-    }
-
-    prewarm_new_worktree(cwd, &worktree_path);
-
-    Ok(worktree_path_str)
-}
-
-fn prewarm_new_worktree(source_root: &Path, worktree_path: &Path) {
-    crate::project_opportunistic_build_warm::prewarm_project_build_caches(
-        source_root,
-        worktree_path,
-    );
-
-    #[cfg(test)]
-    TEST_PREWARM_HOOK.with(|hook| {
-        if let Some(hook) = hook.borrow().as_ref() {
-            hook(source_root, worktree_path);
-        }
-    });
-}
-
-#[cfg(test)]
-type PrewarmHook = dyn Fn(&Path, &Path);
-
-#[cfg(test)]
-thread_local! {
-    static TEST_PREWARM_HOOK: std::cell::RefCell<Option<Box<PrewarmHook>>> =
-        std::cell::RefCell::new(None);
-}
-
-#[cfg(test)]
-fn with_test_prewarm_hook<R>(hook: impl Fn(&Path, &Path) + 'static, f: impl FnOnce() -> R) -> R {
-    TEST_PREWARM_HOOK.with(|slot| {
-        let previous = slot.replace(Some(Box::new(hook)));
-        let result = f();
-        slot.replace(previous);
-        result
-    })
-}
-
-/// Best-effort rollback of a partially-created worktree after `git worktree add`
-/// fails. Every step is non-fatal: the original add error is what gets surfaced;
-/// these cleanups only stop the failure from leaving artifacts that poison a retry.
-///
-/// `created_branch` is `Some(name)` only when the caller passed `-b` and thus owns
-/// the branch ref. In the checkout-existing-branch path it is `None` — deleting a
-/// pre-existing branch would be data loss.
-fn cleanup_failed_worktree(cwd: &Path, worktree_path: &Path, created_branch: Option<&str>) {
-    let worktree_path_str = worktree_path.to_string_lossy().to_string();
-
-    // 1. Drop any admin entry + partial dir git registered before it bailed.
-    if let Err(e) = run_git_bounded(
-        cwd,
-        &["worktree", "remove", &worktree_path_str, "--force"],
-        std::time::Duration::from_secs(30),
-    ) {
-        tracing::debug!(
-            error = %e,
-            worktree = %worktree_path_str,
-            "worktree remove during failed-add cleanup failed; trying fs + prune"
-        );
-        if worktree_path.exists() {
-            if let Err(rm_err) = std::fs::remove_dir_all(worktree_path) {
-                tracing::debug!(error = %rm_err, "fs cleanup of partial worktree failed");
-            }
-        }
-        let _ = run_git(cwd, &["worktree", "prune"]);
-    }
-
-    // 2. Delete the branch we created, but only if it isn't checked out elsewhere
-    //    (defensive: a failed add means it shouldn't be, but never move a ref a
-    //    worktree owns — see AGENTS.md worktree-safety rule).
-    if let Some(branch) = created_branch {
-        if find_branch_in_worktree_list(cwd, branch).is_some() {
-            tracing::debug!(branch, "leaked-branch cleanup skipped: still checked out");
-            return;
-        }
-        if let Err(e) = run_git(cwd, &["branch", "-D", branch]) {
-            tracing::debug!(
-                error = %e,
-                branch,
-                "leaked-branch cleanup failed (non-fatal)"
-            );
-        }
-    }
-}
-
-/// Check if a branch is already checked out in any worktree.
-/// If so, look up the owning conversation for conflict resolution.
-pub(crate) fn check_branch_conflict(
-    cwd: &Path,
-    db: &crate::db::Database,
-    branch_name: &str,
-) -> Result<(), BranchConflict> {
-    if let Some(existing_path) = find_branch_in_worktree_list(cwd, branch_name) {
-        // Branch is checked out somewhere. Check if it's a Phoenix conversation.
-        if let Some(slug) = find_active_branch_conversation_slug(db, branch_name) {
-            return Err(BranchConflict::PhoenixConversation { slug });
-        }
-        // Not a Phoenix conversation -- checked out in main worktree or external.
-        let location = if existing_path == cwd.to_string_lossy() {
-            "your main working tree".to_string()
-        } else {
-            format!("a worktree at {existing_path}")
-        };
-        return Err(BranchConflict::ExternalCheckout {
-            branch: branch_name.to_string(),
-            location,
-        });
-    }
-    Ok(())
-}
-
-/// Result of a branch conflict check.
-#[derive(Debug)]
-pub(crate) enum BranchConflict {
-    /// Branch is owned by an active Phoenix conversation.
-    PhoenixConversation { slug: String },
-    /// Branch is checked out externally (main worktree or non-Phoenix worktree).
-    ExternalCheckout { branch: String, location: String },
-}
-
 /// Check if a branch is already checked out in any worktree.
 /// Returns the worktree path if found, None if the branch is free.
 /// Uses `git worktree list --porcelain` for structured, reliable detection.
@@ -983,22 +800,6 @@ pub(crate) fn find_branch_in_worktree_list(cwd: &Path, branch_name: &str) -> Opt
         }
     }
     None
-}
-
-/// Look up the slug of a non-terminal conversation that owns this branch.
-/// Runs synchronously (called from a blocking thread).
-pub(crate) fn find_active_branch_conversation_slug(
-    db: &crate::db::Database,
-    branch_name: &str,
-) -> Option<String> {
-    let rt = tokio::runtime::Handle::try_current().ok()?;
-    let convs = rt.block_on(db.get_work_conversations()).ok()?;
-    convs
-        .iter()
-        .find(|c| {
-            c.conv_mode.branch_name().is_some_and(|b| b == branch_name) && !c.state.is_terminal()
-        })
-        .and_then(|c| c.slug.clone())
 }
 
 /// If `path` is inside a Phoenix worktree at `{repo_root}/.phoenix/worktrees/{id}`,
@@ -1031,7 +832,6 @@ pub(crate) fn repo_root_from_phoenix_worktree(path: &Path) -> Option<std::path::
         .and_then(|conv_dir| conv_dir.parent()?.parent()?.parent())
         .map(std::path::Path::to_path_buf)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1076,37 +876,6 @@ mod tests {
         std::fs::write(dir.join(name), content).unwrap();
         run_git_for_test(dir, &["add", name]).unwrap();
         run_git_for_test(dir, &["commit", "-q", "-m", message]).unwrap();
-    }
-
-    fn creation_state(dir: &Path) -> (Option<Vec<u8>>, Option<Vec<u8>>, Vec<u8>) {
-        let read_if_present = |path: &Path| {
-            path.exists().then(|| std::fs::read(path).unwrap())
-        };
-        (
-            read_if_present(&dir.join(".gitignore")),
-            read_if_present(&dir.join(".git/info/exclude")),
-            std::fs::read(dir.join(".git/index")).unwrap(),
-        )
-    }
-
-    fn assert_creation_state_unchanged(
-        dir: &Path,
-        before: &(Option<Vec<u8>>, Option<Vec<u8>>, Vec<u8>),
-    ) {
-        assert_eq!(creation_state(dir), *before);
-    }
-
-    fn prepare_creation_state(dir: &Path) {
-        let exclude = dir.join(".git/info/exclude");
-        if exclude.exists() {
-            std::fs::remove_file(exclude).unwrap();
-        }
-        let gitignore = dir.join(".gitignore");
-        if gitignore.exists() {
-            std::fs::remove_file(gitignore).unwrap();
-        }
-        std::fs::write(dir.join("staged-before-worktree.txt"), "keep staged\n").unwrap();
-        run_git_for_test(dir, &["add", "staged-before-worktree.txt"]).unwrap();
     }
 
     fn clone_repo(source: &Path, dest: &Path) {
@@ -1315,166 +1084,6 @@ mod tests {
         );
     }
 
-    fn branch_exists(dir: &Path, branch: &str) -> bool {
-        run_git(
-            dir,
-            &[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ],
-        )
-        .is_ok()
-    }
-
-    #[test]
-    fn create_worktree_success_preserves_ignore_files_and_staged_index() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        commit_file(tmp.path(), "tracked.txt", "content\n", "add tracked file");
-        prepare_creation_state(tmp.path());
-        let before = creation_state(tmp.path());
-
-        let calls = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
-        let calls_for_hook = std::rc::Rc::clone(&calls);
-        let conv_id = "feedface-2222-2222-2222-222222222222";
-
-        let result = with_test_prewarm_hook(
-            move |source_root, worktree_path| {
-                calls_for_hook
-                    .borrow_mut()
-                    .push((source_root.to_path_buf(), worktree_path.to_path_buf()));
-            },
-            || {
-                create_worktree(
-                    tmp.path(),
-                    conv_id,
-                    "task-pending-feedface",
-                    Some("main"),
-                )
-            },
-        )
-        .unwrap();
-
-        let expected_worktree = tmp.path().join(".phoenix/worktrees").join(conv_id);
-        assert_eq!(Path::new(&result), expected_worktree.as_path());
-        assert!(expected_worktree.join("tracked.txt").exists());
-        assert_eq!(
-            calls.borrow().as_slice(),
-            &[(tmp.path().to_path_buf(), expected_worktree)]
-        );
-        assert_creation_state_unchanged(tmp.path(), &before);
-    }
-
-    #[test]
-    fn create_worktree_still_succeeds_when_prewarm_source_cache_exists() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        commit_file(tmp.path(), "tracked.txt", "content\n", "add tracked file");
-        std::fs::create_dir_all(tmp.path().join("target/debug")).unwrap();
-        std::fs::write(tmp.path().join("target/debug/cache.txt"), "warm\n").unwrap();
-
-        let conv_id = "feedface-3333-3333-3333-333333333333";
-        let result = create_worktree(
-            tmp.path(),
-            conv_id,
-            "task-pending-warm",
-            Some("main"),
-        )
-        .unwrap();
-
-        assert!(Path::new(&result).join("tracked.txt").exists());
-    }
-
-    #[test]
-    fn cleanup_failed_worktree_deletes_branch_we_created() {
-        // Models the leak: `git worktree add -b` made the branch, then checkout
-        // failed and git rolled back the dir/admin entry. The branch must go.
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        run_git(tmp.path(), &["branch", "task-pending-deadbeef", "main"]).unwrap();
-        assert!(branch_exists(tmp.path(), "task-pending-deadbeef"));
-
-        let phantom = tmp.path().join(".phoenix/worktrees/deadbeef");
-        cleanup_failed_worktree(tmp.path(), &phantom, Some("task-pending-deadbeef"));
-
-        assert!(!branch_exists(tmp.path(), "task-pending-deadbeef"));
-    }
-
-    #[test]
-    fn cleanup_failed_worktree_preserves_preexisting_branch() {
-        // Checkout-existing-branch path passes None: the branch predates us and
-        // must survive a failed add — deleting it would be data loss.
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        run_git(tmp.path(), &["branch", "existing-feature", "main"]).unwrap();
-
-        let phantom = tmp.path().join(".phoenix/worktrees/cafe");
-        cleanup_failed_worktree(tmp.path(), &phantom, None);
-
-        assert!(branch_exists(tmp.path(), "existing-feature"));
-    }
-
-    #[test]
-    fn cleanup_failed_worktree_spares_branch_checked_out_elsewhere() {
-        // Safety guard: never delete a ref a live worktree owns, even if asked.
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        run_git(tmp.path(), &["branch", "task-pending-live", "main"]).unwrap();
-        let live_wt = TempDir::new().unwrap();
-        run_git(
-            tmp.path(),
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                live_wt.path().to_str().unwrap(),
-                "task-pending-live",
-            ],
-        )
-        .unwrap();
-
-        let phantom = tmp.path().join(".phoenix/worktrees/other");
-        cleanup_failed_worktree(tmp.path(), &phantom, Some("task-pending-live"));
-
-        assert!(branch_exists(tmp.path(), "task-pending-live"));
-    }
-
-    #[test]
-    fn create_worktree_failure_preserves_ignore_files_and_staged_index() {
-        // End-to-end: force `git worktree add -b` to fail by pre-creating a
-        // colliding child path, then assert no `task-pending-*` ref survives.
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        commit_file(tmp.path(), "tracked.txt", "content\n", "add tracked file");
-
-        prepare_creation_state(tmp.path());
-        let before = creation_state(tmp.path());
-
-        // Occupy the worktree target with a non-empty dir so `add` aborts.
-        let conv_id = "feedface-0000-0000-0000-000000000000";
-        let target = tmp.path().join(".phoenix/worktrees").join(conv_id);
-        std::fs::create_dir_all(&target).unwrap();
-        std::fs::write(target.join("squatter"), "blocks the add\n").unwrap();
-
-        let res = create_worktree(
-            tmp.path(),
-            conv_id,
-            "task-pending-feedface",
-            Some("main"),
-        );
-        assert!(res.is_err(), "add into a non-empty dir should fail");
-
-        let branches = run_git(tmp.path(), &["branch", "--list", "task-pending-*"]).unwrap();
-        assert_eq!(
-            branches.trim(),
-            "",
-            "no task-pending branch may leak: {branches:?}"
-        );
-        assert_creation_state_unchanged(tmp.path(), &before);
-    }
-
     #[test]
     fn run_git_capped_passthrough_when_under_cap() {
         let tmp = TempDir::new().unwrap();
@@ -1671,7 +1280,6 @@ mod tests {
         assert_eq!(effective_base_ref(clone.path(), "feature"), "feature");
     }
 
-
     // ---- find_branch_in_worktree_list: porcelain parsing ----
 
     #[test]
@@ -1741,62 +1349,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(find_branch_in_worktree_list(tmp.path(), "feature-2"), None);
-    }
-
-    // ---- check_branch_conflict: the branch-collision gate ----
-    //
-    // `check_branch_conflict` resolves a Phoenix-owner lookup via
-    // `Handle::block_on`, so it must run on a blocking thread, not an async
-    // worker — hence `spawn_blocking` under a multi-thread runtime.
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn check_branch_conflict_ok_when_branch_is_free() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        run_git(tmp.path(), &["branch", "feature", "main"]).unwrap();
-        let db = crate::db::Database::open_in_memory().await.unwrap();
-        let cwd = tmp.path().to_path_buf();
-
-        let result =
-            tokio::task::spawn_blocking(move || check_branch_conflict(&cwd, &db, "feature"))
-                .await
-                .unwrap();
-        assert!(
-            result.is_ok(),
-            "a free branch must not conflict: {result:?}"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn check_branch_conflict_flags_external_checkout() {
-        let tmp = TempDir::new().unwrap();
-        init_repo(tmp.path());
-        run_git(tmp.path(), &["branch", "feature", "main"]).unwrap();
-        let wt = TempDir::new().unwrap();
-        run_git(
-            tmp.path(),
-            &[
-                "worktree",
-                "add",
-                "--quiet",
-                wt.path().to_str().unwrap(),
-                "feature",
-            ],
-        )
-        .unwrap();
-        // Empty DB: no Phoenix conversation owns the branch, so a checkout that
-        // exists on disk must classify as an external (non-Phoenix) checkout.
-        let db = crate::db::Database::open_in_memory().await.unwrap();
-        let cwd = tmp.path().to_path_buf();
-
-        let result =
-            tokio::task::spawn_blocking(move || check_branch_conflict(&cwd, &db, "feature"))
-                .await
-                .unwrap();
-        match result {
-            Err(BranchConflict::ExternalCheckout { branch, .. }) => assert_eq!(branch, "feature"),
-            other => panic!("expected ExternalCheckout, got {other:?}"),
-        }
     }
 
     // ---- materialize_branch: local/remote reconciliation ----

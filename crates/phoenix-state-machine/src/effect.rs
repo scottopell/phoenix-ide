@@ -233,13 +233,6 @@ pub enum Effect {
         plan: String,
         reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
     },
-    ApproveTaskFreshHandoff {
-        task_file: String,
-        title: String,
-        priority: phoenix_core::task_source::Priority,
-        plan: String,
-        reviewed_proposal: Option<phoenix_core::domain::task_approval::ReviewedProposal>,
-    },
     /// Task completed or abandoned: finalize conversation state, mode, and cwd.
     /// Executor calls `finalize_conversation`, injects system message, broadcasts SSE.
     ResolveTask {

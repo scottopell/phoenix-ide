@@ -202,9 +202,6 @@ struct StateDetailBody: View {
                 onFeedback: { onAction(.provideTaskFeedback($0)) },
                 onApproveHere: {
                     onAction(.approveTask(handoff: .continueInCurrentConversation))
-                },
-                onApproveFresh: {
-                    onAction(.approveTask(handoff: .startFreshWorkConversation))
                 })
 
         case .awaitingRecovery(let message):
@@ -393,9 +390,6 @@ struct TaskApprovalCard: View {
             onFeedback: { session.perform(.provideTaskFeedback($0)) },
             onApproveHere: {
                 session.perform(.approveTask(handoff: .continueInCurrentConversation))
-            },
-            onApproveFresh: {
-                session.perform(.approveTask(handoff: .startFreshWorkConversation))
             })
     }
 }
@@ -410,7 +404,6 @@ struct TaskApprovalCardBody: View {
     let onReject: () -> Void
     let onFeedback: (TaskFeedback) -> Void
     let onApproveHere: () -> Void
-    let onApproveFresh: () -> Void
 
     @State private var planExpanded = false
     @State private var showFeedbackField = false
@@ -489,14 +482,9 @@ struct TaskApprovalCardBody: View {
 
                 Spacer()
 
-                Menu {
-                    Button("Start here", action: onApproveHere)
-                    Button("New chat", action: onApproveFresh)
-                } label: {
-                    Label("Approve…", systemImage: "checkmark")
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!actionable)
+                Button("Start here", action: onApproveHere)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!actionable)
             }
             .font(.callout)
 

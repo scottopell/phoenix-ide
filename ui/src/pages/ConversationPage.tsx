@@ -1616,7 +1616,7 @@ function ConversationPageContent({
     [conversation, readOnly, availableModels, defaultModel, navigate, createConversationWithStore],
   );
 
-  const handleApproveTask = async (handoff: 'continue_in_current_conversation' | 'start_fresh_work_conversation') => {
+  const handleApproveTask = async (handoff: 'continue_in_current_conversation') => {
     if (readOnly || !conversationId || isArchived) return;
     dispatch({ type: 'clear_error' });
     try {

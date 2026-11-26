@@ -2524,7 +2524,6 @@ fn creation_provisioned_transition(
             | Effect::ContinuationCommit { .. }
             | Effect::NotifyContextExhausted { .. }
             | Effect::ApproveTask { .. }
-            | Effect::ApproveTaskFreshHandoff { .. }
             | Effect::ResolveTask { .. }
             | Effect::PersistUserInputMessage { .. }
             | Effect::CommitSteeringDrain { .. } => {}
@@ -2626,37 +2625,6 @@ pub fn transition_parent(
                 .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),
-        (
-            ParentState::AwaitingTaskApproval {
-                task_file,
-                title,
-                priority,
-                plan,
-                reviewed_proposal,
-            },
-            ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
-                outcome:
-                    TaskApprovalOutcome::Approved {
-                        handoff: TaskApprovalHandoff::StartFreshWorkConversation,
-                    },
-            }),
-        ) => Ok(
-            ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
-                task_file: task_file.clone(),
-                title: title.clone(),
-                priority: *priority,
-                plan: plan.clone(),
-                reviewed_proposal: reviewed_proposal.clone(),
-            })
-            .with_effect(Effect::ApproveTaskFreshHandoff {
-                task_file: task_file.clone(),
-                title: title.clone(),
-                priority: *priority,
-                plan: plan.clone(),
-                reviewed_proposal: reviewed_proposal.clone(),
-            }),
-        ),
-
         (
             ParentState::AwaitingTaskApproval { .. },
             ParentEvent::Parent(ParentOnlyEvent::TaskHandoffComplete { .. }),
@@ -10096,7 +10064,6 @@ mod tests {
                 !result.effects.iter().any(|effect| matches!(
                     effect,
                     Effect::ApproveTask { .. }
-                        | Effect::ApproveTaskFreshHandoff { .. }
                         | Effect::ResolveTask { .. }
                 )),
                 "proposal interception must not perform an approval or lifecycle Git effect"

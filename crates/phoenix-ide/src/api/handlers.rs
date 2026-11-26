@@ -53,10 +53,7 @@ use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
 use crate::db::{
     ConvMode, ConversationUsage, DbError, ImageData, NotificationSettings, RetrievalRequest,
 };
-use crate::git_ops::{
-    check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
-    GitOpError,
-};
+use crate::git_ops::run_git;
 use crate::runtime::SseEvent;
 use crate::state_machine::{ConvState, Event};
 
@@ -3111,14 +3108,6 @@ async fn create_conversation_with_id(
         ));
     }
 
-    if let Some(mode) = req.mode.as_deref() {
-        if !matches!(mode, "direct" | "managed" | "branch" | "auto") {
-            return Err(AppError::BadRequest(format!(
-                "Invalid mode '{mode}'. Expected one of: direct, managed, branch, auto"
-            )));
-        }
-    }
-
     if let Ok(conv) = state.runtime.db().get_conversation(&id).await {
         if let Some(existing_job) = state
             .runtime
@@ -3212,7 +3201,11 @@ async fn create_conversation_with_id(
         }
     }
 
-    let requested_mode = req.mode.as_deref().unwrap_or("direct");
+    if let Some(mode) = req.mode.as_deref().filter(|mode| *mode != "direct") {
+        return Err(AppError::BadRequest(format!(
+            "Legacy conversation creation mode '{mode}' is no longer supported"
+        )));
+    }
     let persisted_prompt_text = req.text.clone();
 
     let short_id: String = id.chars().take(8).collect();
@@ -3222,10 +3215,6 @@ async fn create_conversation_with_id(
     let desired_base_branch = req.base_branch.as_deref();
     let shell_model = selected_model.clone();
     let intent_model = Some(req.model.clone());
-    let resolved_mode_for_intent = match requested_mode {
-        "direct" => None,
-        other => Some(other.to_string()),
-    };
     // New conversations are pinned to the current global default LLM language.
     // Once set, this conversation (and all its chain continuations / sub-agents)
     // stays in that language even if the global default later changes.
@@ -3293,7 +3282,7 @@ async fn create_conversation_with_id(
             })
             .collect(),
         files: validated_files,
-        mode: resolved_mode_for_intent,
+        mode: None,
         base_branch: req.base_branch.clone(),
         checkout_ref: req.checkout_ref.clone(),
         seed_parent_id: req.seed_parent_id.clone(),
@@ -3421,36 +3410,6 @@ async fn create_conversation_with_attachments(
     create_conversation_with_id(state, req, raw_files).await
 }
 
-// ============================================================
-// Branch Mode Worktree Creation (REQ-PROJ-024)
-// ============================================================
-
-pub(crate) struct BranchWorktreeInfo {
-    pub(crate) branch_name: String,
-    pub(crate) worktree_path: String,
-    pub(crate) base_branch: String,
-}
-
-pub(crate) enum BranchWorktreeError {
-    Conflict { slug: String },
-    Git(String),
-    BadRequest(String),
-}
-
-/// Reject a client-supplied git ref that could be misparsed as a command-line
-/// option when it later reaches a `git` invocation (argument injection). Git
-/// branch names cannot begin with `-`, so this rejects no legitimate input
-/// while closing the `-`-prefixed-ref vector at the HTTP boundary — before the
-/// name is interpolated into any `git worktree add` / `rev-parse` argv.
-pub(crate) fn validate_user_ref(name: &str) -> Result<(), AppError> {
-    if name.starts_with('-') {
-        return Err(AppError::BadRequest(format!(
-            "Invalid branch name '{name}': must not begin with '-'"
-        )));
-    }
-    Ok(())
-}
-
 pub(crate) fn validate_detached_task_worktree(
     worktree_path: &std::path::Path,
     approved_commit_oid: &str,
@@ -3466,167 +3425,6 @@ pub(crate) fn validate_detached_task_worktree(
         return Err("approved-task worktree must remain detached".to_string());
     }
     Ok(())
-}
-
-pub(crate) fn create_detached_task_worktree_blocking(
-    repo_root: &str,
-    target_path: &std::path::Path,
-    approved_branch: &str,
-) -> Result<String, BranchWorktreeError> {
-    let repo = std::path::Path::new(repo_root);
-    let parent = target_path.parent().ok_or_else(|| {
-        BranchWorktreeError::Git("detached worktree target has no parent directory".to_string())
-    })?;
-    std::fs::create_dir_all(parent).map_err(|error| BranchWorktreeError::Git(error.to_string()))?;
-    run_git(
-        repo,
-        &[
-            "worktree",
-            "add",
-            "--detach",
-            target_path.to_string_lossy().as_ref(),
-            approved_branch,
-        ],
-    )
-    .map_err(|error| BranchWorktreeError::Git(error.clone()))?;
-    Ok(target_path.to_string_lossy().to_string())
-}
-
-/// Create a git worktree for an existing branch. Runs on a blocking thread.
-/// Create a git worktree for an existing branch. Runs on a blocking thread.
-///
-/// Delegates to `git_ops::{materialize_branch, check_branch_conflict, create_worktree}`.
-pub(crate) fn create_branch_worktree_blocking(
-    repo_root: &str,
-    conv_id: &str,
-    branch_name: &str,
-    db: &crate::db::Database,
-) -> Result<BranchWorktreeInfo, BranchWorktreeError> {
-    let cwd = std::path::Path::new(repo_root);
-
-    if run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).is_err() {
-        return Err(BranchWorktreeError::BadRequest(
-            "Directory is not a git repository".to_string(),
-        ));
-    }
-
-    let current_branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .unwrap_or_else(|_| "HEAD".to_string())
-        .trim()
-        .to_string();
-    let default_branch = run_git(cwd, &["symbolic-ref", "refs/remotes/origin/HEAD"])
-        .ok()
-        .and_then(|s| {
-            s.trim()
-                .strip_prefix("refs/remotes/origin/")
-                .map(String::from)
-        })
-        .unwrap_or_else(|| current_branch.clone());
-
-    materialize_branch(cwd, branch_name).map_err(|e| match e {
-        GitOpError::BranchNotFound(b) => {
-            BranchWorktreeError::BadRequest(format!("Branch '{b}' not found locally or at origin"))
-        }
-        other => BranchWorktreeError::Git(other.to_string()),
-    })?;
-
-    // REQ-PROJ-025: check if branch is already checked out BEFORE attempting worktree add.
-    match check_branch_conflict(cwd, db, branch_name) {
-        Ok(()) => {}
-        Err(BranchConflict::PhoenixConversation { slug }) => {
-            return Err(BranchWorktreeError::Conflict { slug });
-        }
-        Err(BranchConflict::ExternalCheckout { branch, location }) => {
-            return Err(BranchWorktreeError::BadRequest(format!(
-                "Branch '{branch}' is already checked out in {location}. \
-                 Git doesn't allow a branch to be checked out in two places at once. \
-                 Switch to a different branch there first, or use Direct mode."
-            )));
-        }
-    }
-
-    let worktree_path_str = create_worktree(
-        cwd,
-        conv_id,
-        branch_name,
-        None,
-    )
-    .map_err(|e| match e {
-        GitOpError::Io(msg) | GitOpError::Git(msg) => BranchWorktreeError::Git(msg),
-        GitOpError::BranchNotFound(branch) => BranchWorktreeError::BadRequest(format!(
-            "Branch '{branch}' not found locally or at origin"
-        )),
-    })?;
-
-    tracing::info!(
-        branch = %branch_name,
-        worktree = %worktree_path_str,
-        "Created Branch-mode worktree (REQ-PROJ-024)"
-    );
-
-    Ok(BranchWorktreeInfo {
-        branch_name: branch_name.to_string(),
-        worktree_path: worktree_path_str,
-        base_branch: default_branch,
-    })
-}
-
-// ============================================================
-// Managed Mode Early Worktree (REQ-PROJ-028)
-// ============================================================
-
-/// Create a worktree at conversation start for Managed mode so the agent
-/// explores the selected base branch, not the main checkout.
-///
-/// Creates a temporary branch `task-pending-{conv_id_prefix}` from the
-/// base branch. At approval time, `execute_approve_task_blocking` detects
-/// the existing worktree and renames the branch.
-pub(crate) enum ManagedWorktreeError {
-    /// User-input failure (e.g. branch doesn't exist locally or at origin).
-    BadRequest(String),
-    /// Infrastructure failure (worktree creation, generic git errors).
-    Git(String),
-}
-
-pub(crate) fn create_managed_explore_worktree_blocking(
-    repo_root: &str,
-    conv_id: &str,
-    base_branch: &str,
-    checkout_ref: Option<&str>,
-) -> Result<String, ManagedWorktreeError> {
-    let cwd = std::path::Path::new(repo_root);
-
-    materialize_branch(cwd, base_branch).map_err(|e| match e {
-        GitOpError::BranchNotFound(b) => ManagedWorktreeError::BadRequest(format!(
-            "Branch '{b}' not found locally or at origin",
-        )),
-        other => ManagedWorktreeError::Git(other.to_string()),
-    })?;
-
-    let id_prefix: String = conv_id.chars().take(8).collect();
-    let temp_branch = format!("task-pending-{id_prefix}");
-
-    let worktree_path_str = create_worktree(
-        cwd,
-        conv_id,
-        &temp_branch,
-        checkout_ref.or(Some(base_branch)),
-    )
-    .map_err(|e| {
-        ManagedWorktreeError::Git(format!(
-            "Failed to create early worktree from '{base_branch}': {e}",
-        ))
-    })?;
-
-    tracing::info!(
-        conv_id = %conv_id,
-        base_branch = %base_branch,
-        temp_branch = %temp_branch,
-        worktree = %worktree_path_str,
-        "Created early Managed-mode worktree (REQ-PROJ-028)"
-    );
-
-    Ok(worktree_path_str)
 }
 
 // ============================================================
@@ -9782,20 +9580,24 @@ mod conversation_cwd_validation_tests {
     }
 
     #[tokio::test]
-    async fn managed_mode_without_base_branch_is_deferred_to_worker() {
+    async fn retired_creation_modes_do_not_enqueue_jobs() {
         let tmp = tempfile::tempdir().expect("tempdir");
         init_git_repo(tmp.path());
         let state = api_test_support::make_test_state().await;
-        let mut req = create_request(tmp.path().to_string_lossy().to_string());
-        req.mode = Some("managed".to_string());
-
-        let Json(response) = create_conversation_with_id(state, req, Vec::new())
-            .await
-            .expect("managed intent accepted before base validation");
-        assert_eq!(
-            response.conversation["state"]["type"].as_str(),
-            Some("provisioning")
-        );
+        for mode in ["branch", "managed", "auto", "approved_task"] {
+            let id = uuid::Uuid::new_v4().to_string();
+            let mut req = create_request(tmp.path().to_string_lossy().into_owned());
+            req.conversation_id = Some(id.clone());
+            req.mode = Some(mode.to_string());
+            let result = create_conversation_with_id(state.clone(), req, Vec::new()).await;
+            assert!(matches!(result, Err(AppError::BadRequest(message)) if message.contains(mode)));
+            assert!(state
+                .db
+                .get_conversation_creation_job_for_conversation(&id)
+                .await
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[tokio::test]
@@ -9854,60 +9656,6 @@ mod conversation_cwd_validation_tests {
             .expect("idempotent retry returns existing shell before git checks");
 
         assert_eq!(response.conversation["id"].as_str(), Some(conv_id.as_str()));
-    }
-
-    #[tokio::test]
-    async fn auto_mode_stale_checkout_ref_is_deferred_to_worker() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        init_git_repo(tmp.path());
-        let state = api_test_support::make_test_state().await;
-        let mut req = create_request(tmp.path().to_string_lossy().to_string());
-        req.mode = Some("auto".to_string());
-        req.checkout_ref = Some("does-not-exist".to_string());
-
-        let Json(response) = create_conversation_with_id(state.clone(), req, Vec::new())
-            .await
-            .expect("auto create accepts shell before worker ref validation");
-
-        assert_eq!(
-            response.conversation["state"]["type"].as_str(),
-            Some("provisioning")
-        );
-        let conv_id = response.conversation["id"].as_str().expect("id");
-        let job = state
-            .db
-            .get_conversation_creation_job_for_conversation(conv_id)
-            .await
-            .expect("load job")
-            .expect("job");
-        assert_eq!(job.intent.checkout_ref.as_deref(), Some("does-not-exist"));
-    }
-
-    #[tokio::test]
-    async fn managed_mode_nonexistent_base_branch_is_deferred_to_worker() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        init_git_repo(tmp.path());
-        let state = api_test_support::make_test_state().await;
-        let mut req = create_request(tmp.path().to_string_lossy().to_string());
-        req.mode = Some("managed".to_string());
-        req.base_branch = Some("does-not-exist".to_string());
-
-        let Json(response) = create_conversation_with_id(state.clone(), req, Vec::new())
-            .await
-            .expect("managed create accepts shell before worker ref validation");
-
-        assert_eq!(
-            response.conversation["state"]["type"].as_str(),
-            Some("provisioning")
-        );
-        let conv_id = response.conversation["id"].as_str().expect("id");
-        let job = state
-            .db
-            .get_conversation_creation_job_for_conversation(conv_id)
-            .await
-            .expect("load job")
-            .expect("job");
-        assert_eq!(job.intent.base_branch.as_deref(), Some("does-not-exist"));
     }
 
     #[tokio::test]
@@ -10010,24 +9758,6 @@ mod conversation_cwd_validation_tests {
             }
             other => panic!("expected Conflict, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn branch_mode_nonexistent_branch_is_deferred_to_worker() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        init_git_repo(tmp.path());
-        let state = api_test_support::make_test_state().await;
-        let mut req = create_request(tmp.path().to_string_lossy().to_string());
-        req.mode = Some("branch".to_string());
-        req.base_branch = Some("does-not-exist".to_string());
-
-        let Json(response) = create_conversation_with_id(state, req, Vec::new())
-            .await
-            .expect("branch intent accepted before git validation");
-        assert_eq!(
-            response.conversation["state"]["type"].as_str(),
-            Some("provisioning")
-        );
     }
 
     #[tokio::test]
@@ -12929,8 +12659,6 @@ pub(crate) mod api_test_support {
             .is_empty());
     }
 
-
-
     #[tokio::test]
     async fn coordinator_cached_pr_summary_is_absent() {
         let state = make_test_state().await;
@@ -13719,10 +13447,6 @@ pub(crate) mod api_test_support {
             .expect("accept direct turn");
     }
 
-
-
-
-
     #[test]
     fn ordinary_mutation_admission_preserves_close_and_history_fences() {
         use phoenix_core::domain::close::{CloseAttemptId, ClosePhase};
@@ -14068,8 +13792,6 @@ pub(crate) mod api_test_support {
         .await
         .expect("later idle cancellation repairs deferred steering wake");
     }
-
-
 
     #[tokio::test]
     async fn cancel_rejects_awaiting_continuation_without_changing_state() {
@@ -14465,27 +14187,10 @@ pub(crate) mod api_test_support {
         assert_eq!(paths, vec!["src/right.rs"]);
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     /// Hand-rolled property-style sweep: across a small set of arbitrary
     /// (id, mode) combinations, every successful cascade leaves the in-
     /// memory bash and tmux registries clean of any reference to the
     /// deleted conversation.
-
 
     /// Build a 2-member chain via raw SQL — same trick as the chains.rs
     /// test helper. The cascade tests only need the linkage; they don't
@@ -15321,13 +15026,11 @@ pub(crate) mod api_test_support {
     /// resolved `inheritor_scope = None` for a sub-agent and SIGKILL'd the
     /// parent's b-* handles.
 
-
     /// Counterpart: when the conversation being deleted is the LAST live
     /// conversation on its scope (no continuation, no live sibling), the
     /// cascade must tear the scope down — the deleted conv reads
     /// non-terminal in the DB at cascade time, so excluding it from the
     /// live-owner enumeration is what lets teardown fire.
-
 
     /// Build a real git repo + shared worktree with a parent + sub-agent
     /// pair of Work-mode conversations bound to it. The sub-agent points at the
@@ -15399,11 +15102,9 @@ pub(crate) mod api_test_support {
     /// the parent's still-in-use checkout — destructive data loss against a
     /// live conversation. The any-live-owner signal must suppress it.
 
-
     /// Counterpart: deleting the LAST live owner of the worktree scope (the
     /// parent here, with no live sibling) must still reap the worktree and
     /// the task branch as a normal solo Work conversation would.
-
 
     /// The cleanup cascade fails loud when the sibling-liveness lookup cannot
     /// reach the DB. Proceeding on a fail-closed "assume live" would skip every
@@ -15462,8 +15163,6 @@ pub(crate) mod api_test_support {
              cascade, not silently preserve-and-archive; got {result:?}"
         );
     }
-
-
 
 }
 
@@ -16435,13 +16134,7 @@ mod upgrade_model_state_guard_tests {
 
 #[cfg(test)]
 mod user_ref_tests {
-    #[test]
-    fn rejects_flaglike_branch() {
-        assert!(super::validate_user_ref("--upload-pack=touch /tmp/pwned").is_err());
-        assert!(super::validate_user_ref("-x").is_err());
-        assert!(super::validate_user_ref("feature/login").is_ok());
-        assert!(super::validate_user_ref("main").is_ok());
-    }
+
 }
 
 #[cfg(test)]
@@ -20520,69 +20213,4 @@ mod detached_task_worktree_tests {
         }
     }
 
-    #[test]
-    fn detached_task_cleanup_reaps_worktree_without_deleting_source_branch() {
-        let repo = tempfile::tempdir().unwrap();
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test"]);
-        std::fs::write(repo.path().join("task.md"), "approved").unwrap();
-        git(repo.path(), &["add", "task.md"]);
-        git(repo.path(), &["commit", "-m", "approved"]);
-        let approved_oid = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string();
-        git(repo.path(), &["branch", "task-approved", &approved_oid]);
-        let target = repo.path().join(".phoenix/worktrees/detached-target");
-        create_detached_task_worktree_blocking(
-            repo.path().to_str().unwrap(),
-            &target,
-            &approved_oid,
-        )
-        .unwrap_or_else(|_| panic!("create detached target"));
-        let conversation = detached_work_conversation(&target);
-        assert_eq!(
-            crate::runtime::cleanup_branch_for_unretained_work_scope(&target, [&conversation]),
-            None
-        );
-        git(
-            repo.path(),
-            &["worktree", "remove", "--force", target.to_str().unwrap()],
-        );
-        assert_eq!(
-            git(repo.path(), &["rev-parse", "--verify", "task-approved"]).trim(),
-            approved_oid
-        );
-    }
-
-    #[test]
-    fn detached_task_target_is_pinned_to_approved_oid_after_branch_moves() {
-        let repo = tempfile::tempdir().unwrap();
-        git(repo.path(), &["init", "-b", "main"]);
-        git(repo.path(), &["config", "user.email", "test@example.com"]);
-        git(repo.path(), &["config", "user.name", "Test"]);
-        std::fs::write(repo.path().join("task.md"), "approved").unwrap();
-        git(repo.path(), &["add", "task.md"]);
-        git(repo.path(), &["commit", "-m", "approved"]);
-        let approved_oid = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string();
-        git(repo.path(), &["branch", "task-approved", &approved_oid]);
-        std::fs::write(repo.path().join("task.md"), "moved").unwrap();
-        git(repo.path(), &["add", "task.md"]);
-        git(repo.path(), &["commit", "-m", "source moved"]);
-        let moved_oid = git(repo.path(), &["rev-parse", "HEAD"]).trim().to_string();
-        git(repo.path(), &["branch", "-f", "task-approved", &moved_oid]);
-
-        let target = repo.path().join(".phoenix/worktrees/detached-target");
-        create_detached_task_worktree_blocking(
-            repo.path().to_str().unwrap(),
-            &target,
-            &approved_oid,
-        )
-        .unwrap_or_else(|_| panic!("create detached approved target"));
-        assert_eq!(git(&target, &["rev-parse", "HEAD"]).trim(), approved_oid);
-        validate_detached_task_worktree(&target, &approved_oid).unwrap();
-        assert!(validate_detached_task_worktree(&target, &moved_oid).is_err());
-        assert_eq!(
-            git(repo.path(), &["rev-parse", "--verify", "task-approved"]).trim(),
-            moved_oid
-        );
-    }
 }

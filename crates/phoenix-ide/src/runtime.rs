@@ -400,20 +400,7 @@ pub(crate) struct HandoffReviewRequest {
     pub response: oneshot::Sender<Result<HandoffReviewResponse, String>>,
 }
 
-pub struct TaskApprovalHandoffRequest {
-    pub parent_conversation_id: String,
-    pub approval: TaskApprovalHandoffData,
-    pub authority: AdmittedOperation,
-    pub response_tx: oneshot::Sender<Result<TaskApprovalHandoffResponse, String>>,
-}
-
 pub use phoenix_core::task_handoff::TaskApprovalHandoffData;
-
-#[derive(Debug, Clone)]
-pub struct TaskApprovalHandoffResponse {
-    pub successor_conv_id: String,
-    pub state_updated_at: DateTime<Utc>,
-}
 
 #[derive(Default)]
 struct ConversationMutexGates {
@@ -864,8 +851,6 @@ pub struct RuntimeManager {
     /// Channel for sub-agent cancel requests
     cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
     cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
-    handoff_tx: mpsc::Sender<TaskApprovalHandoffRequest>,
-    handoff_rx: RwLock<Option<mpsc::Receiver<TaskApprovalHandoffRequest>>>,
     /// Credential helper for recovery settlement (REQ-BED-030).
     credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     /// Receiver for browser session lifecycle edges. Taken once by
@@ -2608,7 +2593,6 @@ impl RuntimeManager {
     ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
-        let (handoff_tx, handoff_rx) = mpsc::channel(32);
         // Browser session lifecycle channel. Unbounded because the volume is
         // O(user-clicks-on-browser-tools) — a tightly bounded channel could
         // drop edges and desync the UI's "session live" indicator. The
@@ -2717,8 +2701,6 @@ impl RuntimeManager {
             spawn_rx: RwLock::new(Some(spawn_rx)),
             cancel_tx,
             cancel_rx: RwLock::new(Some(cancel_rx)),
-            handoff_tx,
-            handoff_rx: RwLock::new(Some(handoff_rx)),
             credential_helper,
             browser_lifecycle_rx: RwLock::new(Some(browser_lifecycle_rx)),
             bash_lifecycle_rx: RwLock::new(Some(bash_lifecycle_rx)),
@@ -4683,11 +4665,8 @@ impl RuntimeManager {
         // Take the receivers (can only be done once)
         let spawn_rx = self.spawn_rx.write().await.take();
         let cancel_rx = self.cancel_rx.write().await.take();
-        let handoff_rx = self.handoff_rx.write().await.take();
 
-        if let (Some(mut spawn_rx), Some(mut cancel_rx), Some(mut handoff_rx)) =
-            (spawn_rx, cancel_rx, handoff_rx)
-        {
+        if let (Some(mut spawn_rx), Some(mut cancel_rx)) = (spawn_rx, cancel_rx) {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -4699,46 +4678,12 @@ impl RuntimeManager {
                             let manager = Arc::clone(&manager);
                             tokio::spawn(async move { manager.handle_cancel_request(req).await; });
                         }
-                        Some(req) = handoff_rx.recv() => {
-                            manager.handle_task_handoff_request(req).await;
-                        }
                         else => break,
                     }
                 }
-                tracing::info!("Sub-agent/task-handoff handler stopped");
+                tracing::info!("Sub-agent handler stopped");
             });
         }
-    }
-
-    async fn handle_task_handoff_request(self: &Arc<Self>, req: TaskApprovalHandoffRequest) {
-        let TaskApprovalHandoffRequest {
-            parent_conversation_id,
-            approval,
-            mut authority,
-            response_tx,
-        } = req;
-        let result = self
-            .create_and_start_task_handoff(&parent_conversation_id, &approval, &mut authority)
-            .await;
-        let _ = response_tx.send(result);
-    }
-
-    async fn create_and_start_task_handoff(
-        self: &Arc<Self>,
-        parent_conversation_id: &str,
-        approval: &TaskApprovalHandoffData,
-        _authority: &mut AdmittedOperation,
-    ) -> Result<TaskApprovalHandoffResponse, String> {
-        let successor = self
-            .db
-            .create_task_approval_handoff_creation_job(parent_conversation_id, approval)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.kick_creation_worker();
-        Ok(TaskApprovalHandoffResponse {
-            successor_conv_id: successor.id,
-            state_updated_at: successor.state_updated_at,
-        })
     }
 
     async fn handle_runtime_exit(
@@ -6668,7 +6613,6 @@ impl RuntimeManager {
             .with_state_updated_at(initial_state_updated_at)
             .with_active_direct_turn(active_direct_turn)
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
-            .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
             .with_agent_config(agent_config);
         let runtime = if !is_sub_agent && !is_coordinator {
@@ -10933,39 +10877,6 @@ mod scope_liveness_tests {
                 .len(),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn admitted_task_handoff_persists_creation_job_before_authority_closes() {
-        let manager = Arc::new(test_manager().await);
-        create_handleless_work_conv(&manager, "handoff-parent", "/tmp", None).await;
-        let mut authority = manager.acquire_local_authority_pass().unwrap();
-        let approval = TaskApprovalHandoffData {
-            task_id: "12345".to_string(),
-            task_title: "Inherited handoff".to_string(),
-            title: "Inherited handoff".to_string(),
-            priority: crate::task_source::Priority::P1,
-            plan: "Do the work".to_string(),
-            task_file: "tasks/12345-p1-ready--inherited-handoff.md".to_string(),
-            artifact_body: "# Inherited handoff\n\nDo the work\n".to_string(),
-        };
-        let response = manager
-            .create_and_start_task_handoff("handoff-parent", &approval, &mut authority)
-            .await
-            .unwrap();
-        manager.signal_fatal_local_authority("test_handoff_after_commit");
-        let successor = manager
-            .db()
-            .get_conversation(&response.successor_conv_id)
-            .await
-            .unwrap();
-        assert!(matches!(successor.state, ConvState::Provisioning { .. }));
-        assert!(manager
-            .db()
-            .get_conversation_creation_job_for_conversation(&successor.id)
-            .await
-            .unwrap()
-            .is_some());
     }
 
     fn cancellation_boundary_spec(agent_id: &str) -> SubAgentSpec {

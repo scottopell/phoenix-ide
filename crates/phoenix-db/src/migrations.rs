@@ -24093,6 +24093,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_192_dismisses_pending_forks_without_deleting_history_or_children() {
+        let db = crate::Database::open_in_memory_prefix_for_test(191)
+            .await
+            .unwrap();
+        let origin = db
+            .create_conversation("fork-origin", "fork-origin", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let child = db
+            .create_conversation("fork-child", "fork-child", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(
+            "INSERT INTO fork_proposals (
+                 id, origin_conv_id, task_file, title, priority, body, status,
+                 fork_conv_id, refinement_conv_id, created_at, resolved_at
+             ) VALUES
+                 ('pending-proposal', 'fork-origin', 'tasks/1.md', 'Pending', 'p2',
+                  'snapshot pending', 'pending', 'fork-child', 'fork-child',
+                  '2025-01-01T00:00:00Z', NULL),
+                 ('spawned-proposal', 'fork-origin', 'tasks/2.md', 'Spawned', 'p1',
+                  'snapshot spawned', 'spawned', 'fork-child', NULL,
+                  '2025-01-02T00:00:00Z', '2025-01-03T00:00:00Z')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(run_through_for_test(db.pool(), 192).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 192).await.unwrap(), 0);
+
+        let proposals: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, status, body, resolved_at FROM fork_proposals ORDER BY id",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(proposals.len(), 2);
+        assert_eq!(proposals[0].0, "pending-proposal");
+        assert_eq!(proposals[0].1, "dismissed");
+        assert_eq!(proposals[0].2, "snapshot pending");
+        assert!(proposals[0].3.is_some());
+        assert_eq!(proposals[1].0, "spawned-proposal");
+        assert_eq!(proposals[1].1, "spawned");
+        assert_eq!(proposals[1].2, "snapshot spawned");
+        assert_eq!(proposals[1].3.as_deref(), Some("2025-01-03T00:00:00Z"));
+        assert_eq!(db.get_conversation(&origin.id).await.unwrap().id, origin.id);
+        assert_eq!(db.get_conversation(&child.id).await.unwrap().id, child.id);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM work_scopes")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn migration_070_rejects_legacy_forks_and_cycles_transactionally() {
         for invalid_topology in [
             "PRAGMA foreign_keys = OFF;

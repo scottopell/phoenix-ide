@@ -573,7 +573,7 @@ struct PhoenixAPI: Sendable {
 
     func approveTask(
         conversationId: String,
-        handoff: TaskApprovalHandoff
+        handoff: TaskApprovalHandoff = .continueInCurrentConversation
     ) async throws {
         struct ApprovalResponse: Codable { var success: Bool? }
         _ = try await post(

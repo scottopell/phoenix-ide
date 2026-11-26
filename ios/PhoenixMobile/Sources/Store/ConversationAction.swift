@@ -62,5 +62,4 @@ enum ClientOperation {
 
 enum TaskApprovalHandoff: String, Equatable {
     case continueInCurrentConversation = "continue_in_current_conversation"
-    case startFreshWorkConversation = "start_fresh_work_conversation"
 }

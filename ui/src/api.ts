@@ -1367,7 +1367,7 @@ export interface DiscoveryServicesResponse {
   services: DiscoveredService[];
 }
 
-export type TaskApprovalHandoff = 'continue_in_current_conversation' | 'start_fresh_work_conversation';
+export type TaskApprovalHandoff = 'continue_in_current_conversation';
 
 export const streamApi = {
   subscribeToChainStream,
@@ -2766,7 +2766,7 @@ export const api = {
 
   async approveTask(
     convId: string,
-    handoff: TaskApprovalHandoff = 'start_fresh_work_conversation',
+    handoff: TaskApprovalHandoff = 'continue_in_current_conversation',
   ): Promise<{ success: boolean; first_task?: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/approve-task`, {
       method: 'POST',

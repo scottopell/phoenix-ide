@@ -156,6 +156,11 @@ pub(crate) async fn approve_task(
     require_task_lifecycle_admission(&state, &conv).await?;
 
     let handoff = body.map(|Json(req)| req.handoff).unwrap_or_default();
+    if handoff != phoenix_core::domain::sm_state::TaskApprovalHandoff::ContinueInCurrentConversation {
+        return Err(AppError::BadRequest(
+            "Starting a new conversation through task approval is no longer supported".to_string(),
+        ));
+    }
     // 3. Dispatch approval event to state machine
     state
         .runtime
