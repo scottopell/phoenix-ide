@@ -2650,6 +2650,8 @@ impl Database {
                 "product creation ownership token must not be empty".to_string(),
             ));
         }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let fence_now = self.product_creation_fence_now().max(now.timestamp_micros());
         let updated = sqlx::query(
             "UPDATE product_creation_resource_reservations
              SET ownership_token = ?7, updated_at_unix_micros = ?1
@@ -2665,15 +2667,16 @@ impl Database {
                      AND j.claim_lease_until_unix_micros > ?1
                )",
         )
-        .bind(datetime_to_unix_micros(now))
+        .bind(fence_now)
         .bind(request_id)
         .bind(claim.generation)
         .bind(resource_identity)
         .bind(&claim.worker_id)
         .bind(&claim.token)
         .bind(ownership_token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(updated.rows_affected() == 1)
     }
 
@@ -2690,6 +2693,8 @@ impl Database {
                 "product creation ownership token must not be empty".to_string(),
             ));
         }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let fence_now = self.product_creation_fence_now().max(now.timestamp_micros());
         let updated = sqlx::query(
             "UPDATE product_creation_resource_reservations
              SET status = 'present', ownership_token = ?7, updated_at_unix_micros = ?1
@@ -2703,15 +2708,16 @@ impl Database {
                      AND j.published_product_id IS NULL AND j.published_conversation_id IS NULL
                )",
         )
-        .bind(datetime_to_unix_micros(now))
+        .bind(fence_now)
         .bind(request_id)
         .bind(claim.generation)
         .bind(resource_identity)
         .bind(&claim.worker_id)
         .bind(&claim.token)
         .bind(ownership_token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(updated.rows_affected() == 1)
     }
 
@@ -2983,6 +2989,7 @@ impl Database {
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let fence_now = self.product_creation_fence_now().max(now.timestamp_micros());
         let reserved_id: Option<String> = sqlx::query_scalar(
             "UPDATE product_creation_jobs
              SET status = 'cleanup_ambiguous', retry_at_unix_micros = NULL,
@@ -2998,7 +3005,7 @@ impl Database {
              RETURNING product_conversation_id",
         )
         .bind(cleanup_error)
-        .bind(datetime_to_unix_micros(now))
+        .bind(fence_now)
         .bind(&cleanup.job.request_id)
         .bind(cleanup.claim.generation)
         .bind(&cleanup.claim.worker_id)
@@ -6132,6 +6139,18 @@ mod product_creation_tests {
             .await
             .unwrap()
             .unwrap();
+        let caller_now = Utc::now();
+        db.test_set_product_creation_now(cleanup.claim.lease_until);
+        assert!(!db
+            .mark_claimed_product_creation_cleanup_ambiguous(
+                &cleanup,
+                "expired claimant must not remove the aggregate",
+                caller_now,
+            )
+            .await
+            .unwrap());
+        assert!(db.get_conversation(conversation_id).await.is_ok());
+        db.test_set_product_creation_now(caller_now);
         assert!(db
             .mark_claimed_product_creation_cleanup_ambiguous(
                 &cleanup,
