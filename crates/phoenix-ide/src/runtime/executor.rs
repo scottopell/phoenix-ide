@@ -15707,18 +15707,6 @@ mod test_git_helpers {
             .unwrap();
         !String::from_utf8_lossy(&o.stdout).trim().is_empty()
     }
-
-    pub fn worktree_list(repo: &Path) -> String {
-        String::from_utf8_lossy(
-            &phoenix_core::git::command()
-                .args(["worktree", "list", "--porcelain"])
-                .current_dir(repo)
-                .output()
-                .unwrap()
-                .stdout,
-        )
-        .to_string()
-    }
 }
 
 /// Task 24696 Phase 3: verify the `Effect::NotifyContextExhausted` handler

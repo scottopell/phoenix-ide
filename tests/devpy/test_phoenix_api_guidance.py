@@ -191,7 +191,7 @@ class PhoenixApiGuidanceTests(unittest.TestCase):
     def test_non_exhaustive_policy_keeps_public_contract_and_scope_boundaries(self):
         skill = (REFERENCE.parent.parent / "SKILL.md").read_text()
         prompt = (ROOT / "crates/phoenix-ide/src/system_prompt.rs").read_text().split(
-            "#[cfg(test)]", 1
+            "\n#[cfg(test)]\nmod tests {", 1
         )[0]
         allium = (ROOT / "specs/builtin-skills/builtin-skills.allium").read_text()
         for content in (skill, self.reference, prompt):

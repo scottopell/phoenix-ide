@@ -811,8 +811,6 @@ pub struct RuntimeManager {
     #[cfg(test)]
     bash_reconciliation_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
-    fork_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
-    #[cfg(test)]
     runtime_authority_transfer_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     runtime_authority_sealed_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
@@ -2677,8 +2675,6 @@ impl RuntimeManager {
             terminal_cleanup_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             bash_reconciliation_barrier: AsyncMutex::new(None),
-            #[cfg(test)]
-            fork_runtime_start_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             runtime_authority_transfer_barrier: AsyncMutex::new(None),
             #[cfg(test)]

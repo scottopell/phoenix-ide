@@ -1320,8 +1320,12 @@ def scenario_coordinator_home(_base_url: str) -> None:
                 time.sleep(0.05)
             assert binding() == (scope, cwd)
             assert sentinel.read_text() == 'separate-worker-bytes'
-            deleted = httpx.post(f"{base_url}/api/conversations/{worker['id']}/delete", timeout=10)
-            deleted.raise_for_status()
+            closed_worker = _get_conv(base_url, worker['id'])
+            retired_delete = httpx.post(f"{base_url}/api/conversations/{worker['id']}/delete", timeout=10)
+            assert retired_delete.status_code == 404, retired_delete.text
+            retained_worker = _get_conv(base_url, worker['id'])
+            assert retained_worker['conversation']['archived']
+            assert retained_worker['messages'] == closed_worker['messages']
             assert binding() == (scope, cwd)
             assert Path(cwd, 'e2e-home-evidence.txt').read_text() == 'coordinator-home-proof'
             outside = root / 'data' / 'outside.txt'
