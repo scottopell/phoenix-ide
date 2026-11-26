@@ -3874,8 +3874,13 @@ fn inspect_worktree_at_with_git_leaf_until(
 
 #[derive(Debug)]
 enum InspectedHead {
-    Resolved { symbolic: Option<Vec<u8>>, oid: Vec<u8> },
-    Unborn { symbolic: Vec<u8> },
+    Resolved {
+        symbolic: Option<Vec<u8>>,
+        oid: Vec<u8>,
+    },
+    Unborn {
+        symbolic: Vec<u8>,
+    },
 }
 
 fn inspect_head_with_leaf_until(
@@ -3962,12 +3967,11 @@ fn verify_unborn_head_with_leaf_until(
     operation: &str,
     git_leaf: &mut WorktreeGitLeaf<'_>,
 ) -> Result<(), String> {
-    let mut show_ref_leaf = |mut command: std::process::Command,
-                             leaf_deadline,
-                             leaf_operation: &str| {
-        command.env("LC_ALL", "C");
-        git_leaf(command, leaf_deadline, leaf_operation)
-    };
+    let mut show_ref_leaf =
+        |mut command: std::process::Command, leaf_deadline, leaf_operation: &str| {
+            command.env("LC_ALL", "C");
+            git_leaf(command, leaf_deadline, leaf_operation)
+        };
     let exact_ref = run_bounded_git_command_with_leaf_until(
         repository,
         &["show-ref", "--exists", reference],
@@ -4123,12 +4127,8 @@ fn observe_detached_head_and_submodules_with_leaf_until(
         }
         let mut visited = std::collections::HashSet::new();
         visited.insert(path.canonicalize().map_err(|error| error.to_string())?);
-        let head = inspect_head_with_leaf_until(
-            path,
-            deadline,
-            "detached head inspection",
-            git_leaf,
-        )?;
+        let head =
+            inspect_head_with_leaf_until(path, deadline, "detached head inspection", git_leaf)?;
         let mut result = Vec::new();
         let (symbolic, head_oid) = match head {
             InspectedHead::Resolved { symbolic, oid } => (symbolic, Some(oid)),
@@ -4311,10 +4311,7 @@ fn detached_unreachable_commits_with_leaf_until(
     )?;
     let stash_exists = if stash.status.success() {
         true
-    } else if stash.status.code() == Some(1)
-        && stash.stdout.is_empty()
-        && stash.stderr.is_empty()
-    {
+    } else if stash.status.code() == Some(1) && stash.stdout.is_empty() && stash.stderr.is_empty() {
         false
     } else {
         return Err(String::from_utf8_lossy(&stash.stderr).trim().to_string());
@@ -16403,11 +16400,7 @@ mod tests {
 
     #[cfg(unix)]
     fn synthetic_inspection_output(stdout: Vec<u8>, success: bool) -> std::process::Output {
-        synthetic_inspection_output_raw(
-            stdout,
-            Vec::new(),
-            if success { 0 } else { 1 << 8 },
-        )
+        synthetic_inspection_output_raw(stdout, Vec::new(), if success { 0 } else { 1 << 8 })
     }
 
     #[cfg(unix)]
@@ -18330,7 +18323,11 @@ mod tests {
         let zero = "0".repeat(40);
         let mut log = String::new();
         for oid in 1..=1025 {
-            writeln!(log, "{oid:040x} {zero} User <user@example.test> 1 +0000\tcheckout").unwrap();
+            writeln!(
+                log,
+                "{oid:040x} {zero} User <user@example.test> 1 +0000\tcheckout"
+            )
+            .unwrap();
         }
         let error = super::parse_target_head_reflog_roots(
             log.as_bytes(),
@@ -18929,12 +18926,18 @@ mod tests {
         initialize_repository(temp.path());
         run_git(temp.path(), &["tag", "close-test-safe-base"]);
         std::fs::write(temp.path().join("tracked"), "unreachable history\n").unwrap();
-        run_git(temp.path(), &["commit", "--quiet", "-am", "reflog-only commit"]);
+        run_git(
+            temp.path(),
+            &["commit", "--quiet", "-am", "reflog-only commit"],
+        );
         let old_head = run_git_output(temp.path(), &["rev-parse", "HEAD"]);
         let branch = run_git_output(temp.path(), &["symbolic-ref", "--short", "HEAD"]);
         let branch_ref = format!("refs/heads/{branch}");
         run_git(temp.path(), &["update-ref", "-d", &branch_ref]);
-        run_git(temp.path(), &["symbolic-ref", "HEAD", "refs/heads/unborn-close-test"]);
+        run_git(
+            temp.path(),
+            &["symbolic-ref", "HEAD", "refs/heads/unborn-close-test"],
+        );
         std::fs::write(
             temp.path().join(".git/logs/HEAD"),
             format!(
@@ -19023,13 +19026,12 @@ mod tests {
         let output = match subcommand {
             Some("symbolic-ref") => {
                 reads.symbolic += 1;
-                let branch = if scenario == UnbornHeadScenario::ReboundSymbolicHead
-                    && reads.symbolic > 1
-                {
-                    b"refs/heads/other\n".to_vec()
-                } else {
-                    b"refs/heads/main\n".to_vec()
-                };
+                let branch =
+                    if scenario == UnbornHeadScenario::ReboundSymbolicHead && reads.symbolic > 1 {
+                        b"refs/heads/other\n".to_vec()
+                    } else {
+                        b"refs/heads/main\n".to_vec()
+                    };
                 synthetic_inspection_output(branch, true)
             }
             Some("rev-parse") => {
@@ -19074,7 +19076,8 @@ mod tests {
                     }
                     UnbornHeadScenario::DiagnosticAbsentRef => synthetic_inspection_output_raw(
                         Vec::new(),
-                        b"error: reference does not exist\nwarning: incomplete ref lookup\n".to_vec(),
+                        b"error: reference does not exist\nwarning: incomplete ref lookup\n"
+                            .to_vec(),
                         2 << 8,
                     ),
                     _ => synthetic_inspection_output_raw(
@@ -19093,11 +19096,10 @@ mod tests {
     fn assert_unborn_head_scenario(scenario: UnbornHeadScenario) {
         let (temp, _) = synthetic_inspection_repository();
         let mut reads = HeadReadCounts::default();
-        let mut leaf = |command: std::process::Command,
-                        deadline: std::time::Instant,
-                        operation: &str| {
-            synthetic_head_inspection_output(command, deadline, operation, scenario, &mut reads)
-        };
+        let mut leaf =
+            |command: std::process::Command, deadline: std::time::Instant, operation: &str| {
+                synthetic_head_inspection_output(command, deadline, operation, scenario, &mut reads)
+            };
         let result = super::inspect_head_with_leaf_until(
             temp.path(),
             std::time::Instant::now() + std::time::Duration::from_secs(5),
@@ -19107,7 +19109,10 @@ mod tests {
         if scenario == UnbornHeadScenario::GenuineUnborn {
             assert!(matches!(result, Ok(super::InspectedHead::Unborn { .. })));
         } else {
-            assert!(result.is_err(), "{scenario:?} must not be classified as unborn");
+            assert!(
+                result.is_err(),
+                "{scenario:?} must not be classified as unborn"
+            );
         }
     }
 
@@ -19183,9 +19188,7 @@ mod tests {
                 &["rev-parse", "--absolute-git-dir"],
             ))
             .join("logs/HEAD"),
-            format!(
-                "{abandoned} {safe_a} Synthetic <test@example.com> 0 +0000\treset: old-only\n"
-            ),
+            format!("{abandoned} {safe_a} Synthetic <test@example.com> 0 +0000\treset: old-only\n"),
         )
         .unwrap();
 
