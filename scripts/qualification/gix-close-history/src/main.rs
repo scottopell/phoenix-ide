@@ -89,7 +89,7 @@ fn inventory(
         }
     }
     if let Some(stash) = repo.try_find_reference("refs/stash")?
-        && stash.name().as_bstr().as_slice() == b"refs/stash"
+        && &stash.name().as_bstr()[..] == b"refs/stash"
     {
         charge(deadline, &mut remaining)?;
         add_durable(repo, stash, &mut durable)?;
