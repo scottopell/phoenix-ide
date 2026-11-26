@@ -268,7 +268,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         }
         let terminal = matches!(self.state.step_result(), StepResult::Terminal(_));
         if terminal && !fatal {
-            self.emit_terminal_lifecycle_event().await;
+            self.emit_terminal_lifecycle_event();
         }
         let interrupted =
             self.creation_settlement_disposition == CreationSettlementDisposition::StaleAuthority;
