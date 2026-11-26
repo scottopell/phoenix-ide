@@ -89,7 +89,7 @@ use phoenix_tools as tools;
 use phoenix_db as db;
 
 use api::{create_router, AppState};
-use db::{Conversation, Database};
+use db::Database;
 use phoenix_llm::{LlmConfig, ModelRegistry};
 use std::future::IntoFuture;
 use std::net::{IpAddr, SocketAddr};

@@ -33,7 +33,7 @@ use tokio_stream::StreamExt;
 use ts_rs::TS;
 
 use super::handlers::AppError;
-use super::types::{ConflictErrorResponse, SuccessResponse};
+use super::types::SuccessResponse;
 use super::wire::ChainSseWireEvent;
 use super::AppState;
 use crate::chain_qa::ChainQaError;

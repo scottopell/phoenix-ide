@@ -24,7 +24,7 @@ use phoenix_core::domain::db_schema::Conversation;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use ts_rs::TS;
 
 // ============================================================

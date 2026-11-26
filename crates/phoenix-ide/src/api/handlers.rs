@@ -47,9 +47,7 @@ use super::types::{
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
-use crate::db::{
-    ConvMode, ConversationUsage, DbError, ImageData, NotificationSettings, RetrievalRequest,
-};
+use crate::db::{ConversationUsage, DbError, ImageData, NotificationSettings, RetrievalRequest};
 use crate::git_ops::run_git;
 use crate::runtime::SseEvent;
 use crate::state_machine::{ConvState, Event};
@@ -14401,7 +14399,7 @@ pub(crate) mod api_test_support {
                 "/tmp",
                 &root.id,
                 "test-model",
-                &ConvMode::Direct,
+                &crate::db::ConvMode::Direct,
                 root.llm_language,
                 scope,
                 phoenix_db::SubAgentExecution {
@@ -15954,7 +15952,7 @@ mod upgrade_model_state_guard_tests {
                 "/tmp",
                 &parent.id,
                 "gpt-5.6-sol",
-                &ConvMode::Direct,
+                &crate::db::ConvMode::Direct,
                 parent.llm_language,
                 parent.attached_work_scope_id.as_ref(),
                 phoenix_db::SubAgentExecution {

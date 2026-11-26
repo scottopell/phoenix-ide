@@ -41,11 +41,7 @@ use crate::system_prompt::{
 use crate::tools::{BashProgressSink, BrowserSessionManager, ToolContext};
 use chrono::{DateTime, Utc};
 use phoenix_core::domain::conversation_goal::ToolRoundResult;
-use phoenix_core::domain::db_schema::{
-    merge_duration_into_display_data, tool_result_message_content, tool_result_transcript_content,
-    FinalizedToolResult,
-};
-use phoenix_core::domain::tool_round::tool_result_message;
+use phoenix_core::domain::db_schema::{tool_result_message_content, FinalizedToolResult};
 use phoenix_llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
 };
@@ -5567,7 +5563,7 @@ where
                                         result
                                     }
                                     effect => {
-                                        self.execute_authoritative_effect(effect, admitted, None)
+                                        self.execute_authoritative_effect(effect, admitted)
                                             .await
                                     }
                                 },
@@ -5611,7 +5607,6 @@ where
                                     terminal_unit_admission
                                         .as_deref_mut()
                                         .expect("terminal direct-turn unit is admitted"),
-                                    None,
                                 )
                                 .await
                             }
@@ -9332,12 +9327,8 @@ where
                     conversation_id = %self.context.conversation_id,
                     "Dispatching LLM request after steering drain"
                 );
-                match Box::pin(self.execute_authoritative_effect(
-                    AuthoritativeEffect::RequestLlm,
-                    admitted,
-                    None,
-                ))
-                .await
+                let effect = AuthoritativeEffect::RequestLlm;
+                match Box::pin(self.execute_authoritative_effect(effect, admitted)).await
                 {
                     Ok(event) => Ok(event),
                     Err(error) => Ok(Some(self.llm_dispatch_failure_event(error))),
@@ -10738,7 +10729,6 @@ where
                     assistant_message,
                     tool_results,
                     Some(settlement),
-                    None,
                     admitted,
                 )
                 .await;
@@ -10832,13 +10822,7 @@ where
                     .any(|result| matches!(result, ToolRoundResult::PendingSelfGoal { .. }))
                 {
                     return self
-                        .persist_self_goal_checkpoint(
-                            assistant_message,
-                            tool_results,
-                            None,
-                            None,
-                            admitted,
-                        )
+                        .persist_self_goal_checkpoint(assistant_message, tool_results, None, admitted)
                         .await;
                 }
 
@@ -13983,7 +13967,8 @@ mod strip_tool_blocks_tests {
     }
 }
 
-pub(crate) use crate::git_ops::run_git;
+#[cfg(test)]
+use crate::git_ops::run_git;
 
 fn detect_plain_markdown_task_stem(task_file: &str) -> Option<String> {
     let filename = std::path::Path::new(task_file).file_name()?.to_str()?;
@@ -19767,7 +19752,7 @@ mod authoritative_user_message_effect_tests {
 
 #[cfg(test)]
 mod approved_explore_follow_up_tests {
-    use super::test_git_helpers::{add_explore_worktree, add_worktree, init_repo};
+    use super::test_git_helpers::{add_worktree, init_repo};
     use super::*;
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::ConvContext;
@@ -19986,9 +19971,34 @@ mod approved_explore_follow_up_tests {
     }
 
     #[tokio::test]
-    async fn initial_approval_preserves_existing_checkout() {
+    async fn initial_approval_preserves_detached_checkout_and_index_bytes() {
         let (_tmp, repo_root) = init_repo();
-        let worktree = add_explore_worktree(&repo_root, "approved-explore-follow-up", "main");
+        let common = repo_root.join(".git");
+        let worktree = common.join("phoenix-worktrees/approved-explore-follow-up");
+        run_git(
+            &repo_root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        )
+        .unwrap();
+        let tracked = worktree.join("notes.txt");
+        std::fs::write(&tracked, "staged bytes\n").unwrap();
+        run_git(&worktree, &["add", "notes.txt"]).unwrap();
+        std::fs::write(&tracked, "unstaged bytes\n").unwrap();
+        let index = run_git(
+            &worktree,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )
+        .unwrap();
+        let index_before = std::fs::read(index.trim()).unwrap();
+        let refs_before = run_git(&repo_root, &["show-ref"]).unwrap();
+        let main_head = run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap();
+        let head_before = run_git(&worktree, &["rev-parse", "HEAD"]).unwrap();
         std::fs::create_dir(worktree.join("tasks")).unwrap();
         let task_file = "tasks/72004-p1-ready--follow-up.md";
         let plan = "# Follow up\n\nImplement the first approved objective.\n";
@@ -20020,6 +20030,12 @@ mod approved_explore_follow_up_tests {
             .await
             .expect("initial approval");
 
+        assert_eq!(branch_before, "HEAD");
+        assert_eq!(std::fs::read(index.trim()).unwrap(), index_before);
+        assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "unstaged bytes\n");
+        assert_eq!(run_git(&repo_root, &["show-ref"]).unwrap(), refs_before);
+        assert_eq!(run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap(), main_head);
+        assert_eq!(run_git(&worktree, &["rev-parse", "HEAD"]).unwrap(), head_before);
         assert_eq!(
             run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
             branch_before,

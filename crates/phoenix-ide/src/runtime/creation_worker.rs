@@ -268,6 +268,7 @@ async fn process_claimed_product_creation(
         let persisted_ownership_token = Some(ownership_token.clone());
         let (worktree, ownership_token) = tokio::task::spawn_blocking({
             let repo_root = repo_root.clone();
+            let planned_path = planned_path.clone();
             let oid = oid.clone();
             move || {
                 let _lock = materialization_lock;
@@ -4348,9 +4349,12 @@ mod product_creation_staging_ownership_tests {
             Some("owner-token"),
         )
         .await
-        .unwrap();
+        .expect("join staging cleanup");
 
-        assert!(outcome.is_err());
+        assert_eq!(
+            outcome.expect_err("ignored content must block cleanup"),
+            "unpublished worktree contains changes or ignored files"
+        );
         assert_eq!(std::fs::read_to_string(ignored).unwrap(), "preserve me");
         assert_eq!(std::fs::read_to_string(exclude).unwrap(), "ignored-data\n");
         assert!(
