@@ -1,0 +1,12 @@
+[package]
+name = "gix-close-history-probe"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+
+[workspace]
+
+[dependencies]
+gix = { version = "=0.91.0", default-features = false, features = ["sha1", "sha256"] }
+gix-ref = { version = "=0.70.0", default-features = false, features = ["sha1", "sha256"] }
