@@ -6006,19 +6006,6 @@ impl Database {
                  SELECT lease_until AS deadline
                  FROM conversation_creation_jobs
                  WHERE status = 'claimed'
-                 UNION ALL
-                 SELECT CASE
-                            WHEN cleanup_lease_until IS NOT NULL
-                            THEN cleanup_lease_until
-                            ELSE updated_at
-                        END AS deadline
-                 FROM conversation_creation_jobs
-                 WHERE status IN ('cancelling', 'deletion_pending')
-                    OR (status = 'failed' AND EXISTS (
-                        SELECT 1 FROM conversation_creation_resource_reservations r
-                        WHERE r.job_id = conversation_creation_jobs.id
-                          AND r.status != 'released'
-                    ))
              )",
         )
         .fetch_one(&self.pool)
@@ -18624,7 +18611,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creation_cleanup_retry_clears_lease_and_uses_retry_deadline() {
+    async fn legacy_cleanup_retry_stays_out_of_creation_scheduler_deadline() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-cleanup-retry", "conv-cleanup-retry").await;
         let now = Utc::now();
@@ -18649,10 +18636,7 @@ mod tests {
                 .unwrap(),
             CreationCasOutcome::Applied
         );
-        assert_eq!(
-            db.next_conversation_creation_deadline().await.unwrap(),
-            Some(retry_at)
-        );
+        assert_eq!(db.next_conversation_creation_deadline().await.unwrap(), None);
         assert!(db
             .claim_next_conversation_creation_cleanup(
                 "cleanup-b",
@@ -18676,7 +18660,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creation_cleanup_deadline_waits_for_live_cleanup_lease() {
+    async fn creation_scheduler_deadline_ignores_legacy_cleanup_lease() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-cleanup-deadline", "conv-cleanup-deadline").await;
         let now = Utc::now();
@@ -18696,10 +18680,7 @@ mod tests {
             .expect("cleanup claim");
 
         assert_eq!(cleanup.lease_until, now + lease_duration);
-        assert_eq!(
-            db.next_conversation_creation_deadline().await.unwrap(),
-            Some(cleanup.lease_until)
-        );
+        assert_eq!(db.next_conversation_creation_deadline().await.unwrap(), None);
         assert!(db
             .claim_next_conversation_creation_cleanup(
                 "cleanup-b",

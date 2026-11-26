@@ -1323,38 +1323,6 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
                 .map_err(|db_error| db_error.to_string())?;
         }
     }
-    loop {
-        let Ok(_owner) = manager.acquire_local_authority_pass() else {
-            return Ok(());
-        };
-        let Some(cleanup) = manager
-            .db()
-            .claim_next_conversation_creation_cleanup(
-                &worker_id.0,
-                &uuid::Uuid::new_v4().to_string(),
-                chrono::Utc::now(),
-                chrono::Duration::seconds(30),
-            )
-            .await
-            .map_err(|error| error.to_string())?
-        else {
-            break;
-        };
-        if let Err(error) = reconcile_creation_cleanup(&cleanup) {
-            tracing::warn!(job_id = %cleanup.job_id, error = %error, "conversation creation cleanup will retry");
-            let _admitted = manager.acquire_local_authority_pass().map_err(|()| {
-                "creation cleanup retry rejected after fatal local authority closure".to_string()
-            })?;
-            manager
-                .db()
-                .schedule_conversation_creation_cleanup_retry(
-                    &cleanup,
-                    chrono::Utc::now() + chrono::Duration::seconds(30),
-                )
-                .await
-                .map_err(|db_error| db_error.to_string())?;
-        }
-    }
     drain_claimed_jobs(
         || manager.acquire_local_authority_pass(),
         || {
@@ -1392,13 +1360,6 @@ pub(crate) async fn drain_pending_jobs(manager: &Arc<RuntimeManager>) -> Result<
         },
     )
     .await
-}
-
-fn reconcile_creation_cleanup(cleanup: &crate::db::CreationCleanupJob) -> Result<(), String> {
-    Err(format!(
-        "refusing legacy creation cleanup for job {}; resources and registrations are retained",
-        cleanup.job_id
-    ))
 }
 
 async fn renew_creation_claim_with_admission(
