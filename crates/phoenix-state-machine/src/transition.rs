@@ -3261,8 +3261,6 @@ pub fn transition_parent(
                         .with_effect(Effect::notify_state_change()),
                     );
                 }
-
-
             }
 
             // REQ-AUQ-001: ask_user_question interception. Same shape as
@@ -10063,8 +10061,7 @@ mod tests {
             assert!(
                 !result.effects.iter().any(|effect| matches!(
                     effect,
-                    Effect::ApproveTask { .. }
-                        | Effect::ResolveTask { .. }
+                    Effect::ApproveTask { .. } | Effect::ResolveTask { .. }
                 )),
                 "proposal interception must not perform an approval or lifecycle Git effect"
             );
@@ -10289,7 +10286,10 @@ mod tests {
                 result.new_state
             );
             assert!(
-                !result.effects.iter().any(|e| matches!(e, Effect::ApproveTask { .. })),
+                !result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ApproveTask { .. })),
                 "an invalid file must not be approved"
             );
             assert!(

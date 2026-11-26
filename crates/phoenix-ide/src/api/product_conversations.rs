@@ -1661,7 +1661,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::api::handlers::{create_router, api_test_support::make_test_state};
+    use crate::api::handlers::{api_test_support::make_test_state, create_router};
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
     use phoenix_workflow::ClientTurnKey;
 

@@ -33,16 +33,12 @@ final class SSEParserTests: XCTestCase {
         return out
     }
 
-    func testAggregateDeletionEventDecodesExactMemberSet() {
+    func testRetiredDeletionEventDecodesAsUnknown() {
         let frame = SSEFrame(
             event: "conversation_hard_deleted",
             data: #"{"sequence_id":0,"conversation_id":"product","deleted_conversation_ids":["root","leaf"]}"#)
-
-        XCTAssertEqual(
-            ProductConversationDeletionEvent.decode(frame: frame),
-            ProductConversationDeletionEvent(
-                conversation_id: "product",
-                deleted_conversation_ids: ["root", "leaf"]))
+        guard case .other(type: "conversation_hard_deleted", seq: 0) = PhoenixEvent.decode(frame: frame)
+        else { return XCTFail("retired deletion must not decode as an actionable event") }
     }
 
     func testNamedEventWithDataDispatchesOnBlankLine() {
@@ -323,17 +319,6 @@ final class SSEParserTests: XCTestCase {
         XCTAssertEqual(messageId, "tool-result")
         XCTAssertEqual(durationMs, 1234)
     }
-    func testHardDeletionRetainsConversationIdentity() {
-        let json = #"{"sequence_id":11,"conversation_id":"c1"}"#
-        guard case .conversationHardDeleted(let sequence, let conversationId) =
-            PhoenixEvent.decode(frame: SSEFrame(event: "conversation_hard_deleted", data: json))
-        else {
-            return XCTFail("expected a decoded hard-deletion event")
-        }
-        XCTAssertEqual(sequence, 11)
-        XCTAssertEqual(conversationId, "c1")
-    }
-
     @MainActor
     func testNetworkLossImmediatelyMovesAnOpenSessionOffline() {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
@@ -367,16 +352,4 @@ final class SSEParserTests: XCTestCase {
         XCTAssertTrue(retryable)
     }
 
-    func testHardDeleteEventCarriesConversationIdentity() {
-        let frame = SSEFrame(
-            event: "conversation_hard_deleted",
-            data: "{\"type\":\"conversation_hard_deleted\",\"sequence_id\":42,\"conversation_id\":\"c1\"}")
-        guard case .conversationHardDeleted(let seq, let conversationId) =
-            PhoenixEvent.decode(frame: frame)
-        else {
-            return XCTFail("expected typed hard-delete event")
-        }
-        XCTAssertEqual(seq, 42)
-        XCTAssertEqual(conversationId, "c1")
-    }
 }

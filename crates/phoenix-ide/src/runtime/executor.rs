@@ -5645,10 +5645,7 @@ where
                         }
                     }
                 } else {
-                    Box::pin(
-                        self.execute_effect(effect),
-                    )
-                    .await
+                    Box::pin(self.execute_effect(effect)).await
                 };
                 if state_committed
                     && clears_pending_trusted_after_commit
@@ -12626,7 +12623,12 @@ where
                 return Err(error);
             }
         };
-        let TaskApprovalInput { title, priority, plan, .. } = approval;
+        let TaskApprovalInput {
+            title,
+            priority,
+            plan,
+            ..
+        } = approval;
         let approval_msg = format!(
             "Task approved in the current environment at {}.\n\n## Approved plan: {title}\n\nPriority: {priority}\n\n{plan}",
             cwd.display(),
@@ -12669,7 +12671,9 @@ where
             Ok(establishment) => establishment,
             Err(error) => {
                 self.recovery_disposition = RuntimeRecoveryDisposition::RecreateFromDatabase;
-                return Err(format!("approval persistence failed; recreate actor from database: {error}"));
+                return Err(format!(
+                    "approval persistence failed; recreate actor from database: {error}"
+                ));
             }
         };
         if matches!(
@@ -12681,7 +12685,9 @@ where
         }
         if let Err(error) = self.install_live_state(approved_state, state_updated_at, true) {
             admitted.close("approval_authority_projection");
-            return Err(format!("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: approval projection failed: {error}"));
+            return Err(format!(
+                "FATAL_LOCAL_AUTHORITY_UNCLASSIFIED: approval projection failed: {error}"
+            ));
         }
 
         let _ = self
@@ -12754,7 +12760,6 @@ where
             });
         Ok(())
     }
-
 }
 
 /// Input for task approval, including the reviewed proposal provenance.
@@ -19898,8 +19903,8 @@ mod approved_explore_follow_up_tests {
         let task_file = "tasks/72006-p1-ready--direct-approval.md";
         let plan = "# Direct approval\n\nReviewed task snapshot.\n";
         std::fs::write(repo_root.join(task_file), plan).unwrap();
-        let status_before = run_git(&repo_root, &["status", "--porcelain"])
-            .expect("read status before approval");
+        let status_before =
+            run_git(&repo_root, &["status", "--porcelain"]).expect("read status before approval");
         let head_before = run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap();
         let branch_before = run_git(&repo_root, &["branch", "--show-current"]).unwrap();
 
@@ -19930,7 +19935,10 @@ mod approved_explore_follow_up_tests {
             .await
             .expect("direct approval should settle without Git mutations");
 
-        assert_eq!(run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap(), head_before);
+        assert_eq!(
+            run_git(&repo_root, &["rev-parse", "HEAD"]).unwrap(),
+            head_before
+        );
         assert_eq!(
             run_git(&repo_root, &["branch", "--show-current"]).unwrap(),
             branch_before
@@ -19940,7 +19948,10 @@ mod approved_explore_follow_up_tests {
             status_before,
             "approval must preserve staged, unstaged, and untracked changes"
         );
-        assert_eq!(std::fs::read_to_string(&tracked).unwrap(), "partially staged version\n");
+        assert_eq!(
+            std::fs::read_to_string(&tracked).unwrap(),
+            "partially staged version\n"
+        );
         assert_eq!(storage.recorded_messages().len(), 1);
         let objective = storage
             .approved_task_authority("approved-explore-follow-up")
@@ -20013,7 +20024,10 @@ mod approved_explore_follow_up_tests {
             run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
             branch_before,
         );
-        assert_eq!(std::fs::read_to_string(worktree.join(task_file)).unwrap(), plan);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(task_file)).unwrap(),
+            plan
+        );
         assert_eq!(storage.recorded_messages().len(), 1);
         assert_eq!(runtime.state, ConvState::LlmRequesting { attempt: 1 });
         let objective = storage
@@ -20253,10 +20267,22 @@ mod approved_explore_follow_up_tests {
             .await
             .expect("follow-up approval");
 
-        assert_eq!(std::fs::read_to_string(worktree.join(task_file)).unwrap(), plan);
-        assert_eq!(run_git(&worktree, &["rev-parse", "HEAD"]).unwrap(), head_before);
-        assert_eq!(run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(), branch_before);
-        assert_eq!(run_git(&worktree, &["status", "--porcelain=v1"]).unwrap(), status_before);
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(task_file)).unwrap(),
+            plan
+        );
+        assert_eq!(
+            run_git(&worktree, &["rev-parse", "HEAD"]).unwrap(),
+            head_before
+        );
+        assert_eq!(
+            run_git(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap(),
+            branch_before
+        );
+        assert_eq!(
+            run_git(&worktree, &["status", "--porcelain=v1"]).unwrap(),
+            status_before
+        );
         assert_eq!(storage.recorded_messages().len(), 1);
         assert_eq!(runtime.state, ConvState::LlmRequesting { attempt: 1 });
         assert_eq!(

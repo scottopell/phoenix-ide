@@ -197,7 +197,9 @@ async fn process_claimed_product_creation(
         .await?;
         let planned_path = match job.staging_path.as_deref() {
             Some(path) => PathBuf::from(path),
-            None => product_worktree_path(Path::new(&repo_root), job.product_conversation_id.as_str())?,
+            None => {
+                product_worktree_path(Path::new(&repo_root), job.product_conversation_id.as_str())?
+            }
         };
         let reservation_id = format!("{}:worktree", job.request_id);
         let reserved = manager
@@ -895,7 +897,8 @@ async fn cleanup_unpublished_product_staging_path(
         if !status.is_empty() {
             return Err("unpublished worktree contains changes or ignored files".to_string());
         }
-        let oid = expected_oid.ok_or_else(|| "unpublished worktree has no durable checkout pin".to_string())?;
+        let oid = expected_oid
+            .ok_or_else(|| "unpublished worktree has no durable checkout pin".to_string())?;
         crate::api::handlers::validate_detached_task_worktree(&path, &oid)?;
         crate::git_ops::run_git(
             Path::new(&repo_root),
@@ -2277,7 +2280,6 @@ mod staging_diagnostic_tests {
     }
 }
 
-
 #[cfg(test)]
 mod product_creation_delivery_replay_tests {
     use super::*;
@@ -2679,10 +2681,9 @@ mod product_creation_delivery_replay_tests {
         let original_head =
             crate::git_ops::run_git(repo.as_path(), &["rev-parse", "HEAD"]).unwrap();
         assert_ne!(original_head.trim(), persisted_oid);
-        let worktree = product_worktree_path(
-            repo.as_path(),
-            claimed.job.product_conversation_id.as_str(),
-        ).unwrap();
+        let worktree =
+            product_worktree_path(repo.as_path(), claimed.job.product_conversation_id.as_str())
+                .unwrap();
         let result = Box::pin(process_product_creation_until_closed(&manager, claimed)).await;
         let job = db
             .get_product_creation_job("git-pin")
@@ -2721,10 +2722,9 @@ mod product_creation_delivery_replay_tests {
         let db = Database::open_in_memory().await.unwrap();
         let manager = test_runtime_manager(db.clone());
         let claimed = accept_and_claim_product_at(&db, "cancel-lock", repo.as_path()).await;
-        let worktree = product_worktree_path(
-            repo.as_path(),
-            claimed.job.product_conversation_id.as_str(),
-        ).unwrap();
+        let worktree =
+            product_worktree_path(repo.as_path(), claimed.job.product_conversation_id.as_str())
+                .unwrap();
         let worker = tokio::spawn({
             let manager = Arc::clone(&manager);
             let claimed = claimed.clone();
@@ -4313,7 +4313,11 @@ mod product_creation_staging_ownership_tests {
         let outcome = cleanup_unpublished_product_staging_path(
             Some(path.to_string_lossy().as_ref()),
             Some(repo.path().to_string_lossy().as_ref()),
-            Some(crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap().trim()),
+            Some(
+                crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"])
+                    .unwrap()
+                    .trim(),
+            ),
             Some("owner-token"),
         )
         .await
@@ -4349,9 +4353,11 @@ mod product_creation_staging_ownership_tests {
         assert!(outcome.is_err());
         assert_eq!(std::fs::read_to_string(ignored).unwrap(), "preserve me");
         assert_eq!(std::fs::read_to_string(exclude).unwrap(), "ignored-data\n");
-        assert!(crate::git_ops::run_git(repo.path(), &["status", "--porcelain"])
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::git_ops::run_git(repo.path(), &["status", "--porcelain"])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4395,7 +4401,11 @@ mod product_creation_staging_ownership_tests {
         let outcome = cleanup_unpublished_product_staging_path(
             Some(path.to_string_lossy().as_ref()),
             Some(repo.path().to_string_lossy().as_ref()),
-            Some(crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"]).unwrap().trim()),
+            Some(
+                crate::git_ops::run_git(repo.path(), &["rev-parse", "HEAD"])
+                    .unwrap()
+                    .trim(),
+            ),
             Some("original-owner"),
         )
         .await
@@ -4412,7 +4422,6 @@ mod product_creation_staging_ownership_tests {
         );
     }
 }
-
 
 #[cfg(test)]
 mod worktree_repository_ownership_tests {
@@ -4433,7 +4442,6 @@ mod worktree_repository_ownership_tests {
         assert_eq!(error.1, ErrorKind::InvalidRequest);
     }
 }
-
 
 #[cfg(test)]
 mod missing_resource_cleanup_tests {

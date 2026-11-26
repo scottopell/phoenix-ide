@@ -4,9 +4,8 @@
 use super::handlers::AppError;
 use super::types::{
     CancelCloseBeforeRetirementRequest, ConfirmCloseLossRetirementRequest,
-    ConfirmCloseStopWorkRequest, ConflictErrorResponse,
-    RetryCloseRetirementRequest, SuccessResponse, TaskApprovalRequest, TaskApprovalResponse,
-    TaskFeedbackRequest,
+    ConfirmCloseStopWorkRequest, ConflictErrorResponse, RetryCloseRetirementRequest,
+    SuccessResponse, TaskApprovalRequest, TaskApprovalResponse, TaskFeedbackRequest,
 };
 use super::AppState;
 use crate::close_service::run_legacy_close_compat;
@@ -156,7 +155,8 @@ pub(crate) async fn approve_task(
     require_task_lifecycle_admission(&state, &conv).await?;
 
     let handoff = body.map(|Json(req)| req.handoff).unwrap_or_default();
-    if handoff != phoenix_core::domain::sm_state::TaskApprovalHandoff::ContinueInCurrentConversation {
+    if handoff != phoenix_core::domain::sm_state::TaskApprovalHandoff::ContinueInCurrentConversation
+    {
         return Err(AppError::BadRequest(
             "Starting a new conversation through task approval is no longer supported".to_string(),
         ));

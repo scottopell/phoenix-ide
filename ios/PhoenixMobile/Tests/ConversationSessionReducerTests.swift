@@ -4,9 +4,7 @@ import XCTest
 
 final class ConversationSessionReducerTests: XCTestCase {
     @MainActor
-    private func makeSession(
-        onHardDeleted: @escaping (String) -> Void = { _ in }
-    ) -> ConversationSession {
+    private func makeSession() -> ConversationSession {
         DiskStore.baseDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("phoenix-session-tests-\(UUID().uuidString)")
         return ConversationSession(
@@ -15,8 +13,7 @@ final class ConversationSessionReducerTests: XCTestCase {
                 baseURL: URL(string: "https://phoenix.invalid")!,
                 password: nil,
                 allowSelfSigned: false)!,
-            connectivity: ConnectivityMonitor(),
-            onHardDeleted: onHardDeleted)
+            connectivity: ConnectivityMonitor())
     }
 
     private func json(_ raw: String) throws -> JSONValue {
@@ -152,9 +149,9 @@ final class ConversationSessionReducerTests: XCTestCase {
     }
 
     @MainActor
-    func testHardDeleteClearsLocalTranscriptAndSignalsOwner() async throws {
-        var deletedId: String?
-        let session = makeSession { deletedId = $0 }
+    func testRetiredDeletionEventKeepsLocalTranscript() async throws {
+        let session = makeSession()
+
         session.receive(.initSnapshot(.init(
             conversation: try conversation(),
             messages: [try message(id: "m1", content: "[]")],
@@ -164,14 +161,11 @@ final class ConversationSessionReducerTests: XCTestCase {
         XCTAssertTrue(initialSnapshotSaved)
         XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
 
-        session.receive(.conversationHardDeleted(seq: 1, conversationId: "c1"))
+        session.receive(.other(type: "conversation_hard_deleted", seq: 1))
 
-        XCTAssertTrue(session.isHardDeleted)
-        XCTAssertTrue(session.messages.isEmpty)
-        XCTAssertNil(session.conversation)
-        XCTAssertTrue(session.outbox.entries.isEmpty)
-        XCTAssertEqual(deletedId, "c1")
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
+        XCTAssertEqual(session.messages.count, 1)
+        XCTAssertNotNil(session.conversation)
+        XCTAssertTrue(ConversationSession.hasCachedSnapshot(conversationId: "c1"))
     }
 
     @MainActor

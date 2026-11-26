@@ -1226,7 +1226,6 @@ impl InMemoryStorage {
         *self.fail_watermark_write.lock().unwrap() = fail;
     }
 
-
     /// Read back the persisted steering queue for a conversation (test-only).
     pub fn get_steering_queue(
         &self,

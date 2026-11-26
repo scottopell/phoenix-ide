@@ -185,7 +185,7 @@ enum ProductHistoryLoadError: Error, LocalizedError, Equatable {
         case .segmentIdentityChanged: "Product History lineage changed while loading."
         case .missingCursor, .repeatedCursor: "The server returned an invalid Product History page cursor."
         case .staleServerGeneration: "Product History was invalidated while loading."
-        case .notFound: "This conversation was deleted or is no longer available."
+        case .notFound: "This conversation is no longer available."
         }
     }
 }
@@ -330,7 +330,6 @@ final class AppModel {
     private var closeActionGenerations = ProductActionGenerationTracker()
     private var productHistoryGenerations = ProductActionGenerationTracker()
     private var confirmationRehydrationGenerations = ProductActionGenerationTracker()
-    private(set) var deletedProductHistoryIds: Set<String> = []
     private(set) var pendingProductCloseConfirmation: PendingProductCloseConfirmation?
     private var pendingProductCloseResolution = ProductCloseResolutionTracker()
     var isResolvingPendingProductClose: Bool {
@@ -393,27 +392,18 @@ final class AppModel {
         let aggregateId = aggregateIdentity(forTranscriptRowId: conversationId)
             ?? ConversationSession.cachedConversation(conversationId: conversationId)?
                 .product_conversation_id
-        guard !deletedProductHistoryIds.contains(conversationId),
-              aggregateId.map({ !deletedProductHistoryIds.contains($0) }) ?? true
-        else { return nil }
         if let existing = sessions[conversationId] { return existing }
         let onConversationUpdate: (Conversation) -> Void = { [weak self] conversation in
             self?.handleSessionConversationUpdate(conversation, transcriptRowId: conversationId)
         }
-        let onHardDeleted: (String) -> Void = { [weak self] deletedId in
-            self?.handleHardDeleted(deletedId, aggregateIdentity: self?.aggregateIdentity(forTranscriptRowId: conversationId))
-        }
         let session: ConversationSession
         if let draining = drainSessions.removeValue(forKey: conversationId) {
-            draining.adoptOpenOwnership(
-                onConversationUpdate: onConversationUpdate,
-                onHardDeleted: onHardDeleted)
+            draining.adoptOpenOwnership(onConversationUpdate: onConversationUpdate)
             session = draining
         } else {
             session = ConversationSession(
                 conversationId: conversationId, api: api, connectivity: connectivity,
-                onConversationUpdate: onConversationUpdate,
-                onHardDeleted: onHardDeleted)
+                onConversationUpdate: onConversationUpdate)
         }
         sessions[conversationId] = session
         for aggregateId in closeAdmissionFencedProductConversationIds where sessionBelongsToAggregate(
@@ -474,24 +464,6 @@ final class AppModel {
                 aggregateIdentity: aggregateIdentity))
     }
 
-    private func handleHardDeleted(_ conversationId: String, aggregateIdentity: String?) {
-        let notificationId: String
-        if let aggregateIdentity {
-            listStore.remove(aggregateId: aggregateIdentity)
-            notificationId = aggregateIdentity
-        } else {
-            listStore.removeByTranscriptRowId(conversationId)
-            notificationId = conversationId
-        }
-        if pendingOpenConversationId == conversationId {
-            pendingOpenConversationId = nil
-        }
-        UNUserNotificationCenter.current().removeDeliveredNotifications(
-            withIdentifiers: ["attention-\(notificationId)"])
-        UNUserNotificationCenter.current().removePendingNotificationRequests(
-            withIdentifiers: ["attention-\(notificationId)"])
-    }
-
     private func restartAggregateEventStreamAfterConnectivityRestore() {
         aggregateEventTask?.cancel()
         aggregateEventTask = nil
@@ -548,11 +520,6 @@ final class AppModel {
                                 else { return }
                                 reconciliationRequired = false
                             }
-                            if let deletion = ProductConversationDeletionEvent.decode(frame: frame) {
-                                await self.handleAggregateHardDeleted(
-                                    deletion,
-                                    generation: generation)
-                            }
                         }
                     }
                     reconciliationRequired = true
@@ -573,24 +540,6 @@ final class AppModel {
                 try? await Task.sleep(for: .seconds(retryDelay))
             }
         }
-    }
-
-    private func handleAggregateHardDeleted(
-        _ deletion: ProductConversationDeletionEvent,
-        generation: Int
-    ) async {
-        guard apiGeneration == generation else { return }
-        let aggregateId = deletion.conversation_id
-        let cachedIds = cachedProductHistory(productConversationId: aggregateId)?
-            .snapshot.segments.map(\.transcript_row_id) ?? []
-        let transcriptIds = Set(
-            deletion.deleted_conversation_ids
-                + listStore.transcriptRowIds(forAggregateId: aggregateId)
-                + cachedIds)
-        _ = await removeProductHistoryLocally(
-            productConversationId: aggregateId,
-            transcriptIds: transcriptIds,
-            startedGeneration: generation)
     }
 
     func refreshList() async {
@@ -858,18 +807,7 @@ final class AppModel {
             guard apiGeneration == startedGeneration else {
                 throw ProductHistoryLoadError.staleServerGeneration
             }
-            let cachedTranscriptIds = cachedProductHistory(productConversationId: productConversationId)?
-                .snapshot.segments.map(\.transcript_row_id) ?? []
-            let transcriptIds = Set(
-                listStore.transcriptRowIds(forAggregateId: productConversationId)
-                    + cachedTranscriptIds)
-            guard await removeProductHistoryLocally(
-                productConversationId: productConversationId,
-                transcriptIds: transcriptIds,
-                startedGeneration: startedGeneration)
-            else {
-                throw ProductHistoryLoadError.staleServerGeneration
-            }
+            listStore.remove(aggregateId: productConversationId)
             throw ProductHistoryLoadError.notFound
         }
 
@@ -892,7 +830,6 @@ final class AppModel {
         else {
             throw ProductHistoryLoadError.staleServerGeneration
         }
-        deletedProductHistoryIds.remove(productConversationId)
         return cached
     }
 
@@ -1438,126 +1375,6 @@ final class AppModel {
                 actionGeneration, productConversationId: productConversationId)
     }
 
-    @discardableResult
-    func deleteHistoryConversation(_ conversation: Conversation) async -> Bool {
-        guard ClientOperation.delete.policy == .onlineOnly else { return false }
-        let startedGeneration = apiGeneration
-        guard let api, connectivity.isOnline else {
-            lastActionError = "Deleting needs a connection — it can't be queued."
-            return false
-        }
-        let cachedIds = cachedProductHistory(productConversationId: conversation.aggregateIdentity)?
-            .snapshot.segments.map(\.transcript_row_id) ?? []
-        let transcriptIds = Set(
-            listStore.transcriptRowIds(forAggregateId: conversation.aggregateIdentity)
-                + cachedIds
-                + [conversation.transcriptRowIdentity])
-        do {
-            let rootTranscriptRowId = try await Self.resolveProductHistoryRoot(
-                conversation: conversation,
-                fetch: { try await api.getProductConversation(reference: $0) })
-            guard apiGeneration == startedGeneration else { return false }
-            let outcome = try await api.deleteProductConversation(
-                rootTranscriptRowId: rootTranscriptRowId)
-            guard apiGeneration == startedGeneration else { return false }
-            let authoritativeIds = switch outcome {
-            case let .deleted(conversationIds): Set(conversationIds)
-            case .alreadyAbsent: Set<String>()
-            }
-            return await removeProductHistoryLocally(
-                productConversationId: conversation.aggregateIdentity,
-                transcriptIds: transcriptIds.union(authoritativeIds),
-                startedGeneration: startedGeneration)
-        } catch let error as APIError where error.isNotFound {
-            return await removeProductHistoryLocally(
-                productConversationId: conversation.aggregateIdentity,
-                transcriptIds: transcriptIds,
-                startedGeneration: startedGeneration)
-        } catch {
-            guard apiGeneration == startedGeneration else { return false }
-            lastActionError = error.localizedDescription
-            return false
-        }
-    }
-
-    nonisolated static func resolveProductHistoryRoot(
-        conversation: Conversation,
-        fetch: (String) async throws -> ProductConversationSnapshot
-    ) async throws -> String {
-        if let root = conversation.chain_root_id { return root }
-        return try await fetch(conversation.transcriptRowIdentity).canonical_root.transcript_row_id
-    }
-
-    private func removeProductHistoryLocally(
-        productConversationId: String,
-        transcriptIds: Set<String>,
-        startedGeneration: Int,
-        tombstonesInstalled: (() -> Void)? = nil
-    ) async -> Bool {
-        guard apiGeneration == startedGeneration else { return false }
-
-        let retainedTranscriptIds = Set(sessions.compactMap { transcriptId, session in
-            sessionBelongsToAggregate(
-                session,
-                transcriptId: transcriptId,
-                productConversationId: productConversationId) ? transcriptId : nil
-        }).union(drainSessions.compactMap { transcriptId, session in
-            sessionBelongsToAggregate(
-                session,
-                transcriptId: transcriptId,
-                productConversationId: productConversationId) ? transcriptId : nil
-        })
-        let allTranscriptIds = transcriptIds.union(retainedTranscriptIds)
-        deletedProductHistoryIds.insert(productConversationId)
-        deletedProductHistoryIds.formUnion(allTranscriptIds)
-        tombstonesInstalled?()
-
-        _ = productHistoryGenerations.begin(productConversationId: productConversationId)
-        let historyWriter = ProductHistorySnapshotStore.writer(
-            productConversationId: productConversationId)
-        let revision = historyWriter.reserveRevision()
-        await historyWriter.remove(revision: revision)
-        guard apiGeneration == startedGeneration else { return false }
-
-        for transcriptId in allTranscriptIds {
-            guard apiGeneration == startedGeneration else { return false }
-            let openOwner = sessions.removeValue(forKey: transcriptId)
-            let drainOwner = drainSessions.removeValue(forKey: transcriptId)
-            let owners = [openOwner, drainOwner].compactMap { $0 }
-            owners.forEach { $0.markHardDeleted() }
-
-            for session in owners {
-                guard apiGeneration == startedGeneration else { return false }
-                await session.clearCachedSnapshotAndWait()
-                guard apiGeneration == startedGeneration else { return false }
-                await session.outbox.clearAndWait()
-                guard apiGeneration == startedGeneration else { return false }
-            }
-            DiskStore.remove(name: "conv-\(transcriptId)")
-            DiskStore.remove(name: "outbox-\(transcriptId)")
-        }
-
-        guard apiGeneration == startedGeneration else { return false }
-        listStore.remove(aggregateId: productConversationId)
-        if pendingProductCloseConfirmation?.productConversationId == productConversationId {
-            pendingProductCloseConfirmation = nil
-            pendingProductCloseResolution.reset()
-        }
-        closingProductConversationIds.remove(productConversationId)
-        setProductCloseAdmissionFence(productConversationId: productConversationId, fenced: false)
-        _ = closeActionGenerations.begin(productConversationId: productConversationId)
-        _ = confirmationRehydrationGenerations.begin(
-            productConversationId: "pending-close-confirmation")
-        closeConfirmationReconciliationProductConversationIds.remove(productConversationId)
-        if pendingOpenConversationId == productConversationId
-            || allTranscriptIds.contains(pendingOpenConversationId ?? "")
-        {
-            pendingOpenConversationId = nil
-        }
-        removeAttentionNotifications(productConversationId: productConversationId)
-        return true
-    }
-
     #if DEBUG
     func installAPIForTesting(baseURL: URL = URL(string: "http://127.0.0.1:1")!) {
         apiGeneration &+= 1
@@ -1682,28 +1499,6 @@ final class AppModel {
             productConversationId: productConversationId)
     }
 
-    func removeProductHistoryLocallyForTesting(
-        productConversationId: String,
-        transcriptIds: Set<String>,
-        tombstonesInstalled: (() -> Void)? = nil
-    ) async -> Bool {
-        await removeProductHistoryLocally(
-            productConversationId: productConversationId,
-            transcriptIds: transcriptIds,
-            startedGeneration: apiGeneration,
-            tombstonesInstalled: tombstonesInstalled)
-    }
-
-    func handleAggregateHardDeletedForTesting(
-        productConversationId: String,
-        transcriptIds: [String]
-    ) async {
-        await handleAggregateHardDeleted(
-            ProductConversationDeletionEvent(
-                conversation_id: productConversationId,
-                deleted_conversation_ids: transcriptIds),
-            generation: apiGeneration)
-    }
     #endif
 
     private func removeAttentionNotifications(productConversationId: String) {
@@ -1990,11 +1785,7 @@ final class AppModel {
                     ? row.aggregateIdentity : nil
             }))
         for aggregateId in removed.sorted() {
-            guard await removeProductHistoryLocally(
-                productConversationId: aggregateId,
-                transcriptIds: locallyOwned[aggregateId] ?? [],
-                startedGeneration: startedGeneration)
-            else { return false }
+            listStore.remove(aggregateId: aggregateId)
         }
         guard !Task.isCancelled,
               apiGeneration == startedGeneration,
@@ -2122,7 +1913,6 @@ final class AppModel {
         closeConfirmationReconciliationProductConversationIds.removeAll()
         await DiskStore.removeAllAndWait()
         listStore.reset()
-        deletedProductHistoryIds.removeAll()
         attention.reset()
         UserDefaults.standard.removeObject(forKey: Self.coordinatorIdKey)
         coordinatorConversationId = nil

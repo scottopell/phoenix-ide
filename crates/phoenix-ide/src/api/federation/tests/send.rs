@@ -53,8 +53,7 @@ async fn fixture() -> (
     String,
     crate::db::Conversation,
 ) {
-    fixture_from_state(crate::api::handlers::api_test_support::make_test_state().await)
-        .await
+    fixture_from_state(crate::api::handlers::api_test_support::make_test_state().await).await
 }
 
 async fn fixture_from_state(

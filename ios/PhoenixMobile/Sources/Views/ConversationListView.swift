@@ -276,14 +276,7 @@ struct ConversationListView: View {
                         }
                     }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        if !isCoordinator && conversation.archived == true {
-                            Button(role: .destructive) {
-                                Task { await model.deleteHistoryConversation(conversation) }
-                            } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
-                            .disabled(!model.connectivity.isOnline)
-                        } else if !isCoordinator && conversation.product_close_action == .available {
+                        if if !isCoordinator && conversation.product_close_action == .available {
                             Button {
                                 Task { await model.closeProductConversation(conversation) }
                             } label: {

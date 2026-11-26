@@ -36,14 +36,7 @@ struct ConversationView: View {
                     .padding(.vertical, 4)
                     .background(.red.gradient)
             }
-            if session.isHardDeleted {
-                ContentUnavailableView {
-                    Label("Conversation deleted", systemImage: "trash")
-                } description: {
-                    Text("It was deleted from another Phoenix client.")
-                }
-                .frame(maxHeight: .infinity)
-            } else if isUncachedOffline {
+            if isUncachedOffline {
                 ContentUnavailableView {
                     Label("Not cached on this device", systemImage: "icloud.slash")
                 } description: {

@@ -41,7 +41,6 @@ enum ClientOperation {
     case chat
     case archive
     case close
-    case delete
     case readState
     case conversationAction(ConversationAction)
 
@@ -54,7 +53,7 @@ enum ClientOperation {
         switch self {
         case .chat:
             return .outboxed
-        case .archive, .close, .delete, .readState, .conversationAction:
+        case .archive, .close, .readState, .conversationAction:
             return .onlineOnly
         }
     }

@@ -9,9 +9,7 @@ use super::assets::{
     get_index_response, serve_favicon, serve_root_asset, serve_service_worker, serve_static,
     PUBLIC_ROOT_ASSETS,
 };
-use super::chains::{
-    archive_chain_handler, get_chain, stream_chain, submit_chain_question,
-};
+use super::chains::{archive_chain_handler, get_chain, stream_chain, submit_chain_question};
 use super::event_presentation::{enrich_messages, EventPresentations};
 use super::git_handlers::{
     create_pr_auto_fix_context, get_active_pr_diff, get_conversation_diff,
@@ -21,8 +19,7 @@ use super::git_handlers::{
 use super::global_read;
 use super::lifecycle_handlers::{
     abandon_task, approve_task, cancel_close_before_retirement, confirm_close_loss_retirement,
-    confirm_close_stop_work, mark_merged, reject_task,
-    retry_close_retirement, task_feedback,
+    confirm_close_stop_work, mark_merged, reject_task, retry_close_retirement, task_feedback,
 };
 use super::product_conversations::{
     close_product_conversation, get_product_conversation, list_product_conversation_creations,
@@ -13479,10 +13476,7 @@ pub(crate) mod api_test_support {
                 )),
                 Some("target_unavailable"),
             ),
-            (
-                MessageTargetAdmission::StandaloneAvailable,
-                None,
-            ),
+            (MessageTargetAdmission::StandaloneAvailable, None),
             (
                 MessageTargetAdmission::StandaloneArchived,
                 Some("target_unavailable"),
@@ -15163,7 +15157,6 @@ pub(crate) mod api_test_support {
              cascade, not silently preserve-and-archive; got {result:?}"
         );
     }
-
 }
 
 #[cfg(test)]
@@ -16133,9 +16126,7 @@ mod upgrade_model_state_guard_tests {
 }
 
 #[cfg(test)]
-mod user_ref_tests {
-
-}
+mod user_ref_tests {}
 
 #[cfg(test)]
 mod file_read_tests {
@@ -19201,10 +19192,9 @@ mod handoff_capacity_api_tests {
     #[allow(clippy::too_many_lines)] // complete API recovery scenario
     async fn exhausted_ordinary_and_coordinator_rows_support_review_and_regeneration() {
         for coordinator in [false, true] {
-            let state = super::api_test_support::make_test_state_with_llm(
-                std::sync::Arc::new(SummaryLlm),
-            )
-            .await;
+            let state =
+                super::api_test_support::make_test_state_with_llm(std::sync::Arc::new(SummaryLlm))
+                    .await;
             state.runtime.start_sub_agent_handler().await;
             let conversation = if coordinator {
                 state
@@ -20212,5 +20202,4 @@ mod detached_task_worktree_tests {
             spawned_from_conversation_id: None,
         }
     }
-
 }

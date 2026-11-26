@@ -189,8 +189,6 @@ pub async fn submit_chain_question(
     Ok(Json(SubmitChainQaResponse { chain_qa_id }))
 }
 
-
-
 /// Compatibility route for closing a legacy chain URL.
 /// Single-member roots use the per-conversation compatibility route. A chain
 /// resolves to its latest aggregate transcript and enters the same durable Close
@@ -1013,8 +1011,6 @@ mod tests {
         assert!(by_id["hw-c"].has_worktree, "Work has a worktree");
         assert!(by_id["hw-d"].has_worktree, "Branch has a worktree");
     }
-
-
 
     // ----- POST validation -----------------------------------------------
 

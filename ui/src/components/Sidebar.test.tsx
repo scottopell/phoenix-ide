@@ -7,7 +7,7 @@ import {
 import { act, render, fireEvent, waitFor } from '@testing-library/react';
 import { Link, MemoryRouter, useLocation } from 'react-router-dom';
 import { refreshProductConversationList } from '../conversation/productConversationList';
-import { ApiResponseError, ConflictError } from '../api';
+import { ConflictError } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 
 const { apiMock } = vi.hoisted(() => ({
