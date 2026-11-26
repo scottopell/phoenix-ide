@@ -430,6 +430,16 @@ mod tests {
     }
 
     async fn retained_loss_origin() -> (Database, NativeCloseCommand, CloseRunRef) {
+        retained_loss_origin_with_wire_shape(false).await
+    }
+
+    async fn retained_flat_loss_origin() -> (Database, NativeCloseCommand, CloseRunRef) {
+        retained_loss_origin_with_wire_shape(true).await
+    }
+
+    async fn retained_loss_origin_with_wire_shape(
+        legacy_flat: bool,
+    ) -> (Database, NativeCloseCommand, CloseRunRef) {
         let database = Database::open_in_memory().await.unwrap();
         let owner = database
             .get_or_create_coordinator(None, LlmLanguage::default())
@@ -448,18 +458,24 @@ mod tests {
             .unwrap();
         let work_scope =
             crate::close_foundation::allocate_scope_worktree(&database, &product.id).await;
-        let command = NativeCloseCommand::new(
+        let intent = NativeCloseIntent::Initial {
+            target: product.product_conversation_id,
+        };
+        let input = if legacy_flat {
+            intent.legacy_source_input()
+        } else {
+            intent.source_input()
+        };
+        let command = NativeCloseCommand::new_with_source_input(
             owner.id.clone(),
             SourceToolCall {
                 message_id: "loss-message".into(),
                 tool_use_id: "loss-call".into(),
             },
-            NativeCloseIntent::Initial {
-                target: product.product_conversation_id,
-            },
+            intent,
+            &input,
         )
         .unwrap();
-        let input = command.intent().source_input();
         let live = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "loss-call",
