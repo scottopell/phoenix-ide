@@ -30,6 +30,9 @@ NarrowWebKitMarkdownTable.storyName = 'narrow-webkit-markdown-table';
 export const NarrowWebKitMarkdownTableLight = storyFor('narrow-webkit-markdown-table-light');
 NarrowWebKitMarkdownTableLight.storyName = 'narrow-webkit-markdown-table-light';
 
+export const MobileLongMarkdownTable = storyFor('mobile-long-markdown-table');
+MobileLongMarkdownTable.storyName = 'mobile-long-markdown-table';
+
 export const WideMarkdownTable = storyFor('wide-markdown-table');
 WideMarkdownTable.storyName = 'wide-markdown-table';
 

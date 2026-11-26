@@ -357,6 +357,65 @@ export const narrowWebKitMarkdownTableMessages: Message[] = [
   },
 ];
 
+const mobileMarkdownTableMessages: Message[] = [
+  {
+    event_presentation: null,
+    message_id: 'user-mobile-table-1',
+    conversation_id: 'fixture-message-list-mobile-markdown-table',
+    sequence_id: 1,
+    type: 'user',
+    message_type: 'user',
+    created_at: '2025-01-01T10:00:00.000Z',
+    content: { text: 'Review the remaining mutations.' },
+    display_data: {},
+  },
+  {
+    event_presentation: null,
+    message_id: 'agent-mobile-table-1',
+    conversation_id: 'fixture-message-list-mobile-markdown-table',
+    sequence_id: 2,
+    type: 'agent',
+    message_type: 'agent',
+    created_at: '2025-01-01T10:01:00.000Z',
+    content: [{
+      type: 'text',
+      text: [
+        'There are still a few meaningful ones—including **automatic staging and committing**, not just worktree bookkeeping. I checked current main, including #1192, and traced the important callers so this isn’t merely a list of test helpers.',
+        '',
+        '### Remaining in the running product',
+        '',
+        '| Area | Mutations still present |',
+        '|---|---|',
+        '| **Environment creation** | Creates detached or branched worktrees. Some branch-based paths create local branches and configure their upstream. |',
+        '| **Branch refresh** | Fetches selected branches, updates remote-tracking refs, and in some paths fast-forwards an unchecked-out local branch using `update-ref`. |',
+        '| **Ignore setup** | Some creation paths append `.phoenix/` to the **originating checkout’s `.gitignore` and stage that file**. Other paths use `.git/info/exclude` instead. |',
+        '| **Fork-proposal approval** | Writes the task file, stages its paths, and **creates a commit**. This remains reachable through proposal approval. |',
+        '| **Cleanup / recovery** | Some hard-delete, failed-creation, fork-orphan, and startup-recovery paths still force-remove worktrees, prune registrations, and sometimes force-delete owned branches. Startup orphan recovery also has a targeted `git clean -fdX -- target` path. |',
+        '| **Native Close** | After its preservation and identity checks, directly deletes the checkout and its captured Git administrative directory. It **does not use `git worktree remove`** for that physical-retirement path. |',
+        '',
+        '### Narrow table stress variants',
+        '',
+        '| Label | Detail |',
+        '|---|---|',
+        '| **An exceptionally long label that needs to wrap cleanly at narrow viewport widths** | Inspect this row. |',
+        '',
+        '| Kind | URL |',
+        '|---|---|',
+        '| link | https://github.com/scottopell/phoenix-ide/blob/main/specs/compatibility/requirements.md |',
+        '',
+        '| Kind | Atomic token |',
+        '|---|---|',
+        '| branch | `feature/short-branch` |',
+        '',
+        '| Kind | Numeric value |',
+        '|---|---|',
+        '| duration | 1234567890123456789012345678901234567890 ms |',
+      ].join('\n'),
+    }],
+    display_data: {},
+  },
+];
+
 const wideMarkdownTableMessages: Message[] = [
   {
     event_presentation: null,
@@ -544,6 +603,12 @@ export const messageListScenarios = [
     theme: 'light',
   },
   {
+    id: 'mobile-long-markdown-table',
+    title: 'Mobile long Markdown table',
+    description: 'The supplied long two-column mutation table at mobile width.',
+    theme: 'dark',
+  },
+  {
     id: 'wide-markdown-table',
     title: 'Wide Markdown table / dark',
     description: 'Wide assistant tables keep continuous row surfaces beyond the prose card in dark theme.',
@@ -572,7 +637,9 @@ export function getMessageListScenario(id: MessageListScenarioId): MessageListSc
 }
 
 export function messageListFixtureData(scenario: MessageListScenario): MessageListFixtureData {
-  const messages = scenario.id === 'compact-tool-strip'
+  const messages = scenario.id === 'mobile-long-markdown-table'
+    ? mobileMarkdownTableMessages
+    : scenario.id === 'compact-tool-strip'
     ? toolStripMessages
     : scenario.id === 'compact-expanded-tool-chronology'
       ? compactChronologyInitialMessages
