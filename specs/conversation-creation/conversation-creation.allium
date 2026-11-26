@@ -69,7 +69,7 @@ entity CreationJob {
     delivery_attempt: Integer
     delivery_retry_at: Timestamp? when status = delivery_pending
     next_attempt_at: Timestamp when status = retry_scheduled
-    error_message: String when status in { failed, delivery_failed }
+    error_message: String when status in { failed, delivery_failed, cleanup_ambiguous }
 
     transitions status {
         accepted -> claimed
@@ -81,6 +81,7 @@ entity CreationJob {
         claimed -> failed
         claimed -> cancelling
         claimed -> deletion_pending
+        claimed -> cleanup_ambiguous
         retry_scheduled -> claimed
         retry_scheduled -> failed
         retry_scheduled -> cancelling
@@ -633,10 +634,15 @@ rule AmbiguousCleanupPreservesRecord {
     when: CleanupAmbiguityObserved(job, generation)
 
     requires: job.generation = generation
-    requires: job.status in { cancelling, deletion_pending }
+    requires: job.status in { claimed, cancelling, deletion_pending }
 
     ensures: job.status = cleanup_ambiguous
     ensures: CleanupLeftForManualResolution(job.request_id)
+
+    @guidance
+        -- Settle under the current claim. Do not remove or repair the checkout
+        -- or its registration or schedule automatic recreation. Cancellation
+        -- can still retire the independently proven hidden product aggregate.
 }
 
 ------------------------------------------------------------
@@ -685,7 +691,7 @@ surface CreationControls {
     exposes:
         job.status
         job.creation_intent when job.status in { accepted, claimed, retry_scheduled, delivery_pending, delivery_failed, cancelling, cancelled, failed, cleanup_ambiguous }
-        job.error_message when job.status in { failed, delivery_failed }
+        job.error_message when job.status in { failed, delivery_failed, cleanup_ambiguous }
 
     provides:
         StructurallyValidCreationRequested(request_id, conversation_id, creation_intent, accepted_handle)

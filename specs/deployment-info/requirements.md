@@ -7,9 +7,7 @@ the conversation list. It answers one operator question: *what exactly is this
 running instance, where does it keep its data, and how much of the machine is it
 using right now?*
 
-The page is primarily diagnostic. It changes no server state while reading build,
-network, resource, disk, or log facts. The disk section may expose narrowly scoped
-cleanup actions for backend-confirmed leftover Phoenix-managed worktrees. Every
+The page is diagnostic and read-only. Every
 value it shows is a fact the running process already knows or can measure: build
 identity, runtime ownership, runtime configuration (network binding, TLS), live
 resource usage, on-disk locations with their sizes, and the path to the log file.
@@ -63,16 +61,13 @@ WHEN the user opens that entry
 THE SYSTEM SHALL render a dedicated read-only page (its own route) showing the
 deployment facts described by REQ-DEPLOY-002 through REQ-DEPLOY-006
 
-THE SYSTEM SHALL NOT expose controls on this page that mutate server state except
-for the backend-revalidated leftover worktree cleanup action described by
-REQ-DEPLOY-008
+THE SYSTEM SHALL NOT expose controls on this page that mutate server state.
 
 **Rationale:** The existing settings menu is a floating dropdown sized for a few
 toggles. "About this deployment" is a dense read-only report, not a control, so
 it gets its own page rather than crowding the dropdown. Keeping ordinary
-inspection separate from the explicitly scoped cleanup action means the page is
-safe to open while still giving leftover Phoenix-created disk usage an in-product
-resolution path.
+disk inventory read-only lets an operator inspect leftover usage without changing
+checkout or registration state.
 
 ---
 
@@ -381,7 +376,8 @@ semantic category, absolute path, and, where determinable, its current size:
 - The attachment store: the directory holding file-based attachments when that
   storage mode is active, or an explicit indication that attachments are stored
   inline in the database
-- Phoenix-managed git worktrees created under project `.phoenix/worktrees/`
+- DB-known Phoenix-created Git worktrees, including `phoenix-worktrees/` beneath a Git
+  common directory and legacy `.phoenix/worktrees/` paths
 - Temporary and cache directories used for ephemeral work (e.g. browser caches
   and per-scope browser profiles)
 
@@ -411,8 +407,8 @@ FOR a live/non-terminal managed worktree, THE SYSTEM SHALL show an action to ope
 the owning conversation and SHALL NOT offer direct deletion from the deployment
 page.
 
-FOR a leftover managed worktree, THE SYSTEM SHALL show cleanup only when the
-backend disposition says cleanup is allowed.
+FOR a leftover managed worktree, THE SYSTEM SHALL show its disk information
+without offering cleanup.
 
 **Rationale:** "Where are my bytes?" is the disk-pressure question. The data
 directory is what an operator backs up, copies, or deletes; the caches are what
@@ -586,29 +582,7 @@ Recorder queue-full, disconnected, encoding, and oversized drops SHALL use four 
 
 ---
 
-### REQ-DEPLOY-008: Safely clean up leftover managed worktrees
+### REQ-DEPLOY-008: Keep managed worktree disk inventory read-only
 
-THE SYSTEM SHALL expose a mutation endpoint for cleaning up a Phoenix-managed
-worktree only after backend revalidation.
-
-WHEN cleanup is requested
-THE SYSTEM SHALL re-check that:
-
-- the path is one of the database-known managed worktree paths
-- the path matches the strict Phoenix worktree shape `{repo}/.phoenix/worktrees/{id}`
-- no live, non-terminal, non-archived conversation owns that worktree
-- the operation matches persisted mode semantics: Work-mode cleanup may remove the
-  Phoenix-created branch after removing the worktree; Branch-mode cleanup removes
-  only the worktree and preserves the user branch
-
-WHEN the directory is already absent
-THE SYSTEM SHALL treat cleanup as a successful idempotent no-op.
-
-THE SYSTEM SHALL reject cleanup for unknown paths, malformed/non-Phoenix paths,
-and worktrees still owned by a live conversation.
-
-**Rationale:** A leftover managed worktree is Phoenix-created disk usage, but the
-filesystem is still a user-owned environment. Cleanup therefore belongs behind a
-server-side proof obligation, not a UI convention. The backend already has the
-conversation state, archived flag, and persisted mode semantics needed to avoid
-deleting live work or user branches.
+THE SYSTEM SHALL NOT expose an action or endpoint that cleans up a managed
+worktree from the deployment disk inventory.

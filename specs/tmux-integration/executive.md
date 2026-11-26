@@ -27,7 +27,6 @@ mechanism is mostly plumbing.
 - Lazy server spawn on first operation; default session named `main`.
 - Stale-socket detection (post-system-reboot recovery) — silent unlink
   and recreate, no in-pane breadcrumb.
-- Conversation-hard-delete cascade (kills server, unlinks socket).
 - Server survives Phoenix process restart; the OS keeps it alive
   independently.
 - `tmux` agent tool — pure pass-through that prepends `-S <conv-sock>`
@@ -56,7 +55,6 @@ mechanism is mostly plumbing.
 | Tool name | `tmux` | Matches what the tool literally is |
 | Server spawn timing | Lazy on first operation | No idle servers for unused conversations |
 | Default session name | `main` | Tmux's most-recent-session rule resolves argless `-t` to `main` |
-| Lifetime | Conversation hard-delete only | Soft state (archive, close-tab) does not kill the server |
 | Phoenix restart | Server survives | Core value-prop. The OS keeps tmux processes alive |
 | System reboot | Detect + silent recreate | Stale socket file unlinked; no breadcrumb (would corrupt pane input) |
 | In-app terminal | Auto-attach when tmux available; direct-PTY fallback otherwise | Free scrollback + persistence; preserves v1 behaviour where tmux is absent |
@@ -77,21 +75,8 @@ mechanism is mostly plumbing.
    capture, timeout/cancel handling, response shaping. Integration test
    covering `new-window`, `capture-pane`, `send-keys`, `kill-window` end-
    to-end.
-4. **Hard-delete cascade** — wire `cascade_tmux_on_delete` into the
-   bedrock hard-delete handler per REQ-BED-032, alongside the bash handle
-   cascade and projects worktree cleanup. Direct function call; no
-   event-bus / subscriber pattern.
-5. **Terminal attach branching** — `build_pty_exec_argv` switches between
+4. **Terminal attach branching** — `build_pty_exec_argv` switches between
    `tmux attach` and `$SHELL -i`. Single-attach constraint preserved.
-
-## Bedrock Dependency
-
-REQ-TMUX-007's hard-delete cascade is wired through
-`cascade_tmux_on_delete`, called directly from the bedrock hard-delete
-handler per REQ-BED-032. The cascade orchestrator runs as a sequence of
-direct function calls; there is no event-bus / subscriber-registration
-pattern. Both REQ-BED-032 and this spec are part of the same review;
-implementation is unblocked.
 
 ## Status Summary
 
@@ -103,7 +88,6 @@ implementation is unblocked.
 | **REQ-TMUX-004:** In-App Terminal Auto-Attaches When Tmux Available | ✅ Complete | `crates/phoenix-ide/src/terminal/spawn.rs:3,27,51,283`; argv branching done before fork; outer-tmux nesting refusal handled |
 | **REQ-TMUX-005:** Server Survives Phoenix Process Restart | ✅ Complete | Probe-based reattach in `tools/tmux/probe.rs`; reused on operation per `terminal/ws.rs:319-322` |
 | **REQ-TMUX-006:** Stale Socket Detection (System Reboot Recovery) | ✅ Complete | `tools/tmux/probe.rs:3` (DeadSocket path); silent unlink + respawn |
-| **REQ-TMUX-007:** Server Termination on Conversation Hard-Delete | ✅ Complete | `runtime.rs:511-515` exposes registry to bedrock cascade; wired alongside bash + projects per REQ-BED-032 |
 | **REQ-TMUX-008:** Conversation Soft-State Does Not Affect Server | ✅ Complete | Implicit (no soft-delete hook exists for tmux registry); soft-archive paths in `runtime.rs` do not touch `tmux_registry` |
 | **REQ-TMUX-009:** Tool Description Communicates Two-Tier Persistence Model | ✅ Complete | Tool description text at `tools.rs:326` (referenced by `tools/tmux.rs:3`) |
 | **REQ-TMUX-010:** Tool Cancellation and Output Limits | ✅ Complete | `tools/tmux/invoke.rs:6-18,53` — timeout default + max, middle-truncate at 128 KB |
@@ -111,7 +95,6 @@ implementation is unblocked.
 | **REQ-TMUX-012:** Output Capture Format | ✅ Complete | Separate stdout/stderr in response; wire shape at `api/wire.rs:880` (`TmuxToolResponse`) + `tools/tmux/invoke.rs:3` |
 | **REQ-TMUX-013:** Stateless Tool with Per-Conversation Server Registry | ✅ Complete | `runtime/executor.rs:82` (registry in `ToolContext`); accessor shape mirrors `ctx.browser()` and `ctx.bash_handles()` |
 
-**Progress:** 13 of 13 complete.
 
 ## Behavioural Specification
 
@@ -124,7 +107,6 @@ implementation is unblocked.
   cancelled).
 - Terminal attach with tmux available vs. direct-PTY fallback as sibling
   rules.
-- Hard-delete cascade and soft-state no-op.
 - Invariants: deterministic socket path, one server per conversation,
   socket path always set on live servers.
 - Surfaces `AgentTmuxAccess` (with `SocketIsolation` and `NoStdinAccess`
@@ -146,7 +128,3 @@ conversation dated April 2026 and confirmed by the panel review (see the
 - `specs/terminal/`: REQ-TERM-003's single-terminal-per-conversation
   constraint applies on both the tmux-attach and direct-PTY paths; this
   spec does not require any edit to the terminal spec.
-- `specs/bedrock/`: REQ-BED-032 owns the cascade orchestrator that calls
-  `cascade_tmux_on_delete` (this spec), `cascade_bash_on_delete`
-  (specs/bash/), and `cascade_projects_on_delete` (specs/projects/) in
-  order. No new bedrock states.

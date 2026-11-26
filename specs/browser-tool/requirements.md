@@ -495,11 +495,12 @@ THE SYSTEM SHALL preserve the scope's browser session while another non-terminal
 AND SHALL determine retention from persisted rows rather than process-local runtime handles
 AND SHALL exclude the row being cleaned from that enumeration.
 
-WHEN a ProductConversation is retired through Close/Delete or equivalent aggregate cleanup
-THE SYSTEM SHALL use aggregate retirement authority rather than execution-row liveness
-AND SHALL NOT let continuations or subordinate execution rows belonging to that same aggregate veto its resource retirement
-AND SHALL preserve a scope only for a distinct still-Open aggregate owner
-AND SHALL surface unresolved identity conflicts instead of guessing ownership.
+When a ProductConversation is retired through Close, browser-session retirement
+is governed by `specs/work-lifecycle/requirements.md` REQ-WL-002b, not the
+execution-row cascade. Same-aggregate rows are not independent WorkScope owners
+for that exact aggregate Close. Unresolved identity or resource uncertainty
+remains subject to the Close contract's preservation and incomplete-outcome
+rules. No permanent Delete lifecycle is specified.
 
 WHEN the applicable ownership enumeration cannot be answered
 THE SYSTEM SHALL refuse cleanup and surface the error before side effects rather than assume a retaining owner.
@@ -834,14 +835,14 @@ THE SYSTEM SHALL update the conversation's `browser_session_active` field as the
 
 The panel canvas SHALL have `pointer-events: none` so clicks and key presses on the rendered surface have no effect on the underlying page (REQ-BT-018-NG-INPUT below).
 
-WHEN the conversation is hard-deleted (existing cascade in `BrowserSessionManager::kill_session`)
+WHEN the legacy execution-row cleanup path tears down a browser session
 THE SYSTEM SHALL close any active live-view WebSocket cleanly, signalling "session ended" so the frontend stops reconnecting.
 
 WHEN no browser session exists for a conversation
 THE SYSTEM SHALL NOT poll or reconnect the live-view WebSocket for that conversation. Reconnect attempts are reserved for transient drops on a session that the server-authoritative signal indicates is still live.
 
 WHEN the user chooses to stop a live browser session from a browser-session UI affordance
-THE SYSTEM SHALL request termination of the underlying `BrowserSessionManager` session for that `WorkScope`, using the same destroy lifecycle path as idle cleanup and hard-delete cascade.
+THE SYSTEM SHALL request termination of the underlying `BrowserSessionManager` session for that `WorkScope`, using the same destroy lifecycle path as idle cleanup and execution-row cleanup.
 
 WHEN user-initiated browser-session termination completes
 THE SYSTEM SHALL emit the normal `browser_session_state` false edge and corresponding work-scope inventory update so the browser viewer, launcher, and work-scope row all return to not-live from server truth.

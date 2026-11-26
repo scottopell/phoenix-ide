@@ -144,17 +144,17 @@ WHEN a message update arrives before its identity-bearing message event
 THE SYSTEM SHALL retain the update by message id
 AND apply it when the message arrives
 
-WHEN a conversation hard-delete event arrives
-OR a reconnect receives a definitive not-found response for that conversation
-THE SYSTEM SHALL remove its transcript, snapshot, outbox, and list entry
-AND disable further interaction with the deleted conversation
+WHEN a reconnect to an open conversation receives a definitive not-found response
+THE SYSTEM SHALL stop that conversation's live stream and reconnect loop
+AND surface the not-found failure without deleting the local transcript, snapshot,
+outbox, or list entry
 
 **Rationale:** Mirrors the web client's connection machine against the
 server contract in `specs/sse_wire/sse_wire.allium`; the init-as-resync
 design means the client never needs gap detection.
 
-The precise session, retry, replay, cache-boundary, delivery-ownership, and
-hard-deletion lifecycle is specified in `ios_client_lifecycle.allium`.
+The precise session, retry, replay, cache-boundary, and delivery-ownership
+lifecycle is specified in `ios_client_lifecycle.allium`.
 
 ---
 
@@ -341,7 +341,7 @@ THE SYSTEM SHALL render that summary in the needs-action card
 WHEN an ordinary conversation snapshot is in History
 THE SYSTEM SHALL keep its transcript readable
 AND SHALL disable chat and Open-only state-transition actions
-AND SHALL preserve online-only permanent Delete
+AND SHALL NOT offer permanent Delete
 
 WHEN a state variant is promoted from the catch-all to typed support
 THE SYSTEM SHALL update the typed case, wire parser, state-detail dispatcher,
@@ -781,22 +781,6 @@ AND allow the user to refresh and re-anchor that review contribution or
 explicitly discard that contribution while preserving unrelated draft text
 AND clear or recompute the displayed failure set whenever review authority
 changes so that no failure identifies a removed or repaired contribution
-
-WHEN the ProductConversation is hard-deleted or definitively not found
-THE SYSTEM SHALL invalidate every persistence-pending review payload for that
-conversation
-AND remove its pending render, composer draft, plain segments, review
-authorities, and submission failures
-AND retain and retry a durable, structurally non-sendable invalidation tombstone
-for each affected payload, including after app restart, until version-fenced
-removal is acknowledged
-AND retain a permanent deleted-scope fence that rejects delayed ordinary queue
-entry creation by creating or refreshing a version-fenced invalidation
-tombstone
-AND treat the lifecycle's terminal deleted state as the same fence immediately,
-before the durable fence projection is processed
-AND remove any pending or late-created drain request
-AND SHALL NOT allow a later persistence receipt to recreate a queue entry
 
 WHEN the user attempts to close a reader with unsent notes
 THE SYSTEM SHALL require Cancel or explicit Discard according to `REQ-PF-010`

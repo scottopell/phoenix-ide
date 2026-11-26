@@ -2,7 +2,7 @@
 //!
 //! REQ-TMUX-001 (socket isolation), REQ-TMUX-002 (lazy spawn),
 //! REQ-TMUX-005 (Phoenix-restart probe re-use), REQ-TMUX-006
-//! (stale-socket detection), REQ-TMUX-007 (hard-delete cascade),
+//! (stale-socket detection),
 //! REQ-TMUX-013 (`ToolContext` accessor shape),
 //! REQ-TMUX-WS-001 (`ResourceScopeKey` ownership).
 //!
@@ -2857,7 +2857,7 @@ impl TmuxRegistry {
     /// `kill-server` (server already dead) and `remove_file` (file already
     /// gone) are non-fatal.
     ///
-    /// REQ-TMUX-007, REQ-TMUX-WS-001, REQ-TMUX-WS-002.
+    /// REQ-TMUX-WS-001, REQ-TMUX-WS-002.
     #[allow(clippy::too_many_lines)]
     pub async fn cascade_on_delete(
         &self,
@@ -3123,7 +3123,7 @@ impl Default for TmuxRegistry {
     }
 }
 
-/// Best-effort cascade outcome (REQ-TMUX-007). Both error fields are
+/// Best-effort legacy archive cleanup outcome. Both error fields are
 /// surfaced to the caller (the unified `run_resource_cleanup_cascade`
 /// in handlers.rs) so partial failures can be logged. Neither field is
 /// fatal.
@@ -5339,7 +5339,7 @@ mod tests {
         );
     }
 
-    /// REQ-TMUX-007: cascade on a scope with no registry entry (restarted
+    /// Legacy archive cleanup on a scope with no registry entry (restarted
     /// Phoenix) still discovers and retires the persistent server.
     #[tokio::test]
     async fn cascade_on_delete_reclaims_a_persistent_server_with_an_empty_registry() {

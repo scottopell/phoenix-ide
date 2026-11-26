@@ -52,12 +52,11 @@ conversation mode and write permissions.
 WHEN the user creates a new conversation by providing a directory path
 AND the request is not the explicit gateway Direct/no-repository intent defined by [Slack gateway](../slack-gateway/requirements.md) REQ-SG-008
 THE SYSTEM SHALL detect whether the directory is inside a git repository
-AND create the conversation as an Open Git-backed conversation without asking the user to choose Explore, Work, Managed, or Branch lifecycle modes
-AND resolve any existing hidden `GitRepository` into typed pre-scope provisioning evidence
-AND provision one Phoenix-owned disposable worktree using the repository's canonical default-branch starting point
-AND, only after provisioning resolves the starting commit and creates the worktree, create one `WorkScope` attached to that hidden `GitRepository`
+AND create an Open Git-backed conversation with one Phoenix-owned disposable worktree at detached `HEAD`
+AND pin the worktree to the exact authoritative starting commit selected under REQ-PROJ-022
+AND attach one `WorkScope` to the hidden `GitRepository` only after the pin is resolved and the worktree is materialized
 AND derive the ProductConversation's repository context through that attached `WorkScope`
-AND start that worktree at detached `HEAD`
+AND SHALL NOT create or select a branch, enter a Branch/Managed lifecycle, or create a Git commit as part of creation
 
 WHEN the directory is NOT inside a git repository
 THE SYSTEM SHALL create the conversation in Direct mode (REQ-PROJ-018)
@@ -90,9 +89,9 @@ AND provide full tool access (bash, patch, all tools)
 ### REQ-PROJ-005: Worktree Paths Are Unique by Construction
 
 WHEN a worktree is created for a Git-backed ProductConversation
-THE SYSTEM SHALL place it at `.phoenix/worktrees/{product-conversation-id}/` relative to the
-repository root
-AND ensure `.phoenix/` is excluded through the repository's local Git common-directory `info/exclude` file without rewriting the user's tracked `.gitignore`
+THE SYSTEM SHALL place new staging at `phoenix-worktrees/{product-conversation-id}/` beneath the
+Git common directory, and use the recorded staging path when resuming a known job
+AND SHALL NOT create or modify `.gitignore`, `.git/info/exclude`, the common-directory `info/exclude`, or any other ignore configuration as a side effect
 
 WHEN two conversations create worktrees for the same GitRepository simultaneously
 THE SYSTEM SHALL create separate directories for each
@@ -107,7 +106,7 @@ because their code changes never share a directory.
 
 ### REQ-PROJ-005A: Worktree Build Cache Pre-Warm Is Best-Effort
 
-WHEN Phoenix creates a new conversation worktree under `.phoenix/worktrees/{product-conversation-id}/`
+WHEN Phoenix pre-warms a new conversation worktree
 THE SYSTEM MAY pre-warm allowlisted repository-local build cache directories from the repository root
 AND SHALL keep the destination paths inside the new worktree
 AND SHALL skip missing sources and existing destination paths
@@ -148,12 +147,13 @@ AND SHALL NOT infer any branch-ownership mutation from the recorded starting pro
 
 ### REQ-PROJ-022: Default-Branch Materialization Uses Authoritative Origin or Exact Local Main Only
 
-WHEN Phoenix materializes the starting commit for a new Git-backed conversation, a Start-in-new-conversation spawn, or a follow-up conversation
+WHEN Phoenix resolves the starting commit for a new Git-backed conversation, including an independent follow-up from History
 THE SYSTEM SHALL first detect whether the repository has a remote named `origin`
 
 WHEN remote `origin` exists
-THE SYSTEM SHALL hold the `RepositoryMutationLock` while discovering the remote's current authoritative default branch and fetching that branch tip fresh for provisioning
-AND SHALL provision from the freshly fetched authoritative default-branch tip at detached `HEAD`
+THE SYSTEM SHALL hold the `RepositoryMutationLock` while discovering the remote's advertised `HEAD` symbolic ref and exact commit OID and fetching that OID
+AND SHALL fetch without applying configured ref mappings, updating shared refs or `FETCH_HEAD`, or pruning refs
+AND SHALL provision from that exact advertised commit at detached `HEAD`
 AND SHALL treat any remote-default discovery failure, authentication failure, authorization failure, transport failure, or fetch failure as an explicit retryable creation-job failure
 AND SHALL NOT fall back to cached remote state, previously observed canonical-default facts, local branch tips, the currently checked out branch, another arbitrary ref, or a synthetic default
 
@@ -181,7 +181,8 @@ WHEN task approval later grants write authority
 THE SYSTEM SHALL continue using the same worktree rather than creating a second workspace
 
 WHEN a Git-backed conversation closes without ever receiving write authority
-THE SYSTEM SHALL still clean up the disposable worktree through the ordinary Close/reconciliation path
+THE SYSTEM SHALL apply the same explicit Close safety contract as any other Git-backed conversation
+AND SHALL NOT permit startup or background reconciliation to reclaim its worktree
 
 **Rationale:** Planning and implementation should observe the same isolated filesystem view. Provisioning the detached worktree at conversation creation preserves that continuity without introducing branch-selection semantics.
 
@@ -271,16 +272,20 @@ THE SYSTEM SHALL preserve a failed conversation record with the original creatio
 WHEN provisioning fails for a permanent reason
 THE SYSTEM SHALL preserve the failed conversation without an automatic retry
 
-### REQ-CCR-005: Repository Mutation Serialization
+### REQ-CCR-005: Repository Mutation and Unpublished Staging Custody
 
-WHEN creation mutates Git refs or worktrees
+WHEN creation mutates Git worktrees
 THE SYSTEM SHALL serialize mutation by canonical repository identity across live Phoenix processes
-AND cleanup SHALL remove only resources whose durable ownership still belongs to the cleanup operation
-AND deterministic staging paths beneath the repository's `.phoenix/worktrees` namespace SHALL be a Phoenix-private resource namespace whose Phoenix writers serialize through the repository mutation lock
-AND cleanup ownership checks SHALL protect against stale Phoenix operations and observed identity mismatch within that namespace, while hostile same-user filesystem mutation outside Phoenix writers is not part of the automatic-cleanup threat model
-AND SHALL enter an explicit non-destructive ambiguous cleanup outcome when ownership, equivalence, or safety cannot be proven exactly
+AND SHALL place new detached worktrees beneath `phoenix-worktrees` in the Git common directory
 
-ADR-043 records the private staging namespace and automatic-cleanup threat boundary for this requirement.
+WHEN creation resumes an existing staged checkout
+THE SYSTEM SHALL use the durable staging location rather than deriving a new one
+AND SHALL require the exact checkout and repository registration, durable ownership, and detached starting pin to match before adoption
+
+WHEN unpublished creation fails or is cancelled
+THE SYSTEM SHALL remove only job-created partial resources for which it proves exclusive custody
+AND, if worktree materialization may have begun and safe rollback cannot be proven, SHALL retain the checkout and its Git registration, record a diagnostic, and fence automatic retry and recreation
+AND SHALL NOT treat a missing checkout, a clean status, or a Phoenix-only repository mutation lock as proof that rollback is safe
 
 ### REQ-CCR-005A: Immutable Starting Pin Selection
 
@@ -321,7 +326,7 @@ THE SYSTEM SHALL leave the job non-ready and retryable or failed according to th
 
 WHEN a user cancels an accepted, claimed, retry-scheduled, or `delivery_pending` creation before durable objective acceptance
 THE SYSTEM SHALL immediately revoke the active generation
-AND SHALL preserve a visible cancelled creation record with its original creation intent
+AND SHALL preserve a visible creation record with its original creation intent and the outcome of reconciliation
 AND SHALL reconcile owned resources asynchronously, including removing the exactly owned hidden staged ProductConversation, transcript, and attached `WorkScope` aggregate without publishing it
 AND SHALL preserve selected working-directory segments whose exclusive Phoenix ownership cannot be proven
 
@@ -338,10 +343,13 @@ THE SYSTEM SHALL offer Start over and Delete for the cancelled record
 
 ### REQ-CCR-008: Deletion During Creation
 
-WHEN a user deletes a non-ready creation record
+WHEN a user deletes an eligible unpublished creation record
 THE SYSTEM SHALL immediately omit it from normal user-facing conversation surfaces
-AND SHALL retain an internal deletion-pending record until owned resources are safely reconciled or explicit ambiguity is recorded
+AND SHALL reject deletion if either publication identity is present or the request is of federated origin
+AND SHALL retain the internal record and custody evidence if reconciliation cannot establish safe release
 AND SHALL physically delete the record only after reconciliation succeeds
+
+This action is dismissal of an unpublished creation request, not Hard Delete of a published conversation.
 
 ### REQ-CCR-009: Durable Scheduling
 
@@ -439,9 +447,8 @@ AND SHALL NOT treat retained evidence as authority for execution, recovery, or r
 WHILE any transcript of the published product exists
 THE SYSTEM SHALL retain the accepted creation-request image delivery payloads without changing their bytes.
 
-WHEN the product's last transcript is hard-deleted
-THE SYSTEM SHALL atomically retire those delivery payloads while retaining historical creation status, original identities, provenance, and bounded ordered image replay identity
-AND SHALL NOT retire payloads when only the original transcript is deleted with a surviving continuation.
+WHEN the product moves to History or an owned checkout is closed
+THE SYSTEM SHALL retain the creation receipt, replay identity, and delivery payloads.
 
 WHERE delivery payloads are retired
 THE SYSTEM SHALL reconcile identical request retry to the retained original receipt and conflict on a changed image count, order, media type, or exact accepted data

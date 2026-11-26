@@ -546,7 +546,7 @@ rule WatchdogResetOnAnyEvent {
         --   conversation_update, error, browser_session_state,
         --   bash_tool_progress, steer_message_queued,
         --   steer_message_cancelled, rate_limit_snapshot,
-        --   work_scope_update, conversation_hard_deleted
+        --   work_scope_update
         --
         -- Plus the new variants this spec introduces:
         --
@@ -778,20 +778,6 @@ rule InflightToolTimerRemovedOnConversationHistory {
 -- exit edge.
 rule InflightToolTimerRemovedOnToolPhaseExit {
     when: ObservedPhaseUpdatedFromWorking(view, tool_executing, new_phase)
-
-    ensures: for t in InflightToolTimer{view: view}:
-        not exists t
-}
-
--- Hard-delete of the conversation removes the per-view state
--- entirely. Mirrors the runtime cascade (REQ-BED-032 in bedrock).
--- Defensive; in practice the ClientView itself is destroyed when the
--- conversation is hard-deleted, so the timers go with it. The rule
--- exists so the invariant holds without depending on actor-destruction
--- ordering.
--- Event shape: SseConversationHardDeleted(view).
-rule InflightToolTimerRemovedOnConversationDelete {
-    when: SseConversationHardDeleted(view)
 
     ensures: for t in InflightToolTimer{view: view}:
         not exists t

@@ -12,8 +12,10 @@ own CI job (`.github/workflows/ios.yml`, macOS runner) that generates the
 Xcode project and runs the unit-test target on a simulator for any change
 under `ios/`.
 
-The connection, foreground/background, delivery-ownership, replay, cache,
-and hard-deletion lifecycle is normative in `ios_client_lifecycle.allium`.
+The connection, foreground/background, delivery-ownership, replay, and cache
+lifecycle is normative in `ios_client_lifecycle.allium`. A definitive not-found
+response to the live stream stops and surfaces the failure without purging local
+conversation state.
 It composes with the existing server SSE and user-message queue contracts
 rather than duplicating their state machines.
 
@@ -23,12 +25,12 @@ Unit coverage follows a contract-test pattern (see `ios/README.md`
 "Testing"): pure components get one test per rule of the contract they
 implement. An opt-in live-server XCUITest covers first-run TLS setup, mock
 conversation creation, optimistic-send reconciliation, and cold relaunch;
-it is isolated from the ordinary CI scheme. Coverage includes SSE framing and typed
-hard-delete decoding, the outbox delivery and real-disk durability rules,
-versioned-store downgrade protection, typed conversation states and chat
-eligibility, question encoding, image processing, attention diffs, bash
-result parsing, certificate-pin decisions, legacy conversation decoding,
-and reducer ordering/hard-delete behavior. Remaining verification steps:
+it is isolated from the ordinary CI scheme. Coverage includes SSE framing with generic historical-event decoding, the
+outbox delivery and real-disk durability rules, versioned-store downgrade
+protection, typed conversation states and chat eligibility, question encoding,
+image processing, attention diffs, bash result parsing, certificate-pin
+decisions, legacy conversation decoding, and reducer ordering. Remaining
+verification steps:
 on-device build and an airplane-mode queue/drain test pass.
 
 Slack gateway input provenance is a typed origin with an exact request source
@@ -77,8 +79,8 @@ iOS vNext first establishes an independent deterministic native fixture
 harness, then migrates the client to the shipped ProductConversation REST
 aggregate while preserving ordinary transcript-row sessions as the sole owners
 of live SSE, cache, reducer, and outbox behavior. Core migration may begin after
-the fixture contract seam is committed and reviewed. Permanent delete,
-follow-up/source retrieval, grounding, and comments are later capabilities and
+the fixture contract seam is committed and reviewed. Follow-up/source
+retrieval, grounding, and comments are later capabilities and
 do not block that migration.
 
 | Section | Status | Task |

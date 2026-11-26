@@ -241,8 +241,7 @@ entity ViewerSlot {
 --
 --   localStorage["phoenix:lastviewer:<slug>"] = ViewerUrlSnapshot.params
 --
--- Survives page reload, cleared by explicit close (REQ-VS-004), and
--- cleared when the conversation is hard-deleted (REQ-BED-032 cascade).
+-- Survives page reload and is cleared by explicit close (REQ-VS-004).
 -- Keyed by slug rather than conversation id so the read on entry can
 -- fire from `useParams<{slug}>` without an extra slug→id lookup.
 -- Slugs are stable identifiers.
@@ -290,10 +289,6 @@ entity ViewerSlot {
 -- entry-source discriminator the restore rule depends on.
 --   ConversationEntered(slot, source: ConversationEntrySource)
 --
--- Hard-delete cascade: bedrock removed the conversation row server-
--- side. Storage entries for that slug must be cleared so a future
--- conversation that happens to reuse the slug doesn't inherit them.
---   ConversationHardDeleted(slug)
 
 ------------------------------------------------------------
 -- Rules
@@ -494,7 +489,7 @@ rule BrowserSessionFellAutoClosesSlot {
 }
 
 -- @guidance: the falling edge source is intentionally opaque to the slot:
--- idle cleanup, hard-delete cascade, or a user-initiated Stop browser action
+-- idle cleanup or a user-initiated Stop browser action
 -- all arrive as the same server-authoritative browser_session_active=false
 -- transition. When the falling edge fires while slot.kind != browser, no rule
 -- applies -- the slot doesn't change. The launcher chip naturally disappears
@@ -627,8 +622,7 @@ rule UrlHydratesMessageWritesStorage {
 -- re-open the file -- undoing the user's close intent. Co-fires with
 -- UserClosesActiveViewer (slot.kind transitions to none); listed
 -- separately for clarity. The cleared key is the conversation's
--- slug -- storage is slug-keyed throughout (see ConversationHardDeleted
--- event for the parallel cascade path).
+-- slug -- storage is slug-keyed throughout; no delete-event cleanup path exists.
 rule UserClosesClearsStorage {
     when: UserClosesViewer(slot)
     ensures: ViewerSnapshotCleared(slot.conversation.slug)
@@ -655,17 +649,6 @@ rule InAppNavigationRestoresFromStorage {
 -- restore rule. The URL is authoritative -- if it has params, the
 -- existing UrlHydrates* rules apply; if bare, the slot stays none.
 -- Storage is consulted only on in-app entry. This is decision D1.
-
--- Storage cleanup on hard-delete. Without this, slug entries
--- accumulate forever for conversations the user has explicitly
--- removed. The slug-keyed storage assumes slugs are stable
--- identifiers; if a future server change recycles slugs, an
--- orphan entry would silently restore a file under the wrong
--- conversation.
-rule HardDeleteClearsStorage {
-    when: ConversationHardDeleted(slug)
-    ensures: ViewerSnapshotCleared(slug)
-}
 
 -- ===========================================================
 -- VS 6. PROSE PATCH CONTEXT (REQ-VS-011)

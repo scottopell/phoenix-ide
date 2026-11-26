@@ -27,7 +27,9 @@ A stopped target's pending proposal SHALL remain inspectable; Stop is not a refu
 
 WHEN new native approval effects are requested
 THE SYSTEM SHALL require explicit consequential approval, explicit `ContinueHere` placement, and the exact inspected target, occurrence and snapshot identity
-AND SHALL return a typed unsupported refusal for `StartFresh`, without substitution; HTTP fresh-start behavior SHALL remain unchanged.
+AND SHALL continue only in the existing conversation and its existing `WorkScope`
+AND SHALL reject `StartFresh` and any new-conversation or fork placement without creating a conversation, worktree, or provenance relation
+AND SHALL NOT rename, stage, commit, or otherwise mutate Git state as an approval side effect.
 
 THE SYSTEM SHALL preserve existing mutation, owner, WorkScope, task lifecycle, Close and history admission
 AND SHALL re-read only the reviewed path for the reviewed kind and compare body and digest before effects
@@ -64,7 +66,7 @@ A receipt SHALL identify the historical fact and owner, not assert that the owne
 
 THE SYSTEM SHALL distinguish committed approval/continuation requested from dispatch, model response and fresh provisioning, using REQ-DWF-043's closed command-scoped outcomes.
 
-WHEN failure is fatal, unclassified, or follows Git mutation before approval database commit
+WHEN failure is fatal or unclassified
 THE SYSTEM SHALL preserve actionable evidence and fail-stop at the owning execution boundary, not report `NotApplied`, ordinary success or presumed safe automatic retry.
 
 WHEN authority projection fails after commit

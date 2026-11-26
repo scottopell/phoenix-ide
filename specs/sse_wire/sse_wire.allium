@@ -9,7 +9,7 @@
 --
 -- Includes: All SSE event types (init, message, message_updated,
 --           state_change, token, llm_first_byte, llm_attempt, agent_done,
---           conversation_became_terminal, conversation_hard_deleted,
+--           conversation_became_terminal,
 --           conversation_update, browser_session_state, bash_tool_progress,
 --           work_scope_update, steer_message_queued,
 --           steer_message_cancelled,
@@ -163,7 +163,7 @@ value SteeringMessage {
 --   "agent_done", "conversation_became_terminal",
 --   "conversation_update", "error", "browser_session_state",
 --   "steer_message_queued", "steer_message_cancelled", "rate_limit_snapshot",
---   "conversation_hard_deleted", "bash_tool_progress", "work_scope_update",
+--   "bash_tool_progress", "work_scope_update",
 --   "llm_first_byte", "llm_attempt"
 --
 -- Ring eligibility (which events can appear as a PendingEventEntry):
@@ -183,7 +183,6 @@ value SteeringMessage {
 --       `send_live_progress`, which broadcasts without appending)
 --     - "steer_message_queued" and "steer_message_cancelled" (live
 --       projections of the durable queue; init reconstructs current state)
---     - "conversation_hard_deleted" (terminal live projection; no later init)
 --
 -- Note on `rate_limit_snapshot` replay: the snapshot represents a
 -- point-in-time codex quota state. It remains in the conversation ring
@@ -743,8 +742,7 @@ rule PersistedMessageClearsReplayRing {
 -- rate_limit_snapshot, work_scope_update, llm_first_byte, llm_attempt.
 -- Excludes Init (per-stream, never broadcast) and BashToolProgress
 -- (replaceable live progress), steering queue mutations (durable-state-
--- subsumed live projections), and ConversationHardDeleted (terminal live
--- projection); each exclusion broadcasts without ring retention.
+-- subsumed live projections); each exclusion broadcasts without ring retention.
 --
 -- `llm_first_byte` (introduced by specs/working-phase-visibility/)
 -- MUST replay alongside the `token` events it precedes — if a client
@@ -822,15 +820,14 @@ rule EphemeralEventAppendedToReplayRing {
         -- count, not bytes.
 }
 
--- Queue mutations and hard deletion are live projections whose durable state
--- is either reconstructed by init or no longer exists. They carry the current
+-- Queue mutations are live projections reconstructed from durable state by init.
+-- They carry the current
 -- sequence witness but do not allocate a new cursor position or enter replay.
 rule DurableStateProjectionBroadcastLiveOnly {
     when: EphemeralEventBroadcast(conv_id, entry)
 
     requires: entry.event_type in {
-        "steer_message_queued", "steer_message_cancelled",
-        "conversation_hard_deleted"
+        "steer_message_queued", "steer_message_cancelled"
     }
 
     let ring = ReplayRing{conversation_id: conv_id}
@@ -846,8 +843,7 @@ rule DurableStateProjectionBroadcastLiveOnly {
         -- The broadcaster gate is held from watermark observation through the
         -- channel send, so a later sequenced event cannot be delivered first.
         -- Authorized init replaces steering state from SQLite. Shared init and
-        -- live filtering omit private steering content. Hard deletion has no
-        -- later init because the conversation row is gone.
+        -- live filtering omit private steering content.
 }
 
 -- Eager (non-persisted) Message broadcast appends to the ring without
@@ -1067,8 +1063,7 @@ rule AggregateBoundLiveCarrierEnvelopeAllocated {
         -- carriers (`product_conversation_lifecycle`, `continuation_boundary`,
         -- `work_scope_update`) carry null there.
         --
-        -- Explicit exclusions: `init` is per-subscriber and not a live carrier;
-        -- `conversation_hard_deleted` is terminal and cannot participate in replay.
+        -- `init` is per-subscriber and not a live carrier.
 }
 
 rule AggregateBoundMemberLiveCarrierClaimsRootSequence {

@@ -230,7 +230,6 @@ enum RecoveryKind { credential }
 enum RecoveryResumeTarget { conversation_turn | continuation_summary | server_overload_retry }
 enum TaskApprovalDecision {
     approved_continue_current
-    | approved_start_fresh
     | request_changes
     | rejected
 }
@@ -1477,7 +1476,7 @@ rule ProposeTaskIntercepted {
 rule ApprovalSnapshotMismatchRequiresRequestChanges {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
-    requires: decision in { approved_continue_current, approved_start_fresh }
+    requires: decision = approved_continue_current
     requires: reread_task_repo_relative_path(conversation.proposal_snapshot.task_file) != conversation.proposal_snapshot.repo_relative_path
         or reread_task_kind(conversation.proposal_snapshot.task_file) != conversation.proposal_snapshot.task_kind
         or reread_task_digest(conversation.proposal_snapshot.task_file) != conversation.proposal_snapshot.content_digest
@@ -1863,67 +1862,6 @@ rule UserApprovesTaskCurrentConversation {
         -- wins and approval is blocked until a fresh review snapshot is captured.
 }
 
-rule UserApprovesTaskNewConversation {
-    when: TaskApprovalDecided(conversation, decision)
-    requires: conversation.parent_status = awaiting_task_approval
-    requires: decision = approved_start_fresh
-    requires: conversation.environment_kind = git_backed
-    requires: attached_git_work_scope_id(conversation.product_conversation) != absent
-    requires: reread_task_repo_relative_path(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.repo_relative_path
-    requires: reread_task_kind(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.task_kind
-    requires: reread_task_digest(conversation.proposal_snapshot.task_file) = conversation.proposal_snapshot.content_digest
-    ensures: ApprovalRereadSnapshot(
-        conversation,
-        original_task_file: conversation.proposal_snapshot.task_file,
-        original_repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
-        original_task_kind: conversation.proposal_snapshot.task_kind,
-        original_content_digest: conversation.proposal_snapshot.content_digest
-    )
-    ensures: ApprovalMatchesReviewedSnapshot(
-        conversation,
-        original_task_file: conversation.proposal_snapshot.task_file,
-        original_repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
-        original_task_kind: conversation.proposal_snapshot.task_kind,
-        original_content_digest: conversation.proposal_snapshot.content_digest,
-        approved_body: reread_task_body(conversation.proposal_snapshot.task_file)
-    )
-    ensures: ExactApprovedBodyPersisted(
-        conversation,
-        repo_relative_path: conversation.proposal_snapshot.repo_relative_path,
-        task_kind: conversation.proposal_snapshot.task_kind,
-        content_digest: conversation.proposal_snapshot.content_digest,
-        approved_body: reread_task_body(conversation.proposal_snapshot.task_file)
-    )
-    let fresh_work_conversation = created_fresh_work_conversation(conversation)
-    let target_product_conversation = fresh_work_conversation.product_conversation
-    ensures: FreshWorkConversationCreated(conversation, fresh_work_conversation)
-    ensures: fresh_work_conversation.product_conversation != conversation.product_conversation
-    ensures: fresh_work_conversation.continued_in_conv_id = absent
-    ensures: FreshWorkConversationProvisioningRequested(
-        source_conversation: conversation,
-        target_conversation: fresh_work_conversation,
-        target_product_conversation: target_product_conversation,
-        source_work_scope_id: attached_git_work_scope_id(conversation.product_conversation)
-    )
-    ensures: conversation.core_status = idle
-
-    @guidance
-        -- Starting fresh for approved task work creates a separate product
-        -- conversation boundary. It is not a continuation: the source returns to
-        -- ordinary Open/idle, no continuation edge is written, and no handed_off
-        -- row condition is introduced.
-        -- Typed provisioning owns when the spawned conversation becomes runnable:
-        -- approval requests fresh provisioning, and only a later successful durable
-        -- provisioning-completed event may dispatch the first LLM request. Failed
-        -- provisioning never dispatches the fresh conversation.
-        --
-        -- Approval remains bound to the reviewed snapshot identity here too; Phoenix
-        -- cannot seed a new conversation from arbitrary current file contents after a
-        -- post-review swap or edit. Repository context is resolved through the source
-        -- ProductConversation's attached WorkScope by the provisioning boundary; this
-        -- event does not copy repository identity onto ProductConversation.
-}
-
 rule UserRequestsTaskChanges {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
@@ -1948,11 +1886,9 @@ rule CancelDuringTaskApproval {
     ensures: AgentDone(conversation)
 }
 
--- Approved-task placement never writes continuation topology. Start in new
--- conversation creates a separate top-level lineage while the source stays Open.
--- Continue here resumes the same ProductConversation, transcript context, attached
--- WorkScope, and mode with typed approved-task objective/write-authority state.
--- A fork proposal is resolved entirely in the surviving task-source workflow authority and leaves its origin untouched.
+-- Task approval continues in the existing conversation and WorkScope only.
+-- It pins the exact reviewed task snapshot and performs no Git writes. New
+-- conversation placement and fork proposals are not approval outcomes.
 
 -- ===========================================================
 -- PARENT 6. USER QUESTION RESPONSE
@@ -3651,130 +3587,6 @@ rule UserStartsFollowUpFromHistory {
         -- Follow-up is a typed command from History. It creates a separate Open
         -- aggregate with fresh environment intent and visible follow_up provenance;
         -- the source transcript is not injected.
-}
-
--- REQ-BED-032: User hard-deletes a conversation when the conversation is
--- not busy. Cascade cleanup runs as direct function calls in the handler;
--- the SSE wire event ConversationHardDeleted is emitted last for UI
--- consumers. There is no event-bus / subscriber-registration pattern.
-rule UserHardDeletesConversationRule {
-    when: UserHardDeletesConversation(conversation)
-    let aggregate = conversation.product_conversation
-
-    requires: aggregate.kind = ordinary
-    requires: not conversation.is_busy
-    requires: aggregate.lifecycle = history
-    requires: DestructiveLifecycleMayProceed(conversation, hard_delete)
-
-    ensures: BashHandlesCleanedUp(aggregate)
-        -- Direct call: cascade_bash_on_delete (REQ-BASH-006).
-    ensures: TmuxServerCleanedUp(aggregate)
-        -- Direct call: cascade_tmux_on_delete (REQ-TMUX-007).
-    ensures: BrowserSessionsCleanedUp(aggregate)
-        -- Direct call: aggregate-scoped browser lifecycle cascade.
-    ensures: WorkScopeResourcesCleanedUp(aggregate)
-        -- Direct call: WorkScope resource cleanup subscriber.
-    ensures: AggregateTranscriptRowsRemoved(aggregate)
-    ensures: SolelyOwnedCloseObligationsRemoved(aggregate)
-    ensures: SolelyOwnedCloseAttemptMembersRemoved(aggregate)
-    ensures: SolelyOwnedCloseInspectionRowsRemoved(aggregate)
-    ensures: SolelyOwnedCloseInventoryRowsRemoved(aggregate)
-    ensures: SolelyOwnedCloseLossRowsRemoved(aggregate)
-    ensures: SolelyOwnedCloseRetirementEvidenceRowsRemoved(aggregate)
-    ensures: SolelyOwnedLineageQaRowsRemoved(aggregate)
-    ensures: SolelyOwnedConversationMessagesRemoved(aggregate)
-    ensures: SolelyOwnedConversationToolCallRowsRemoved(aggregate)
-    ensures: SolelyOwnedConversationApprovalRowsRemoved(aggregate)
-    ensures: SolelyOwnedConversationAttachmentRowsRemoved(aggregate)
-    ensures: SolelyOwnedConversationRetrievalChunkRowsRemoved(aggregate)
-    ensures: SolelyOwnedConversationRetrievalLocatorRowsRemoved(aggregate)
-    ensures: SolelyOwnedConversationFtsRowsRemoved(aggregate)
-    ensures: RepeatedDeleteRemainsIdempotent(aggregate)
-    ensures: NonCascadeProvenanceRelationsPreservedAsTypedTombstones(aggregate)
-    ensures: NonCascadeBranchAndPullRequestRelationsRemain(aggregate)
-    ensures: ProductConversationRemoved(aggregate)
-    ensures: ConversationHardDeleted(aggregate)
-        -- SSE wire event for UI consumers (sidebar refresh, etc.).
-        -- Emitted AFTER aggregate removal; not a cleanup-dispatch hook.
-
-    @guidance
-        -- Handler sequence (in src/api/handlers.rs::delete_conversation):
-        --   1. Cancellation pre-step: if conversation is busy, either
-        --      reject with "cancel first" (RejectHardDeleteWhileBusy
-        --      governs) or issue cancellation and wait for idle. The
-        --      requires: not conversation.is_busy above is the post-
-        --      cancel contract that this rule's effects are predicated
-        --      on.
-        --   2. cascade_bash_on_delete — kill live handles, drop tombstones.
-        --   3. cascade_tmux_on_delete — kill-server, unlink socket, drop
-        --      registry entry.
-        --   4. cascade_projects_on_delete — aggregate-scoped worktree cleanup if
-        --      applicable.
-        --   5. cascade_browser_on_delete — drop aggregate-scoped browser sessions
-        --      unless another live owner retains the same WorkScope.
-        --   6. db.delete_product_conversation(product_conversation_id) — remove
-        --      every transcript row and solely-owned child row in the History
-        --      aggregate, including Close obligations/members/evidence,
-        --      lineage Q&A, message rows, tool-call rows, approval rows,
-        --      message/file-attachment rows, retrieval chunk/locator rows, and
-        --      FTS rows, while retaining typed tombstones for surviving
-        --      provenance links and leaving separately-owned branch /
-        --      pull-request relations untouched.
-        --      Re-running the same delete after rows are already gone still
-        --      returns the same idempotent success post-state.
-        --   7. Broadcast ConversationHardDeleted SSE wire event.
-        --   8. Return success to the user.
-        --
-        -- Each cascade step (2-4) logs failures at WARN with structured
-        -- fields sufficient for manual cleanup (pids, socket paths,
-        -- worktree paths) and continues. Phoenix does NOT attempt
-        -- automatic recovery on subsequent startup; orphans created by
-        -- failed cleanup are the operator's problem (deliberate v1 scope
-        -- decision — see REQ-BED-032 rationale).
-        --
-        -- Allium ensures clauses are concurrent assertions about the
-        -- post-state, not a temporal sequence. The handler implementation
-        -- in @guidance specifies the actual order. Allium's role here is
-        -- to assert "after the handler returns, all of these effects
-        -- have happened." A property test that runs the handler and
-        -- checks the post-state suffices.
-        --
-        -- Close conversation / History and hard-delete are distinct flows.
-        -- This hard-delete cascade does not model Close orchestration or
-        -- ordinary WorkScope retirement authority; the Open -> History
-        -- transition is owned by ProductConversationTransitionsToHistory, and
-        -- WorkScope-owned worktree/terminal retirement remains owned by the
-        -- Close retirement path. Branches remain observed repository facts.
-        -- History is lifecycle truth, not proof of resource retirement. Retained
-        -- cleanup_attention resources do not grant this cascade extra Close authority.
-        -- UI-only state changes (close-tab, blur) do NOT trigger this rule
-        -- — tmux servers and browser sessions deliberately survive them
-        -- (specs/tmux-integration/ REQ-TMUX-008; specs/browser-tool/
-        -- REQ-BROWSER-WS-003).
-}
-
--- REQ-BED-032: Reject the hard-delete request when the conversation is
--- busy. Mirrors RejectMessageWhileBusy at REQ-BED-002; the API layer can
--- choose between this rejection branch or a cancel-and-retry branch
--- (which feeds back into UserHardDeletesConversationRule above once the
--- conversation reaches idle).
-rule RejectHardDeleteWhileBusy {
-    when: UserHardDeletesConversation(conversation)
-
-    requires: conversation.is_busy
-
-    ensures: HardDeleteRejected(conversation, reason: cancel_first)
-}
-
-rule RepeatedHardDeleteOfAbsentAggregateIsIdempotent {
-    when: UserHardDeletesProductConversation(product_conversation_id)
-    requires: not exists ProductConversation{id: product_conversation_id}
-    ensures: HardDeleteSucceeded(product_conversation_id)
-    ensures: ProductConversationRemainsAbsent(product_conversation_id)
-
-    @guidance
-        -- Retry reaches the same success post-state even after the aggregate row is
-        -- gone; idempotence does not require reloading a deleted row first.
 }
 
 -- REQ-BED-017: Mode change injects synthetic message

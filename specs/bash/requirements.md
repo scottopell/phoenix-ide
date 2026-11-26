@@ -503,17 +503,6 @@ THE SYSTEM SHALL respond with the same `status: "tombstoned"` shape as
 peek/wait — no `already_terminal` flag is needed because the
 `tombstoned` status conveys it
 
-WHEN a conversation is hard-deleted AND no surviving conversation inherits its
-`WorkScope`
-THE SYSTEM SHALL kill any of that `WorkScope`'s processes whose handles are
-still `running`
-AND remove all tombstone records for that `WorkScope`
-
-WHEN a conversation is hard-deleted AND a continuation inherits the same
-`WorkScope`
-THE SYSTEM SHALL leave that `WorkScope`'s handles and tombstones intact for the
-inheritor (REQ-BASH-WS-002)
-
 WHEN Phoenix shuts down (gracefully or via crash)
 THE SYSTEM SHALL kill all live processes via the reaper machinery
 (REQ-BASH-007)
@@ -528,8 +517,8 @@ persistence across restart.
 **Rationale:** Demoting the ring to a final-tail tombstone bounds memory while
 preserving "any handle the agent was given remains peekable for the lifetime
 of the Phoenix process." Tombstones are kilobytes; live rings are megabytes.
-Hard-delete is the only event that loses a tombstone within a Phoenix
-lifetime.
+Tombstones are process-local. They remain available until the owning scope
+is retired, legacy archive cleans up the handles, or Phoenix exits.
 
 The "no SQLite shadow store" decision was made in revision 2: the structured
 `lost_in_restart` response that v1 originally proposed was not worth the
@@ -1028,52 +1017,18 @@ scope-owned environment data, not resource identity.
 
 ---
 
-### REQ-BASH-WS-002: Hard-Delete Cascade Preserves a Scope Still Owned by a Live Conversation
+### REQ-BASH-WS-002: Resource Retirement Respects WorkScope Ownership
 
-WHEN a conversation is hard-deleted AND a non-terminal conversation OTHER THAN
-the one being deleted resolves to the same `WorkScope` — whether a continuation
-that inherits it, or a sibling such as a Work-mode sub-agent that shares its
-parent's scope
-THE SYSTEM SHALL NOT kill that `WorkScope`'s running processes or drop its
-tombstones — the surviving owner keeps them
+WHEN exact aggregate Close retires a `WorkScope`'s Bash resources
+THE SYSTEM SHALL apply the ownership, admission, and incomplete-outcome rules in
+[`REQ-WL-002b`](../work-lifecycle/requirements.md#req-wl-002b-retirement-seals-one-workscope-gate-and-retires-its-owned-resources-without-automatic-recovery-artifacts)
+AND SHALL retire the scope's Bash handles and tombstones when that retirement succeeds
+AND SHALL NOT count same-aggregate continuation rows or subordinate execution conversations as independent owners
 
-WHEN a conversation is hard-deleted AND no non-terminal conversation other than
-the one being deleted resolves to its `WorkScope`
-THE SYSTEM SHALL kill every running process in that `WorkScope`'s handle table
-AND drop the `WorkScope`'s handles and tombstones
-
-THE cascade SHALL receive the deleted conversation's `WorkScope` and a
-preservation signal that is true iff the scope is still owned, and SHALL skip
-teardown when the signal is true, mirroring `cascade_terminal_on_delete` /
-`cascade_browser_on_delete` (REQ-TERM-WS-002, REQ-BROWSER-WS-002).
-
-THE preservation signal SHALL exclude the conversation being deleted when
-enumerating live owners. The cascade runs before the deleted conversation's
-terminal-state write, so it still reads non-terminal; excluding it is what lets
-the scope tear down when it is the last live owner.
-
-A live owner is a conversation, RECORDED IN THE DATABASE, that is BOTH
-non-terminal in state AND not `archived`. Liveness SHALL be determined from
-the persisted conversation rows, NOT from the set of live runtime handles: a
-conversation can be non-terminal in the DB yet hold no runtime handle (after a
-server restart or runtime eviction), and such a conversation is still a live
-owner. Enumerating only handles would let the cascade tear down a scope whose
-surviving owner is a handle-less, non-terminal conversation — destroying its
-shared worktree, branch, and processes. An archived conversation SHALL NOT
-count as a live owner even while its state row still reads non-terminal:
-archiving a chain archives its earlier members before the leaf's cleanup
-cascade runs, so counting one as live would preserve the shared `WorkScope`
-and leak its processes and tombstones.
-
-**Rationale:** A continuation is not the only way a scope outlives one
-conversation. A Work-mode sub-agent inherits its parent's `conv_mode` and so
-resolves to the parent's `WorkScope`, but has no continuation. Preserving only
-on a continuation SIGKILLs the still-open parent's processes (and tears down its
-tmux server, terminal, and browser session, which share the call site) the
-instant the sub-agent is deleted — an asymmetry the agent experiences as the
-runtime randomly forgetting work. The correct signal is "is the scope still
-owned by a live conversation other than this one," which a continuation
-satisfies as one case among several.
+WHEN legacy archive requests row-level Bash resource cleanup
+THE SYSTEM SHALL preserve the Bash handles and tombstones if the exact `WorkScope`
+remains owned by another live, unarchived conversation
+AND SHALL derive that preservation signal from persisted rows, not runtime handles
 
 ---
 

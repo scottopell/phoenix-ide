@@ -211,34 +211,6 @@ input-stream-corrupting breadcrumb.
 
 ---
 
-### REQ-TMUX-007: Server Termination on Conversation Hard-Delete
-
-WHEN a conversation is hard-deleted
-THE SYSTEM SHALL run `tmux -S <conv-sock> kill-server` (idempotent — no-op
-if server is already gone)
-AND unlink the socket file
-AND remove the conversation's entry from any in-memory tmux registry
-THE SYSTEM SHALL run this within the bedrock hard-delete cascade alongside
-the bash handle cleanup (`specs/bash/` REQ-BASH-006) and any project
-cleanup (`specs/projects/`); strict transactional atomicity is not claimed
-because tmux kill-server is a subprocess invocation, not a SQL statement,
-but the cascade SHALL ensure each step is invoked.
-
-**Rationale:** Conversations are the unit of long-lived state in Phoenix;
-when one is deleted, its associated tmux server and all its scrollback
-must go too. The tmux server kill cannot share a SQL transaction with
-the conversation row deletion (it's a subprocess), but the cascade
-orchestrator runs both within the same delete handler; partial failure
-is logged.
-
-> **Bedrock dependency:** the hard-delete cascade requires bedrock to
-> emit a `ConversationHardDeleted` event (or expose a cascade-orchestrator
-> hook) that this spec — and `specs/bash/`, `specs/projects/` — can
-> subscribe to. At the time of this revision, bedrock has neither
-> directly. The cascade integration is gated on adding that hook.
-
----
-
 ### REQ-TMUX-008: Conversation UI-State (Close, Blur) Does Not Affect Server
 
 WHEN a conversation transitions to a UI-only state (conversation tab
@@ -247,20 +219,16 @@ THE SYSTEM SHALL NOT terminate the conversation's tmux server
 AND the server's windows / panes / scrollback SHALL remain available
 upon the conversation's next active touch
 
-WHEN a conversation completes Close conversation or permanent Delete
-THE SYSTEM SHALL invoke `cascade_tmux_on_delete` with the same
-scope-equality preservation rule as hard-delete, as narrowed by the
-work-lifecycle distinct-open-aggregate rule (REQ-TMUX-WS-002)
-AND SHALL retire the server when its owning ordinary ProductConversation completes Close
-AND SHALL treat a distinct ordinary ProductConversation attachment to that `WorkScope` as structurally invalid repair input rather than a preservation case
-AND SHALL NOT let same-aggregate continuation rows or subordinate execution conversations within that one ProductConversation veto retirement
-AND SHALL preserve an ambiguously identified persistent server rather than signaling it
+When an owning ProductConversation completes Close, tmux retirement is governed
+by `specs/work-lifecycle/requirements.md` REQ-WL-002b. Same-aggregate rows are
+not independent WorkScope owners for that exact aggregate Close. Unresolved
+identity or resource uncertainty remains subject to the Close contract's
+preservation and incomplete-outcome rules. No permanent Delete lifecycle is
+specified.
 
 **Rationale:** "Comes back tomorrow, dev server still running" applies across
-UI noise such as closing a tab, blurring it, or restarting Phoenix. Close or
-Delete is the user's signal that the work is over; preserving live resources
-after that point is a leak, not a feature. See the unified lifecycle and delete
-contracts for the matching API and orchestrator requirements.
+UI noise such as closing a tab, blurring it, or restarting Phoenix. The explicit
+Close contract defines when owned resources are retired; see REQ-WL-002b.
 
 ---
 

@@ -2944,7 +2944,7 @@ impl RuntimeManager {
         &self.work_scope_load
     }
 
-    /// Get the tmux server registry (REQ-TMUX-007 hard-delete cascade,
+    /// Get the tmux server registry (REQ-TMUX-WS-001 resource cleanup,
     /// terminal attach path).
     pub fn tmux_registry(&self) -> &Arc<TmuxRegistry> {
         &self.tmux_registry

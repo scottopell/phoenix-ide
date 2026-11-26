@@ -162,12 +162,11 @@ THE SYSTEM SHALL fetch and print the corresponding server projection:
 - `--usage`: token usage totals
 - `--system-prompt`: resolved system prompt
 - `--tasks`: task files in the conversation's working directory
-- `--proposals`: fork proposals for the conversation
 
 WHEN an introspection flag is used without `--conversation`
 THE SYSTEM SHALL exit with a usage error before contacting the server
 
-**Rationale:** An agent that just sent a message often needs to inspect what changed (diff, git status) or the conversation's configuration (system prompt, model usage) before deciding what to do next. Surfacing these as structured output avoids shelling out to `git` in the worktree, which the client never exposes.
+**Rationale:** An agent that just sent a message often needs to inspect what changed (diff, git status) or the conversation's configuration (system prompt, model usage) before deciding what to do next. Surfacing these as structured output avoids shelling out to `git` in the worktree, which the client never exposes. Fork-proposal introspection is not part of the client contract.
 
 ---
 

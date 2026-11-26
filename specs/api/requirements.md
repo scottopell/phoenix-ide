@@ -238,9 +238,7 @@ THE SYSTEM SHALL broadcast the event live at the current stream watermark withou
 AND SHALL reconstruct the complete current steering queue from durable state in every authorized init snapshot
 SO THAT missed live mutations converge on reconnect without retaining private or attachment-heavy queued payloads in memory
 
-WHEN the server emits `conversation_hard_deleted`
-THE SYSTEM SHALL broadcast it live without retaining it for replay
-WHERE deletion removes the durable conversation required to produce a later init snapshot
+THE SYSTEM SHALL NOT emit `conversation_hard_deleted` for ordinary conversation lifecycle transitions
 
 WHEN the server emits an eager (non-persisted) assistant Message via the runtime's BroadcastAssistantMessage effect
 THE SYSTEM SHALL request one root-stream sequence allocation from the RootStreamLedger for the enclosing ProductConversation
@@ -278,7 +276,7 @@ AND SHALL carry the root ProductConversation id plus that `root_sequence_id` on 
 AND SHALL include member conversation identity on carriers sourced from one transcript member rather than from the aggregate itself
 AND SHALL treat `work_scope_update` as aggregate-native, carrying the root ProductConversation id plus the inventory payload identity rather than any member-row owner
 AND SHALL append the same root-keyed envelope to replay and surface the same ledger watermark through init
-WHERE `init` is excluded because it is per-subscriber, steering queue mutations are durable-state-subsumed live projections, and `conversation_hard_deleted` is terminal and non-replayable
+WHERE `init` is excluded because it is per-subscriber and steering queue mutations are durable-state-subsumed live projections
 SO THAT live delivery, replay, and init snapshots share one authoritative ordering space
 
 WHEN the server process restarts
