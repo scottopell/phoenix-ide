@@ -22,9 +22,11 @@ compare() {
     [[ $a -le 1 && $b -le 1 ]]
     printf '%s: CLI[%s]=%s gix[%s]=%s\n' "$name" "$a" "$(cat cli-out cli-err)" "$b" "$(cat gix-out gix-err)"
     case $name in
-        unborn|attached|detached) test "$a" -eq 0 && test "$b" -eq 0 && cmp cli-out gix-out ;;
+        unborn|attached|detached|recursive-chain|dangling-chain|missing-branch-with-dwim-decoy|ambiguous-HEAD-with-tag) test "$a" -eq 0 && test "$b" -eq 0 && cmp cli-out gix-out ;;
+        missing-nonbranch) test "$a" -eq 1 && test "$b" -eq 0 && grep -Fxq "unborn refs/tags/absent" gix-out ;;
+        cyclic-chain|broken-ref|malformed-HEAD|missing-HEAD) test "$a" -eq 1 && test "$b" -eq 1 ;;
         changing-unborn) test "$a" -eq 1 && test "$b" -eq 1 && grep -Fq 'changed' cli-err && grep -Fq 'changed' gix-err ;;
-    esac
+    esac || return 1
 }
 compare unborn
 compare changing-unborn refs/heads/other

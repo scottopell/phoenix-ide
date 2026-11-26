@@ -10,6 +10,7 @@ jobs:
     timeout-minutes: 12
     defaults:
       run:
+        shell: bash
         working-directory: scripts/qualification/gix-close-history
     steps:
       - uses: actions/checkout@v6
@@ -38,4 +39,5 @@ jobs:
             scripts/qualification/gix-close-history/build.txt
             scripts/qualification/gix-close-history/runtime.txt
             scripts/qualification/gix-close-history/decoder-*.txt
+            scripts/qualification/gix-close-history/decoder-build/Cargo.lock
             scripts/qualification/gix-close-history/head-compare.txt
