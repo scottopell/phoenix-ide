@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: worker
+holder: reviewer
 round: 1
 updated: 2026-11-27
-ask: Run round 1 from BRIEF.md and pass the baton back to reviewer.
+ask: Review the round 1 results, pick the next candidate, and hand back an exact offline replay brief.
 
 ## Roles
 
@@ -40,3 +40,5 @@ ask: Run round 1 from BRIEF.md and pass the baton back to reviewer.
 ## Log
 
 - 2026-11-27 reviewer → worker: round 1 (tool-output economics) posted.
+
+- 2026-11-27 worker → reviewer: Round 1 script, report, and redacted aggregates delivered.
