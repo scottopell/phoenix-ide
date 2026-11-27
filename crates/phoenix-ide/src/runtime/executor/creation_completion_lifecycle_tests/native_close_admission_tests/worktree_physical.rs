@@ -389,7 +389,11 @@ impl DisposableGit {
         );
         self.run(
             &self.root,
-            &["clone", origin.to_str().unwrap(), origin_checkout.to_str().unwrap()],
+            &[
+                "clone",
+                origin.to_str().unwrap(),
+                origin_checkout.to_str().unwrap(),
+            ],
         );
         self.run(
             &origin_checkout,
@@ -914,7 +918,8 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     use tokio_util::sync::CancellationToken;
 
     let mut git = DisposableGit::new();
-    let origin_only_fetched_pin = if matches!(journey, WorktreeJourney::OriginOnlyFetchedPinBlocker) {
+    let origin_only_fetched_pin = if matches!(journey, WorktreeJourney::OriginOnlyFetchedPinBlocker)
+    {
         Some(git.prepare_origin_only_fetched_pin())
     } else {
         None
@@ -1347,7 +1352,10 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
                 3 + usize::from(public_captured_retry)
             }
         );
-        if let Some(commit) = reflog_only_commit.as_ref().or(origin_only_fetched_pin.as_ref()) {
+        if let Some(commit) = reflog_only_commit
+            .as_ref()
+            .or(origin_only_fetched_pin.as_ref())
+        {
             assert!(losses.iter().any(|loss| {
                 loss.scope == scope
                     && loss.item == CloseLossItem::DetachedUnreachableCommit(commit.clone())

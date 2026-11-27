@@ -2724,7 +2724,10 @@ mod product_creation_delivery_replay_tests {
         let git = |cwd: &Path, args: &[&str]| crate::git_ops::run_git(cwd, args).unwrap();
         git(&repo, &["clone", "--bare", ".", origin.to_str().unwrap()]);
         git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
-        git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
         git(&repo, &["fetch", "origin"]);
         let fetch_head = repo.join(".git/FETCH_HEAD");
         let fetch_head_before = std::fs::read(&fetch_head).unwrap();
