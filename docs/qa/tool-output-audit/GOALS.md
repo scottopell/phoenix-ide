@@ -38,13 +38,12 @@ The work is done (`holder: done`) when any of these holds:
 
 ## Current target
 
-Round 2: replay A (compact the cleared-result marker, ≈3.5% of input carried as markers) and
-B (patch diff as a clearable preview with a durable record, ≈7.8% carried). Baseline:
-reconstructed carry from round 1, tool results 29.7B of 60.79B recorded input.
+Round 3: an exact replay of B as implemented (`a9e1564b3`, about 5.3–5.6%) for the merge vote; revised
+A (`@self#seq-<n>` marker, about 3% before overlap); and clearing that grows a result.
 
-Queued: bash command echo as a typed reference (1.1% reconstructed); deferring the browser tool
-definitions (2.7% of transcripts use them, about 2.9k tokens per request); bounded bash results
-with retrieval; long-line shortening.
+Queued: deferring the browser tool definitions (2.7% of transcripts use them, about 2.9k tokens per
+request); bounded bash results with retrieval; long-line shortening; read_file line-number
+prefixes. Dropped: the bash command echo, already removed by ADR-290.
 
 ## Wins log
 

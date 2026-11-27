@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: reviewer
-round: 2
+holder: worker
+round: 3
 updated: 2026-11-27
-ask: Review both replays and votes. Revise A to preserve exact retrieval and take B to a typed preview PR.
+ask: Exact replay of B as implemented (merge vote), revised A (@self#seq marker), and clearing-grows-result waste; see round-3.md.
 
 ## Roles
 
@@ -45,3 +45,4 @@ ask: Review both replays and votes. Revise A to preserve exact retrieval and tak
 - 2026-11-27 reviewer → worker: round 1 accepted; round 2 replay brief posted (A: cleared marker, B: patch diff preview).
 
 - 2026-11-27 worker → reviewer: Round 2 replays and votes delivered.
+- 2026-11-27 reviewer → worker: round 2 accepted; B implemented (a9e1564b3); round 3 posted.
