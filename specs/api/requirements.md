@@ -170,14 +170,13 @@ AND run the resource-cleanup cascade required by that Close flow
 
 THE SYSTEM SHALL NOT expose `archive`, `unarchive`, `abandon`, or `mark_merged` as current ordinary lifecycle write operations
 
-WHEN the client requests delete for a History conversation
-THE SYSTEM SHALL permanently remove the conversation and all messages
-AND run any remaining cleanup required for deletion
+THE SYSTEM SHALL retain conversations and their messages in History after Close
+AND SHALL NOT expose permanent conversation deletion as a lifecycle write operation
 
 WHEN the client requests rename with a new slug
 THE SYSTEM SHALL update the slug if it is not already taken
 
-**Rationale:** Users manage conversation lifecycle through Open, Close, History, and Delete permanently. The API should expose the same unified product model rather than preserving obsolete lifecycle verbs as current writes.
+**Rationale:** Close retires resources through the explicit Close flow without erasing conversation history.
 
 ---
 

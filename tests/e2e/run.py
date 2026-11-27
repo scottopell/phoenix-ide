@@ -1742,7 +1742,7 @@ def scenario_git_lifecycle_public_http(base_url: str) -> None:
         closed = httpx.post(
             f"{base_url}/api/product-conversations/{product_id}/close", timeout=10.0,
         )
-        closed.raise_for_status()
+        assert closed.is_success, f"physical Close returned HTTP {closed.status_code}: {closed.text}"
         assert closed.json().get("success") is True
         assert not checkout.exists(), f"physical Close retained the checkout: {checkout}"
         assert checkout not in _git_worktree_paths(repo), "physical Close retained the Git registration"
