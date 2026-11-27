@@ -4274,10 +4274,7 @@ mod product_creation_tests {
             claimed.claim.lease_until - chrono::Duration::microseconds(1)
         };
         db.test_set_product_creation_now(sampled);
-        sqlx::query("COMMIT")
-            .execute(&mut *writer)
-            .await
-            .unwrap();
+        sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
         assert_eq!(renewal.await.unwrap(), !expired);
 
         let job = db
