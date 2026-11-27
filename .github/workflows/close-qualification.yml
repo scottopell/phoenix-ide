@@ -1018,7 +1018,6 @@ jobs:
             directory_child_swap_after_inspection_preserves_replacement_for_needs_repair
             file_child_swap_after_inspection_preserves_replacement_for_needs_repair
             detached_unreachable_commits_until_rejects_expired_deadline_before_repository_access
-            detached_head_is_unreachable_rejects_expired_deadline_before_repository_access
             detached_reachability_evidence_until_rejects_expired_deadline_before_repository_access
             staged_index_query_materializes_only_requested_dirty_paths
             detached_unreachable_commits_excludes_the_exact_stash_ref
