@@ -327,13 +327,13 @@ def _is_addr_in_use(log_text: str) -> bool:
     return "kind: AddrInUse" in log_text or "Address already in use" in log_text
 
 
-def _start_server_attempt(env: dict[str, str], tmpdir: Path, attempt: int):
+def _start_server_attempt(env: dict[str, str], tmpdir: Path, attempt: int, *, binary: Path = BINARY):
     port = _free_port()
     attempt_env = env | {"PHOENIX_PORT": str(port)}
     log_path = tmpdir / f"phoenix-startup-{attempt}.log"
     log_file = log_path.open("w")
     proc = subprocess.Popen(
-        [str(BINARY)],
+        [str(binary)],
         cwd=tmpdir,
         env=attempt_env,
         stdout=log_file,
@@ -433,7 +433,7 @@ def _server_env(tmpdir: Path, parent_env: dict[str, str] | None = None) -> dict[
 
 
 @contextmanager
-def _server():
+def _server(binary: Path = BINARY):
     tmpdir = Path(tempfile.mkdtemp(prefix="phoenix-e2e-"))
     env = _server_env(tmpdir)
     profile_dir = _profile_dir_from_env()
@@ -442,7 +442,10 @@ def _server():
     startup_started_cpu = _harness_cpu_times() if profile_dir is not None else None
 
     try:
-        proc, base_url, log_path, log_file = _start_server_with_retries(env, tmpdir)
+        proc, base_url, log_path, log_file = _start_server_with_retries(
+            env, tmpdir,
+            lambda env, tmpdir, attempt: _start_server_attempt(env, tmpdir, attempt, binary=binary),
+        )
     except Exception:
         startup_finished_monotonic_ns = time.monotonic_ns()
         _write_cpu_window(
@@ -1739,9 +1742,12 @@ def scenario_git_lifecycle_public_http(base_url: str) -> None:
         assert _git_lifecycle_snapshot(checkout) == checkout_before_approval, (
             "test left checkout changes before physical Close"
         )
-        closed = httpx.post(
-            f"{base_url}/api/product-conversations/{product_id}/close", timeout=10.0,
-        )
+        try:
+            closed = httpx.post(
+                f"{base_url}/api/product-conversations/{product_id}/close", timeout=10.0,
+            )
+        except httpx.RequestError as error:
+            raise AssertionError(f"physical Close request failed: {error}") from error
         assert closed.is_success, f"physical Close returned HTTP {closed.status_code}: {closed.text}"
         assert closed.json().get("success") is True
         assert not checkout.exists(), f"physical Close retained the checkout: {checkout}"
@@ -2265,6 +2271,7 @@ SCENARIO_MAP = dict(SCENARIOS)
 def _parse_args(argv: list[str]):
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--isolated-git-lifecycle", action="store_true")
     parser.add_argument(
         "--scenario",
         action="append",
@@ -2275,6 +2282,8 @@ def _parse_args(argv: list[str]):
     args = parser.parse_args(argv)
     if args.positional:
         parser.error(f"unrecognized arguments: {' '.join(args.positional)}")
+    if args.isolated_git_lifecycle and (args.self_test or args.scenario):
+        parser.error("--isolated-git-lifecycle is a fixed standalone selector")
     return args
 
 
@@ -2793,6 +2802,13 @@ class ScenarioSelectorTests(unittest.TestCase):
         self.assertEqual(["patch", "list_models"], args.scenario)
         self.assertFalse(args.self_test)
 
+    def test_isolated_git_lifecycle_cannot_select_other_work(self):
+        flag = "--isolated-git-lifecycle"
+        self.assertTrue(_parse_args([flag]).isolated_git_lifecycle)
+        for other in (["--scenario", "patch"], ["--scenario", "git_lifecycle_public_http"], ["--self-test"]):
+            with self.subTest(other=other), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                _parse_args([flag, *other])
+
     def test_parse_args_rejects_positional_arguments(self):
         with self.assertRaises(SystemExit):
             _parse_args(["product_conversation_context_continuation"])
@@ -2987,19 +3003,50 @@ def _run_self_tests() -> int:
     return 0 if result.wasSuccessful() else 1
 
 
+def _verify_isolated_server(base_url: str, pid: int, binary: Path, expected_sha: str) -> None:
+    version = httpx.get(f"{base_url}/api/version", timeout=10.0)
+    version.raise_for_status()
+    assert version.json()["git_sha"] == expected_sha, version.text
+    server_proc = Path(f"/proc/{pid}")
+    for namespace in ("pid", "mnt"):
+        harness_ns = Path(f"/proc/self/ns/{namespace}").readlink()
+        assert (server_proc / "ns" / namespace).readlink() == harness_ns
+        print(f"[e2e] harness and server share {harness_ns}", flush=True)
+    assert (server_proc / "exe").samefile(binary), "server executable differs from staged binary"
+    credentials = dict(line.split(":", 1) for line in (server_proc / "status").read_text().splitlines())
+    uid = os.getuid()
+    assert uid != 0 and credentials["Uid"].split() == [str(uid)] * 4
+    assert not credentials["Groups"].split()
+    assert credentials["NoNewPrivs"].strip() == "1"
+    assert all(int(credentials[f"Cap{kind}"], 16) == 0 for kind in ("Inh", "Prm", "Eff", "Bnd", "Amb"))
+    print(f"[e2e] isolated server source={expected_sha} uid={uid} pid={pid}", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.self_test:
         return _run_self_tests()
     if _run_self_tests() != 0:
         return 1
-    selected_scenarios = _select_scenarios(args.scenario)
-    _build_binary()
+    binary = BINARY
+    if args.isolated_git_lifecycle:
+        selected_scenarios = _select_scenarios(["git_lifecycle_public_http"])
+        binary = Path.cwd() / "runtime-test"
+        expected_sha = (Path(__file__).parent / "source.sha").read_text().strip()
+    else:
+        selected_scenarios = _select_scenarios(args.scenario)
+        _build_binary()
     failures: list[tuple[str, str]] = []
     log_text = ""
     workers = _e2e_worker_budget()
-    with _server() as (base_url, log_path, server_pid, profile_dir):
+    with _server(binary) as (base_url, log_path, server_pid, profile_dir):
         print(f"[e2e] server up at {base_url}", flush=True)
+        if args.isolated_git_lifecycle:
+            try:
+                _verify_isolated_server(base_url, server_pid, binary, expected_sha)
+            except Exception:
+                print("\n".join(log_path.read_text().splitlines()[-80:]), file=sys.stderr)
+                raise
         if profile_dir is None and workers > 1 and len(selected_scenarios) > 1:
             failures = _run_scenarios_parallel(
                 selected_scenarios, base_url, min(workers, len(selected_scenarios))
@@ -3057,7 +3104,7 @@ def main(argv: list[str] | None = None) -> int:
                     )
 
         lifecycle_close_failed = any(
-            name == "git_lifecycle_public_http" and "physical Close returned HTTP" in detail
+            name == "git_lifecycle_public_http" and "physical Close " in detail
             for name, detail in failures
         )
         if lifecycle_close_failed and sys.platform == "linux":

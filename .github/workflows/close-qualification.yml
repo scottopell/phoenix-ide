@@ -3,7 +3,7 @@ name: Close exact-source qualification
 on:
   workflow_dispatch:
   push:
-    branches: [feat/unified-close-receipts]
+    branches: [feat/unified-close-receipts, refactor/git-lifecycle-do-less]
 
 permissions:
   contents: read
@@ -13,7 +13,96 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  git-lifecycle-public-http:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/refactor/git-lifecycle-do-less'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ''
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: close-http-qualification
+      - uses: astral-sh/setup-uv@v7
+      - name: Verify disposable runner dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -VV
+          /usr/bin/tmux -V
+          /usr/bin/git --version
+          /usr/bin/unshare --version
+          /usr/bin/setpriv --version
+      - name: Build and record reviewed source as the runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          payload="$RUNNER_TEMP/close-http-payload"
+          mkdir -p "$evidence" "$payload"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          printf '%s\n' "$GITHUB_SHA" > "$payload/source.sha"
+          git rev-parse HEAD^{tree} > "$evidence/source.tree"
+          cp "$payload/source.sha" "$evidence/source.sha"
+          cp tests/e2e/{run.py,coordinator_home_resolution_contract.py} "$payload/"
+          PHOENIX_BUILD_GIT_SHA="$GITHUB_SHA" PHOENIX_BUILD_GIT_DIRTY=clean \
+            cargo build --locked --bin phoenix_ide --target-dir "$GITHUB_WORKSPACE/target" \
+            2>&1 | tee "$evidence/build.log"
+          test -z "$(git status --porcelain)"
+          uv pip install --python /usr/bin/python3 --target "$payload/deps" --only-binary :all: --no-deps \
+            httpx==0.28.1 httpx-sse==0.4.3 httpcore==1.0.9 h11==0.16.0 \
+            anyio==4.11.0 idna==3.11 certifi==2025.11.12 typing-extensions==4.15.0
+          tar -C "$payload" -cf "$RUNNER_TEMP/close-http-payload.tar" run.py coordinator_home_resolution_contract.py source.sha deps
+          sha256sum target/debug/phoenix_ide "$RUNNER_TEMP/close-http-payload.tar" > "$evidence/input-sha256.txt"
+      - name: Run only the public Git lifecycle with the real Close detector
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          sha256sum --check "$evidence/input-sha256.txt"
+          mapfile -t digests < <(cut -d ' ' -f 1 "$evidence/input-sha256.txt")
+          timeout --kill-after=10s 2m bash scripts/ci/close-unprivileged-qualification.sh \
+            "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/target/debug/phoenix_ide" \
+            "$RUNNER_TEMP/close-http-payload.tar" "$(id -u)" git_lifecycle_public_http "${digests[@]}" \
+            2>&1 | tee "$evidence/git-lifecycle-http.log"
+          grep -E "^\[e2e\] isolated server source=$GITHUB_SHA uid=[1-9][0-9]* pid=[1-9][0-9]*$" "$evidence/git-lifecycle-http.log"
+          grep -E '^  ✓ git_lifecycle_public_http +[0-9.]+s$' "$evidence/git-lifecycle-http.log"
+          grep -F '✓ all 1 e2e scenarios passed' "$evidence/git-lifecycle-http.log"
+      - name: Build and run the existing live-writer rejection control
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          cargo test --locked -p phoenix_ide --lib --no-run --message-format=json \
+            --target-dir "$GITHUB_WORKSPACE/target" > "$evidence/writer-control-build.jsonl"
+          runtime_test_binary="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "phoenix_ide" and .profile.test == true and .executable != null) | .executable' "$evidence/writer-control-build.jsonl")"
+          test -x "$runtime_test_binary"
+          test_name='runtime::close_retirement::tests::quarantine_rejects_live_linux_descriptor_writer_before_deletion'
+          timeout --kill-after=10s 2m bash scripts/ci/close-unprivileged-qualification.sh \
+            "$GITHUB_WORKSPACE" "$runtime_test_binary" "$GITHUB_WORKSPACE/target/debug/phoenix_ide" \
+            "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "$evidence/writer-control.log"
+          grep -F "$test_name ... ok" "$evidence/writer-control.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$evidence/writer-control.log"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: close-http-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/close-http-evidence/
+          if-no-files-found: error
+          retention-days: 14
   specifications:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/feat/unified-close-receipts'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -50,6 +139,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
   frontend:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/feat/unified-close-receipts'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -93,6 +183,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
   database:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/feat/unified-close-receipts'
     runs-on: ubuntu-latest
     # The exact-source DB and runtime suites share this job. Hosted cold builds
     # and repeated Cargo invocations exceeded 60m before physical actor coverage.
