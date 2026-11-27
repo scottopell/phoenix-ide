@@ -4444,13 +4444,9 @@ mod product_creation_staging_ownership_tests {
 
         let root = repo.path().to_str().unwrap();
         assert!(verify_product_creation_checkout(root, &path, &oid).is_ok());
-        let error = verify_existing_product_creation_staging(
-            root,
-            &path,
-            &oid,
-            Some("owner-token"),
-        )
-        .unwrap_err();
+        let error =
+            verify_existing_product_creation_staging(root, &path, &oid, Some("owner-token"))
+                .unwrap_err();
         assert_eq!(
             error,
             "existing staging occupant did not match durable ownership"
