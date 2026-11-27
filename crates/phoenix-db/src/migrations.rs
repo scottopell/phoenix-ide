@@ -17676,9 +17676,12 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         for prefix in [171, 172] {
-            let pending = migration_identities()
-                .filter(|(version, _)| *version > prefix)
-                .count() as u32;
+            let pending = u32::try_from(
+                migration_identities()
+                    .filter(|(version, _)| *version > prefix)
+                    .count(),
+            )
+            .unwrap();
             let path = dir.path().join(format!("prefix-{prefix}.db"));
             let path = path.to_str().unwrap();
             let db = crate::Database::open(path).await.unwrap();
