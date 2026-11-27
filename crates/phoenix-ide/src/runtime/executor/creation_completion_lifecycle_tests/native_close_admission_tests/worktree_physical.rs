@@ -278,6 +278,7 @@ struct DisposableGit {
 const FIXTURE_CREATION_REPOSITORY_IDENTITY: &str = "physical-close-fixture-incarnation";
 
 impl DisposableGit {
+    #[allow(clippy::too_many_lines)]
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();

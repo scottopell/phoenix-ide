@@ -2575,6 +2575,7 @@ mod product_creation_delivery_replay_tests {
         .unwrap()
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn failed_creation_retains_owned_checkout_and_fences_new_claims() {
         let repo = super::product_creation_staging_ownership_tests::initialized_repo();
@@ -2895,6 +2896,7 @@ mod product_creation_delivery_replay_tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn reopened_creation_reuses_fetched_pin_when_origin_is_unavailable() {
         let (_directory, repo) = initialized_product_repository();
@@ -3008,6 +3010,7 @@ mod product_creation_delivery_replay_tests {
         assert_eq!(std::fs::read(fetch_head).unwrap(), fetch_head_before);
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn reopened_creation_refuses_same_path_same_oid_replacement_repository() {
         let (_original, repo) = initialized_product_repository();
@@ -3330,6 +3333,7 @@ mod product_creation_delivery_replay_tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn restarted_worker_refuses_legacy_token_only_staging_without_losing_checkout() {
         let repo_fixture = super::product_creation_staging_ownership_tests::initialized_repo();

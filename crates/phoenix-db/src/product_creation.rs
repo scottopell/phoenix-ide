@@ -4173,6 +4173,7 @@ mod product_creation_tests {
         fingerprint
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn staging_requires_current_bound_pin_and_reservation_and_preserves_tuple() {
         let db = Database::open_in_memory().await.unwrap();
@@ -8508,6 +8509,7 @@ mod product_creation_tests {
             .unwrap());
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn persisted_resource_ownership_revalidation_is_fenced_by_live_claim() {
         let db = Database::open_in_memory().await.unwrap();
@@ -8760,6 +8762,7 @@ mod product_creation_tests {
         );
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn product_creation_cleanup_conflict_is_durable_and_blocks_finalization() {
         let db = Database::open_in_memory().await.unwrap();
@@ -8878,6 +8881,7 @@ mod product_creation_tests {
             .unwrap());
     }
 
+    #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn persisted_cleanup_conflict_is_idempotent_and_requeued_for_deletion() {
         let db = Database::open_in_memory().await.unwrap();
