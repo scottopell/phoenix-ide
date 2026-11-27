@@ -3689,14 +3689,11 @@ impl RuntimeManager {
     ) -> Result<usize, String> {
         let obligations = self
             .db
-            .list_pending_generic_close_settlements()
+            .list_pending_generic_close_settlements(attempt_id)
             .await
             .map_err(|error| error.to_string())?;
         let manager = Arc::clone(self);
-        let selected = obligations.into_iter().filter(|settlement| {
-            attempt_id.is_none_or(|id| settlement.obligation().attempt_id() == id)
-        });
-        self.run_authority_units(selected, move |obligation| {
+        self.run_authority_units(obligations, move |obligation| {
             let manager = Arc::clone(&manager);
             async move { manager.settle_close_obligation(obligation).await }
         })

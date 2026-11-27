@@ -2774,6 +2774,7 @@ impl Database {
     /// Lists only settlement work admitted to the generic background worker.
     pub async fn list_pending_generic_close_settlements(
         &self,
+        attempt_id: Option<&CloseAttemptId>,
     ) -> DbResult<Vec<GenericCloseSettlement>> {
         let rows = sqlx::query(
             "SELECT o.attempt_id, o.product_conversation_id, o.phase,
@@ -2781,6 +2782,7 @@ impl Database {
                     o.updated_at, o.completed_at, o.close_outcome
              FROM close_obligations o
              WHERE o.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
+               AND (?1 IS NULL OR o.attempt_id = ?1)
                AND NOT EXISTS (
                    SELECT 1 FROM native_close_initial_receipts receipt
                    WHERE receipt.attempt_id = o.attempt_id
@@ -2789,6 +2791,7 @@ impl Database {
                )
              ORDER BY o.created_at DESC, o.attempt_id DESC",
         )
+        .bind(attempt_id.map(CloseAttemptId::as_str))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()

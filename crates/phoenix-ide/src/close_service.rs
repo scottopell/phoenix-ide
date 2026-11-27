@@ -13,9 +13,12 @@ pub(crate) async fn require_close_settlement_without_retained_custody(
         .require_no_retained_legacy_creation_for_retirement(attempt_id)
         .await
         .map_err(|error| match error {
-            crate::db::DbError::CloseFoundationPrecondition(detail) => AppError::Conflict(
-                Box::new(ConflictErrorResponse::new(detail, "close_settlement_in_progress")),
-            ),
+            crate::db::DbError::CloseFoundationPrecondition(detail) => {
+                AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    detail,
+                    "close_settlement_in_progress",
+                )))
+            }
             error => AppError::Internal(error.to_string()),
         })
 }

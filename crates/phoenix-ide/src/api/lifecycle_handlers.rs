@@ -20,6 +20,7 @@ use axum::{
     extract::{Path, State},
     Json,
 };
+use phoenix_core::domain::close::CloseCompletionOutcome;
 
 // ============================================================
 // Terminal-action gate (REQ-BED-031)
@@ -360,6 +361,12 @@ pub(crate) async fn confirm_close_stop_work(
         .map_err(|error| AppError::Internal(error.to_string()))?;
     if refreshed.phase() == phoenix_core::domain::close::ClosePhase::SettlingActiveWork {
         require_close_settlement_without_retained_custody(&state, refreshed.attempt_id()).await?;
+    }
+    if refreshed.close_outcome() == Some(CloseCompletionOutcome::Cancelled) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Close was cancelled before retirement",
+            "close_cancelled",
+        ))));
     }
     match refreshed.phase() {
         phoenix_core::domain::close::ClosePhase::SettlingActiveWork

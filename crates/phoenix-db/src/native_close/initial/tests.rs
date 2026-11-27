@@ -2125,7 +2125,7 @@ async fn prepared_native_initial_is_not_generic_settlement_work() {
     let (command, receipt, live_source) = prepared_initial(&f).await;
     assert!(f
         .db
-        .list_pending_generic_close_settlements()
+        .list_pending_generic_close_settlements(None)
         .await
         .unwrap()
         .is_empty());

@@ -6347,7 +6347,10 @@ mod product_creation_tests {
             .unwrap();
         assert_eq!(unchanged.status, "delivery_pending");
         assert_eq!(unchanged.claim_generation, delivery.claim.generation);
-        assert_eq!(unchanged.published_product_id, delivery.job.published_product_id);
+        assert_eq!(
+            unchanged.published_product_id,
+            delivery.job.published_product_id
+        );
         assert_eq!(
             unchanged.published_conversation_id,
             delivery.job.published_conversation_id
