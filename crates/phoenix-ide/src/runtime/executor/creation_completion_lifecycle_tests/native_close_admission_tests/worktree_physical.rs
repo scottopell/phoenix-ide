@@ -82,6 +82,12 @@ async fn registered_native_close_physically_retires_worktree_only_and_replays_wi
     run_public_worktree_close(WorktreeJourney::Retire).await;
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn registered_native_close_refuses_a_live_writable_descriptor() {
+    run_public_worktree_close(WorktreeJourney::RefuseDescriptorWriter).await;
+}
+
 #[tokio::test]
 async fn registered_native_close_with_loss_content_stops_incomplete_without_retirement() {
     run_public_worktree_close(WorktreeJourney::RetainContentBlockers).await;
@@ -172,6 +178,7 @@ async fn registered_native_close_after_source_stop_preserves_reused_path_and_ori
 enum WorktreeJourney {
     Retire,
     RetireWithProductionDetector,
+    RefuseDescriptorWriter,
     CapturedLossPublicRetryWithProductionDetector,
     CapturedLossPublicRetryStoppedDuringAssessment,
     CapturedLossPublicRetryStoppedDuringPreparation,
@@ -760,6 +767,13 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     use tokio_util::sync::CancellationToken;
 
     let mut git = DisposableGit::new();
+    // Keep a real writable handle on tracked content without changing its bytes.
+    let _writer = matches!(journey, WorktreeJourney::RefuseDescriptorWriter).then(|| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(git.worktree.join("tracked.txt"))
+            .unwrap()
+    });
     // Start at ancestor A, create C, then leave HEAD at A. C has no ref and is
     // reachable only through this linked checkout's HEAD reflog.
     let reflog_only_commit = if matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
@@ -854,8 +868,8 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation
     ) {
         // Qualify public admission and real Git/filesystem retirement independently
-        // of ambient runner processes. Production inspection gaps remain blocking;
-        // deterministic Linux detector tests qualify that separate safety boundary.
+        // of ambient runner processes. Separate production-probe journeys qualify
+        // how the admitted physical gate handles gaps and proven writers.
         Arc::get_mut(&mut backend)
             .expect("fresh Worktree journey manager must be uniquely owned")
             .clean_close_writer_fixture = true;
@@ -1398,6 +1412,15 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             );
             git.assert_untargeted_state_preserved();
         }
+    } else if matches!(journey, WorktreeJourney::RefuseDescriptorWriter) {
+        assert!(output.is_success(), "{}", output.output());
+        let admitted: Value = serde_json::from_str(output.output()).unwrap();
+        assert_eq!(admitted["status"], "newly_admitted");
+        assert_eq!(admitted["admitted"]["run_ordinal"], 1);
+        let attempt =
+            CloseAttemptId::parse(admitted["admitted"]["attempt_id"].as_str().unwrap()).unwrap();
+        assert_public_descriptor_veto(&fixture, &git, &scope, attempt, &registrations_before_admission)
+            .await;
     } else {
         assert!(output.is_success(), "{}", output.output());
         let admitted: Value = serde_json::from_str(output.output()).unwrap();
@@ -1844,6 +1867,70 @@ async fn durable_target_rows(fixture: &CloseFixture) -> Value {
 
 // Failure diagnostics must not replace the original outcome with a query panic.
 // Keep replay snapshots below strict: query failures there remain test failures.
+async fn assert_public_descriptor_veto(
+    fixture: &CloseFixture,
+    git: &DisposableGit,
+    scope: &WorkScopeId,
+    attempt: CloseAttemptId,
+    registrations: &[u8],
+) {
+    use crate::db::{
+        CloseFileWriteAccess, CloseWriterAuthority, CloseWriterDetector, CloseWriterObservation,
+    };
+
+    let run = CloseRunRef::initial(attempt.clone());
+    let obligation = fixture
+        .db
+        .get_close_obligation(attempt.as_str())
+        .await
+        .unwrap();
+    assert_eq!(
+        obligation.close_outcome(),
+        Some(CloseCompletionOutcome::CloseIncomplete)
+    );
+    assert_eq!(
+        fixture.db.get_close_run(&run).await.unwrap().status,
+        CloseRunStatus::Stopped,
+    );
+    let observations = fixture
+        .db
+        .list_close_writer_observations(&run, scope)
+        .await
+        .unwrap();
+    let [entry] = observations.as_slice() else {
+        panic!("expected one positive observation: {observations:?}");
+    };
+    assert_eq!(entry.run, run);
+    let CloseWriterObservation::Authority {
+        detector: CloseWriterDetector::LinuxDescriptor,
+        authority: CloseWriterAuthority::WritableFile(CloseFileWriteAccess::WriteOnly),
+        process,
+        matched_path,
+    } = &entry.observation
+    else {
+        panic!("expected current writable descriptor: {entry:?}");
+    };
+    assert_eq!(process.pid, std::process::id());
+    assert_eq!(matched_path.file_name().unwrap(), "tracked.txt");
+    let retained = matched_path.parent().unwrap();
+    assert_eq!(directory_identity(retained), git.checkout_identity);
+    assert_eq!(std::fs::read(matched_path).unwrap(), b"durable content\n");
+    assert_eq!(directory_identity(&git.admin), git.admin_identity);
+    assert_eq!(
+        git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]),
+        registrations,
+    );
+    assert_eq!(
+        fixture
+            .db
+            .read_ordinary_product_conversation_metadata(TARGET_ID)
+            .await
+            .unwrap()
+            .lifecycle,
+        OrdinaryProductConversationLifecycle::History,
+    );
+}
+
 async fn assert_ordinary_linux_gap_if_requested(
     fixture: &CloseFixture,
     run: &CloseRunRef,
@@ -1851,7 +1938,7 @@ async fn assert_ordinary_linux_gap_if_requested(
     snapshot: &CloseRetirementSnapshot,
     resource: &phoenix_core::domain::close::RetiredResourceIdentity,
 ) {
-    use phoenix_core::domain::close::{CloseWriterDetector, CloseWriterObservation};
+    use crate::db::{CloseWriterDetector, CloseWriterObservation};
 
     let Ok(value) = std::env::var("PHOENIX_TEST_OPAQUE_CLOSE_PID") else {
         return;

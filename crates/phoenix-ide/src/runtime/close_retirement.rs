@@ -7871,8 +7871,8 @@ fn scan_writer_detectors(
     mut mapping: impl FnMut() -> Result<ExternalWriterEvidence, String>,
 ) -> Result<ExternalWriterEvidence, String> {
     let mut incomplete = ExternalWriterEvidence::NoPositiveEvidence;
-    let probes: [&mut dyn FnMut() -> Result<ExternalWriterEvidence, String>; 3] =
-        [&mut descriptor, &mut cwd, &mut mapping];
+    type Probe<'a> = dyn FnMut() -> Result<ExternalWriterEvidence, String> + 'a;
+    let probes: [&mut Probe<'_>; 3] = [&mut descriptor, &mut cwd, &mut mapping];
     for probe in probes {
         check_directory_deletion_deadline(Some(deadline))?;
         let evidence = probe()?;
@@ -7921,33 +7921,40 @@ fn quarantine_has_writable_mappings_in_until(
         deadline,
         |process, canonical| {
             writer_scan_check(deadline)?;
-            let mappings_result = std::fs::read_to_string(process.join("maps"));
+            let mappings_result = std::fs::read(process.join("maps"));
             writer_scan_check(deadline)?;
             let mappings = mappings_result.map_err(|_| CloseWriterGap::Unavailable)?;
-            scan_writer_entries(mappings.lines(), deadline, |mapping| {
-                let mut fields = mapping.split_whitespace();
-                let _address = fields.next().ok_or(CloseWriterGap::Malformed)?;
-                let permissions = fields.next().ok_or(CloseWriterGap::Malformed)?;
-                let _offset = fields.next().ok_or(CloseWriterGap::Malformed)?;
-                let _device = fields.next().ok_or(CloseWriterGap::Malformed)?;
-                let _inode = fields.next().ok_or(CloseWriterGap::Malformed)?;
+            if mappings.is_empty() {
+                return Ok(None);
+            }
+            let mappings = mappings.strip_suffix(b"\n").unwrap_or(&mappings);
+            scan_writer_entries(mappings.split(|byte| *byte == b'\n'), deadline, |mapping| {
+                use std::os::unix::ffi::OsStrExt;
+
                 let mut remainder = mapping;
-                for _ in 0..5 {
-                    remainder = remainder.trim_start();
-                    remainder = remainder
-                        .get(
-                            remainder
-                                .find(char::is_whitespace)
-                                .unwrap_or(remainder.len())..,
-                        )
-                        .ok_or(CloseWriterGap::Malformed)?;
+                let mut permissions = &[][..];
+                for index in 0..5 {
+                    remainder = remainder.trim_ascii_start();
+                    if remainder.is_empty() {
+                        return Err(CloseWriterGap::Malformed.into());
+                    }
+                    let end = remainder
+                        .iter()
+                        .position(u8::is_ascii_whitespace)
+                        .unwrap_or(remainder.len());
+                    if index == 1 {
+                        permissions = &remainder[..end];
+                    }
+                    remainder = &remainder[end..];
                 }
-                let mapped_path = PathBuf::from(remainder.trim_start());
+                let mapped_path = PathBuf::from(std::ffi::OsStr::from_bytes(
+                    remainder.trim_ascii_start(),
+                ));
                 if permissions.len() != 4 {
                     return Err(CloseWriterGap::Malformed.into());
                 }
-                if permissions.as_bytes()[1] == b'w'
-                    && permissions.as_bytes()[3] == b's'
+                if permissions[1] == b'w'
+                    && permissions[3] == b's'
                     && path_is_within(&mapped_path, canonical)
                 {
                     return Ok(Some((
@@ -20606,14 +20613,12 @@ mod tests {
         let process = fake_linux_process(&proc_root, 3, 1, 42);
         let mapped = quarantine.join("mapped file");
         for permissions in ["r--s", "rw-p", "rw-s"] {
-            std::fs::write(
-                process.join("maps"),
-                format!(
-                    "00000000-00001000 {permissions} 00000000 00:00 1 {}\n",
-                    mapped.display()
-                ),
-            )
-            .unwrap();
+            let mut maps = b"1000-2000 rw-s 00000000 00:00 1 /unrelated/\xff\n".to_vec();
+            maps.extend_from_slice(format!(
+                "0000-1000 {permissions} 00000000 00:00 1 {}\n",
+                mapped.display()
+            ).as_bytes());
+            std::fs::write(process.join("maps"), maps).unwrap();
             let evidence =
                 super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap();
             if permissions == "rw-s" {
