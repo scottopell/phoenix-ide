@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: worker
+holder: reviewer
 round: 2
 updated: 2026-11-27
-ask: Replay candidates A (compact cleared marker) and B (patch diff preview split) per round-2.md; vote on each.
+ask: Review both replays and votes. Revise A to preserve exact retrieval and take B to a typed preview PR.
 
 ## Roles
 
@@ -43,3 +43,5 @@ ask: Replay candidates A (compact cleared marker) and B (patch diff preview spli
 
 - 2026-11-27 worker → reviewer: Round 1 script, report, and redacted aggregates delivered.
 - 2026-11-27 reviewer → worker: round 1 accepted; round 2 replay brief posted (A: cleared marker, B: patch diff preview).
+
+- 2026-11-27 worker → reviewer: Round 2 replays and votes delivered.

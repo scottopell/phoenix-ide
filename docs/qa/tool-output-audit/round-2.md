@@ -68,3 +68,48 @@ and B going to a PR. The privacy rules in `BATON.md` apply.
 Implement A on this branch (`claude/data-loss-token-waste-hunt-3enn9f`; the only branch the reviewer may push), with tests. If the replay confirms
 it, the PR opens against main. Prototype the record/preview split for B and check that it can be
 done by construction (a typed two-part tool output), not by string surgery.
+
+## Results
+
+Offline read-only replay over **60.792B recorded input tokens**, with 561,647 response anchors across 12,698 transcripts. Both candidates use the same reconstructed sweep schedule. The exact marker sizes include the complete stored IDs, which the Round 1 marker estimate approximated.
+
+### A · Compact clearing markers
+
+- **1,933.9M token-turns saved (3.18%)**. 233,100 cleared result rows produced 43,350,170 marker occurrences. Calibrated carry changes from 2,309.8M to 375.9M.
+- Current marker sizes are 219/221/222 UTF-8 bytes at p50/p90/p99 versus 31/32/32 with the proposal. Calibrated tokens are 56.9/66.4/72.5 versus 8.5/9.5/10.1. The local one-token-per-four-ASCII-bytes estimator with per-marker rounding gives 2,066.7M versus 346.7M, a 2.83% saving. Provider tokenization was unavailable for individual historical markers.
+- Foreign-source cleared results in the replay · **0**. The current renderer applies clearance inside a single transcript. Historical provider prompt bodies are unavailable, so the count covers reconstructed requests.
+- 674 of 2,616 marked transcripts later called a retrieval tool (25.76%). Exact cleared-source references were observed in 12 transcripts. An exact reference can come from another source. Unresolved, paged, and human retrieval are outside this count.
+
+| Tool | Calls after first marker | Transcripts with calls | Calls explicitly targeting a cleared source |
+|---|---:|---:|---:|
+| previous_transcripts | 377 | 116 | 0 |
+| query_database | 17,515 | 476 | 18 |
+| read_conversation | 2,658 | 407 | 3 |
+| read_event_evidence | 87 | 17 | 0 |
+| resolve_reference | 1,583 | 66 | 0 |
+
+### B · Durable patch receipts and clearable diff previews
+
+- **3,388.5M token-turns saved (5.57%)** using the path already recorded in the tool call. Including a new explicit path field in the receipt gives **3,242.5M (5.33%)** after accounting for its carry on every recognized success.
+- 62,047 successful patch results had recognized previews and 38,118 previews cross a reconstructed sweep. Current patch output carry is 4,733.7M, moving to 1,345.2M before any explicit path duplication.
+- Receipt sizes at p50/p90/p99 are 24.0/49.0/79.4 estimated tokens with the path in the producing call and 41.9/71.9/103.5 with an explicit path field. The replay preserves warnings, post-diff metadata, hunk coordinates, and truncation notes. 0 of 118,623 hunks have additional context on the header line beyond its coordinates.
+- Patch errors stay intact. 7,807 of 71,597 results (10.90%) carried 131.1M token-turns.
+- Adding previews increases aggregate gain on the fixed schedule by 18.6M local-estimator tokens (4.13%). 5,946 of 14,006 sweeps gain additional tokens, with p50/p90/p99 2,034/7,430/15,279. A changed schedule would need a separate replay with request pressure and eligibility recalculated at each request.
+
+Within the next 20 measured requests after hypothetical clearing, 33,429 previews had full follow-up. Same-path file reads occurred in 17.91%, Git diff or show in 18.21%, and a failed same-path patch in 7.50%.
+
+| Patch age in requests | Matched cleared previews | Same-path reads, cleared / retained | Git diff or show | Failed same-path patch |
+|---|---:|---:|---:|---:|
+| 10 | 4,966 | 19.11% / 22.35% | 16.23% / 18.43% | 8.10% / 8.66% |
+| 25 | 14,462 | 17.87% / 22.83% | 17.42% / 17.66% | 7.24% / 8.75% |
+| 50 | 20,579 | 17.28% / 22.27% | 17.97% / 15.79% | 6.85% / 8.62% |
+| 100 | 21,279 | 16.43% / 17.11% | 18.62% / 12.14% | 6.71% / 7.75% |
+
+Controls stay retained throughout follow-up and are weighted to match cleared previews by role, diff size band, and prior request-count band at the same age. Each rate describes later calls in observed history. These comparisons do not measure behavior after shipping the change.
+
+### Worker votes
+
+- **A · Disagree with the sequence-only marker as written.** The current exact-message reader resolves message IDs. The replay found three calls to that reader explicitly targeting cleared results. Preserve a resolvable message ID in the shorter marker, or add and test an exact same-transcript sequence lookup where the marker is emitted. Then replay the exact revised format.
+- **B · Agree to a typed prototype PR.** The modeled gain is 5.33% with an explicit path. Keep the applied-effect receipt, all error text, and the stored diff preview retrievable. Git evidence lookups are more frequent in the cleared cohort at the oldest ages. The merge vote requires the exact implementation replay and a verified retrieval path.
+
+The replay uses a fixed schedule and estimates input tokens from UTF-8 sizes. A revised cache prefix, retrieval, or changed sweep timing can affect net savings. Candidate percentages are separate scenarios.
