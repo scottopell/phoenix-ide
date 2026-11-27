@@ -5219,7 +5219,10 @@ mod product_pin_tests {
             !fetch_head_before.is_empty(),
             "the preceding fetch should leave real FETCH_HEAD data"
         );
-        let refs_command = ["for-each-ref", "--format=%(refname) %(objectname) %(symref)"];
+        let refs_command = [
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(symref)",
+        ];
         let refs_before = git(&checkout, &refs_command);
 
         let (selected_oid, logical_base) = strict_product_creation_pin(&checkout).unwrap();
@@ -5270,7 +5273,10 @@ mod product_pin_tests {
         git(repo, &["config", "user.name", "Test"]);
         git(repo, &["commit", "--allow-empty", "-m", "cached default"]);
         let missing = repo.join("missing-origin.git");
-        git(repo, &["remote", "add", "origin", missing.to_str().unwrap()]);
+        git(
+            repo,
+            &["remote", "add", "origin", missing.to_str().unwrap()],
+        );
         git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git(
             repo,
@@ -5281,7 +5287,10 @@ mod product_pin_tests {
             ],
         );
         let cached = git(repo, &["rev-parse", "refs/remotes/origin/HEAD^{commit}"]);
-        assert_eq!(cached, git(repo, &["rev-parse", "refs/heads/main^{commit}"]));
+        assert_eq!(
+            cached,
+            git(repo, &["rev-parse", "refs/heads/main^{commit}"])
+        );
 
         let error = strict_product_creation_pin(repo).unwrap_err();
         assert!(
