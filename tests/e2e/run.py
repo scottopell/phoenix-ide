@@ -626,6 +626,71 @@ def _get_product_conversation_route(base_url: str, reference: str) -> dict:
     return r.json()
 
 
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "--no-optional-locks", *args], cwd=cwd, check=True, capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_lifecycle_snapshot(cwd: Path) -> tuple:
+    index = Path(_git(cwd, "rev-parse", "--git-path", "index"))
+    if not index.is_absolute():
+        index = cwd / index
+    common = Path(_git(cwd, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = cwd / common
+    excludes = common / "info" / "exclude"
+    ignores = tuple(sorted(
+        (str(path.relative_to(cwd)), path.read_bytes())
+        for path in cwd.rglob(".gitignore") if ".git" not in path.parts
+    ))
+    return (
+        _git(cwd, "rev-parse", "HEAD"),
+        _git(cwd, "for-each-ref", "--format=%(refname) %(objectname)"),
+        _git(cwd, "status", "--porcelain=v1", "--untracked-files=all"),
+        _git(cwd, "fsck", "--no-reflogs", "--unreachable"),
+        index.read_bytes() if index.exists() else None,
+        excludes.read_bytes() if excludes.exists() else None,
+        ignores,
+    )
+
+
+def _git_worktree_paths(repo: Path) -> list[Path]:
+    output = _git(repo, "worktree", "list", "--porcelain")
+    return [Path(line.removeprefix("worktree ")) for line in output.splitlines()
+            if line.startswith("worktree ")]
+
+
+def _wait_for_task_proposal(base_url: str, conv_id: str, ordinal: int) -> dict:
+    deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        snapshot = _get_conv(base_url, conv_id)
+        state = _state_str(snapshot["conversation"].get("state"))
+        if state == "error":
+            raise AssertionError(f"proposal turn failed: {snapshot!r}")
+        if state == "awaiting_task_approval":
+            assert _count_tool_use(snapshot["messages"], "propose_task") == ordinal, (
+                "approval state did not contain the model-emitted propose_task"
+            )
+            return snapshot
+        time.sleep(0.05)
+    raise TimeoutError(f"conversation did not reach task approval: {_get_conv(base_url, conv_id)!r}")
+
+
+def _wait_for_idle(base_url: str, conv_id: str) -> dict:
+    deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        snapshot = _get_conv(base_url, conv_id)
+        state = _state_str(snapshot["conversation"].get("state"))
+        if state == "error":
+            raise AssertionError(f"approved turn failed: {snapshot!r}")
+        if state == "idle" and not snapshot.get("agent_working"):
+            return snapshot
+        time.sleep(0.05)
+    raise TimeoutError(f"conversation did not return to idle: {_get_conv(base_url, conv_id)!r}")
+
+
 def _list_product_conversations(base_url: str) -> dict:
     r = httpx.get(f"{base_url}/api/product-conversations", timeout=10.0)
     r.raise_for_status()
@@ -1585,6 +1650,116 @@ def scenario_continuation(base_url: str) -> None:
     )
 
 
+def scenario_git_lifecycle_public_http(base_url: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="phoenix-e2e-git-lifecycle-") as temp_dir:
+        repo = Path(temp_dir) / "source"
+        repo.mkdir()
+        _git(repo, "init", "-q", "-b", "main")
+        (repo / ".gitignore").write_text("*.ignored\n")
+        (repo / "e2e-task.md").write_text(
+            "# Disposable Git lifecycle task\n\nPrepared by the E2E fixture for approval.\n"
+        )
+        (repo / "e2e-follow-up.md").write_text("# Disposable follow-up\n\nReview the second plan.\n")
+        _git(repo, "add", ".gitignore", "e2e-task.md", "e2e-follow-up.md")
+        subprocess.run(
+            ["git", "-c", "user.name=Phoenix E2E", "-c", "user.email=e2e@example.invalid",
+             "commit", "-qm", "fixture"], cwd=repo, check=True,
+        )
+        (repo / "staged.txt").write_text("staged source bytes\n")
+        _git(repo, "add", "staged.txt")
+        (repo / "staged.txt").write_text("unstaged source bytes\n")
+        ignored = repo / "source.ignored"
+        ignored.write_text("ignored source bytes\n")
+        original = _git_lifecycle_snapshot(repo)
+
+        request_id = str(uuid.uuid4())
+        created = httpx.post(
+            f"{base_url}/api/product-conversations/new",
+            json={
+                "cwd": str(repo),
+                "model": _default_model(base_url),
+                "objective": "[[scenario:git_lifecycle_proposal]] review the prepared task",
+                "images": [],
+                "request_id": request_id,
+            }, timeout=10.0,
+        )
+        created.raise_for_status()
+        assert created.status_code == 202, f"unexpected creation acceptance: {created.status_code}"
+        product_id = created.json()["product_conversation_id"]
+
+        deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+        while True:
+            status = httpx.get(
+                f"{base_url}/api/product-conversations/creation/{request_id}", timeout=10.0,
+            )
+            status.raise_for_status()
+            creation = status.json()
+            if creation["kind"] == "published":
+                break
+            if creation["kind"] in {"failed", "cancelled"}:
+                raise AssertionError(f"Git product creation failed: {creation!r}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Git product creation timed out: {creation!r}")
+            time.sleep(0.05)
+
+        conv_id = creation["transcript_row_id"]
+        first = _wait_for_task_proposal(base_url, conv_id, 1)
+        checkout = Path(first["conversation"]["cwd"])
+        assert checkout != repo and checkout.exists(), f"Git route did not publish a disposable checkout: {checkout}"
+        assert checkout in _git_worktree_paths(repo), "created checkout is not registered as a Git worktree"
+        assert (checkout / "e2e-task.md").is_file(), "prepared task markdown was not present in checkout"
+        root_before_approval = _git_lifecycle_snapshot(repo)
+        checkout_before_approval = _git_lifecycle_snapshot(checkout)
+
+        for approval_number in (1, 2):
+            approval = httpx.post(
+                f"{base_url}/api/conversations/{conv_id}/approve-task", json={}, timeout=10.0,
+            )
+            approval.raise_for_status()
+            assert approval.json().get("success") is True
+            idle = _wait_for_idle(base_url, conv_id)
+            assert Path(idle["conversation"]["cwd"]) == checkout, "approval changed the checkout path"
+            assert _git_lifecycle_snapshot(repo) == root_before_approval, (
+                f"approval {approval_number} mutated the source repository/index/refs/ignores"
+            )
+            assert _git_lifecycle_snapshot(checkout) == checkout_before_approval, (
+                f"approval {approval_number} changed checkout status, index, refs, ignores, or commits"
+            )
+            if approval_number == 1:
+                followup = httpx.post(
+                    f"{base_url}/api/conversations/{conv_id}/chat",
+                    json={
+                        "text": "[[scenario:git_lifecycle_followup]] review this ordinary Git follow-up",
+                        "images": [],
+                        "message_id": str(uuid.uuid4()),
+                    }, timeout=10.0,
+                )
+                followup.raise_for_status()
+                _wait_for_task_proposal(base_url, conv_id, 2)
+        assert _git_lifecycle_snapshot(checkout) == checkout_before_approval, (
+            "test left checkout changes before physical Close"
+        )
+        closed = httpx.post(
+            f"{base_url}/api/product-conversations/{product_id}/close", timeout=10.0,
+        )
+        closed.raise_for_status()
+        assert closed.json().get("success") is True
+        assert not checkout.exists(), f"physical Close retained the checkout: {checkout}"
+        assert checkout not in _git_worktree_paths(repo), "physical Close retained the Git registration"
+        assert _git_lifecycle_snapshot(repo) == original, "Close or approval changed the original repository"
+        assert (repo / "staged.txt").read_text() == "unstaged source bytes\n"
+        assert ignored.read_text() == "ignored source bytes\n"
+
+        archived = httpx.get(f"{base_url}/api/conversations/archived", timeout=10.0)
+        archived.raise_for_status()
+        history = archived.json().get("conversations", [])
+        assert any(item.get("id") == conv_id for item in history), (
+            "closed conversation is not readable from History"
+        )
+        retained = _get_conv(base_url, conv_id)
+        assert retained["messages"], "closed transcript history is empty"
+
+
 def scenario_product_conversation_context_continuation(base_url: str) -> None:
     worktrees_before = _git_worktree_inventory()
     with tempfile.TemporaryDirectory(prefix="phoenix-e2e-product-cwd-") as temp_cwd:
@@ -2073,6 +2248,7 @@ SCENARIOS = [
     ("patch", scenario_patch),
     ("present_svg", scenario_present_svg),
     ("continuation", scenario_continuation),
+    ("git_lifecycle_public_http", scenario_git_lifecycle_public_http),
     (
         "product_conversation_context_continuation",
         scenario_product_conversation_context_continuation,
