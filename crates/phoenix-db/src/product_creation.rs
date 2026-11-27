@@ -610,6 +610,27 @@ fn publication_registration_matches(
         Some(record.trim_end_matches(['\r', '\n']).to_owned())
     }
 
+    let repo_root = std::path::Path::new(&facts.repository_root);
+    let repo_dot_git = repo_root.join(".git");
+    let repo_admin = if repo_dot_git.is_dir() {
+        repo_dot_git.canonicalize().ok()?
+    } else {
+        let pointer = read_record(&repo_dot_git)?;
+        repo_root
+            .join(pointer.strip_prefix("gitdir: ")?)
+            .canonicalize()
+            .ok()?
+    };
+    let common_record = repo_admin.join("commondir");
+    let expected_common = match std::fs::symlink_metadata(&common_record) {
+        Ok(_) => repo_admin
+            .join(read_record(&common_record)?)
+            .canonicalize()
+            .ok()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => repo_admin,
+        Err(_) => return None,
+    };
+
     let dot_git = checkout.join(".git");
     let pointer = read_record(&dot_git)?;
     let admin = checkout
@@ -622,6 +643,7 @@ fn publication_registration_matches(
     let registered_common = admin.join(read_record(&admin.join("commondir"))?);
     let owner = read_record(&admin.join(PRODUCT_CREATION_OWNER_MARKER))?;
     (registrations.file_name()? == "worktrees"
+        && common == expected_common.as_path()
         && backpointer.canonicalize().ok()? == dot_git.canonicalize().ok()?
         && registered_common.canonicalize().ok()?.as_path() == common
         && read_record(&admin.join("HEAD"))? == facts.exact_checkout_oid
@@ -2293,6 +2315,23 @@ impl Database {
         )
         .await?;
         insert_conversation_tx(&mut tx, &input.conversation).await?;
+        if let Some(facts) = &input.git_publication {
+            let (path, captured): (String, Option<String>) = sqlx::query_as(
+                "SELECT worktree_path, worktree_fingerprint FROM work_scopes WHERE id = ?1",
+            )
+            .bind(scope_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if captured.as_deref() != Some(facts.checkout_fingerprint.as_str())
+                || publication_registration_matches(std::path::Path::new(&path), facts).is_none()
+                || Self::observe_worktree_fingerprint(&path) != captured
+            {
+                tx.rollback().await?;
+                return Err(DbError::Serialization(
+                    "linked checkout identity changed before publication".to_string(),
+                ));
+            }
+        }
         let commit_now = unix_micros_now();
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
@@ -2345,23 +2384,6 @@ impl Database {
         if updated.rows_affected() != 1 {
             tx.rollback().await?;
             return Ok(false);
-        }
-        if let Some(facts) = &input.git_publication {
-            let (path, captured): (String, Option<String>) = sqlx::query_as(
-                "SELECT worktree_path, worktree_fingerprint FROM work_scopes WHERE id = ?1",
-            )
-            .bind(scope_id.as_str())
-            .fetch_one(&mut *tx)
-            .await?;
-            if captured.as_deref() != Some(facts.checkout_fingerprint.as_str())
-                || publication_registration_matches(std::path::Path::new(&path), facts).is_none()
-                || Self::observe_worktree_fingerprint(&path) != captured
-            {
-                tx.rollback().await?;
-                return Err(DbError::Serialization(
-                    "linked checkout identity changed before publication".to_string(),
-                ));
-            }
         }
         tx.commit().await?;
         Ok(true)
@@ -4069,11 +4091,11 @@ mod product_creation_tests {
         assert_unproven_publication_left_no_rows(db, scope_id).await;
     }
 
-    fn fixture_checkout_fingerprint(path: &str, oid: &str) -> String {
+    fn fixture_checkout_fingerprint(repo: &str, path: &str, oid: &str) -> String {
         let checkout = std::path::Path::new(path);
-        let admin = checkout
-            .with_extension("git")
-            .join("worktrees/registration");
+        let admin = std::path::Path::new(repo)
+            .join(".git/worktrees")
+            .join(checkout.file_name().unwrap());
         std::fs::create_dir_all(checkout).unwrap();
         std::fs::create_dir_all(&admin).unwrap();
         let dot_git = checkout.join(".git");
@@ -6912,9 +6934,16 @@ mod product_creation_tests {
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("worktree");
         let checkout = checkout.to_str().unwrap();
-        let checkout_fingerprint = fixture_checkout_fingerprint(checkout, "unpersisted-oid");
+        let repo = dir.path().join("repo");
+        let repo = repo.to_str().unwrap();
+        let registered = dir.path().join("registered");
+        let checkout_fingerprint =
+            fixture_checkout_fingerprint(registered.to_str().unwrap(), checkout, "unpersisted-oid");
+        std::fs::create_dir(repo).unwrap();
+        let repo_marker = dir.path().join("repo/.git");
+        std::fs::create_dir(&repo_marker).unwrap();
         let db = Database::open_in_memory().await.unwrap();
-        db.accept_product_creation("unproven-publication", &intent("/repo", "publish"))
+        db.accept_product_creation("unproven-publication", &intent(repo, "publish"))
             .await
             .unwrap();
         let claimed = db
@@ -6949,7 +6978,7 @@ mod product_creation_tests {
             },
             git_publication: Some(ProductCreationGitPublicationFacts {
                 exact_checkout_oid: "unpersisted-oid".to_string(),
-                repository_root: "/repo".to_string(),
+                repository_root: repo.to_string(),
                 ownership_token: "unrecorded-owner".to_string(),
                 checkout_fingerprint,
             }),
@@ -6962,7 +6991,7 @@ mod product_creation_tests {
             &db,
             &input.request_id,
             &input.claim,
-            "/repo",
+            repo,
             checkout,
             "unpersisted-oid",
         )
@@ -6973,7 +7002,7 @@ mod product_creation_tests {
         ));
         let mut direct = input.clone();
         direct.environment = EnvironmentContext::UnownedCwd {
-            cwd: "/repo".into(),
+            cwd: repo.into(),
         };
         direct.git_publication = None;
         assert!(matches!(
@@ -6996,7 +7025,10 @@ mod product_creation_tests {
         std::fs::copy(&original, &marker).unwrap();
         assert_publication_rejected_changed_checkout(&db, &input, &scope_id).await;
         std::fs::rename(&original, &marker).unwrap();
-        let head = dir.path().join("worktree.git/worktrees/registration/HEAD");
+        assert_publication_rejected_changed_checkout(&db, &input, &scope_id).await;
+        std::fs::remove_dir(&repo_marker).unwrap();
+        std::fs::write(&repo_marker, "gitdir: ../registered/.git\n").unwrap();
+        let head = registered.join(".git/worktrees/worktree/HEAD");
         std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
         assert_publication_rejected_changed_checkout(&db, &input, &scope_id).await;
         std::fs::write(&head, "unpersisted-oid\n").unwrap();
@@ -9892,9 +9924,11 @@ mod product_creation_tests {
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("worktree");
         let checkout = checkout.to_str().unwrap();
-        let checkout_fingerprint = fixture_checkout_fingerprint(checkout, "0123456789abcdef");
+        let repo = dir.path().join("hidden");
+        let repo = repo.to_str().unwrap();
+        let checkout_fingerprint = fixture_checkout_fingerprint(repo, checkout, "0123456789abcdef");
         let db = Database::open_in_memory().await.unwrap();
-        db.accept_product_creation("req-cascade", &intent("/repo/hidden", "owner"))
+        db.accept_product_creation("req-cascade", &intent(repo, "owner"))
             .await
             .unwrap();
         let claim = db
@@ -9918,14 +9952,14 @@ mod product_creation_tests {
             "conv-cascade",
             product_id.clone(),
             scope.clone(),
-            "/repo/hidden",
+            repo,
         );
         advance_to_metadata(&db, "req-cascade", &claim.claim).await;
         record_git_publication_fixture(
             &db,
             "req-cascade",
             &claim.claim,
-            "/repo/hidden",
+            repo,
             checkout,
             "0123456789abcdef",
         )
@@ -9944,7 +9978,7 @@ mod product_creation_tests {
                 },
                 git_publication: Some(ProductCreationGitPublicationFacts {
                     exact_checkout_oid: "0123456789abcdef".to_string(),
-                    repository_root: "/repo/hidden".to_string(),
+                    repository_root: repo.to_string(),
                     ownership_token: "fixture-owner".to_string(),
                     checkout_fingerprint,
                 }),
@@ -9969,7 +10003,7 @@ mod product_creation_tests {
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(staging_facts.0, "/repo/hidden");
+        assert_eq!(staging_facts.0, repo);
         assert_eq!(staging_facts.1, "0123456789abcdef");
         let repository_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM git_repositories")
             .fetch_one(db.pool())
@@ -10000,7 +10034,7 @@ mod product_creation_tests {
             Some("conv-cascade")
         );
         let replay = db
-            .accept_product_creation("req-cascade", &intent("/repo/hidden", "owner"))
+            .accept_product_creation("req-cascade", &intent(repo, "owner"))
             .await
             .unwrap();
         let ProductCreationAcceptOutcome::Replayed(replay) = replay else {
@@ -10018,7 +10052,7 @@ mod product_creation_tests {
             .unwrap()
             .is_none());
         assert!(matches!(
-            db.accept_product_creation("req-cascade", &intent("/repo/hidden", "changed"))
+            db.accept_product_creation("req-cascade", &intent(repo, "changed"))
                 .await
                 .unwrap(),
             ProductCreationAcceptOutcome::Conflict
@@ -10147,9 +10181,11 @@ mod product_creation_tests {
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("worktree");
         let checkout = checkout.to_str().unwrap();
-        let checkout_fingerprint = fixture_checkout_fingerprint(checkout, "stale-oid");
+        let repo = dir.path().join("stale");
+        let repo = repo.to_str().unwrap();
+        let checkout_fingerprint = fixture_checkout_fingerprint(repo, checkout, "stale-oid");
         let db = Database::open_in_memory().await.unwrap();
-        db.accept_product_creation("req-current-root", &intent("/repo/stale", "publish"))
+        db.accept_product_creation("req-current-root", &intent(repo, "publish"))
             .await
             .unwrap();
         let claim = db
@@ -10173,36 +10209,37 @@ mod product_creation_tests {
             &db,
             "req-current-root",
             &claim.claim,
-            "/repo/stale",
+            repo,
             checkout,
             "stale-oid",
         )
         .await;
-        db.publish_product_creation_atomically(&ProductCreationPublishInput {
-            request_id: "req-current-root".to_string(),
-            claim: claim.claim,
-            conversation: published_conversation(
-                conversation_id,
-                accepted.product_conversation_id,
-                WorkScopeId::new(),
-                checkout,
-            ),
-            authority_kind: AuthorityKind::Work,
-            environment: EnvironmentContext::AllocatedWorktree {
-                cwd: checkout.to_string(),
-                worktree_path: checkout.to_string(),
-                branch_name: None,
-                base_branch: Some("main".into()),
-            },
-            git_publication: Some(ProductCreationGitPublicationFacts {
-                exact_checkout_oid: "stale-oid".to_string(),
-                repository_root: "/repo/stale".to_string(),
-                ownership_token: "fixture-owner".to_string(),
-                checkout_fingerprint,
-            }),
-        })
-        .await
-        .unwrap();
+        assert!(db
+            .publish_product_creation_atomically(&ProductCreationPublishInput {
+                request_id: "req-current-root".to_string(),
+                claim: claim.claim,
+                conversation: published_conversation(
+                    conversation_id,
+                    accepted.product_conversation_id,
+                    WorkScopeId::new(),
+                    checkout,
+                ),
+                authority_kind: AuthorityKind::Work,
+                environment: EnvironmentContext::AllocatedWorktree {
+                    cwd: checkout.to_string(),
+                    worktree_path: checkout.to_string(),
+                    branch_name: None,
+                    base_branch: Some("main".into()),
+                },
+                git_publication: Some(ProductCreationGitPublicationFacts {
+                    exact_checkout_oid: "stale-oid".to_string(),
+                    repository_root: repo.to_string(),
+                    ownership_token: "fixture-owner".to_string(),
+                    checkout_fingerprint,
+                }),
+            })
+            .await
+            .unwrap());
         sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'published', claim_worker_id = NULL, claim_token = NULL,
@@ -10241,7 +10278,11 @@ mod product_creation_tests {
     async fn product_creation_recent_management_roots_rank_by_support_then_recency() {
         let db = Database::open_in_memory().await.unwrap();
         let dir = tempfile::tempdir().unwrap();
-        for (idx, cwd) in [(1, "/repo/a"), (2, "/repo/b"), (3, "/repo/a")] {
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        let a = a.to_str().unwrap();
+        let b = b.to_str().unwrap();
+        for (idx, cwd) in [(1, a), (2, b), (3, a)] {
             let req = format!("req-rec-{idx}");
             db.accept_product_creation(&req, &intent(cwd, "publish"))
                 .await
@@ -10267,7 +10308,7 @@ mod product_creation_tests {
             let oid = format!("oid-{idx}");
             let worktree = dir.path().join(format!("checkout-{idx}"));
             let worktree = worktree.to_str().unwrap();
-            let checkout_fingerprint = fixture_checkout_fingerprint(worktree, &oid);
+            let checkout_fingerprint = fixture_checkout_fingerprint(cwd, worktree, &oid);
             record_git_publication_fixture(&db, &req, &claim.claim, cwd, worktree, &oid).await;
             db.publish_product_creation_atomically(&ProductCreationPublishInput {
                 request_id: req,
@@ -10303,6 +10344,6 @@ mod product_creation_tests {
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
         }
         let cwds = db.recent_distinct_management_roots(5).await.unwrap();
-        assert_eq!(cwds, vec!["/repo/a".to_string(), "/repo/b".to_string()]);
+        assert_eq!(cwds, vec![a.to_string(), b.to_string()]);
     }
 }
