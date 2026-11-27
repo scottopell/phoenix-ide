@@ -2133,6 +2133,27 @@ async fn worktree_close_failure_evidence(fixture: &CloseFixture, run: &CloseRunR
     )
 }
 
+async fn durable_native_close_writer_rows(
+    fixture: &CloseFixture,
+    run: &CloseRunRef,
+) -> Vec<String> {
+    let attempt = run.attempt_id.as_str();
+    sqlx::query_scalar(
+        "SELECT json_array(product_conversation_id, attempt_id, run_ordinal, scope,
+                           inspection_generation, inspection_fingerprint, resource_kind,
+                           identity_kind, identity_codec, quote(identity_value), detector, pid,
+                           incarnation, quote(executable), quote(matched_path), matched_kind,
+                           access, authority, gap)
+         FROM close_writer_observations WHERE attempt_id = ?1 AND run_ordinal = ?2
+         ORDER BY scope, detector",
+    )
+    .bind(attempt)
+    .bind(run.ordinal.get())
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap()
+}
+
 async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) -> Value {
     let attempt = run.attempt_id.as_str();
     let obligation = fixture.db.get_close_obligation(attempt).await.unwrap();
@@ -2197,20 +2218,7 @@ async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) ->
     .fetch_one(fixture.db.pool())
     .await
     .unwrap();
-    let writer_observations: Vec<String> = sqlx::query_scalar(
-        "SELECT json_array(product_conversation_id, attempt_id, run_ordinal, scope,
-                           inspection_generation, inspection_fingerprint, resource_kind,
-                           identity_kind, identity_codec, quote(identity_value), detector, pid,
-                           incarnation, quote(executable), quote(matched_path), matched_kind,
-                           access, authority, gap)
-         FROM close_writer_observations WHERE attempt_id = ?1 AND run_ordinal = ?2
-         ORDER BY scope, detector",
-    )
-    .bind(attempt)
-    .bind(run.ordinal.get())
-    .fetch_all(fixture.db.pool())
-    .await
-    .unwrap();
+    let writer_observations = durable_native_close_writer_rows(fixture, run).await;
     let process_successes: Vec<(String, String, String, String, i64)> = sqlx::query_as(
         "SELECT scope, resource_kind, identity_value, outcome, observed_at_us
          FROM close_process_step_successes WHERE attempt_id = ?1 AND run_ordinal = ?2
