@@ -2678,6 +2678,20 @@ impl Database {
         Ok(())
     }
 
+    /// Checks for retained legacy creation custody before executing retirement effects.
+    ///
+    /// # Errors
+    /// Returns an error if the Close attempt cannot be loaded or custody requires operator review.
+    pub async fn require_no_retained_legacy_creation_for_retirement(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        Self::require_no_retained_legacy_creation_for_attempt_tx(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub(crate) async fn require_no_retained_legacy_creation_for_attempt_tx(
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &CloseAttemptId,
@@ -10098,6 +10112,12 @@ mod tests {
         .await
         .unwrap();
 
+        assert!(matches!(
+            db.require_no_retained_legacy_creation_for_retirement(&attempt_id)
+                .await,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("operator review is required")
+        ));
         assert!(matches!(
             db.capture_close_retirement_inventory(inventory).await,
             Err(DbError::CloseFoundationPrecondition(message))

@@ -1684,6 +1684,10 @@ impl RuntimeManager {
         ) {
             return Ok(());
         }
+        self.db()
+            .require_no_retained_legacy_creation_for_retirement(&attempt_id)
+            .await
+            .map_err(|error| error.to_string())?;
         let snapshot = obligation
             .snapshot()
             .cloned()

@@ -2598,6 +2598,7 @@ impl Database {
                     "Close attempt {attempt_id} is not active with a sealed topology capturing work scope {scope_id}"
                 )));
             }
+            Self::require_no_retained_legacy_creation_for_attempt_tx(&mut tx, attempt_id).await?;
             let resources_retired: bool = sqlx::query_scalar(
                 "SELECT NOT EXISTS(
                      SELECT 1
