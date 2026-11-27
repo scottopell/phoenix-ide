@@ -80,7 +80,8 @@ jobs:
           grep -E "^\[e2e\] isolated server source=$GITHUB_SHA uid=[1-9][0-9]* pid=[1-9][0-9]*$" "$evidence/git-lifecycle-http.log"
           grep -E '^  ✓ git_lifecycle_public_http +[0-9.]+s$' "$evidence/git-lifecycle-http.log"
           grep -F '✓ all 1 e2e scenarios passed' "$evidence/git-lifecycle-http.log"
-      - name: Build and run the existing live-writer rejection control
+      - name: Build and inventory exact Runtime controls
+        id: controls
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         shell: bash
         run: |
@@ -90,12 +91,48 @@ jobs:
             --target-dir "$GITHUB_WORKSPACE/target" > "$evidence/writer-control-build.jsonl"
           runtime_test_binary="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "phoenix_ide" and .profile.test == true and .executable != null) | .executable' "$evidence/writer-control-build.jsonl")"
           test -x "$runtime_test_binary"
-          test_name='runtime::close_retirement::tests::quarantine_rejects_live_linux_descriptor_writer_before_deletion'
-          timeout --kill-after=10s 2m bash scripts/ci/close-unprivileged-qualification.sh \
-            "$GITHUB_WORKSPACE" "$runtime_test_binary" "$GITHUB_WORKSPACE/target/debug/phoenix_ide" \
-            "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "$evidence/writer-control.log"
-          grep -F "$test_name ... ok" "$evidence/writer-control.log"
-          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$evidence/writer-control.log"
+          printf 'PHOENIX_RUNTIME_TEST_BINARY=%s\n' "$runtime_test_binary" >> "$GITHUB_ENV"
+          printf 'PHOENIX_BASH_LAUNCH_TEST_EXE=%s\n' "$GITHUB_WORKSPACE/target/debug/phoenix_ide" >> "$GITHUB_ENV"
+          printf 'PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1\n' >> "$GITHUB_ENV"
+          (cd crates/phoenix-ide && "$runtime_test_binary" --list) | tee "$evidence/runtime-inventory.log"
+      - name: Required production writer detection on the ordinary Linux runner
+        if: ${{ !cancelled() && steps.controls.outcome == 'success' }}
+        shell: bash
+        run: bash scripts/ci/close-ordinary-writer-qualification.sh "$PHOENIX_RUNTIME_TEST_BINARY" "$RUNNER_TEMP/close-http-evidence"
+      - name: Run the isolated writer veto and captured-loss Retry controls
+        if: ${{ !cancelled() && steps.controls.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          for test_name in \
+            runtime::close_retirement::tests::quarantine_rejects_live_linux_descriptor_writer_before_deletion \
+            runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays; do
+            log="$evidence/${test_name##*::}.log"
+            grep -Fx "$test_name: test" "$evidence/runtime-inventory.log"
+            timeout --kill-after=10s 6m bash scripts/ci/close-unprivileged-qualification.sh \
+              "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" \
+              "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+            grep -F "$test_name ... ok" "$log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
+          done
+      - name: Run the fetched pin, strict Retry gap and original deadline controls
+        if: ${{ !cancelled() && steps.controls.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          for selector in \
+            anchored_native_retry_assessment_preserves_writer_inspection_gap \
+            registered_native_close_origin_only_fetched_pin_public_retry_preserves_owner_ref \
+            detached_unreachable_commits_until_rejects_expired_deadline_before_repository_access \
+            detached_reachability_evidence_until_rejects_expired_deadline_before_repository_access; do
+            test_name="$(grep -E "::${selector}: test$" "$evidence/runtime-inventory.log" | sed 's/: test$//')"
+            log="$evidence/$selector.log"
+            (cd crates/phoenix-ide && timeout --kill-after=10s 2m "$PHOENIX_RUNTIME_TEST_BINARY" "$test_name" --exact --nocapture --test-threads=1) 2>&1 | tee "$log"
+            grep -F "$test_name ... ok" "$log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
+          done
       - uses: actions/upload-artifact@v6
         if: always()
         with:
@@ -266,6 +303,12 @@ jobs:
           printf 'PHOENIX_RUNTIME_TEST_BINARY=%s\n' "$runtime_test_binary" >> "$GITHUB_ENV"
           (cd crates/phoenix-ide && "$runtime_test_binary" --list) 2>&1 | tee evidence/runtime-inventory.log
           grep -E 'native_close_application::tests::.*: test$|native_close_admission_tests::.*: test$' evidence/runtime-inventory.log > evidence/runtime-selected-tests.txt
+      - name: Required production writer detection on the ordinary Linux runner
+        if: success() || failure()
+        shell: bash
+        run: |
+          bash scripts/ci/close-ordinary-writer-qualification.sh "$PHOENIX_RUNTIME_TEST_BINARY" "$GITHUB_WORKSPACE/evidence"
+
       - name: Required public Worktree retirement with production writer detector
         if: success() || failure()
         shell: bash
@@ -1074,7 +1117,6 @@ jobs:
             directory_child_swap_after_inspection_preserves_replacement_for_needs_repair
             file_child_swap_after_inspection_preserves_replacement_for_needs_repair
             detached_unreachable_commits_until_rejects_expired_deadline_before_repository_access
-            detached_head_is_unreachable_rejects_expired_deadline_before_repository_access
             detached_reachability_evidence_until_rejects_expired_deadline_before_repository_access
             staged_index_query_materializes_only_requested_dirty_paths
             detached_unreachable_commits_excludes_the_exact_stash_ref

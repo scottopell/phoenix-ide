@@ -88,6 +88,11 @@ THE SYSTEM SHALL transition the sub-agent to a terminal state
 AND persist terminal evidence before reporting the outcome
 AND resolve the receiving parent from the child's durable parent-conversation identity
 
+WHEN startup repairs a missing receipt for the terminal tool call of a sub-agent
+AND the persisted call exactly agrees with the durable child terminal cause and outcome
+THE SYSTEM SHALL acknowledge that submission using the original assistant and tool call identity
+AND SHALL preserve the child outcome and any existing parent acceptance without replaying the submission.
+
 WHEN the parent accepts a terminal outcome for an admitted child
 THE SYSTEM SHALL treat repeated delivery of that child's terminal outcome as idempotent success
 AND SHALL NOT append a second result or resume the parent more than once

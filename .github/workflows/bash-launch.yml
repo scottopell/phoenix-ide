@@ -63,7 +63,7 @@ jobs:
           cargo build -p phoenix_ide --bin phoenix_ide
           test -x "$PHOENIX_BASH_LAUNCH_TEST_EXE"
       # One invocation: a second one recompiled phoenix-db and phoenix_ide.
-      - name: Launch and identity fault regressions
+      - name: Launch, identity, and Close writer regressions
         run: |
           cat > "$RUNNER_TEMP/nextest.toml" <<'TOML'
           [profile.default]
@@ -77,7 +77,7 @@ jobs:
           test-group = 'serial-runtime'
           TOML
           cargo nextest --config-file "$RUNNER_TEMP/nextest.toml" run \
-            -p phoenix-core -p phoenix-tools -p phoenix_ide --lib --success-output final -E '
+            -p phoenix-core -p phoenix-tools -p phoenix_ide --lib -j 1 --success-output final -E '
               (package(phoenix-core) and (test(process_identity::tests) or test(domain::tool_wire::bash_tmux_wire_tests)))
               or (package(phoenix-tools) and (test(bash::operations::tests) or test(bash::launch_protocol::tests)
                 or test(bash::ring::tests) or test(bash::registry::tests) or test(bash::reaper::tests)
@@ -85,4 +85,15 @@ jobs:
               or (package(phoenix_ide) and (test(browser_retirement)
                 or test(coordinator_bash_executes_owned_home_with_zero_ordinary_conversations)
                 or test(real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay)
-                or test(conversation_runtime_dispatches_real_zero_and_normal_bash_waits)))'
+                or test(conversation_runtime_dispatches_real_zero_and_normal_bash_waits)
+                or test(macos_disposable_writer_scan_finds_same_user_process_cwd)
+                or test(macos_vnode_fd_read_unavailable_is_not_a_changed_sample)
+                or test(macos_process_inventory_excludes_foreign_uid_before_inspection)
+                or test(selected_macos_pid_with_changed_uid_fails_closed_as_process_changed)
+                or test(process_disappearance_and_pid_reuse_are_gaps_not_writers_or_clean)
+                or test(external_writer_detector_gap_does_not_mask_independent_evidence_or_target_failure)
+                or test(external_writer_entry_gap_does_not_mask_an_independent_match)
+                or test(macos_process_inventory_failures_are_absent_evidence)
+                or test(expired_macos_process_inventory_stops_before_listing)
+                or test(macos_process_inventory_retries_full_buffer_and_accepts_complete_list)
+                or test(macos_disposable_detached_worktree_retires_with_real_writer_scans)))'

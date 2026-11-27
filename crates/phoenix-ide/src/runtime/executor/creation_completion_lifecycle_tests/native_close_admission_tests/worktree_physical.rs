@@ -82,6 +82,13 @@ async fn registered_native_close_physically_retires_worktree_only_and_replays_wi
     run_public_worktree_close(WorktreeJourney::Retire).await;
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn registered_native_close_refuses_a_live_writable_descriptor() {
+    install_physical_close_diagnostics();
+    run_public_worktree_close(WorktreeJourney::RefuseDescriptorWriter).await;
+}
+
 #[tokio::test]
 async fn registered_native_close_with_loss_content_stops_incomplete_without_retirement() {
     run_public_worktree_close(WorktreeJourney::RetainContentBlockers).await;
@@ -177,6 +184,7 @@ async fn registered_native_close_after_source_stop_preserves_reused_path_and_ori
 enum WorktreeJourney {
     Retire,
     RetireWithProductionDetector,
+    RefuseDescriptorWriter,
     CapturedLossPublicRetryWithProductionDetector,
     CapturedLossPublicRetryStoppedDuringAssessment,
     CapturedLossPublicRetryStoppedDuringPreparation,
@@ -949,6 +957,15 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     let mut git = DisposableGit::new();
     let origin_only_fetched_pin = matches!(journey, WorktreeJourney::FetchedPinPublicRetry)
         .then(|| git.prepare_origin_only_fetched_pin());
+    // Keep a real writable handle on tracked content without changing its bytes.
+    let _writer = matches!(journey, WorktreeJourney::RefuseDescriptorWriter).then(|| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(git.worktree.join("tracked.txt"))
+            .unwrap()
+    });
+    // Start at ancestor A, create C, then leave HEAD at A. C has no ref and is
+    // reachable only through this linked checkout's HEAD reflog.
     let reflog_only_commit = if matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
         let ancestor = git.run(&git.worktree, &["rev-parse", "HEAD"]);
         std::fs::write(git.worktree.join("tracked.txt"), b"reflog-only commit\n").unwrap();
@@ -1047,8 +1064,8 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation
     ) {
         // Qualify public admission and real Git/filesystem retirement independently
-        // of ambient runner processes. Production inspection gaps remain blocking;
-        // deterministic Linux detector tests qualify that separate safety boundary.
+        // of ambient runner processes. Separate production-probe journeys qualify
+        // how the admitted physical gate handles gaps and proven writers.
         Arc::get_mut(&mut backend)
             .expect("fresh Worktree journey manager must be uniquely owned")
             .clean_close_writer_fixture = true;
@@ -1123,6 +1140,26 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             startup_llm_recovery_ack: Arc::new(Mutex::new(None)),
         },
     );
+    #[cfg(target_os = "linux")]
+    let physical_witness = if matches!(journey, WorktreeJourney::RetireWithProductionDetector)
+        && std::env::var_os("PHOENIX_TEST_OPAQUE_CLOSE_PID").is_some()
+    {
+        use crate::runtime::executor::native_close_retry::test_hooks::{Hooks, Point};
+
+        let hooks = Hooks::default();
+        let pause = hooks.arm(Point::PhysicalBeforeCheckoutRemoval);
+        Some((hooks, pause))
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let running = if let Some((hooks, _)) = physical_witness.as_ref() {
+        let hooks = hooks.clone();
+        tokio::spawn(async move { hooks.scope(actor.run()).await })
+    } else {
+        tokio::spawn(actor.run())
+    };
+    #[cfg(not(target_os = "linux"))]
     let running = tokio::spawn(actor.run());
     tokio::time::timeout(std::time::Duration::from_secs(10), started)
         .await
@@ -1259,6 +1296,23 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             .await
             .unwrap();
     }
+    #[cfg(target_os = "linux")]
+    let gap_before_removal = if let Some((_, mut pause)) = physical_witness {
+        tokio::select! {
+            output = close.as_mut() => panic!(
+                "ordinary physical witness completed before its deletion checkpoint: {}\n{}",
+                output.output(),
+                physical_close_diagnostics(),
+            ),
+            reached = pause.reached() => reached.expect("physical deletion must reach the persistence-before-deletion witness"),
+        }
+        let witness =
+            assert_ordinary_linux_gap_before_checkout_removal(&fixture, &git, &scope).await;
+        pause.release();
+        Some(witness)
+    } else {
+        None
+    };
     let output = tokio::time::timeout(Duration::from_secs(10), close.as_mut())
         .await
         .expect("public native Close must return a bounded admission result");
@@ -1613,6 +1667,21 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             );
             git.assert_untargeted_state_preserved();
         }
+    } else if matches!(journey, WorktreeJourney::RefuseDescriptorWriter) {
+        assert!(output.is_success(), "{}", output.output());
+        let admitted: Value = serde_json::from_str(output.output()).unwrap();
+        assert_eq!(admitted["status"], "newly_admitted");
+        assert_eq!(admitted["admitted"]["run_ordinal"], 1);
+        let attempt =
+            CloseAttemptId::parse(admitted["admitted"]["attempt_id"].as_str().unwrap()).unwrap();
+        assert_public_descriptor_veto(
+            &fixture,
+            &git,
+            &scope,
+            attempt,
+            &registrations_before_admission,
+        )
+        .await;
     } else {
         assert!(output.is_success(), "{}", output.output());
         let admitted: Value = serde_json::from_str(output.output()).unwrap();
@@ -1808,6 +1877,23 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
                 .1,
             WorkScopeLifecycle::Retired
         );
+        #[cfg(target_os = "linux")]
+        if let Some((observation, moved_checkout)) = gap_before_removal {
+            assert_eq!(
+                fixture
+                    .db
+                    .list_close_writer_observations(&run, &scope)
+                    .await
+                    .unwrap(),
+                [observation],
+                "the exact pre-removal gap must survive terminal completion",
+            );
+            assert_eq!(
+                moved_checkout.symlink_metadata().unwrap_err().kind(),
+                std::io::ErrorKind::NotFound,
+                "the exact checkout witnessed in quarantine must no longer exist",
+            );
+        }
         // Do not let a dangling symlink masquerade as physical removal.
         assert_eq!(
             std::fs::symlink_metadata(&git.worktree).unwrap_err().kind(),
@@ -2052,8 +2138,191 @@ async fn durable_target_rows(fixture: &CloseFixture) -> Value {
     })
 }
 
+async fn assert_public_descriptor_veto(
+    fixture: &CloseFixture,
+    git: &DisposableGit,
+    scope: &WorkScopeId,
+    attempt: CloseAttemptId,
+    registrations: &[u8],
+) {
+    use crate::db::{
+        CloseFileWriteAccess, CloseWriterAuthority, CloseWriterDetector, CloseWriterObservation,
+    };
+
+    let run = CloseRunRef::initial(attempt.clone());
+    let obligation = fixture
+        .db
+        .get_close_obligation(attempt.as_str())
+        .await
+        .unwrap();
+    assert_eq!(
+        obligation.close_outcome(),
+        Some(CloseCompletionOutcome::ArchivedCleanupAttention),
+        "positive writer veto should archive with actionable cleanup attention: {}\n{}",
+        worktree_close_failure_evidence(fixture, &run).await,
+        physical_close_diagnostics(),
+    );
+    assert_eq!(
+        fixture.db.get_close_run(&run).await.unwrap().status,
+        CloseRunStatus::Stopped,
+        "positive writer veto must stop the exact run: {}\n{}",
+        worktree_close_failure_evidence(fixture, &run).await,
+        physical_close_diagnostics(),
+    );
+    let observations = fixture
+        .db
+        .list_close_writer_observations(&run, scope)
+        .await
+        .unwrap();
+    let [entry] = observations.as_slice() else {
+        panic!("expected one positive observation: {observations:?}");
+    };
+    assert_eq!(entry.run, run);
+    let CloseWriterObservation::Authority {
+        detector: CloseWriterDetector::LinuxDescriptor,
+        authority: CloseWriterAuthority::WritableFile(CloseFileWriteAccess::WriteOnly),
+        process,
+        matched_path,
+    } = &entry.observation
+    else {
+        panic!("expected current writable descriptor: {entry:?}");
+    };
+    assert_eq!(process.pid, std::process::id());
+    assert_eq!(matched_path.file_name().unwrap(), "tracked.txt");
+    let retained = matched_path.parent().unwrap();
+    assert_eq!(directory_identity(retained), git.checkout_identity);
+    assert_eq!(std::fs::read(matched_path).unwrap(), b"durable content\n");
+    assert_eq!(directory_identity(&git.admin), git.admin_identity);
+    assert_eq!(
+        std::fs::read(git.admin.join("gitdir")).unwrap(),
+        format!("{}\n", git.worktree.join(".git").display()).into_bytes(),
+    );
+    let listing = git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]);
+    let checkout_entry = [b"worktree ", git.worktree.as_os_str().as_bytes()].concat();
+    let mut in_checkout_entry = false;
+    let actual: Vec<_> = listing
+        .split(|byte| *byte == 0)
+        .filter(|field| {
+            if field.starts_with(b"worktree ") {
+                in_checkout_entry = *field == checkout_entry;
+            }
+            // With the original path absent, Git may mark the retained entry prunable.
+            !(in_checkout_entry && field.starts_with(b"prunable "))
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        registrations.split(|byte| *byte == 0).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        fixture
+            .db
+            .read_ordinary_product_conversation_metadata(TARGET_ID)
+            .await
+            .unwrap()
+            .lifecycle,
+        OrdinaryProductConversationLifecycle::History,
+    );
+}
+
+#[cfg(target_os = "linux")]
+async fn assert_ordinary_linux_gap_before_checkout_removal(
+    fixture: &CloseFixture,
+    git: &DisposableGit,
+    scope: &WorkScopeId,
+) -> (phoenix_db::RecordCloseWriterObservationRequest, PathBuf) {
+    use crate::db::{CloseWriterDetector, CloseWriterObservation};
+
+    let attempt: String = sqlx::query_scalar(
+        "SELECT attempt_id FROM native_close_initial_receipts WHERE request_id = ?1",
+    )
+    .bind(fixture.command.request_id().to_string())
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    let attempt = CloseAttemptId::parse(attempt).unwrap();
+    let run = CloseRunRef::initial(attempt.clone());
+    assert_eq!(
+        fixture.db.get_close_run(&run).await.unwrap().status,
+        CloseRunStatus::Running,
+    );
+    let expected = fixture
+        .db
+        .list_close_expected_retirement_resources(attempt.as_str())
+        .await
+        .unwrap();
+    let worktree = expected
+        .iter()
+        .find(|item| &item.scope == scope && item.resource.kind() == RetiredResourceKind::Worktree)
+        .expect("sealed capture must contain the exact Worktree");
+    let cleanup = fixture
+        .db
+        .close_worktree_cleanup_plan(&attempt, scope, &worktree.snapshot, &worktree.resource)
+        .await
+        .unwrap()
+        .unwrap();
+    let object = cleanup.final_tombstone.unwrap().root.join("object");
+    assert_eq!(directory_identity(&object), git.checkout_identity);
+    assert_eq!(
+        std::fs::read(object.join("tracked.txt")).unwrap(),
+        b"durable content\n",
+    );
+    assert_eq!(cleanup.administrative_dir, git.admin);
+    assert_eq!(directory_identity(&git.admin), git.admin_identity);
+    // The original path is absent while quarantined, so Git can label the entry
+    // prunable. The exact registration itself must still exist.
+    let expected_registration = [b"worktree ", git.worktree.as_os_str().as_bytes()].concat();
+    assert!(git
+        .run(&git.repo, &["worktree", "list", "--porcelain", "-z"])
+        .split(|byte| *byte == 0)
+        .any(|field| field == expected_registration));
+
+    let value = std::env::var("PHOENIX_TEST_OPAQUE_CLOSE_PID").unwrap();
+    let pid: u32 = value.parse().expect("ordinary-runner opaque fixture PID");
+    let path = format!("/proc/{pid}/exe");
+    assert_eq!(
+        std::fs::read_link(&path).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    let observations = fixture
+        .db
+        .list_close_writer_observations(&run, scope)
+        .await
+        .unwrap();
+    let diagnostics = physical_close_diagnostics();
+    assert!(
+        diagnostics.lines().any(|line| {
+            line.contains("operation=\"process_exe_read_link\"")
+                && line.contains(&path)
+                && line.contains("error_kind=PermissionDenied")
+        }),
+        "the production scanner must encounter the opaque fixture: {path}\n{observations:?}\n{diagnostics}",
+    );
+    assert_eq!(
+        observations.len(),
+        1,
+        "one representative immutable observation"
+    );
+    let entry = &observations[0];
+    assert_eq!(entry.run, run);
+    assert_eq!(&entry.scope, scope);
+    assert_eq!(entry.snapshot, worktree.snapshot);
+    assert_eq!(entry.resource, worktree.resource);
+    assert!(matches!(
+        entry.observation,
+        CloseWriterObservation::InspectionGap {
+            detector: CloseWriterDetector::LinuxDescriptor,
+            ..
+        }
+    ));
+    eprintln!(
+        "ordinary Linux: opaque process witnessed; durable gap precedes removal of the exact checkout and registration"
+    );
+    (entry.clone(), object)
+}
+
 // Failure diagnostics must not replace the original outcome with a query panic.
-// Keep replay snapshots below strict: query failures there remain test failures.
+// Replay snapshots remain strict: a query failure there is itself a test failure.
 async fn worktree_close_failure_evidence(fixture: &CloseFixture, run: &CloseRunRef) -> String {
     let evidence = fixture
         .db
@@ -2084,6 +2353,27 @@ async fn worktree_close_failure_evidence(fixture: &CloseFixture, run: &CloseRunR
     format!(
         "retirement evidence: {evidence:?}; retirement history: {history:?}; scanner_pid: {scanner_pid}; captured scopes: {scopes:?}; writer observations: {writers:?}"
     )
+}
+
+async fn durable_native_close_writer_rows(
+    fixture: &CloseFixture,
+    run: &CloseRunRef,
+) -> Vec<String> {
+    let attempt = run.attempt_id.as_str();
+    sqlx::query_scalar(
+        "SELECT json_array(product_conversation_id, attempt_id, run_ordinal, scope,
+                           inspection_generation, inspection_fingerprint, resource_kind,
+                           identity_kind, identity_codec, quote(identity_value), detector, pid,
+                           incarnation, quote(executable), quote(matched_path), matched_kind,
+                           access, authority, gap)
+         FROM close_writer_observations WHERE attempt_id = ?1 AND run_ordinal = ?2
+         ORDER BY scope, detector",
+    )
+    .bind(attempt)
+    .bind(run.ordinal.get())
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap()
 }
 
 async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) -> Value {
@@ -2150,6 +2440,7 @@ async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) ->
     .fetch_one(fixture.db.pool())
     .await
     .unwrap();
+    let writer_observations = durable_native_close_writer_rows(fixture, run).await;
     let process_successes: Vec<(String, String, String, String, i64)> = sqlx::query_as(
         "SELECT scope, resource_kind, identity_value, outcome, observed_at_us
          FROM close_process_step_successes WHERE attempt_id = ?1 AND run_ordinal = ?2
@@ -2175,6 +2466,7 @@ async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) ->
         "counts": close_row_counts(fixture).await,
         "receipt": receipt,
         "run_times": run_times,
+        "writer_observations": writer_observations,
         "process_successes": process_successes,
         "history": history,
         "obligation": obligation,

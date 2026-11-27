@@ -296,7 +296,7 @@ rule RetirementInspectionRequestCreatesAttemptBoundEvidence {
         -- becomes distinct evidence rather than collapsing multiple items into one
         -- category summary. Operational impediments name the exact affected expected
         -- resource or scope when a path cannot be inspected, without inventing files
-        -- or writer identities. Incomplete inspection always creates a blocker.
+        -- or writer identities. Incomplete target inspection creates a blocker.
         -- Evidence capture and decision creation share one atomic snapshot; neither
         -- outcome selection nor projection recomputes through a separate side channel.
 }
@@ -345,8 +345,9 @@ rule GitBackedInspectionWithoutBlockersRequestsRetirement {
         -- grants discard permission. Nested repositories are inspected only as
         -- declared submodules. LFS edits are tracked changes; branches, remote refs,
         -- tags and stash are durable refs, but reflog-only detached commits are not.
-        -- Writers, permission/layout errors, inspection gaps and deadlines also
-        -- block. A clear content inventory is not proof that mutation will succeed.
+        -- Positive writers, target permission/layout or inspection errors, and
+        -- deadlines also block. A clear content inventory is not proof that
+        -- mutation will succeed.
 }
 
 rule GitBackedInspectionWithBlockersStopsRun {
@@ -500,12 +501,16 @@ rule AmbiguousPrivateDirectoryIdentityPreservesSafeLeftover {
         -- path-relative authority, writable regular-file descriptors as direct
         -- authority, and writable shared mappings independently of descriptors.
         -- Process incarnation and descriptor identity must remain stable;
-        -- incomplete attributable inspection blocks deletion. Under admitted-run
-        -- authority, a positive writer or inspection gap is persisted as an
-        -- immutable child observation of the exact run, scope, inspection snapshot
-        -- and resource before returning the blocker. Failed evidence persistence
-        -- preserves the target (REQ-WL-002e). Pre-admission retry probes cannot
-        -- write observations under a hypothetical ordinal.
+        -- otherwise the process evidence is unknown, not writer-free. Independent
+        -- checks can still find a positive match after a gap. Persist the positive
+        -- match, or a representative gap if no match is verified, as immutable
+        -- evidence of the exact run, scope, inspection snapshot and resource.
+        -- Once Phoenix-owned shutdown is proven, admitted native physical removal
+        -- blocks on positive writer evidence, not on a process gap alone. Failure
+        -- to persist, target uncertainty, losses and deadlines still stop removal.
+        -- An undetected concurrent save may be lost. Logical removal is not proof
+        -- that open handles released disk space (REQ-WL-002e). Pre-admission retry
+        -- remains strict and cannot write evidence under a hypothetical ordinal.
 }
 
 rule RetirementStepSuccessRecordsTypedEvidence {
@@ -934,7 +939,8 @@ rule PrStatusObservedAsAdvisoryCloseGuidance {
 --       identity, permissions and writer state immediately before mutation. It
 --       captures new normalized rows, the complete immutable per-scope inspection
 --       membership relation and their aggregate decision atomically.
---       Missing/incomplete inspection is a gap blocker; inability to persist it
+--       Missing/incomplete target inspection is a blocker. For external process
+--       inspection, apply REQ-WL-002e. Inability to persist required evidence
 --       preserves the target and fails the step. It never grants live source or
 --       process permission, expands targets, or authorizes independent owner cleanup.
 --       This same decision is consumed by the effect gate, failure and projection.

@@ -29,6 +29,8 @@ Strict local-only selection of Kache v1.2.2 on macOS arm64 and Linux x86_64 is g
 
 Conversation creation and task approval use one detached worktree and same-conversation checkpoint, with no approval Git writes, fork/handoff, permanent Delete, or startup resource reclamation, under [ADR-291](291_single-detached-conversation-workflow.md). Creation-pin binding to the supplying common-directory incarnation is governed by [ADR-292](292_bind-starting-pin-to-repository-incarnation.md); it is distinct from hidden `GitRepository` identity.
 
+[ADR-293](293_native-close-requires-positive-external-writer-evidence.md) narrows only the external process-inspection blocker for admitted native physical Close; ADR-241's exact-run evidence and ADR-286's remaining safeguards still apply.
+
 ## Numbering and validation
 
 ADRs use unique three-digit numeric IDs in `NNN_<slug>.md` filenames. The
@@ -51,6 +53,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [293](293_native-close-requires-positive-external-writer-evidence.md) | Require positive external writer evidence to block admitted native physical Close on a process | Accepted | REQ-WL-002e |
 | [292](292_bind-starting-pin-to-repository-incarnation.md) | Bind creation pins to the supplying Git common-directory incarnation | Accepted | REQ-CCR-005A; Git aggregate staging |
 | [291](291_single-detached-conversation-workflow.md) | One detached conversation worktree with in-place task approval | Accepted | REQ-CCR-005, REQ-PROJ-005, REQ-TAT-001, REQ-BED-028 |
 | [290](290_compact-model-visible-tool-output.md) | Compact model-visible tool output, separate from typed displays | Accepted | REQ-BASH-002, REQ-BASH-004, REQ-BASH-017, REQ-RQD-010 |
