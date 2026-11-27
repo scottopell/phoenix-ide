@@ -40,6 +40,7 @@ silently cleared.
 | REQ-STR-010 | Tune Retention Per Deployment | 🔄 In Progress |
 | REQ-STR-011 | Govern a Result's Images and Text Together | ✅ Complete |
 | REQ-STR-012 | Preserve Interpretation Without Duplicating Memory | Deterministic backend qualification |
+| REQ-STR-013 | Clear a Preview, Keep the Record | ✅ Complete (patch diffs) |
 
 ## Scope Notes
 
@@ -99,6 +100,13 @@ Its fraction is set at implementation against the deployed models' windows and
 recorded here once benchmarked. There is no `target_after_clear`: a sweep always
 clears the whole prefix outside the recency floor, so `keep_recent_rounds` alone
 bounds retention.
+
+REQ-STR-013 is covered by `cleared_patch_keeps_receipt_and_hunk_headers`,
+`retained_patch_renders_full_diff`, `preview_decides_clearability_of_non_clearable_tool`,
+`preview_smaller_than_marker_is_not_cleared` and `capped_output_drops_clearable_preview`
+in `stale_tool_result_clearing_tests`. Also covered by the `clearable_preview_tests` property test in
+phoenix-core and `successful_patch_marks_exactly_the_diff_block_as_preview` in
+the patch tool.
 
 REQ-STR-012 has deterministic backend coverage in
 `stale_tool_result_clearing_tests::render_placeholders_cleared_keeps_rest`:

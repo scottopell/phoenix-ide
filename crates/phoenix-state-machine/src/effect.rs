@@ -386,6 +386,7 @@ impl Effect {
                 content: output.into(),
                 is_error,
                 images,
+                clearable_preview: None,
             }),
             display_data,
             usage_data: None,

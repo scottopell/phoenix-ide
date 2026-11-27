@@ -379,7 +379,14 @@ Size limit: each patch call must be less than 60 KB of input.".to_string()
             );
         }
 
-        let _ = write!(output, "\n<diff>\n{}</diff>", bounded_diff(&plan.diff));
+        output.push('\n');
+        let preview_start = output.len();
+        let _ = write!(output, "<diff>\n{}</diff>", bounded_diff(&plan.diff));
+        let preview = phoenix_core::domain::db_schema::ClearablePreview {
+            start: preview_start,
+            end: output.len(),
+            kind: phoenix_core::domain::db_schema::ClearablePreviewKind::UnifiedDiff,
+        };
 
         if let Some(next_step) = self.proposal_next_step(&patch_input.path) {
             output.push_str(&next_step);
@@ -390,7 +397,9 @@ Size limit: each patch call must be less than 60 KB of input.".to_string()
             "diff": plan.diff
         });
 
-        ToolOutput::success(output).with_display(display_data)
+        ToolOutput::success(output)
+            .with_clearable_preview(preview)
+            .with_display(display_data)
     }
 }
 
@@ -445,6 +454,48 @@ mod tests {
 
         assert!(result.is_success(), "Error: {}", result.output());
         assert_eq!(fs::read_to_string(&test_file).unwrap(), "Hello Rust");
+    }
+
+    /// REQ-PATCH-007 / REQ-STR-013: the applied diff is marked as the
+    /// clearable preview, and everything outside it is the durable receipt.
+    #[tokio::test]
+    async fn successful_patch_marks_exactly_the_diff_block_as_preview() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("test.txt"), "Hello World\n").unwrap();
+        let result = PatchTool::default()
+            .run(
+                json!({
+                    "path": "test.txt",
+                    "patches": [{"operation": "replace", "oldText": "World", "newText": "Rust"}]
+                }),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+        let ToolOutput::Success {
+            output,
+            clearable_preview: Some(preview),
+            ..
+        } = result
+        else {
+            panic!("expected success with a preview: {result:?}");
+        };
+        let span = output.get(preview.start..preview.end).unwrap();
+        assert!(
+            span.starts_with("<diff>\n") && span.ends_with("</diff>"),
+            "{span}"
+        );
+        assert!(span.contains("+Hello Rust"), "{span}");
+        assert_eq!(
+            output.get(..preview.start).unwrap(),
+            "<patches_applied>all</patches_applied>\n"
+        );
+        assert_eq!(
+            preview.cleared_summary(&output).unwrap(),
+            span.lines()
+                .filter(|l| l.starts_with("@@ "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     #[tokio::test]

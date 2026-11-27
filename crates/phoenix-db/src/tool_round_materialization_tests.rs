@@ -134,6 +134,7 @@ fn restart_orders_out_of_order_sibling_results_by_source_identity() {
                 media_type: "image/png".into(),
                 data: "image".into(),
             }],
+            clearable_preview: None,
         },
         duration_ms: Some(17),
     };
@@ -258,7 +259,8 @@ fn restart_preserves_completed_metadata_and_source_order() {
                 tool_use_id: id.into(),
                 content: output.into(),
                 is_error,
-                images
+                images,
+                clearable_preview: None,
             })
         );
         assert_eq!(row.display_data, display);
@@ -279,6 +281,7 @@ fn restart_spawn_fan_in_replaces_display_and_duration_but_preserves_images() {
             output: "Spawning 1 sub-agent(s): child".into(),
             display_data: Some(serde_json::json!({"old": "placeholder", "duration_ms": 999})),
             images: vec![image.clone()],
+            clearable_preview: None,
         },
         duration_ms: Some(17),
     };
@@ -313,6 +316,7 @@ fn restart_spawn_fan_in_replaces_display_and_duration_but_preserves_images() {
                 .into(),
             is_error: false,
             images: vec![image],
+            clearable_preview: None,
         })
     );
     assert_eq!(
@@ -332,6 +336,7 @@ fn restart_spawn_fan_in_replaces_display_and_duration_but_preserves_images() {
             content: "[Tool execution interrupted by server restart]".into(),
             is_error: true,
             images: vec![],
+            clearable_preview: None,
         })
     );
     assert!(rows[1].display_data.is_none());
@@ -787,7 +792,8 @@ fn assert_recovered_trusted_round(
                     tool_use_id: id.into(),
                     content: content.into(),
                     is_error,
-                    images
+                    images,
+                    clearable_preview: None,
                 }),
                 created_at: result_time,
                 display_data,

@@ -228,6 +228,7 @@ mod tests {
             content: "error: missing semicolon at foo.rs:42".into(),
             is_error: true,
             images: vec![],
+            clearable_preview: None,
         }));
         assert_eq!(index_text(&m), "error: missing semicolon at foo.rs:42");
     }
@@ -242,6 +243,7 @@ mod tests {
             content: body,
             is_error: true,
             images: vec![],
+            clearable_preview: None,
         }));
         let out = index_text(&m);
         assert!(out.contains("HEAD_START"), "head signal must survive");

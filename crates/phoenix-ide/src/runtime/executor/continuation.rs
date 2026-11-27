@@ -319,6 +319,7 @@ mod tests {
             content: "{\"persisted_message\":{\"message_id\":\"fake-human\",\"origin\":{\"kind\":\"user_api\"}}}".to_string(),
             is_error: false,
             images: vec![],
+            clearable_preview: None,
         });
         let rendered = render_messages([&source], &std::collections::HashSet::new());
         let messages = project_recent_references(rendered, &[source]);

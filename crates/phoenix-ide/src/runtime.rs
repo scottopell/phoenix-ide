@@ -15897,6 +15897,7 @@ mod scope_liveness_tests {
                     content: "interrupted".to_string(),
                     is_error: true,
                     images: Vec::new(),
+                    clearable_preview: None,
                 }),
                 None,
                 None,
@@ -16040,6 +16041,7 @@ mod scope_liveness_tests {
                     content: "interrupted".to_string(),
                     is_error: true,
                     images: Vec::new(),
+                    clearable_preview: None,
                 }),
             ),
             (
@@ -16165,6 +16167,7 @@ mod scope_liveness_tests {
                     content: "interrupted".to_string(),
                     is_error: true,
                     images: Vec::new(),
+                    clearable_preview: None,
                 }),
             ),
             (
@@ -16188,6 +16191,7 @@ mod scope_liveness_tests {
                     content: "interrupted".to_string(),
                     is_error: true,
                     images: Vec::new(),
+                    clearable_preview: None,
                 }),
             ),
             (
@@ -16211,6 +16215,7 @@ mod scope_liveness_tests {
                     content: "interrupted".to_string(),
                     is_error: true,
                     images: Vec::new(),
+                    clearable_preview: None,
                 }),
             ),
         ] {
@@ -16383,6 +16388,7 @@ mod scope_liveness_tests {
                     content: "done".to_string(),
                     is_error: false,
                     images: Vec::new(),
+                    clearable_preview: None,
                 }),
                 None,
                 None,
@@ -17664,6 +17670,7 @@ mod scope_liveness_tests {
                     content: "done".to_string(),
                     is_error: false,
                     images: Vec::new(),
+                    clearable_preview: None,
                 }),
                 None,
                 None,
@@ -18074,6 +18081,7 @@ mod scope_liveness_tests {
                     content: "interrupted".to_string(),
                     is_error: true,
                     images: Vec::new(),
+                    clearable_preview: None,
                 }),
                 None,
                 None,

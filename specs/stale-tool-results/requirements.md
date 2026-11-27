@@ -66,6 +66,9 @@ THE SYSTEM MAY remove a result whose producing tool reads re-queryable state,
 accepting that the exact earlier snapshot is not preserved; the agent retains the
 ability to re-read the current state if it later needs it.
 
+THE SYSTEM MAY remove the part of a state-changing result that only previews
+re-queryable state, under REQ-STR-013, while retaining the record of the effect.
+
 ### REQ-STR-003 — Preserve the Agent's Immediate Working Set
 
 **Rationale:** The most recent tool output is the agent's active working memory.
@@ -179,3 +182,27 @@ AND SHALL retain known uncertainty and later supersession rather than promote an
 AND SHALL provide retrieval references for omitted supporting evidence when known.
 
 The durable transcript SHALL remain the evidence authority. These obligations SHALL NOT require a second continuously synchronized semantic memory store or a distinct Coordinator retention engine.
+
+### REQ-STR-013 — Clear a Preview, Keep the Record
+
+**Rationale:** A state-changing result can carry two different kinds of
+information: the record that the change happened, which the agent cannot
+re-obtain, and a preview of the resulting state, which it can. A patch result
+is both: the receipt that edits applied, and the applied diff, which `git diff`
+or a file read reproduces. Keeping the whole result forever because of the
+receipt carries the preview long after the agent acted on it.
+
+WHERE a successful tool result marks a region of its text as a re-obtainable
+preview, THE SYSTEM SHALL treat that result as clearable, and clearing it SHALL
+remove only the preview region, keep every other part of the result verbatim,
+and put in place of the preview a summary determined by the preview's kind
+followed by the removal marker of REQ-STR-004.
+
+THE SYSTEM SHALL NOT clear a preview whose cleared form would not be smaller
+than the full result.
+
+IF a preview region is not a valid range of the result's text, or the result
+is an error, THE SYSTEM SHALL keep the whole result.
+
+WHEN a unified-diff preview is cleared, THE SYSTEM SHALL keep its hunk headers
+as the summary, so the agent still knows where each edit landed.

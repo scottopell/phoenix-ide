@@ -155,9 +155,13 @@ pub(super) async fn retained_result_tx(
         content,
         is_error,
         images,
+        clearable_preview,
     } = serde_json::from_str(&row.try_get::<String, _>("content")?)
         .map_err(|_| GoalDbError::Integrity("pending report retained result content"))?;
-    if tool_use_id != report.call().tool_use_id.as_str() || !images.is_empty() {
+    if tool_use_id != report.call().tool_use_id.as_str()
+        || !images.is_empty()
+        || clearable_preview.is_some()
+    {
         return Err(GoalDbError::Integrity(
             "pending report retained result identity",
         ));

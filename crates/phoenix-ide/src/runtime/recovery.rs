@@ -331,6 +331,7 @@ mod tests {
                 content: output.to_string(),
                 is_error: false,
                 images: vec![],
+                clearable_preview: None,
             }),
             display_data: None,
             usage_data: None,
@@ -839,6 +840,7 @@ mod proptests {
                 content: "tool output".to_string(),
                 is_error: false,
                 images: vec![],
+                clearable_preview: None,
             }),
             _ => MessageContent::User(UserContent {
                 text: "fallback".to_string(),

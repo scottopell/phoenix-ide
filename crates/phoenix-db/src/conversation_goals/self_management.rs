@@ -272,6 +272,7 @@ fn canonical_result(
             output: serde_json::json!({"status":status}).to_string(),
             display_data: None,
             images: vec![],
+            clearable_preview: None,
         },
         Err(reason) => ToolOutcome::Error {
             output: serde_json::json!({"status":"refused","reason":reason}).to_string(),

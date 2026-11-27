@@ -153,6 +153,9 @@ pub enum ToolOutput {
         images: Vec<ToolImage>,
         display_data: Option<Value>,
         llm_usage: Option<Box<ToolLlmUsage>>,
+        /// Span of `output` that stale-result clearing may remove
+        /// (specs/stale-tool-results REQ-STR-013).
+        clearable_preview: Option<phoenix_core::domain::db_schema::ClearablePreview>,
     },
     /// Instructions from an authenticated audience-bound built-in skill.
     TrustedInstructions(skill::TrustedInstructions),
@@ -171,6 +174,7 @@ impl ToolOutput {
             images: vec![],
             display_data: None,
             llm_usage: None,
+            clearable_preview: None,
         }
     }
 
@@ -198,7 +202,43 @@ impl ToolOutput {
     pub fn with_output(mut self, text: impl Into<String>) -> Self {
         match &mut self {
             Self::TrustedInstructions(_) => {}
-            Self::Success { output, .. } | Self::Error { output, .. } => *output = text.into(),
+            Self::Success {
+                output,
+                clearable_preview,
+                ..
+            } => {
+                *output = text.into();
+                // a span into the old text is meaningless for the new text
+                *clearable_preview = None;
+            }
+            Self::Error { output, .. } => *output = text.into(),
+        }
+        self
+    }
+
+    /// Mark `output[start..end]` as a preview that stale-result clearing may
+    /// remove. Ignored (and logged) unless this is a success whose output the
+    /// span fits.
+    #[must_use]
+    pub fn with_clearable_preview(
+        mut self,
+        preview: phoenix_core::domain::db_schema::ClearablePreview,
+    ) -> Self {
+        if let Self::Success {
+            output,
+            clearable_preview,
+            ..
+        } = &mut self
+        {
+            if preview.is_valid_for(output) {
+                *clearable_preview = Some(preview);
+            } else {
+                tracing::warn!(
+                    ?preview,
+                    len = output.len(),
+                    "invalid clearable preview span ignored"
+                );
+            }
         }
         self
     }

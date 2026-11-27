@@ -730,6 +730,26 @@ fn required_clear_gain_tokens(reported_prompt_tokens: i64) -> usize {
 /// `tool_use` block is preserved, so this is never a silent gap (REQ-STR-004).
 const CLEARED_TOOL_RESULT_PLACEHOLDER: &str = "[tool result cleared to save context]";
 
+/// Text sent in place of a cleared tool result. A result with a valid
+/// clearable preview keeps everything outside the preview, with the preview
+/// replaced by its kind's summary and the marker (REQ-STR-013); any other
+/// result becomes the marker alone (REQ-STR-004).
+fn cleared_tool_result_text(message: &crate::db::Message, tool: &crate::db::ToolContent) -> String {
+    let marker = cleared_tool_result_marker(message);
+    let Some(preview) = tool.valid_clearable_preview() else {
+        return marker;
+    };
+    let summary = preview.cleared_summary(&tool.content).unwrap_or_default();
+    let replacement = if summary.is_empty() {
+        marker
+    } else {
+        format!("{summary}\n{marker}")
+    };
+    preview
+        .replace_in(&tool.content, &replacement)
+        .unwrap_or_else(|| cleared_tool_result_marker(message))
+}
+
 fn cleared_tool_result_marker(message: &crate::db::Message) -> String {
     format!(
         "{CLEARED_TOOL_RESULT_PLACEHOLDER} [persisted source: conversation={}, message={}, sequence={}]",
@@ -817,12 +837,27 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             output,
             images,
             display_data,
+            clearable_preview,
             ..
-        } => ToolOutcome::Success {
-            output: cap_tool_output_text(output),
-            display_data,
-            images: convert(images),
-        },
+        } => {
+            let original_len = output.len();
+            let output = cap_tool_output_text(output);
+            // capping rewrites the text, so a span into the original no longer applies
+            let clearable_preview = if output.len() == original_len {
+                clearable_preview
+            } else {
+                if clearable_preview.is_some() {
+                    tracing::debug!("dropping clearable preview: tool output was capped");
+                }
+                None
+            };
+            ToolOutcome::Success {
+                output,
+                display_data,
+                images: convert(images),
+                clearable_preview,
+            }
+        }
         ToolOutput::TrustedInstructions(instructions) => ToolOutcome::TrustedInstructions {
             output: cap_tool_output_text(instructions.into_output()),
         },
@@ -1443,12 +1478,17 @@ fn collect_tool_result_facts(
                     .get(tc.tool_use_id.as_str())
                     .copied()
                     .unwrap_or("");
+                let token_estimate = estimate_tool_result_tokens(&tc.content, tc.images.len());
+                let marker_token_estimate = estimate_text_tokens(&cleared_tool_result_text(m, tc));
+                // a preview is cleared only when that shrinks the result
+                let preview_shrinks = tc.valid_clearable_preview().is_some()
+                    && marker_token_estimate < token_estimate;
                 results.push(ToolResultFacts {
                     sequence_id: m.sequence_id,
                     round: current_round,
-                    clearable: clearable_tool_names.contains(name),
-                    token_estimate: estimate_tool_result_tokens(&tc.content, tc.images.len()),
-                    marker_token_estimate: estimate_text_tokens(&cleared_tool_result_marker(m)),
+                    clearable: clearable_tool_names.contains(name) || preview_shrinks,
+                    token_estimate,
+                    marker_token_estimate,
                 });
                 max_round = current_round;
             }
@@ -1843,18 +1883,21 @@ fn render_messages<'a>(
                 });
             }
 
-            MessageContent::Tool(ToolContent {
-                tool_use_id,
-                content,
-                is_error,
-                images,
-            }) => {
+            MessageContent::Tool(
+                tool @ ToolContent {
+                    tool_use_id,
+                    content,
+                    is_error,
+                    images,
+                    clearable_preview: _,
+                },
+            ) => {
                 // Cleared results render as a placeholder with no images; kept
                 // results carry their body and any images verbatim (REQ-STR-004,
                 // REQ-STR-011).
                 let (text, image_sources): (String, Vec<ImageSource>) =
                     if cleared_sequence_ids.contains(&msg.sequence_id) {
-                        (cleared_tool_result_marker(msg), Vec::new())
+                        (cleared_tool_result_text(msg, tool), Vec::new())
                     } else {
                         let sources = images
                             .iter()
@@ -30646,6 +30689,7 @@ mod steer_drain_detector_tests {
                     media_type: "image/png".to_string(),
                     data: "QUJD".to_string(),
                 }],
+                clearable_preview: None,
             },
             duration_ms: None,
         };
@@ -31464,6 +31508,7 @@ mod steer_drain_detector_tests {
                 output: "contents".to_string(),
                 display_data: None,
                 images: vec![],
+                clearable_preview: None,
             },
             duration_ms: Some(12),
         };
@@ -33501,7 +33546,9 @@ mod tool_output_to_outcome_tests {
                 output,
                 display_data,
                 images,
+                clearable_preview,
             } => {
+                assert_eq!(clearable_preview, None);
                 assert_eq!(output, "ran clean");
                 assert_eq!(display_data, Some(serde_json::json!({ "k": "v" })));
                 assert_eq!(images.len(), 1);
@@ -35413,6 +35460,182 @@ mod stale_tool_result_clearing_tests {
         assert_eq!(plan.new_watermark, 0);
         assert_eq!(plan.freed_tokens, 0);
         assert!(plan.cleared_sequence_ids.is_empty());
+    }
+
+    const PATCH_RECEIPT: &str = "<patches_applied>all</patches_applied>";
+    const PATCH_DIFF: &str = concat!(
+        "<diff>\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n keep\n@@ -9 +9 @@\n-a\n+b\n",
+        " context line one that makes this diff comfortably larger than the marker\n",
+        " context line two that makes this diff comfortably larger than the marker\n",
+        " context line three that makes this diff comfortably larger than the marker\n",
+        " context line four that makes this diff comfortably larger than the marker\n",
+        "</diff>"
+    );
+
+    fn patch_content(tool_use_id: &str, is_error: bool) -> crate::db::ToolContent {
+        let content = format!("{PATCH_RECEIPT}\n{PATCH_DIFF}");
+        let mut tc = crate::db::ToolContent::new(tool_use_id, content, is_error);
+        tc.clearable_preview = Some(phoenix_core::domain::db_schema::ClearablePreview {
+            start: PATCH_RECEIPT.len() + 1,
+            end: PATCH_RECEIPT.len() + 1 + PATCH_DIFF.len(),
+            kind: phoenix_core::domain::db_schema::ClearablePreviewKind::UnifiedDiff,
+        });
+        tc
+    }
+
+    async fn add_patch_round(
+        storage: &Arc<InMemoryStorage>,
+        conv: &str,
+        tag: &str,
+        content: crate::db::ToolContent,
+    ) -> i64 {
+        add(
+            storage,
+            conv,
+            MessageContent::agent(vec![ContentBlock::ToolUse {
+                id: format!("{tag}-tool"),
+                name: "patch".to_string(),
+                input: serde_json::json!({}),
+            }]),
+        )
+        .await;
+        add(storage, conv, MessageContent::Tool(content)).await
+    }
+
+    /// REQ-STR-013: clearing a result with a preview keeps the durable record
+    /// and the hunk headers, drops the diff body, and leaves the marker.
+    #[tokio::test]
+    async fn cleared_patch_keeps_receipt_and_hunk_headers() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-patch-clear";
+        let seq = add_patch_round(&storage, conv, "p", patch_content("p-tool", false)).await;
+        let db = storage.get_messages(conv).await.unwrap();
+        let msgs = render_messages(&db, &std::iter::once(seq).collect());
+        let text = msgs
+            .iter()
+            .flat_map(|m| &m.content)
+            .find_map(|b| match b {
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content,
+                    ..
+                } if tool_use_id == "p-tool" => Some(content.clone()),
+                _ => None,
+            })
+            .expect("patch result rendered");
+        assert!(text.starts_with(PATCH_RECEIPT), "{text}");
+        assert!(text.contains("@@ -1,2 +1,2 @@\n@@ -9 +9 @@\n"), "{text}");
+        assert!(text.contains(CLEARED_TOOL_RESULT_PLACEHOLDER), "{text}");
+        assert!(!text.contains("+new") && !text.contains("<diff>"), "{text}");
+    }
+
+    /// A retained result with a preview renders its full stored text.
+    #[tokio::test]
+    async fn retained_patch_renders_full_diff() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-patch-keep";
+        add_patch_round(&storage, conv, "p", patch_content("p-tool", false)).await;
+        let db = storage.get_messages(conv).await.unwrap();
+        let msgs = render_messages(&db, &HashSet::new());
+        assert!(msgs.iter().flat_map(|m| &m.content).any(|b| matches!(
+            b,
+            ContentBlock::ToolResult { content, .. } if *content == format!("{PATCH_RECEIPT}\n{PATCH_DIFF}")
+        )));
+    }
+
+    /// Eligibility: a valid preview makes a result of a non-clearable tool
+    /// clearable; no preview, an invalid span, or an error result does not.
+    #[tokio::test]
+    async fn preview_decides_clearability_of_non_clearable_tool() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-patch-facts";
+        let with_preview =
+            add_patch_round(&storage, conv, "a", patch_content("a-tool", false)).await;
+        let plain = add_patch_round(
+            &storage,
+            conv,
+            "b",
+            crate::db::ToolContent::new("b-tool", "<patches_applied>all</patches_applied>", false),
+        )
+        .await;
+        let mut bad = patch_content("c-tool", false);
+        bad.clearable_preview.as_mut().unwrap().end = bad.content.len() + 1;
+        let invalid = add_patch_round(&storage, conv, "c", bad).await;
+        let errored = add_patch_round(&storage, conv, "d", patch_content("d-tool", true)).await;
+
+        let db = storage.get_messages(conv).await.unwrap();
+        let (facts, _) = collect_tool_result_facts(&db, &clearable(&["bash"]));
+        let is_clearable = |seq: i64| {
+            facts
+                .iter()
+                .find(|f| f.sequence_id == seq)
+                .unwrap()
+                .clearable
+        };
+        assert!(is_clearable(with_preview));
+        assert!(!is_clearable(plain));
+        assert!(!is_clearable(invalid));
+        assert!(!is_clearable(errored));
+
+        let fact = facts
+            .iter()
+            .find(|f| f.sequence_id == with_preview)
+            .unwrap();
+        assert!(fact.marker_token_estimate < fact.token_estimate);
+    }
+
+    /// A preview too small to outweigh the marker stays: clearing it would
+    /// make the request larger.
+    #[tokio::test]
+    async fn preview_smaller_than_marker_is_not_cleared() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-patch-tiny";
+        let receipt = "<patches_applied>all</patches_applied>";
+        let diff = "<diff>\n@@ -1 +1 @@\n-a\n+b\n</diff>";
+        let mut tc = crate::db::ToolContent::new("t-tool", format!("{receipt}\n{diff}"), false);
+        tc.clearable_preview = Some(phoenix_core::domain::db_schema::ClearablePreview {
+            start: receipt.len() + 1,
+            end: receipt.len() + 1 + diff.len(),
+            kind: phoenix_core::domain::db_schema::ClearablePreviewKind::UnifiedDiff,
+        });
+        let seq = add_patch_round(&storage, conv, "t", tc).await;
+        let db = storage.get_messages(conv).await.unwrap();
+        let (facts, _) = collect_tool_result_facts(&db, &clearable(&["bash"]));
+        assert!(
+            !facts
+                .iter()
+                .find(|f| f.sequence_id == seq)
+                .unwrap()
+                .clearable
+        );
+    }
+
+    /// Capping rewrites the text, so a preview span must not survive it.
+    #[test]
+    fn capped_output_drops_clearable_preview() {
+        let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 10);
+        let preview = phoenix_core::domain::db_schema::ClearablePreview {
+            start: 0,
+            end: 5,
+            kind: phoenix_core::domain::db_schema::ClearablePreviewKind::UnifiedDiff,
+        };
+        let out = crate::tools::ToolOutput::success(big).with_clearable_preview(preview);
+        let ToolOutcome::Success {
+            clearable_preview, ..
+        } = tool_output_to_outcome(out)
+        else {
+            panic!("expected success");
+        };
+        assert_eq!(clearable_preview, None);
+
+        let out = crate::tools::ToolOutput::success("small diff").with_clearable_preview(preview);
+        let ToolOutcome::Success {
+            clearable_preview, ..
+        } = tool_output_to_outcome(out)
+        else {
+            panic!("expected success");
+        };
+        assert_eq!(clearable_preview, Some(preview));
     }
 }
 

@@ -881,6 +881,10 @@ pub enum ToolOutcome {
         // backfill and no migration is owed.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ToolContentImage>,
+        // owned: results produced before clearable previews existed had none,
+        // so None is correct, no migration owed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clearable_preview: Option<ClearablePreview>,
     },
     /// Authenticated instructions from an audience-bound immutable built-in skill.
     TrustedInstructions {
@@ -923,6 +927,7 @@ impl ToolResult {
                 output,
                 display_data: None,
                 images: vec![],
+                clearable_preview: None,
             },
             duration_ms: None,
         }
@@ -966,6 +971,7 @@ impl ToolResult {
                 output,
                 display_data,
                 images: vec![],
+                clearable_preview: None,
             },
             duration_ms: None,
         }
@@ -1051,11 +1057,20 @@ pub fn tool_result_transcript_content(result: &ToolResult) -> ToolContent {
             result.output()
         }
     };
+    let clearable_preview = match &result.outcome {
+        ToolOutcome::Success {
+            clearable_preview, ..
+        } => *clearable_preview,
+        ToolOutcome::TrustedInstructions { .. }
+        | ToolOutcome::Error { .. }
+        | ToolOutcome::Cancelled { .. } => None,
+    };
     ToolContent {
         tool_use_id: result.tool_use_id.clone(),
         content: persisted_output.to_owned(),
         is_error: result.is_error(),
         images: result.images().to_vec(),
+        clearable_preview,
     }
 }
 
@@ -1275,6 +1290,14 @@ pub struct ToolContent {
     /// and no migration is owed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ToolContentImage>,
+    /// Region of `content` that stale-result clearing may remove while the rest
+    /// of the result stays as a durable record (specs/stale-tool-results
+    /// REQ-STR-013).
+    ///
+    /// owned: rows written before clearable previews existed had none, so None
+    /// is correct, no migration owed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clearable_preview: Option<ClearablePreview>,
 }
 
 impl ToolContent {
@@ -1284,7 +1307,79 @@ impl ToolContent {
             content: content.into(),
             is_error,
             images: vec![],
+            clearable_preview: None,
         }
+    }
+
+    /// The preview span, if present and valid for this content.
+    #[must_use]
+    pub fn valid_clearable_preview(&self) -> Option<&ClearablePreview> {
+        self.clearable_preview
+            .as_ref()
+            .filter(|preview| !self.is_error && preview.is_valid_for(&self.content))
+    }
+}
+
+/// What kind of text a [`ClearablePreview`] span holds. The kind decides what
+/// summary survives when the span is cleared.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClearablePreviewKind {
+    /// A unified diff; its hunk headers survive clearing.
+    UnifiedDiff,
+}
+
+/// A byte range `start..end` of a tool result's text that is a re-obtainable
+/// preview rather than part of the durable record.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClearablePreview {
+    pub start: usize,
+    pub end: usize,
+    pub kind: ClearablePreviewKind,
+}
+
+impl ClearablePreview {
+    /// A span is usable only when it is non-empty, in bounds, and on UTF-8
+    /// boundaries of `text`.
+    #[must_use]
+    pub fn is_valid_for(&self, text: &str) -> bool {
+        self.start < self.end
+            && self.end <= text.len()
+            && text.is_char_boundary(self.start)
+            && text.is_char_boundary(self.end)
+    }
+
+    /// Render `text` with this span replaced by `replacement`. Returns `None`
+    /// when the span is not valid for `text`.
+    #[must_use]
+    pub fn replace_in(&self, text: &str, replacement: &str) -> Option<String> {
+        if !self.is_valid_for(text) {
+            return None;
+        }
+        let (head, rest) = text.split_at(self.start);
+        let (_, tail) = rest.split_at(self.end - self.start);
+        let mut out = String::with_capacity(head.len() + replacement.len() + tail.len());
+        out.push_str(head);
+        out.push_str(replacement);
+        out.push_str(tail);
+        Some(out)
+    }
+
+    /// The summary of the span's text kept after clearing.
+    #[must_use]
+    pub fn cleared_summary(&self, text: &str) -> Option<String> {
+        if !self.is_valid_for(text) {
+            return None;
+        }
+        let (_, rest) = text.split_at(self.start);
+        let (span, _) = rest.split_at(self.end - self.start);
+        Some(match self.kind {
+            ClearablePreviewKind::UnifiedDiff => span
+                .lines()
+                .filter(|line| line.starts_with("@@ "))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        })
     }
 }
 
@@ -1600,6 +1695,7 @@ impl MessageContent {
             content: content.into(),
             is_error,
             images,
+            clearable_preview: None,
         })
     }
 
@@ -2950,6 +3046,7 @@ mod conversation_serde_tests {
                     output: "success output".into(),
                     display_data: Some(serde_json::json!({"detail": "success", "duration_ms": 1})),
                     images: images.clone(),
+                    clearable_preview: None,
                 },
                 FinalizedToolDisposition::Success,
                 "success output",
@@ -3020,6 +3117,7 @@ mod conversation_serde_tests {
                     content: content.into(),
                     is_error,
                     images,
+                    clearable_preview: None,
                 })
             );
             let expected = serde_json::to_value(row).unwrap();
@@ -3062,6 +3160,7 @@ mod conversation_serde_tests {
                         output: "ok".into(),
                         display_data,
                         images: vec![],
+                        clearable_preview: None,
                     },
                     duration_ms,
                 },
@@ -3208,5 +3307,92 @@ mod conversation_serde_tests {
             serde_json::from_str(r#"{"tool_use_id":"t1","content":"out","is_error":false}"#)
                 .unwrap();
         assert!(content.images.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod clearable_preview_tests {
+    use super::{ClearablePreview, ClearablePreviewKind, ToolContent};
+    use proptest::prelude::*;
+
+    fn span(start: usize, end: usize) -> ClearablePreview {
+        ClearablePreview {
+            start,
+            end,
+            kind: ClearablePreviewKind::UnifiedDiff,
+        }
+    }
+
+    #[test]
+    fn rejects_empty_out_of_bounds_and_non_boundary_spans() {
+        let text = "aé<diff>x</diff>";
+        assert!(!span(3, 3).is_valid_for(text));
+        assert!(!span(3, text.len() + 1).is_valid_for(text));
+        assert!(!span(2, 6).is_valid_for(text), "inside the two-byte é");
+        assert!(span(3, text.len()).is_valid_for(text));
+    }
+
+    #[test]
+    fn unified_diff_summary_keeps_only_hunk_headers() {
+        let text = "r\n<diff>\n@@ -1 +1 @@\n-a\n+b\n@@ -5,2 +5,3 @@\n x\n</diff>";
+        let preview = span(2, text.len());
+        assert_eq!(
+            preview.cleared_summary(text).unwrap(),
+            "@@ -1 +1 @@\n@@ -5,2 +5,3 @@"
+        );
+    }
+
+    #[test]
+    fn absent_key_deserializes_to_none_and_none_is_not_written() {
+        let old = r#"{"tool_use_id":"t","content":"c","is_error":false}"#;
+        let tc: ToolContent = serde_json::from_str(old).unwrap();
+        assert_eq!(tc.clearable_preview, None);
+        assert_eq!(serde_json::to_string(&tc).unwrap(), old);
+    }
+
+    #[test]
+    fn preview_round_trips_through_serde() {
+        let mut tc = ToolContent::new("t", "receipt\n<diff>x</diff>", false);
+        tc.clearable_preview = Some(span(8, tc.content.len()));
+        let back: ToolContent = serde_json::from_str(&serde_json::to_string(&tc).unwrap()).unwrap();
+        assert_eq!(back, tc);
+        assert!(back.valid_clearable_preview().is_some());
+    }
+
+    #[test]
+    fn error_results_never_expose_a_preview() {
+        let mut tc = ToolContent::new("t", "receipt\n<diff>x</diff>", true);
+        tc.clearable_preview = Some(span(8, tc.content.len()));
+        assert!(tc.valid_clearable_preview().is_none());
+    }
+
+    proptest! {
+        /// For any text and any span, replacing the span either refuses an
+        /// invalid span or keeps every byte outside it verbatim.
+        #[test]
+        fn replace_preserves_text_outside_the_span(
+            text in "\\PC{0,64}",
+            a in 0usize..80,
+            b in 0usize..80,
+            replacement in "\\PC{0,16}",
+        ) {
+            let preview = span(a.min(b), a.max(b));
+            match preview.replace_in(&text, &replacement) {
+                None => prop_assert!(!preview.is_valid_for(&text)),
+                Some(out) => {
+                    prop_assert!(preview.is_valid_for(&text));
+                    prop_assert!(out.starts_with(text.get(..preview.start).unwrap()));
+                    prop_assert!(out.ends_with(text.get(preview.end..).unwrap()));
+                    prop_assert_eq!(
+                        out.len(),
+                        text.len() - (preview.end - preview.start) + replacement.len()
+                    );
+                    prop_assert_eq!(
+                        preview.cleared_summary(&text).is_some(),
+                        true
+                    );
+                }
+            }
+        }
     }
 }
