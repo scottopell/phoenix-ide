@@ -191,46 +191,28 @@ pub(crate) async fn collect_native_initial_inspection(
     let mut requests = Vec::with_capacity(scopes.len());
     for captured in scopes {
         let scope = captured.scope;
-        let identity = match captured.captured_worktree {
-            None => continue,
-            Some(CapturedWorktreeIdentity::Resolved(identity)) => identity,
-            Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
+        let Some(captured_worktree) = captured.captured_worktree else {
+            continue;
+        };
+        match inspect_captured_close_worktree(&scope, captured_worktree, empty_generation.as_deref())
+            .await
+        {
+            Ok(CapturedCloseWorktreeInspection::Present(inspection)) => requests.push(inspection),
+            Ok(CapturedCloseWorktreeInspection::Absent(_)) => {
                 return Err(Failure::Scope {
                     scope,
                     reason: RetirementFailureReason::IdentityNotProven,
-                    detail: "captured worktree identity is unresolved".into(),
+                    detail: CAPTURED_WORKTREE_ABSENT.into(),
                 });
             }
-        };
-        let actual_path = native_initial_inspection_path(&identity, scope.clone())?;
-        if observe_worktree_fingerprint(&actual_path).as_deref()
-            != Some(identity.fingerprint().as_str())
-        {
-            return Err(Failure::Scope {
-                scope,
-                reason: RetirementFailureReason::IdentityNotProven,
-                detail: "captured worktree administrative incarnation changed".into(),
-            });
+            Err(failure) => {
+                return Err(Failure::Scope {
+                    scope,
+                    reason: failure.reason,
+                    detail: failure.detail,
+                });
+            }
         }
-        let (snapshot, losses) =
-            inspect_worktree_at(&identity, actual_path)
-                .await
-                .map_err(|detail| Failure::Scope {
-                    scope: scope.clone(),
-                    reason: RetirementFailureReason::ManualRepairRequired,
-                    detail,
-                })?;
-        let snapshot = rotate_inspection_generation(snapshot, empty_generation.as_deref())
-            .map_err(|detail| Failure::Scope {
-                scope: scope.clone(),
-                reason: RetirementFailureReason::ManualRepairRequired,
-                detail,
-            })?;
-        requests.push(ReplaceCloseInspectionScopeRequest {
-            scope,
-            snapshot,
-            losses,
-        });
     }
     Ok(NativeInitialInspection {
         request: ReplaceCloseInspectionRequest {
@@ -241,49 +223,71 @@ pub(crate) async fn collect_native_initial_inspection(
     })
 }
 
-fn native_initial_inspection_path(
-    identity: &WorktreeIdentity,
-    scope: WorkScopeId,
-) -> Result<PathBuf, NativeInitialInspectionFailure> {
-    use NativeInitialInspectionFailure as Failure;
+const CAPTURED_WORKTREE_ABSENT: &str = "captured worktree is absent before inspection";
 
-    let path = worktree_path(identity);
-    let actual_path = match path.try_exists() {
-        Ok(true) => path,
-        Ok(false) => {
-            let quarantine =
-                worktree_quarantine_path(identity).map_err(|detail| Failure::Scope {
-                    scope: scope.clone(),
-                    reason: RetirementFailureReason::IdentityNotProven,
-                    detail,
-                })?;
-            match quarantine.try_exists() {
-                Ok(true) => quarantine,
-                Ok(false) => {
-                    return Err(Failure::Scope {
-                        scope,
-                        reason: RetirementFailureReason::IdentityNotProven,
-                        detail: "captured worktree is absent before inspection".into(),
-                    })
-                }
-                Err(error) => {
-                    return Err(Failure::Scope {
-                        scope,
-                        reason: RetirementFailureReason::ManualRepairRequired,
-                        detail: error.to_string(),
-                    })
-                }
-            }
-        }
-        Err(error) => {
-            return Err(Failure::Scope {
-                scope,
-                reason: RetirementFailureReason::ManualRepairRequired,
-                detail: error.to_string(),
-            })
-        }
+struct CapturedCloseWorktreeInspectionFailure {
+    reason: RetirementFailureReason,
+    detail: String,
+}
+
+// Absence is an observation, not a retirement result or permission to resume.
+enum CapturedCloseWorktreeInspection {
+    Present(ReplaceCloseInspectionScopeRequest),
+    Absent(WorktreeIdentity),
+}
+
+async fn inspect_captured_close_worktree(
+    scope: &WorkScopeId,
+    captured: CapturedWorktreeIdentity,
+    inspection_generation: Option<&str>,
+) -> Result<CapturedCloseWorktreeInspection, CapturedCloseWorktreeInspectionFailure> {
+    let identity_failure = |detail| CapturedCloseWorktreeInspectionFailure {
+        reason: RetirementFailureReason::IdentityNotProven,
+        detail,
     };
-    Ok(actual_path)
+    let repair_required = |detail| CapturedCloseWorktreeInspectionFailure {
+        reason: RetirementFailureReason::ManualRepairRequired,
+        detail,
+    };
+    let CapturedWorktreeIdentity::Resolved(identity) = captured else {
+        return Err(identity_failure("captured worktree identity is unresolved".into()));
+    };
+    let path = worktree_path(&identity);
+    let exists = |path: &Path| {
+        path.try_exists().map_err(|error| {
+            repair_required(format!(
+                "cannot observe captured worktree at {}: {error}",
+                path.display()
+            ))
+        })
+    };
+    let actual_path = if exists(&path)? {
+        path
+    } else {
+        let quarantine = worktree_quarantine_path(&identity).map_err(identity_failure)?;
+        if !exists(&quarantine)? {
+            return Ok(CapturedCloseWorktreeInspection::Absent(identity));
+        }
+        quarantine
+    };
+    if observe_worktree_fingerprint(&actual_path).as_deref() != Some(identity.fingerprint().as_str())
+    {
+        return Err(identity_failure(
+            "captured worktree administrative incarnation changed".into(),
+        ));
+    }
+    let (snapshot, losses) = inspect_worktree_at(&identity, actual_path)
+        .await
+        .map_err(repair_required)?;
+    let snapshot = rotate_inspection_generation(snapshot, inspection_generation)
+        .map_err(repair_required)?;
+    Ok(CapturedCloseWorktreeInspection::Present(
+        ReplaceCloseInspectionScopeRequest {
+            scope: scope.clone(),
+            snapshot,
+            losses,
+        },
+    ))
 }
 
 impl CloseLeaseFailure {
@@ -1207,181 +1211,88 @@ impl RuntimeManager {
             }
         }
         let mut requests = Vec::with_capacity(scopes.len());
-        for scope in scopes {
-            let (snapshot, losses) = match scope.captured_worktree {
-                None => continue,
-                Some(CapturedWorktreeIdentity::Resolved(identity)) => {
-                    let path = worktree_path(&identity);
-                    let quarantine = worktree_quarantine_path(&identity)?;
-                    match path.try_exists() {
-                        Ok(true) => {
-                            if observe_worktree_fingerprint(&path).as_deref()
-                                != Some(identity.fingerprint().as_str())
-                            {
-                                return self
-                                    .route_close_attempt_to_repair(
-                                        &attempt_id,
-                                        &scope.scope,
-                                        RetirementFailureReason::IdentityNotProven,
-                                        "captured worktree administrative incarnation changed",
-                                    )
-                                    .await;
-                            }
-                            let (snapshot, losses) = match inspect_worktree(&identity).await {
-                                Ok(inspection) => inspection,
-                                Err(error) => {
-                                    return self
-                                        .route_close_attempt_to_repair(
-                                            &attempt_id,
-                                            &scope.scope,
-                                            RetirementFailureReason::ManualRepairRequired,
-                                            error,
-                                        )
-                                        .await;
-                                }
-                            };
-                            (
-                                rotate_inspection_generation(
-                                    snapshot,
-                                    reinspection_generation.as_deref(),
-                                )?,
-                                losses,
-                            )
-                        }
-                        Ok(false)
-                            if quarantine.try_exists().map_err(|error| {
-                                format!("cannot observe quarantined worktree path: {error}")
-                            })? =>
-                        {
-                            if observe_worktree_fingerprint(&quarantine).as_deref()
-                                != Some(identity.fingerprint().as_str())
-                            {
-                                return self
-                                    .route_close_attempt_to_repair(
-                                        &attempt_id,
-                                        &scope.scope,
-                                        RetirementFailureReason::IdentityNotProven,
-                                        "captured worktree administrative incarnation changed",
-                                    )
-                                    .await;
-                            }
-                            let (snapshot, losses) =
-                                match inspect_worktree_at(&identity, quarantine).await {
-                                    Ok(inspection) => inspection,
-                                    Err(error) => {
-                                        return self
-                                            .route_close_attempt_to_repair(
-                                                &attempt_id,
-                                                &scope.scope,
-                                                RetirementFailureReason::ManualRepairRequired,
-                                                error,
-                                            )
-                                            .await;
-                                    }
-                                };
-                            (
-                                rotate_inspection_generation(
-                                    snapshot,
-                                    reinspection_generation.as_deref(),
-                                )?,
-                                losses,
-                            )
-                        }
-                        Ok(false) => {
-                            let obligation = self
-                                .db()
-                                .get_close_obligation(attempt_id.as_str())
-                                .await
-                                .map_err(|error| error.to_string())?;
-                            if let Some(prior_snapshot) = obligation.snapshot().cloned() {
-                                let worktree = RetiredResourceIdentity::parse(
-                                    RetiredResourceKind::Worktree,
-                                    LossItemIdentity::Worktree(identity.clone()),
-                                )
-                                .map_err(|error| error.to_string())?;
-                                if self
-                                    .db()
-                                    .close_retirement_resource_was_dispatched(
-                                        &attempt_id,
-                                        &scope.scope,
-                                        &prior_snapshot,
-                                        &worktree,
-                                    )
-                                    .await
-                                    .map_err(|error| error.to_string())?
-                                {
-                                    if continue_clean_retirement {
-                                        let active_snapshot = if obligation.phase()
-                                            == ClosePhase::AwaitingRetirementInspection
-                                        {
-                                            self.db()
-                                                .resume_close_retirement_after_dispatched_absence(
-                                                    &attempt_id,
-                                                    &prior_snapshot,
-                                                    reinspection_generation.as_deref().ok_or_else(
-                                                        || {
-                                                            "dispatched absence retry lacks replacement generation"
-                                                                .to_string()
-                                                        },
-                                                    )?,
-                                                )
-                                                .await
-                                                .map_err(|error| error.to_string())?
-                                        } else {
-                                            prior_snapshot
-                                        };
-                                        self.retire_close_runtime_resources(attempt_id).await?;
-                                        return Ok(active_snapshot);
-                                    }
-                                    return Ok(prior_snapshot);
-                                }
-                            }
-                            return self
-                                .route_close_attempt_to_repair(
-                                    &attempt_id,
-                                    &scope.scope,
-                                    RetirementFailureReason::IdentityNotProven,
-                                    format!(
-                                        "scope {} captured worktree is absent before inspection",
-                                        scope.scope
-                                    ),
-                                )
-                                .await;
-                        }
-                        Err(error) => {
-                            return self
-                                .route_close_attempt_to_repair(
-                                    &attempt_id,
-                                    &scope.scope,
-                                    RetirementFailureReason::ManualRepairRequired,
-                                    format!(
-                                        "scope {} captured worktree is inaccessible before inspection: {error}",
-                                        scope.scope
-                                    ),
-                                )
-                                .await;
-                        }
-                    }
+        for captured in scopes {
+            let scope = captured.scope;
+            let Some(captured_worktree) = captured.captured_worktree else {
+                continue;
+            };
+            let identity = match inspect_captured_close_worktree(
+                &scope,
+                captured_worktree,
+                reinspection_generation.as_deref(),
+            )
+            .await
+            {
+                Ok(CapturedCloseWorktreeInspection::Present(inspection)) => {
+                    requests.push(inspection);
+                    continue;
                 }
-                Some(CapturedWorktreeIdentity::Unresolved { .. }) => {
+                Ok(CapturedCloseWorktreeInspection::Absent(identity)) => identity,
+                Err(failure) => {
                     return self
                         .route_close_attempt_to_repair(
                             &attempt_id,
-                            &scope.scope,
-                            RetirementFailureReason::IdentityNotProven,
-                            format!(
-                                "scope {} has unresolved captured worktree identity",
-                                scope.scope
-                            ),
+                            &scope,
+                            failure.reason,
+                            failure.detail,
                         )
                         .await;
                 }
             };
-            requests.push(ReplaceCloseInspectionScopeRequest {
-                scope: scope.scope,
-                snapshot,
-                losses,
-            });
+            let obligation = self
+                .db()
+                .get_close_obligation(attempt_id.as_str())
+                .await
+                .map_err(|error| error.to_string())?;
+            if let Some(prior_snapshot) = obligation.snapshot().cloned() {
+                let worktree = RetiredResourceIdentity::parse(
+                    RetiredResourceKind::Worktree,
+                    LossItemIdentity::Worktree(identity),
+                )
+                .map_err(|error| error.to_string())?;
+                if self
+                    .db()
+                    .close_retirement_resource_was_dispatched(
+                        &attempt_id,
+                        &scope,
+                        &prior_snapshot,
+                        &worktree,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?
+                {
+                    if !continue_clean_retirement {
+                        return Ok(prior_snapshot);
+                    }
+                    let active_snapshot = if obligation.phase()
+                        == ClosePhase::AwaitingRetirementInspection
+                    {
+                        self.db()
+                            .resume_close_retirement_after_dispatched_absence(
+                                &attempt_id,
+                                &prior_snapshot,
+                                reinspection_generation.as_deref().ok_or_else(|| {
+                                    "dispatched absence retry lacks replacement generation"
+                                        .to_string()
+                                })?,
+                            )
+                            .await
+                            .map_err(|error| error.to_string())?
+                    } else {
+                        prior_snapshot
+                    };
+                    self.retire_close_runtime_resources(attempt_id).await?;
+                    return Ok(active_snapshot);
+                }
+            }
+            return self
+                .route_close_attempt_to_repair(
+                    &attempt_id,
+                    &scope,
+                    RetirementFailureReason::IdentityNotProven,
+                    CAPTURED_WORKTREE_ABSENT,
+                )
+                .await;
         }
         self.db()
             .replace_close_inspection_with_empty_generation(
@@ -14628,6 +14539,47 @@ mod tests {
         std::fs::write(path.join("tracked"), "initial\n").unwrap();
         run_git(path, &["add", "tracked"]);
         run_git(path, &["commit", "--quiet", "-m", "initial"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shared_close_inspection_distinguishes_absence_from_quarantine_probe_failure() {
+        use phoenix_core::domain::close::{CapturedWorktreeIdentity, RetirementFailureReason};
+        use phoenix_core::work_scope::WorkScopeId;
+        use std::os::unix::{ffi::OsStrExt as _, fs::symlink};
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("captured");
+        let scope = WorkScopeId::parse("inspection-test-scope").unwrap();
+        let identity = WorktreeIdentity::from_parts(
+            WorktreeId::parse("inspection-test-worktree").unwrap(),
+            WorktreeFingerprint::parse("inspection-test-fingerprint").unwrap(),
+            GitPathIdentity::from_bytes(path.as_os_str().as_bytes().to_vec()),
+        );
+        assert!(matches!(
+            super::inspect_captured_close_worktree(
+                &scope,
+                CapturedWorktreeIdentity::Resolved(identity.clone()),
+                None,
+            )
+            .await,
+            Ok(super::CapturedCloseWorktreeInspection::Absent(observed)) if observed == identity
+        ));
+
+        let quarantine = super::worktree_quarantine_path(&identity).unwrap();
+        symlink(&quarantine, &quarantine).unwrap();
+        assert!(matches!(
+            super::inspect_captured_close_worktree(
+                &scope,
+                CapturedWorktreeIdentity::Resolved(identity),
+                None,
+            )
+            .await,
+            Err(super::CapturedCloseWorktreeInspectionFailure {
+                reason: RetirementFailureReason::ManualRepairRequired,
+                ..
+            })
+        ));
     }
 
     #[test]
