@@ -367,7 +367,15 @@ impl DisposableGit {
         git.fingerprint = phoenix_core::git::observe_linked_worktree_fingerprint(&git.worktree)
             .expect("real linked Worktree has its original administrative fingerprint");
         assert!(git
-            .run(&git.worktree, &["--no-optional-locks", "status", "--porcelain=v1", "--ignored"])
+            .run(
+                &git.worktree,
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain=v1",
+                    "--ignored"
+                ]
+            )
             .is_empty());
         git.original_refs = git.run(
             &git.repo,
@@ -468,7 +476,12 @@ impl DisposableGit {
     fn worktree_status(&self) -> Vec<u8> {
         self.run(
             &self.worktree,
-            &["--no-optional-locks", "status", "--porcelain=v1", "--ignored"],
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--ignored",
+            ],
         )
     }
 

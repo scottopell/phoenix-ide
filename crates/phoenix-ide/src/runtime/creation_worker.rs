@@ -995,7 +995,8 @@ fn lock_product_creation_publication(
     facts: &crate::db::ProductCreationGitPublicationFacts,
 ) -> Result<RepositoryMutationLock, String> {
     let root = Path::new(&facts.repository_root);
-    let repository = LockedProductCreationRepository::acquire(root, Some(&facts.repository_identity))?;
+    let repository =
+        LockedProductCreationRepository::acquire(root, Some(&facts.repository_identity))?;
     let (_, observed) = verify_existing_product_creation_staging(
         &facts.repository_root,
         path,
@@ -1186,7 +1187,8 @@ fn observe_creation_repository_identity(common_dir: &Path) -> Result<String, Str
 fn observe_creation_repository_identity(common_dir: &Path) -> Result<String, String> {
     use std::os::unix::fs::MetadataExt as _;
 
-    let unavailable = |error: std::io::Error| format!("could not establish repository identity: {error}");
+    let unavailable =
+        |error: std::io::Error| format!("could not establish repository identity: {error}");
     let metadata = std::fs::symlink_metadata(common_dir).map_err(unavailable)?;
     if !metadata.is_dir() || metadata.ino() == 0 {
         return Err("could not establish identity of the common Git directory".to_string());
@@ -1198,7 +1200,12 @@ fn observe_creation_repository_identity(common_dir: &Path) -> Result<String, Str
                 .map_err(std::io::Error::other)
         })
         .map_err(unavailable)?;
-    Ok(format!("v1:{}:{}:{}", metadata.dev(), metadata.ino(), birth.as_nanos()))
+    Ok(format!(
+        "v1:{}:{}:{}",
+        metadata.dev(),
+        metadata.ino(),
+        birth.as_nanos()
+    ))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1261,8 +1268,10 @@ async fn lock_and_pin_product_creation(
 
 #[cfg(test)]
 fn test_creation_repository_identity(root: &Path) -> String {
-    observe_creation_repository_identity(&LockedProductCreationRepository::common_directory(root).unwrap())
-        .unwrap()
+    observe_creation_repository_identity(
+        &LockedProductCreationRepository::common_directory(root).unwrap(),
+    )
+    .unwrap()
 }
 
 #[cfg(test)]
@@ -2828,8 +2837,8 @@ mod product_creation_delivery_replay_tests {
                 "fresh",
                 &test_creation_repository_identity(&repo),
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             crate::db::ProductCreationPinOutcome::Pinned(_)
         ));
         claimed.job = db
@@ -2951,8 +2960,8 @@ mod product_creation_delivery_replay_tests {
                 "fresh",
                 &test_creation_repository_identity(&repo),
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             crate::db::ProductCreationPinOutcome::Pinned(_)
         ));
         let worktree =
@@ -3039,7 +3048,10 @@ mod product_creation_delivery_replay_tests {
             oid
         );
         assert_ne!(test_creation_repository_identity(&repo), original_identity);
-        assert_eq!(test_creation_repository_identity(&archived), original_identity);
+        assert_eq!(
+            test_creation_repository_identity(&archived),
+            original_identity
+        );
         let registrations = git(&repo, &["worktree", "list", "--porcelain", "-z"]).unwrap();
         let refs = product_repository_refs(&repo);
         let planned =
@@ -3059,9 +3071,12 @@ mod product_creation_delivery_replay_tests {
             .unwrap();
         assert!(resumed.claim.generation > first.claim.generation);
         let manager = test_runtime_manager(db.clone());
-        let error = Box::pin(process_product_creation_until_closed(&manager, resumed.clone()))
-            .await
-            .unwrap_err();
+        let error = Box::pin(process_product_creation_until_closed(
+            &manager,
+            resumed.clone(),
+        ))
+        .await
+        .unwrap_err();
         assert_eq!(
             error,
             "repository identity does not match the durable starting pin"
@@ -3082,7 +3097,10 @@ mod product_creation_delivery_replay_tests {
             .unwrap();
         assert_eq!(job.pin_exact_checkout_oid.as_deref(), Some(oid.as_str()));
         assert_eq!(job.status, "retry_scheduled");
-        assert_eq!(job.pin_repository_identity.as_deref(), Some(original_identity.as_str()));
+        assert_eq!(
+            job.pin_repository_identity.as_deref(),
+            Some(original_identity.as_str())
+        );
         assert_eq!(job.staging_path, None);
         assert_eq!(job.published_conversation_id, None);
         assert!(db
@@ -3092,7 +3110,10 @@ mod product_creation_delivery_replay_tests {
             .is_empty());
         assert!(!planned.exists());
         assert!(!repo.join(".git/phoenix-creation.lock").exists());
-        assert_eq!(git(&repo, &["worktree", "list", "--porcelain", "-z"]).unwrap(), registrations);
+        assert_eq!(
+            git(&repo, &["worktree", "list", "--porcelain", "-z"]).unwrap(),
+            registrations
+        );
         assert_eq!(product_repository_refs(&repo), refs);
     }
 
@@ -3272,9 +3293,12 @@ mod product_creation_delivery_replay_tests {
             .expect("expired historical claim must be resumed");
         assert!(restarted.claim.generation > 1);
         let manager = test_runtime_manager(restarted_db.clone());
-        let error = Box::pin(process_product_creation_until_closed(&manager, restarted.clone()))
-            .await
-            .expect_err("worker must reject a pre-193 pin with no repository identity");
+        let error = Box::pin(process_product_creation_until_closed(
+            &manager,
+            restarted.clone(),
+        ))
+        .await
+        .expect_err("worker must reject a pre-193 pin with no repository identity");
         assert!(error.contains("repository identity"), "{error}");
         cleanup_and_retry_unpublished_product_creation(
             &manager,
@@ -3300,7 +3324,10 @@ mod product_creation_delivery_replay_tests {
             checkout_contents
         );
         assert_eq!(std::fs::read(&marker).unwrap(), b"legacy-owner-token");
-        assert_eq!(git(&["worktree", "list", "--porcelain", "-z"]), registrations);
+        assert_eq!(
+            git(&["worktree", "list", "--porcelain", "-z"]),
+            registrations
+        );
     }
 
     #[tokio::test]
@@ -3311,7 +3338,9 @@ mod product_creation_delivery_replay_tests {
         let database = database_fixture.path().join("creation.sqlite");
         let database_path = database.to_str().unwrap();
         let request_id = "legacy-token-only-restart";
-        let initial_db = Database::open_migrated_for_test(database_path).await.unwrap();
+        let initial_db = Database::open_migrated_for_test(database_path)
+            .await
+            .unwrap();
         let first = accept_and_claim_product_at(&initial_db, request_id, &repo).await;
         let root = repo.to_str().unwrap();
         let worktree =
@@ -3373,11 +3402,17 @@ mod product_creation_delivery_replay_tests {
             restarted.job.pin_exact_checkout_oid.as_deref(),
             Some(oid.as_str())
         );
-        assert_eq!(restarted.job.pin_logical_base.as_deref(), Some(base.as_str()));
+        assert_eq!(
+            restarted.job.pin_logical_base.as_deref(),
+            Some(base.as_str())
+        );
         let manager = test_runtime_manager(restarted_db.clone());
-        let error = Box::pin(process_product_creation_until_closed(&manager, restarted.clone()))
-            .await
-            .expect_err("token-only legacy staging must not be adopted");
+        let error = Box::pin(process_product_creation_until_closed(
+            &manager,
+            restarted.clone(),
+        ))
+        .await
+        .expect_err("token-only legacy staging must not be adopted");
         assert_eq!(
             error,
             "existing staging occupant did not match durable ownership"

@@ -4206,9 +4206,16 @@ mod product_creation_tests {
             .await
             .unwrap());
         assert!(matches!(
-            db.pin_product_creation_once(request_id, &claimed.claim, "oid", "main", "fresh", "repo-a")
-                .await
-                .unwrap(),
+            db.pin_product_creation_once(
+                request_id,
+                &claimed.claim,
+                "oid",
+                "main",
+                "fresh",
+                "repo-a"
+            )
+            .await
+            .unwrap(),
             ProductCreationPinOutcome::Pinned(_)
         ));
         assert!(!db
@@ -4216,24 +4223,57 @@ mod product_creation_tests {
             .await
             .unwrap());
         assert!(!db
-            .reserve_product_creation_resource("wrong-repo", request_id, &claimed.claim, "repo-b", path, now)
+            .reserve_product_creation_resource(
+                "wrong-repo",
+                request_id,
+                &claimed.claim,
+                "repo-b",
+                path,
+                now
+            )
             .await
             .unwrap());
         assert!(db
-            .reserve_product_creation_resource("reservation", request_id, &claimed.claim, "repo-a", path, now)
+            .reserve_product_creation_resource(
+                "reservation",
+                request_id,
+                &claimed.claim,
+                "repo-a",
+                path,
+                now
+            )
             .await
             .unwrap());
         assert!(!db
-            .record_product_creation_staging(request_id, &claimed.claim, path, "/repo/a", "other-oid")
+            .record_product_creation_staging(
+                request_id,
+                &claimed.claim,
+                path,
+                "/repo/a",
+                "other-oid"
+            )
             .await
             .unwrap());
         assert!(!db
-            .record_product_creation_staging(request_id, &claimed.claim, "/other/path", "/repo/a", "oid")
+            .record_product_creation_staging(
+                request_id,
+                &claimed.claim,
+                "/other/path",
+                "/repo/a",
+                "oid"
+            )
             .await
             .unwrap());
         db.test_set_product_creation_now(claimed.claim.lease_until);
         assert!(!db
-            .reserve_product_creation_resource("late", request_id, &claimed.claim, "repo-a", "/late", now)
+            .reserve_product_creation_resource(
+                "late",
+                request_id,
+                &claimed.claim,
+                "repo-a",
+                "/late",
+                now
+            )
             .await
             .unwrap());
         assert!(!db
@@ -4259,7 +4299,11 @@ mod product_creation_tests {
             .record_product_creation_staging(request_id, &claimed.claim, path, "/repo/a", "oid")
             .await
             .unwrap());
-        let job = db.get_product_creation_job(request_id).await.unwrap().unwrap();
+        let job = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(job.staging_path.as_deref(), Some(path));
         assert_eq!(job.staging_repo_root.as_deref(), Some("/repo/a"));
         assert_eq!(job.staging_exact_oid.as_deref(), Some("oid"));
@@ -8484,9 +8528,16 @@ mod product_creation_tests {
             .unwrap();
         let resource = "/repo/a/.phoenix/worktrees/owner-fence";
         assert!(matches!(
-            db.pin_product_creation_once("req-owner-fence", &claimed.claim, "oid", "main", "fresh", "/repo/a")
-                .await
-                .unwrap(),
+            db.pin_product_creation_once(
+                "req-owner-fence",
+                &claimed.claim,
+                "oid",
+                "main",
+                "fresh",
+                "/repo/a"
+            )
+            .await
+            .unwrap(),
             ProductCreationPinOutcome::Pinned(_)
         ));
         assert!(db
@@ -8642,9 +8693,16 @@ mod product_creation_tests {
             .unwrap()
             .unwrap();
         assert!(matches!(
-            db.pin_product_creation_once("req-resolved", &claimed.claim, "oid", "main", "fresh", "/repo/a")
-                .await
-                .unwrap(),
+            db.pin_product_creation_once(
+                "req-resolved",
+                &claimed.claim,
+                "oid",
+                "main",
+                "fresh",
+                "/repo/a"
+            )
+            .await
+            .unwrap(),
             ProductCreationPinOutcome::Pinned(_)
         ));
         assert!(db
@@ -8721,9 +8779,16 @@ mod product_creation_tests {
             .unwrap()
             .unwrap();
         assert!(matches!(
-            db.pin_product_creation_once("req-conflict", &claimed.claim, "oid", "main", "fresh", "/repo/a")
-                .await
-                .unwrap(),
+            db.pin_product_creation_once(
+                "req-conflict",
+                &claimed.claim,
+                "oid",
+                "main",
+                "fresh",
+                "/repo/a"
+            )
+            .await
+            .unwrap(),
             ProductCreationPinOutcome::Pinned(_)
         ));
         assert!(db
@@ -8832,9 +8897,16 @@ mod product_creation_tests {
             .unwrap()
             .unwrap();
         assert!(matches!(
-            db.pin_product_creation_once("req-requeue", &claimed.claim, "oid", "main", "fresh", "/repo/a")
-                .await
-                .unwrap(),
+            db.pin_product_creation_once(
+                "req-requeue",
+                &claimed.claim,
+                "oid",
+                "main",
+                "fresh",
+                "/repo/a"
+            )
+            .await
+            .unwrap(),
             ProductCreationPinOutcome::Pinned(_)
         ));
         assert!(db
@@ -10086,15 +10158,29 @@ mod product_creation_tests {
             .unwrap()
             .unwrap();
         assert!(matches!(
-            db.pin_product_creation_once("req-2", &claim.claim, "oid", "main", "fresh", "repo-identity")
-                .await
-                .unwrap(),
+            db.pin_product_creation_once(
+                "req-2",
+                &claim.claim,
+                "oid",
+                "main",
+                "fresh",
+                "repo-identity"
+            )
+            .await
+            .unwrap(),
             ProductCreationPinOutcome::Pinned(_)
         ));
         assert!(matches!(
-            db.pin_product_creation_once("req-2", &claim.claim, "oid", "main", "fresh", "repo-identity")
-                .await
-                .unwrap(),
+            db.pin_product_creation_once(
+                "req-2",
+                &claim.claim,
+                "oid",
+                "main",
+                "fresh",
+                "repo-identity"
+            )
+            .await
+            .unwrap(),
             ProductCreationPinOutcome::Same(_)
         ));
         assert!(matches!(
@@ -10106,8 +10192,8 @@ mod product_creation_tests {
                 "fresh",
                 "other-repository",
             )
-                .await
-                .unwrap(),
+            .await
+            .unwrap(),
             ProductCreationPinOutcome::Conflict(_)
         ));
         assert!(sqlx::query(
@@ -10123,9 +10209,16 @@ mod product_creation_tests {
         .await
         .is_err());
         assert!(matches!(
-            db.pin_product_creation_once("req-2", &claim.claim, "other", "main", "fresh", "repo-identity")
-                .await
-                .unwrap(),
+            db.pin_product_creation_once(
+                "req-2",
+                &claim.claim,
+                "other",
+                "main",
+                "fresh",
+                "repo-identity"
+            )
+            .await
+            .unwrap(),
             ProductCreationPinOutcome::Conflict(_)
         ));
     }
@@ -10155,9 +10248,16 @@ mod product_creation_tests {
             ..claim.claim.clone()
         };
         assert!(matches!(
-            db.pin_product_creation_once("req-pin-live", &expired, "oid", "main", "fresh", "repo-identity")
-                .await
-                .unwrap(),
+            db.pin_product_creation_once(
+                "req-pin-live",
+                &expired,
+                "oid",
+                "main",
+                "fresh",
+                "repo-identity"
+            )
+            .await
+            .unwrap(),
             ProductCreationPinOutcome::Conflict(_)
         ));
         assert!(matches!(
