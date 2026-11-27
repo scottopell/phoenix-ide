@@ -6013,36 +6013,38 @@ impl Database {
         Ok(deadline.as_deref().map(parse_datetime))
     }
 
-    /// Revoke provisioning authority and preserve a visible cancelled record.
+    /// Cancel provisioning without changing resource ownership.
+    /// Returns false if the conversation no longer has cancellable provisioning.
     ///
     /// # Errors
     ///
-    /// Returns [`DbError`] if the transaction fails or no creation job exists.
+    /// Returns [`DbError`] if the transaction fails.
     pub async fn cancel_conversation_creation(
         &self,
         conversation_id: &str,
         now: DateTime<Utc>,
-    ) -> DbResult<()> {
+    ) -> DbResult<bool> {
         let now = now.to_rfc3339();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let job: Option<(String, i64)> = sqlx::query_as(
-            "SELECT id, generation FROM conversation_creation_jobs
-             WHERE conversation_id = ?1
-               AND status IN ('accepted', 'claimed', 'retry_scheduled')",
+            "SELECT j.id, j.generation FROM conversation_creation_jobs j
+             JOIN conversations c ON c.id = j.conversation_id
+             WHERE j.conversation_id = ?1 AND c.state_kind = 'provisioning'
+               AND j.status IN ('accepted', 'claimed', 'retry_scheduled')",
         )
         .bind(conversation_id)
         .fetch_optional(&mut *tx)
         .await?;
         let Some((job_id, generation)) = job else {
             tx.rollback().await?;
-            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+            return Ok(false);
         };
         let result = sqlx::query(
             "UPDATE conversation_creation_jobs
-             SET status = 'cancelling', generation = generation + 1,
+             SET status = 'cancelled', generation = generation + 1,
                  claim_worker_id = NULL, claim_token = NULL, lease_until = NULL,
                  cleanup_worker_id = NULL, cleanup_token = NULL, cleanup_lease_until = NULL,
-                 next_attempt_at = NULL, updated_at = ?1
+                 next_attempt_at = NULL, cancelled_at = ?1, updated_at = ?1
              WHERE id = ?2 AND generation = ?3
                AND status IN ('accepted', 'claimed', 'retry_scheduled')",
         )
@@ -6053,7 +6055,7 @@ impl Database {
         .await?;
         if result.rows_affected() != 1 {
             tx.rollback().await?;
-            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+            return Ok(false);
         }
         native_close::fence_native_retry_sources_tx(
             &mut tx,
@@ -6079,16 +6081,6 @@ impl Database {
         .bind(conversation_id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query(
-            "UPDATE conversation_creation_resource_reservations
-             SET generation = ?3, status = 'cleanup_required', updated_at = ?1
-             WHERE job_id = ?2 AND status IN ('reserved', 'present')",
-        )
-        .bind(now)
-        .bind(&job_id)
-        .bind(generation + 1)
-        .execute(&mut *tx)
-        .await?;
         crate::coordinator_watches::record_creation_event_tx(
             &mut tx,
             &job_id,
@@ -6099,7 +6091,7 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Revoke provisioning authority and hide a deletion tombstone.
@@ -17950,7 +17942,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn creation_cancel_and_delete_revoke_claim_before_cleanup() {
+    async fn historical_creation_cleanup_and_deletion_revoke_claim() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-cancel", "conv-cancel").await;
         let now = Utc::now();
@@ -17980,9 +17972,27 @@ mod tests {
         .await
         .unwrap();
 
-        db.cancel_conversation_creation("conv-cancel", now)
+        db.update_conversation_state(
+            "conv-cancel",
+            &ConvState::CreationCancelled {
+                job_id: "job-cancel".into(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE conversation_creation_jobs SET status = 'cancelling' WHERE id = ?")
+            .bind("job-cancel")
+            .execute(db.pool())
             .await
             .unwrap();
+        sqlx::query(
+            "UPDATE conversation_creation_resource_reservations
+             SET status = 'cleanup_required' WHERE job_id = ?",
+        )
+        .bind("job-cancel")
+        .execute(db.pool())
+        .await
+        .unwrap();
         assert_eq!(
             db.fail_conversation_creation_job(
                 "job-cancel",
@@ -18208,9 +18218,19 @@ mod tests {
         let CreationStatus::Claimed(stale_claim) = job.protocol.status else {
             panic!("expected stale authority");
         };
-        db.cancel_conversation_creation("conv-seeded-stale", now)
+        db.update_conversation_state(
+            "conv-seeded-stale",
+            &ConvState::Provisioning {
+                job_id: "job-seeded-stale".into(),
+                phase: ConversationCreationPhase::Provisioning,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .cancel_conversation_creation("conv-seeded-stale", now)
             .await
-            .unwrap();
+            .unwrap());
         assert_eq!(
             db.complete_seeded_empty_conversation_creation(
                 "job-seeded-stale",
@@ -18251,14 +18271,10 @@ mod tests {
             .unwrap()
             .state;
 
-        let result = db
+        assert!(!db
             .cancel_conversation_creation("conv-ready-cancel", Utc::now())
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(DbError::Sqlx(sqlx::Error::RowNotFound))
-        ));
+            .await
+            .unwrap());
         assert_eq!(
             db.get_conversation("conv-ready-cancel")
                 .await
@@ -18479,9 +18495,19 @@ mod tests {
         let CreationStatus::Claimed(claim) = job.protocol.status else {
             panic!("expected claim authority");
         };
-        db.cancel_conversation_creation("conv-stale-metadata", now)
+        db.update_conversation_state(
+            "conv-stale-metadata",
+            &ConvState::Provisioning {
+                job_id: "job-stale-metadata".into(),
+                phase: ConversationCreationPhase::Provisioning,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .cancel_conversation_creation("conv-stale-metadata", now)
             .await
-            .unwrap();
+            .unwrap());
 
         let before = db.get_conversation("conv-stale-metadata").await.unwrap();
         let outcome = db
@@ -18611,11 +18637,91 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn competing_legacy_stops_settle_once_without_changing_reservations() {
+        let db = Database::open_in_memory().await.unwrap();
+        let job_id = "job-stop";
+        let conversation_id = "conv-stop";
+        insert_test_creation_job(&db, job_id, conversation_id).await;
+        db.update_conversation_state(
+            conversation_id,
+            &ConvState::Provisioning {
+                job_id: job_id.into(),
+                phase: ConversationCreationPhase::Provisioning,
+            },
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let CreationClaimOutcome::Claimed(job) = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker".into()),
+                &CreationClaimToken("token".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected provisioning claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        assert_eq!(
+            db.reserve_conversation_creation_resource(
+                "reservation-stop",
+                job_id,
+                &claim,
+                "/repo",
+                "/repo/worktree",
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let before = db.get_creation_resource_reservations(job_id).await.unwrap();
+        let (first, second) = tokio::join!(
+            db.cancel_conversation_creation(conversation_id, now),
+            db.cancel_conversation_creation(conversation_id, now),
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        assert_eq!(
+            db.complete_seeded_empty_conversation_creation(job_id, &claim, conversation_id, now)
+                .await
+                .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        assert_eq!(
+            db.get_conversation_creation_job(job_id)
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Cancelled
+        );
+        assert!(matches!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            ConvState::CreationCancelled { .. }
+        ));
+        assert_eq!(
+            db.get_creation_resource_reservations(job_id).await.unwrap(),
+            before
+        );
+        assert_eq!(
+            db.next_conversation_creation_deadline().await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
     async fn legacy_cleanup_retry_stays_out_of_creation_scheduler_deadline() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-cleanup-retry", "conv-cleanup-retry").await;
         let now = Utc::now();
-        db.cancel_conversation_creation("conv-cleanup-retry", now)
+        sqlx::query("UPDATE conversation_creation_jobs SET status = 'cancelling' WHERE id = ?")
+            .bind("job-cleanup-retry")
+            .execute(db.pool())
             .await
             .unwrap();
         let cleanup = db
@@ -18667,7 +18773,9 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-cleanup-deadline", "conv-cleanup-deadline").await;
         let now = Utc::now();
-        db.cancel_conversation_creation("conv-cleanup-deadline", now)
+        sqlx::query("UPDATE conversation_creation_jobs SET status = 'cancelling' WHERE id = ?")
+            .bind("job-cleanup-deadline")
+            .execute(db.pool())
             .await
             .unwrap();
         let lease_duration = chrono::Duration::seconds(30);

@@ -5814,6 +5814,19 @@ async fn cancel_conversation_inner(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    if matches!(conversation.state, ConvState::CreationCancelled { .. }) {
+        record_cancel_outcome(
+            &id,
+            &conversation.state,
+            "creation_already_cancelled",
+            "not_applicable",
+        );
+        return Ok(Json(CancelResponse {
+            ok: true,
+            no_op: true,
+        }));
+    }
+
     if matches!(conversation.state, ConvState::Provisioning { .. }) {
         let mut admitted = state.runtime.acquire_local_authority_pass().map_err(|()| {
             AppError::Internal(
@@ -5821,12 +5834,18 @@ async fn cancel_conversation_inner(
                     .to_string(),
             )
         })?;
-        state
+        let cancelled = state
             .runtime
             .db()
             .cancel_conversation_creation(&id, chrono::Utc::now())
             .await
             .map_err(|error| AppError::Internal(error.to_string()))?;
+        if !cancelled {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Creation changed before Stop could cancel provisioning; refresh and retry Stop if needed",
+                "creation_cancel_conflict",
+            ))));
+        }
         let cancelled = state
             .runtime
             .db()
@@ -5847,7 +5866,6 @@ async fn cancel_conversation_inner(
             .runtime
             .evict_runtime(&id, crate::runtime::EvictionReason::CreationProvisioned)
             .await;
-        state.runtime.kick_creation_worker();
         record_cancel_outcome(
             &id,
             &conversation.state,
