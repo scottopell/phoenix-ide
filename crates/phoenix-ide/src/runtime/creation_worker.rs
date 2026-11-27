@@ -5173,10 +5173,14 @@ mod product_pin_tests {
         git(dir.path(), &["init", "--bare", bare.to_str().unwrap()]);
         git(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
         git(&seed, &["push", "origin", "main", "HEAD:refs/heads/trunk"]);
-        git(&bare, &["symbolic-ref", "HEAD", "refs/heads/trunk"]);
+        git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
         git(
             dir.path(),
             &["clone", bare.to_str().unwrap(), checkout.to_str().unwrap()],
+        );
+        assert_eq!(
+            git(&checkout, &["symbolic-ref", "refs/remotes/origin/HEAD"]).trim(),
+            "refs/remotes/origin/main"
         );
         git(&checkout, &["fetch", "origin"]);
         git(&checkout, &["tag", "local-only"]);
@@ -5205,6 +5209,7 @@ mod product_pin_tests {
         git(&seed, &["commit", "-m", "advance advertised default"]);
         let advertised_oid = git(&seed, &["rev-parse", "HEAD"]);
         git(&seed, &["push", "origin", "HEAD:refs/heads/trunk"]);
+        git(&bare, &["symbolic-ref", "HEAD", "refs/heads/trunk"]);
         assert_ne!(initial_oid.trim(), advertised_oid.trim());
 
         let fetch_head_path = git(&checkout, &["rev-parse", "--git-path", "FETCH_HEAD"]);
@@ -5214,20 +5219,15 @@ mod product_pin_tests {
             !fetch_head_before.is_empty(),
             "the preceding fetch should leave real FETCH_HEAD data"
         );
-        let refs_before = git(
-            &checkout,
-            &["for-each-ref", "--format=%(refname) %(objectname)"],
-        );
+        let refs_command = ["for-each-ref", "--format=%(refname) %(objectname) %(symref)"];
+        let refs_before = git(&checkout, &refs_command);
 
         let (selected_oid, logical_base) = strict_product_creation_pin(&checkout).unwrap();
 
         assert_eq!(selected_oid, advertised_oid.trim());
         assert_eq!(logical_base, "trunk");
         assert_eq!(
-            git(
-                &checkout,
-                &["for-each-ref", "--format=%(refname) %(objectname)"],
-            ),
+            git(&checkout, &refs_command),
             refs_before,
             "exact-pin fetch must not apply configured refmaps or prune refs"
         );
@@ -5264,12 +5264,30 @@ mod product_pin_tests {
     #[test]
     fn origin_discovery_failure_does_not_fall_back_to_cached_head() {
         let dir = tempfile::tempdir().unwrap();
-        git(dir.path(), &["init", "-b", "main"]);
+        let repo = dir.path();
+        git(repo, &["init", "-b", "main"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test"]);
+        git(repo, &["commit", "--allow-empty", "-m", "cached default"]);
+        let missing = repo.join("missing-origin.git");
+        git(repo, &["remote", "add", "origin", missing.to_str().unwrap()]);
+        git(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
         git(
-            dir.path(),
-            &["remote", "add", "origin", "/definitely/missing/remote"],
+            repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
         );
-        assert!(strict_product_creation_pin(dir.path()).is_err());
+        let cached = git(repo, &["rev-parse", "refs/remotes/origin/HEAD^{commit}"]);
+        assert_eq!(cached, git(repo, &["rev-parse", "refs/heads/main^{commit}"]));
+
+        let error = strict_product_creation_pin(repo).unwrap_err();
+        assert!(
+            error.starts_with("could not discover origin default:"),
+            "{error}"
+        );
     }
 }
 
