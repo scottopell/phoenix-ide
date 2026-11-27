@@ -55,10 +55,15 @@ async fn process_claimed_product_creation(
     let cwd = tokio::task::spawn_blocking({
         let cwd = job.intent.cwd.clone();
         let home = manager.runtime_home().to_path_buf();
+        let pinned = job.pin_exact_checkout_oid.is_some();
         move || {
-            crate::conversation_cwd::ensure_product_creation_cwd(&cwd, &home)
-                .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
-                .map_err(|error| error.to_string())
+            if pinned {
+                crate::conversation_cwd::validate_existing_product_creation_cwd(&cwd)
+            } else {
+                crate::conversation_cwd::ensure_product_creation_cwd(&cwd, &home)
+            }
+            .map(crate::conversation_cwd::ValidConversationCwd::into_raw)
+            .map_err(|error| error.to_string())
         }
     })
     .await
@@ -103,42 +108,8 @@ async fn process_claimed_product_creation(
                 Stage::ResolveStartingPin,
             )
             .await?;
-            let (oid, logical_base) = if let (Some(oid), Some(base)) = (
-                job.pin_exact_checkout_oid.clone(),
-                job.pin_logical_base.clone(),
-            ) {
-                (oid, base)
-            } else {
-                let resolved = tokio::task::spawn_blocking({
-                    let repo_root = repo_root.clone();
-                    move || strict_product_creation_pin(Path::new(&repo_root))
-                })
-                .await
-                .map_err(|error| format!("starting-pin join failed: {error}"))??;
-                match manager
-                    .db()
-                    .pin_product_creation_once(
-                        &job.request_id,
-                        &claimed.claim,
-                        &resolved.0,
-                        &resolved.1,
-                        "fresh",
-                    )
-                    .await
-                    .map_err(|error| error.to_string())?
-                {
-                    crate::db::ProductCreationPinOutcome::Pinned(_)
-                    | crate::db::ProductCreationPinOutcome::Same(_) => resolved,
-                    crate::db::ProductCreationPinOutcome::Conflict(existing) => (
-                        existing
-                            .pin_exact_checkout_oid
-                            .ok_or_else(|| "conflicting pin lacked OID".to_string())?,
-                        existing
-                            .pin_logical_base
-                            .ok_or_else(|| "conflicting pin lacked logical base".to_string())?,
-                    ),
-                }
-            };
+            let (oid, logical_base, repository) =
+                lock_and_pin_product_creation(manager, claimed, &repo_root).await?;
             checkpoint_product_creation_stage(
                 manager,
                 claimed,
@@ -158,10 +129,10 @@ async fn process_claimed_product_creation(
                         "staged worktree does not match the durable repository and pin".to_string(),
                     );
                 }
-                None => product_worktree_path(
-                    Path::new(&repo_root),
+                None => product_worktree_path_in(
+                    &repository.common_dir,
                     job.product_conversation_id.as_str(),
-                )?,
+                ),
             };
             let reservation_id = format!("{}:worktree", job.request_id);
             let reserved = manager
@@ -170,7 +141,7 @@ async fn process_claimed_product_creation(
                     &reservation_id,
                     &job.request_id,
                     &claimed.claim,
-                    &repo_root,
+                    &repository.identity,
                     planned_path.to_string_lossy().as_ref(),
                     chrono::Utc::now(),
                 )
@@ -187,6 +158,15 @@ async fn process_claimed_product_creation(
                 .into_iter()
                 .find(|reservation| reservation.id == reservation_id)
                 .ok_or_else(|| "product creation worktree reservation disappeared".to_string())?;
+            let repository = tokio::task::spawn_blocking({
+                let repo_root = repo_root.clone();
+                move || {
+                    repository.verify(Path::new(&repo_root))?;
+                    Ok::<_, String>(repository)
+                }
+            })
+            .await
+            .map_err(|error| error.to_string())??;
             if !manager
                 .db()
                 .record_product_creation_staging(
@@ -201,14 +181,6 @@ async fn process_claimed_product_creation(
             {
                 return Err("product creation staging claim was lost".to_string());
             }
-            let materialization_lock = tokio::task::spawn_blocking({
-                let repo_root = repo_root.clone();
-                move || {
-                    RepositoryMutationLock::acquire(Path::new(&repo_root)).map_err(|error| error.0)
-                }
-            })
-            .await
-            .map_err(|error| format!("repository lock acquisition join failed: {error}"))??;
             let persisted_ownership_token = reservation.ownership_token.clone();
             let ownership_token = persisted_ownership_token
                 .clone()
@@ -230,67 +202,77 @@ async fn process_claimed_product_creation(
                 );
             }
             let had_materialization_authority = persisted_ownership_token.is_some();
+            let repository_identity = repository.identity.clone();
             let staged_checkout = tokio::task::spawn_blocking({
-            let repo_root = repo_root.clone();
-            let planned_path = planned_path.clone();
-            let oid = oid.clone();
-            move || {
-                let _lock = materialization_lock;
-                let path = planned_path;
-                let already_present = match std::fs::symlink_metadata(&path) {
-                    Ok(_) => true,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-                    Err(error) => {
-                        return Err(format!("could not inspect staging path {}: {error}", path.display()));
-                    }
-                };
-                let (ownership_token, checkout_fingerprint) = if already_present {
-                    verify_existing_product_creation_staging(
-                        &repo_root,
-                        &path,
-                        &oid,
-                        persisted_ownership_token.as_deref(),
-                    )?
-                } else {
-                    if had_materialization_authority {
-                        return Err("previously authorized worktree path is missing; inspect its Git registration".to_string());
-                    }
-                    std::fs::create_dir_all(
-                        path.parent()
-                            .ok_or_else(|| "worktree path lacked parent".to_string())?,
-                    )
-                    .map_err(|error| error.to_string())?;
-                    run_git_with_timeout(
-                        Path::new(&repo_root),
-                        &[
-                            "worktree",
-                            "add",
-                            "--detach",
-                            path.to_string_lossy().as_ref(),
+                let repo_root = repo_root.clone();
+                let planned_path = planned_path.clone();
+                let oid = oid.clone();
+                move || {
+                    repository.verify(Path::new(&repo_root))?;
+                    let path = planned_path;
+                    let already_present = match std::fs::symlink_metadata(&path) {
+                        Ok(_) => true,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                        Err(error) => {
+                            return Err(format!("could not inspect staging path {}: {error}", path.display()));
+                        }
+                    };
+                    let (ownership_token, checkout_fingerprint) = if already_present {
+                        verify_existing_product_creation_staging(
+                            &repo_root,
+                            &path,
                             &oid,
-                        ],
-                        Duration::from_secs(30),
-                    )?;
-                    let fingerprint = product_creation_checkout_fingerprint(&path)?;
-                    verify_product_creation_checkout(&repo_root, &path, &oid)?;
-                    write_product_creation_owner_marker(&path, &ownership_token, &fingerprint)?;
-                    (ownership_token, fingerprint)
-                };
-                let staged_token = read_product_creation_owner_marker(&path)?;
-                if staged_token.as_deref() != Some(ownership_token.as_str())
-                    || product_creation_checkout_fingerprint(&path)? != checkout_fingerprint
-                {
-                    return Err("staging checkout changed after verification".to_string());
+                            persisted_ownership_token.as_deref(),
+                        )?
+                    } else {
+                        if had_materialization_authority {
+                            return Err("previously authorized worktree path is missing; inspect its Git registration".to_string());
+                        }
+                        std::fs::create_dir_all(
+                            path.parent()
+                                .ok_or_else(|| "worktree path lacked parent".to_string())?,
+                        )
+                        .map_err(|error| error.to_string())?;
+                        let common_dir = repository.common_dir.to_str().ok_or_else(|| {
+                            "common Git directory is not representable as UTF-8".to_string()
+                        })?;
+                        repository.verify(Path::new(&repo_root))?;
+                        run_git_with_timeout(
+                            Path::new(&repo_root),
+                            &[
+                                "--git-dir",
+                                common_dir,
+                                "worktree",
+                                "add",
+                                "--detach",
+                                path.to_string_lossy().as_ref(),
+                                &oid,
+                            ],
+                            Duration::from_secs(30),
+                        )?;
+                        repository.verify(Path::new(&repo_root))?;
+                        let fingerprint = product_creation_checkout_fingerprint(&path)?;
+                        verify_product_creation_checkout(&repo_root, &path, &oid)?;
+                        repository.verify(Path::new(&repo_root))?;
+                        write_product_creation_owner_marker(&path, &ownership_token, &fingerprint)?;
+                        (ownership_token, fingerprint)
+                    };
+                    repository.verify(Path::new(&repo_root))?;
+                    let staged_token = read_product_creation_owner_marker(&path)?;
+                    if staged_token.as_deref() != Some(ownership_token.as_str())
+                        || product_creation_checkout_fingerprint(&path)? != checkout_fingerprint
+                    {
+                        return Err("staging checkout changed after verification".to_string());
+                    }
+                    Ok::<_, String>((
+                        path.to_string_lossy().to_string(),
+                        ownership_token,
+                        checkout_fingerprint,
+                    ))
                 }
-                Ok::<_, String>((
-                    path.to_string_lossy().to_string(),
-                    ownership_token,
-                    checkout_fingerprint,
-                ))
-            }
-        })
-        .await
-        .map_err(|error| format!("worktree materialization join failed: {error}"))??;
+            })
+            .await
+            .map_err(|error| format!("worktree materialization join failed: {error}"))??;
             let (worktree, ownership_token, checkout_fingerprint) = staged_checkout;
             let non_empty = NonEmptyString::new(worktree.clone())
                 .map_err(|_| "materialized worktree path was empty".to_string())?;
@@ -330,6 +312,7 @@ async fn process_claimed_product_creation(
                 Some(crate::db::ProductCreationGitPublicationFacts {
                     exact_checkout_oid: oid,
                     repository_root: repo_root,
+                    repository_identity,
                     ownership_token,
                     checkout_fingerprint,
                 }),
@@ -737,7 +720,7 @@ async fn cleanup_and_retry_unpublished_product_creation(
             .mark_product_creation_cleanup_ambiguous(
                 request_id,
                 claim,
-                &cleanup_error,
+                &format!("{provisioning_error}; cleanup: {cleanup_error}"),
                 chrono::Utc::now(),
             )
             .await
@@ -1011,8 +994,8 @@ fn lock_product_creation_publication(
     path: &Path,
     facts: &crate::db::ProductCreationGitPublicationFacts,
 ) -> Result<RepositoryMutationLock, String> {
-    let lock = RepositoryMutationLock::acquire(Path::new(&facts.repository_root))
-        .map_err(|(error, _)| error)?;
+    let root = Path::new(&facts.repository_root);
+    let repository = LockedProductCreationRepository::acquire(root, Some(&facts.repository_identity))?;
     let (_, observed) = verify_existing_product_creation_staging(
         &facts.repository_root,
         path,
@@ -1022,7 +1005,8 @@ fn lock_product_creation_publication(
     if observed != facts.checkout_fingerprint {
         return Err("staging checkout changed before publication".to_string());
     }
-    Ok(lock)
+    repository.verify(root)?;
+    Ok(repository.lock)
 }
 
 fn verify_product_creation_checkout(
@@ -1124,13 +1108,175 @@ fn read_product_creation_owner_marker(worktree_path: &Path) -> Result<Option<Str
     Ok(Some(token.to_string()))
 }
 
-fn product_worktree_path(repo_root: &Path, id: &str) -> Result<PathBuf, String> {
-    let common = PathBuf::from(git_common_dir_for_repository_root(repo_root)?);
-    Ok(common.join("phoenix-worktrees").join(id))
+fn product_worktree_path_in(common_dir: &Path, id: &str) -> PathBuf {
+    common_dir.join("phoenix-worktrees").join(id)
 }
 
+#[cfg(test)]
+fn product_worktree_path(repo_root: &Path, id: &str) -> Result<PathBuf, String> {
+    let common = PathBuf::from(git_common_dir_for_repository_root(repo_root)?);
+    Ok(product_worktree_path_in(&common, id))
+}
+
+struct LockedProductCreationRepository {
+    lock: RepositoryMutationLock,
+    common_dir: PathBuf,
+    identity: String,
+}
+
+impl LockedProductCreationRepository {
+    fn common_directory(root: &Path) -> Result<PathBuf, String> {
+        Path::new(&git_common_dir_for_repository_root(root)?)
+            .canonicalize()
+            .map_err(|error| format!("could not locate the common Git directory: {error}"))
+    }
+
+    fn acquire(root: &Path, expected: Option<&str>) -> Result<Self, String> {
+        let common_dir = Self::common_directory(root)?;
+        let identity = observe_creation_repository_identity(&common_dir)?;
+        if expected.is_some_and(|expected| expected != identity) {
+            return Err("repository identity does not match the durable starting pin".to_string());
+        }
+        let lock = RepositoryMutationLock::acquire_common_directory_until(
+            &common_dir,
+            std::time::Instant::now() + Duration::from_secs(30),
+        )
+        .map_err(|(error, _)| error)?;
+        let repository = Self {
+            lock,
+            common_dir,
+            identity,
+        };
+        repository.verify(root)?;
+        Ok(repository)
+    }
+
+    fn verify(&self, root: &Path) -> Result<(), String> {
+        if Self::common_directory(root)? != self.common_dir
+            || observe_creation_repository_identity(&self.common_dir)? != self.identity
+        {
+            return Err("repository identity changed while holding the creation lock".to_string());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn observe_creation_repository_identity(common_dir: &Path) -> Result<String, String> {
+    use rustix::fs::{statx, AtFlags, FileType, StatxFlags, CWD};
+
+    let required = StatxFlags::TYPE | StatxFlags::INO | StatxFlags::BTIME;
+    let metadata = statx(CWD, common_dir, AtFlags::SYMLINK_NOFOLLOW, required)
+        .map_err(|error| format!("could not establish repository identity: {error}"))?;
+    if metadata.stx_mask & required.bits() != required.bits()
+        || FileType::from_raw_mode(metadata.stx_mode.into()) != FileType::Directory
+        || metadata.stx_ino == 0
+        || metadata.stx_btime.tv_sec < 0
+        || metadata.stx_btime.tv_nsec >= 1_000_000_000
+    {
+        return Err("could not establish identity of the common Git directory".to_string());
+    }
+    let dev = rustix::fs::makedev(metadata.stx_dev_major, metadata.stx_dev_minor);
+    let birth = i128::from(metadata.stx_btime.tv_sec) * 1_000_000_000
+        + i128::from(metadata.stx_btime.tv_nsec);
+    Ok(format!("v1:{dev}:{}:{birth}", metadata.stx_ino))
+}
+
+#[cfg(target_os = "macos")]
+fn observe_creation_repository_identity(common_dir: &Path) -> Result<String, String> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let unavailable = |error: std::io::Error| format!("could not establish repository identity: {error}");
+    let metadata = std::fs::symlink_metadata(common_dir).map_err(unavailable)?;
+    if !metadata.is_dir() || metadata.ino() == 0 {
+        return Err("could not establish identity of the common Git directory".to_string());
+    }
+    let birth = metadata
+        .created()
+        .and_then(|time| {
+            time.duration_since(std::time::UNIX_EPOCH)
+                .map_err(std::io::Error::other)
+        })
+        .map_err(unavailable)?;
+    Ok(format!("v1:{}:{}:{}", metadata.dev(), metadata.ino(), birth.as_nanos()))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn observe_creation_repository_identity(_common_dir: &Path) -> Result<String, String> {
+    Err("repository identity is not available on this platform".to_string())
+}
+
+async fn lock_and_pin_product_creation(
+    manager: &RuntimeManager,
+    claimed: &crate::db::ClaimedProductCreationJob,
+    root: &str,
+) -> Result<(String, String, LockedProductCreationRepository), String> {
+    let job = &claimed.job;
+    let observed = tokio::task::spawn_blocking({
+        let root = PathBuf::from(root);
+        let oid = job.pin_exact_checkout_oid.clone();
+        let base = job.pin_logical_base.clone();
+        let identity = job.pin_repository_identity.clone();
+        move || match (oid, base, identity) {
+            (Some(oid), Some(base), Some(identity)) => Ok((
+                oid,
+                base,
+                LockedProductCreationRepository::acquire(&root, Some(&identity))?,
+            )),
+            (None, None, None) => {
+                let repository = LockedProductCreationRepository::acquire(&root, None)?;
+                let (oid, base) = resolve_product_creation_pin(&root, &repository)?;
+                repository.verify(&root)?;
+                Ok((oid, base, repository))
+            }
+            _ => Err("durable starting pin has no proven repository identity".to_string()),
+        }
+    })
+    .await
+    .map_err(|error| format!("starting-pin join failed: {error}"))??;
+    if job.pin_exact_checkout_oid.is_none() {
+        use crate::db::ProductCreationPinOutcome;
+
+        match manager
+            .db()
+            .pin_product_creation_once(
+                &job.request_id,
+                &claimed.claim,
+                &observed.0,
+                &observed.1,
+                "fresh",
+                &observed.2.identity,
+            )
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            ProductCreationPinOutcome::Pinned(_) | ProductCreationPinOutcome::Same(_) => {}
+            ProductCreationPinOutcome::Conflict(_) => {
+                return Err("resolved starting pin conflicts with the durable pin".to_string());
+            }
+        }
+    }
+    Ok(observed)
+}
+
+#[cfg(test)]
+fn test_creation_repository_identity(root: &Path) -> String {
+    observe_creation_repository_identity(&LockedProductCreationRepository::common_directory(root).unwrap())
+        .unwrap()
+}
+
+#[cfg(test)]
 fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), String> {
-    let _lock = RepositoryMutationLock::acquire(repo_root).map_err(|e| e.0)?;
+    let repository = LockedProductCreationRepository::acquire(repo_root, None)?;
+    let pin = resolve_product_creation_pin(repo_root, &repository)?;
+    repository.verify(repo_root)?;
+    Ok(pin)
+}
+
+fn resolve_product_creation_pin(
+    repo_root: &Path,
+    repository: &LockedProductCreationRepository,
+) -> Result<(String, String), String> {
     let remotes = crate::git_ops::run_git(repo_root, &["remote"])
         .map_err(|error| format!("could not inspect configured remotes: {error}"))?;
     if remotes.lines().any(|remote| remote.trim() == "origin") {
@@ -1154,9 +1300,13 @@ fn strict_product_creation_pin(repo_root: &Path) -> Result<(String, String), Str
                 matches!(oid.len(), 40 | 64) && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
             .ok_or_else(|| "origin did not advertise a valid default commit ID".to_string())?;
+        let git_dir = crate::git_ops::run_git(repo_root, &["rev-parse", "--absolute-git-dir"])?;
+        repository.verify(repo_root)?;
         run_git_with_timeout(
             repo_root,
             &[
+                "--git-dir",
+                git_dir.trim_end(),
                 "fetch",
                 "--no-tags",
                 "--no-prune",
@@ -1991,6 +2141,7 @@ pub(crate) struct RepositoryMutationLock {
 }
 
 impl RepositoryMutationLock {
+    #[cfg(test)]
     pub(crate) fn acquire(repo_root: &Path) -> Result<Self, (String, ErrorKind)> {
         Self::acquire_with_timeout(repo_root, Duration::from_secs(30))
     }
@@ -2003,6 +2154,7 @@ impl RepositoryMutationLock {
         Self::acquire_open_file_until(file, &lock_path, deadline)
     }
 
+    #[cfg(test)]
     fn acquire_with_timeout(
         repo_root: &Path,
         timeout: Duration,
@@ -2052,6 +2204,7 @@ impl RepositoryMutationLock {
         )
     }
 
+    #[cfg(test)]
     fn open_file(
         repo_root: &Path,
         timeout: Duration,
@@ -2430,12 +2583,25 @@ mod product_creation_delivery_replay_tests {
         let location = path.to_str().unwrap();
         let git = |args: &[&str]| crate::git_ops::run_git(Path::new(root), args).unwrap();
         let oid = git(&["rev-parse", "HEAD"]);
+        assert!(matches!(
+            db.pin_product_creation_once(
+                request_id,
+                &claimed.claim,
+                &oid,
+                "main",
+                "fresh",
+                &test_creation_repository_identity(Path::new(root)),
+            )
+            .await
+            .unwrap(),
+            crate::db::ProductCreationPinOutcome::Pinned(_)
+        ));
         assert!(db
             .reserve_product_creation_resource(
                 "reservation",
                 request_id,
                 &claimed.claim,
-                root,
+                &test_creation_repository_identity(Path::new(root)),
                 location,
                 chrono::Utc::now(),
             )
@@ -2654,7 +2820,14 @@ mod product_creation_delivery_replay_tests {
             oid
         );
         assert!(matches!(
-            db.pin_product_creation_once("git-pin", &claimed.claim, &oid, &base, "fresh")
+            db.pin_product_creation_once(
+                "git-pin",
+                &claimed.claim,
+                &oid,
+                &base,
+                "fresh",
+                &test_creation_repository_identity(&repo),
+            )
                 .await
                 .unwrap(),
             crate::db::ProductCreationPinOutcome::Pinned(_)
@@ -2770,7 +2943,14 @@ mod product_creation_delivery_replay_tests {
         let request_id = "restart-fetched-pin";
         let first = accept_and_claim_product_at(&db, request_id, &repo).await;
         assert!(matches!(
-            db.pin_product_creation_once(request_id, &first.claim, &oid, &base, "fresh")
+            db.pin_product_creation_once(
+                request_id,
+                &first.claim,
+                &oid,
+                &base,
+                "fresh",
+                &test_creation_repository_identity(&repo),
+            )
                 .await
                 .unwrap(),
             crate::db::ProductCreationPinOutcome::Pinned(_)
@@ -2819,6 +2999,103 @@ mod product_creation_delivery_replay_tests {
         assert_eq!(std::fs::read(fetch_head).unwrap(), fetch_head_before);
     }
 
+    #[tokio::test]
+    async fn reopened_creation_refuses_same_path_same_oid_replacement_repository() {
+        let (_original, repo) = initialized_product_repository();
+        let fixture = tempfile::tempdir().unwrap();
+        let archived = fixture.path().join("original");
+        let replacement = fixture.path().join("replacement");
+        let database = fixture.path().join("creation-replacement.sqlite");
+        let database = database.to_str().unwrap();
+        let request_id = "restart-replacement-pin";
+        let db = Database::open_migrated_for_test(database).await.unwrap();
+        let first = accept_and_claim_product_at(&db, request_id, &repo).await;
+        let manager = test_runtime_manager(db.clone());
+        let (oid, _, repository) =
+            lock_and_pin_product_creation(&manager, &first, repo.to_str().unwrap())
+                .await
+                .unwrap();
+        let original_identity = repository.identity.clone();
+        drop(repository);
+        drop(manager);
+        db.pool().close().await;
+        drop(db);
+
+        let git = crate::git_ops::run_git;
+        git(
+            fixture.path(),
+            &[
+                "clone",
+                "--no-hardlinks",
+                repo.to_str().unwrap(),
+                replacement.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        std::fs::rename(&repo, &archived).unwrap();
+        std::fs::rename(&replacement, &repo).unwrap();
+        assert_eq!(
+            git(&repo, &["rev-parse", "refs/remotes/origin/main"]).unwrap(),
+            oid
+        );
+        assert_ne!(test_creation_repository_identity(&repo), original_identity);
+        assert_eq!(test_creation_repository_identity(&archived), original_identity);
+        let registrations = git(&repo, &["worktree", "list", "--porcelain", "-z"]).unwrap();
+        let refs = product_repository_refs(&repo);
+        let planned =
+            product_worktree_path(&repo, first.job.product_conversation_id.as_str()).unwrap();
+
+        let db = Database::open(database).await.unwrap();
+        let resumed = db
+            .claim_product_creation(
+                request_id,
+                "restarted-worker",
+                "replacement-claim",
+                first.claim.lease_until + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(resumed.claim.generation > first.claim.generation);
+        let manager = test_runtime_manager(db.clone());
+        let error = Box::pin(process_product_creation_until_closed(&manager, resumed.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "repository identity does not match the durable starting pin"
+        );
+        cleanup_and_retry_unpublished_product_creation(
+            &manager,
+            request_id,
+            &resumed.claim,
+            &resumed.job,
+            &error,
+        )
+        .await
+        .unwrap();
+        let job = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.pin_exact_checkout_oid.as_deref(), Some(oid.as_str()));
+        assert_eq!(job.status, "retry_scheduled");
+        assert_eq!(job.pin_repository_identity.as_deref(), Some(original_identity.as_str()));
+        assert_eq!(job.staging_path, None);
+        assert_eq!(job.published_conversation_id, None);
+        assert!(db
+            .get_product_creation_resource_reservations(request_id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(!planned.exists());
+        assert!(!repo.join(".git/phoenix-creation.lock").exists());
+        assert_eq!(git(&repo, &["worktree", "list", "--porcelain", "-z"]).unwrap(), registrations);
+        assert_eq!(product_repository_refs(&repo), refs);
+    }
+
     async fn seed_legacy_staging(
         initial_db: &Database,
         first: &crate::db::ClaimedProductCreationJob,
@@ -2833,7 +3110,7 @@ mod product_creation_delivery_replay_tests {
                 &reservation_id,
                 request_id,
                 &first.claim,
-                root,
+                &test_creation_repository_identity(Path::new(root)),
                 worktree_string,
                 chrono::Utc::now(),
             )
@@ -2884,6 +3161,148 @@ mod product_creation_delivery_replay_tests {
         );
     }
 
+    async fn seed_pre_193_unpublished_creation(
+        historical_db: &Database,
+        request_id: &str,
+        product_conversation_id: &str,
+        root: &str,
+        oid: &str,
+        base: &str,
+        worktree_string: &str,
+    ) {
+        let historical_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _migrations")
+            .fetch_one(historical_db.pool())
+            .await
+            .unwrap();
+        assert_eq!(historical_version, 192);
+        sqlx::query(
+            "INSERT INTO product_creation_jobs (
+                request_id, product_conversation_id, cwd, objective, llm_language, status,
+                accepted_at_unix_micros, updated_at_unix_micros,
+                claim_generation, claim_worker_id, claim_token, claim_lease_until_unix_micros,
+                pin_exact_checkout_oid, pin_logical_base, pin_freshness,
+                staging_path, staging_repo_root, staging_exact_oid, provisioning_stage
+             ) VALUES (?1, ?2, ?3, 'historical request', 'phoenix-native', 'claimed',
+                       1, 1, 1, 'old-worker', 'old-claim', 1,
+                       ?4, ?5, 'fresh', ?6, ?3, ?4, 'materialize_worktree')",
+        )
+        .bind(request_id)
+        .bind(product_conversation_id)
+        .bind(root)
+        .bind(oid)
+        .bind(base)
+        .bind(worktree_string)
+        .execute(historical_db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO product_creation_resource_reservations (
+                id, request_id, generation, repository_identity, resource_identity,
+                status, created_at_unix_micros, updated_at_unix_micros, ownership_token
+             ) VALUES (?1, ?2, 1, ?3, ?4, 'reserved', 1, 1, 'legacy-owner-token')",
+        )
+        .bind(format!("{request_id}:worktree"))
+        .bind(request_id)
+        .bind(root)
+        .bind(worktree_string)
+        .execute(historical_db.pool())
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn pre_193_file_backed_restart_rejects_unbound_pin_and_retains_path_reservation() {
+        let repo_fixture = super::product_creation_staging_ownership_tests::initialized_repo();
+        let repo = repo_fixture.path().canonicalize().unwrap();
+        let database_fixture = tempfile::tempdir().unwrap();
+        let database = database_fixture.path().join("pre-193-creation.sqlite");
+        let database_path = database.to_str().unwrap();
+        let request_id = "pre-193-unbound-pin-restart";
+        let product_conversation_id = "pre-193-product";
+        let root = repo.to_str().unwrap();
+        let worktree = product_worktree_path(&repo, product_conversation_id).unwrap();
+        let worktree_string = worktree.to_str().unwrap();
+        let git = |args: &[&str]| crate::git_ops::run_git(&repo, args).unwrap();
+        let oid = git(&["rev-parse", "HEAD"]);
+        let base = git(&["symbolic-ref", "--short", "HEAD"]);
+
+        let historical_db = Database::open_prefix_for_test(database_path, 192)
+            .await
+            .unwrap();
+        seed_pre_193_unpublished_creation(
+            &historical_db,
+            request_id,
+            product_conversation_id,
+            root,
+            &oid,
+            &base,
+            worktree_string,
+        )
+        .await;
+        git(&["worktree", "add", "--detach", worktree_string, &oid]);
+        let marker = product_creation_owner_marker_path(&worktree).unwrap();
+        std::fs::write(&marker, "legacy-owner-token").unwrap();
+        let checkout_contents = std::fs::read(worktree.join("README")).unwrap();
+        let registrations = git(&["worktree", "list", "--porcelain", "-z"]);
+        historical_db.pool().close().await;
+        drop(historical_db);
+
+        let restarted_db = Database::open(database_path).await.unwrap();
+        phoenix_db::run_pending_migrations(restarted_db.pool())
+            .await
+            .unwrap();
+        let migrated: Option<String> = sqlx::query_scalar(
+            "SELECT pin_repository_identity FROM product_creation_jobs WHERE request_id = ?1",
+        )
+        .bind(request_id)
+        .fetch_one(restarted_db.pool())
+        .await
+        .unwrap();
+        assert_eq!(migrated, None, "migration must not bind a historical pin");
+        let restarted = restarted_db
+            .claim_product_creation(
+                request_id,
+                "restarted-worker",
+                "replacement-claim",
+                chrono::Utc::now(),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("expired historical claim must be resumed");
+        assert!(restarted.claim.generation > 1);
+        let manager = test_runtime_manager(restarted_db.clone());
+        let error = Box::pin(process_product_creation_until_closed(&manager, restarted.clone()))
+            .await
+            .expect_err("worker must reject a pre-193 pin with no repository identity");
+        assert!(error.contains("repository identity"), "{error}");
+        cleanup_and_retry_unpublished_product_creation(
+            &manager,
+            request_id,
+            &restarted.claim,
+            &restarted.job,
+            &error,
+        )
+        .await
+        .unwrap();
+
+        assert_legacy_staging_retained(&restarted_db, request_id, worktree_string).await;
+        let reservations = restarted_db
+            .get_product_creation_resource_reservations(request_id)
+            .await
+            .unwrap();
+        assert_eq!(reservations[0].repository_identity, root);
+        assert_eq!(reservations[0].generation, 1);
+        assert_eq!(reservations[0].status, "reserved");
+        assert!(worktree.exists(), "cleanup must retain the checkout");
+        assert_eq!(
+            std::fs::read(worktree.join("README")).unwrap(),
+            checkout_contents
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"legacy-owner-token");
+        assert_eq!(git(&["worktree", "list", "--porcelain", "-z"]), registrations);
+    }
+
     #[tokio::test]
     async fn restarted_worker_refuses_legacy_token_only_staging_without_losing_checkout() {
         let repo_fixture = super::product_creation_staging_ownership_tests::initialized_repo();
@@ -2903,7 +3322,14 @@ mod product_creation_delivery_replay_tests {
         let base = git(&["symbolic-ref", "--short", "HEAD"]);
         assert!(matches!(
             initial_db
-                .pin_product_creation_once(request_id, &first.claim, &oid, &base, "fresh")
+                .pin_product_creation_once(
+                    request_id,
+                    &first.claim,
+                    &oid,
+                    &base,
+                    "fresh",
+                    &test_creation_repository_identity(&repo),
+                )
                 .await
                 .unwrap(),
             crate::db::ProductCreationPinOutcome::Pinned(_)
@@ -3088,12 +3514,25 @@ mod product_creation_delivery_replay_tests {
                 product_worktree_path(&repo, claimed.job.product_conversation_id.as_str()).unwrap();
             let path_str = path.to_str().unwrap();
             let now = chrono::Utc::now();
+            assert!(matches!(
+                db.pin_product_creation_once(
+                    request,
+                    &claimed.claim,
+                    oid.trim(),
+                    "main",
+                    "fresh",
+                    &test_creation_repository_identity(&repo),
+                )
+                .await
+                .unwrap(),
+                crate::db::ProductCreationPinOutcome::Pinned(_)
+            ));
             assert!(db
                 .reserve_product_creation_resource(
                     "reservation",
                     request,
                     &claimed.claim,
-                    repo_root,
+                    &test_creation_repository_identity(&repo),
                     path_str,
                     now,
                 )
@@ -4763,6 +5202,7 @@ mod product_creation_staging_ownership_tests {
         write_test_owner_marker(&path, "owner-token");
         let facts = crate::db::ProductCreationGitPublicationFacts {
             repository_root: repo.path().to_str().unwrap().to_string(),
+            repository_identity: test_creation_repository_identity(repo.path()),
             exact_checkout_oid: crate::git_ops::run_git(&path, &["rev-parse", "HEAD"]).unwrap(),
             ownership_token: "owner-token".to_string(),
             checkout_fingerprint: product_creation_checkout_fingerprint(&path).unwrap(),

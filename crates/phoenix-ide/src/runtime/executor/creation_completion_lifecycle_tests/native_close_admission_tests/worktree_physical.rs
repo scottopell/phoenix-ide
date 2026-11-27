@@ -275,6 +275,8 @@ struct DisposableGit {
     original_registrations: Vec<u8>,
 }
 
+const FIXTURE_CREATION_REPOSITORY_IDENTITY: &str = "physical-close-fixture-incarnation";
+
 impl DisposableGit {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -365,7 +367,7 @@ impl DisposableGit {
         git.fingerprint = phoenix_core::git::observe_linked_worktree_fingerprint(&git.worktree)
             .expect("real linked Worktree has its original administrative fingerprint");
         assert!(git
-            .run(&git.worktree, &["status", "--porcelain=v1", "--ignored"])
+            .run(&git.worktree, &["--no-optional-locks", "status", "--porcelain=v1", "--ignored"])
             .is_empty());
         git.original_refs = git.run(
             &git.repo,
@@ -457,12 +459,17 @@ impl DisposableGit {
             self.run(&self.worktree, &["rev-parse", "HEAD"]),
             format!("{oid}\n").as_bytes()
         );
-        assert!(self
-            .run(&self.worktree, &["status", "--porcelain=v1", "--ignored"])
-            .is_empty());
+        assert!(self.worktree_status().is_empty());
         self.original_registrations =
             self.run(&self.repo, &["worktree", "list", "--porcelain", "-z"]);
         phoenix_core::domain::close::GitOidIdentity::parse_hex(&oid).unwrap()
+    }
+
+    fn worktree_status(&self) -> Vec<u8> {
+        self.run(
+            &self.worktree,
+            &["--no-optional-locks", "status", "--porcelain=v1", "--ignored"],
+        )
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -533,6 +540,7 @@ impl DisposableGit {
             phoenix_db::ProductCreationGitPublicationFacts {
                 exact_checkout_oid: oid,
                 repository_root: cwd,
+                repository_identity: FIXTURE_CREATION_REPOSITORY_IDENTITY.to_string(),
                 ownership_token: "fixture-owner".to_string(),
                 checkout_fingerprint: phoenix_core::git::observe_linked_worktree_fingerprint(
                     &self.worktree,
@@ -611,7 +619,14 @@ impl DisposableGit {
         assert!(matches!(
             fixture
                 .db
-                .pin_product_creation_once(request_id, &claimed.claim, &oid, "main", "fresh")
+                .pin_product_creation_once(
+                    request_id,
+                    &claimed.claim,
+                    &oid,
+                    "main",
+                    "fresh",
+                    FIXTURE_CREATION_REPOSITORY_IDENTITY,
+                )
                 .await
                 .unwrap(),
             phoenix_db::ProductCreationPinOutcome::Pinned(_)
@@ -646,7 +661,7 @@ impl DisposableGit {
                 request_id,
                 request_id,
                 &claimed.claim,
-                cwd,
+                FIXTURE_CREATION_REPOSITORY_IDENTITY,
                 &path,
                 now,
             )
@@ -1438,9 +1453,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
                 git.admin.is_dir(),
                 "the exact target registration remains present"
             );
-            assert!(git
-                .run(&git.worktree, &["status", "--porcelain=v1", "--ignored"])
-                .is_empty());
+            assert!(git.worktree_status().is_empty());
         }
         if matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
             assert_eq!(

@@ -1008,6 +1008,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "dismiss_pending_fork_proposals",
         sql: "UPDATE fork_proposals SET status = 'dismissed', resolved_at = COALESCE(resolved_at, CURRENT_TIMESTAMP) WHERE status = 'pending';",
     },
+    Migration {
+        version: 193,
+        name: "product_creation_repository_identity_pin",
+        sql: MIGRATION_193,
+    },
 ];
 
 const MIGRATION_175: &str = r"
@@ -12732,7 +12737,7 @@ async fn run_migration_156(pool: &SqlitePool, migration: &Migration) -> DbResult
     result
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn run_through_for_test(pool: &SqlitePool, version: u32) -> DbResult<u32> {
     let end = MIGRATIONS.partition_point(|migration| migration.version <= version);
     run_migration_list(pool, &MIGRATIONS[..end]).await
@@ -17330,6 +17335,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (193, "product_creation_repository_identity_pin"),
             (192, "dismiss_pending_fork_proposals"),
             (191, "native_close_origin_owner_cleanup"),
             (190, "native_close_retry_origin_gate"),
@@ -25627,5 +25633,134 @@ mod native_close_initial_receipt_tests {
                 .await
                 .unwrap();
         assert_eq!(remaining, 0);
+    }
+}
+
+const MIGRATION_193: &str = r"
+ALTER TABLE product_creation_jobs
+    ADD COLUMN pin_repository_identity TEXT
+    CHECK (pin_repository_identity IS NULL OR
+           (typeof(pin_repository_identity) = 'text' AND trim(pin_repository_identity) <> ''));
+
+CREATE TRIGGER product_creation_pin_repository_identity_guard_insert
+BEFORE INSERT ON product_creation_jobs
+WHEN NOT (
+    (NEW.pin_exact_checkout_oid IS NULL AND NEW.pin_logical_base IS NULL
+     AND NEW.pin_freshness IS NULL AND NEW.pin_repository_identity IS NULL)
+    OR (NEW.pin_exact_checkout_oid IS NOT NULL AND NEW.pin_logical_base IS NOT NULL
+        AND NEW.pin_freshness IS 'fresh' AND NEW.pin_repository_identity IS NOT NULL)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'product creation checkout pin requires repository identity');
+END;
+
+CREATE TRIGGER product_creation_pin_repository_identity_guard_update
+BEFORE UPDATE OF pin_exact_checkout_oid, pin_logical_base, pin_freshness, pin_repository_identity
+ON product_creation_jobs
+WHEN (
+    OLD.pin_exact_checkout_oid IS NOT NULL OR OLD.pin_logical_base IS NOT NULL
+    OR OLD.pin_freshness IS NOT NULL OR OLD.pin_repository_identity IS NOT NULL
+) AND (
+    NEW.pin_exact_checkout_oid IS NOT OLD.pin_exact_checkout_oid
+    OR NEW.pin_logical_base IS NOT OLD.pin_logical_base
+    OR NEW.pin_freshness IS NOT OLD.pin_freshness
+    OR NEW.pin_repository_identity IS NOT OLD.pin_repository_identity
+) OR (
+    OLD.pin_exact_checkout_oid IS NULL AND OLD.pin_logical_base IS NULL
+    AND OLD.pin_freshness IS NULL AND OLD.pin_repository_identity IS NULL
+    AND NOT (
+        (NEW.pin_exact_checkout_oid IS NULL AND NEW.pin_logical_base IS NULL
+         AND NEW.pin_freshness IS NULL AND NEW.pin_repository_identity IS NULL)
+        OR (NEW.pin_exact_checkout_oid IS NOT NULL AND NEW.pin_logical_base IS NOT NULL
+            AND NEW.pin_freshness IS 'fresh' AND NEW.pin_repository_identity IS NOT NULL)
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'product creation checkout pin repository identity is immutable');
+END;
+";
+
+#[cfg(test)]
+mod product_creation_repository_identity_pin_tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::MIGRATION_193;
+
+    #[tokio::test]
+    async fn migration_preserves_legacy_pins_and_guards_new_identity_bindings() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE product_creation_jobs (
+                request_id TEXT PRIMARY KEY,
+                pin_exact_checkout_oid TEXT,
+                pin_logical_base TEXT,
+                pin_freshness TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO product_creation_jobs
+                (request_id, pin_exact_checkout_oid, pin_logical_base, pin_freshness)
+             VALUES ('legacy', 'old-oid', 'main', 'fresh')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_193).execute(&pool).await.unwrap();
+
+        let identity: Option<String> = sqlx::query_scalar(
+            "SELECT pin_repository_identity FROM product_creation_jobs WHERE request_id = 'legacy'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(identity, None);
+        assert!(sqlx::query(
+            "UPDATE product_creation_jobs SET pin_repository_identity = 'bound-later' WHERE request_id = 'legacy'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO product_creation_jobs
+                (request_id, pin_exact_checkout_oid, pin_logical_base, pin_freshness)
+             VALUES ('unbound', 'oid', 'main', 'fresh')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+
+        sqlx::query("INSERT INTO product_creation_jobs (request_id) VALUES ('direct-flow')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_creation_jobs
+                (request_id, pin_exact_checkout_oid, pin_logical_base, pin_freshness, pin_repository_identity)
+             VALUES ('bound', 'oid', 'main', 'fresh', 'repo-incarnation')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for invalid in [
+            "UPDATE product_creation_jobs SET pin_freshness = NULL WHERE request_id = 'bound'",
+            "UPDATE product_creation_jobs SET pin_exact_checkout_oid = NULL WHERE request_id = 'legacy'",
+            "UPDATE product_creation_jobs SET pin_repository_identity = 'orphan' WHERE request_id = 'direct-flow'",
+        ] {
+            assert!(sqlx::query(invalid).execute(&pool).await.is_err());
+        }
+        assert!(sqlx::query(
+            "UPDATE product_creation_jobs SET pin_repository_identity = 'replacement' WHERE request_id = 'bound'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
     }
 }

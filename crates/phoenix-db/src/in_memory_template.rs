@@ -5,14 +5,14 @@ use sha2::{Digest, Sha256};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteConnection, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
@@ -25,11 +25,11 @@ const SQLITE_HEADER_MAGIC: &[u8] = b"SQLite format 3\0";
 const MIN_SQLITE_BYTES: usize = 4096;
 const TEMPLATE_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type PrefixTemplateCache = HashMap<u32, Arc<OnceCell<Vec<u8>>>>;
 
 static IN_MEMORY_TEMPLATE: OnceCell<Vec<u8>> = OnceCell::const_new();
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static PREFIX_TEMPLATES: OnceLock<Mutex<PrefixTemplateCache>> = OnceLock::new();
 
 fn template_disabled() -> bool {
@@ -303,7 +303,7 @@ async fn load_or_build_template() -> DbResult<&'static [u8]> {
     Ok(bytes.as_slice())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 async fn build_fresh_prefix_bytes(through: u32) -> DbResult<Vec<u8>> {
     let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
         .journal_mode(SqliteJournalMode::Wal)
@@ -322,7 +322,7 @@ async fn build_fresh_prefix_bytes(through: u32) -> DbResult<Vec<u8>> {
     serialize_connection(&mut conn).await
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 async fn load_or_build_prefix_template(through: u32) -> DbResult<Vec<u8>> {
     let cell = {
         let map = PREFIX_TEMPLATES.get_or_init(|| Mutex::new(HashMap::new()));
@@ -353,7 +353,7 @@ async fn load_or_build_prefix_template(through: u32) -> DbResult<Vec<u8>> {
     Ok(bytes.clone())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 async fn refresh_instance_identity_if_present(
     conn: &mut SqliteConnection,
     fresh_instance_id: &str,
@@ -382,7 +382,7 @@ fn is_in_memory_path(path: &str) -> bool {
         || path.is_empty()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn open_in_memory_prefix_for_test(through: u32) -> DbResult<Database> {
     if template_disabled() {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
@@ -452,7 +452,7 @@ pub(crate) async fn open_in_memory_prefix_for_test(through: u32) -> DbResult<Dat
     ))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn open_prefix_for_test(path: &str, through: u32) -> DbResult<Database> {
     if is_in_memory_path(path) {
         return open_in_memory_prefix_for_test(through).await;

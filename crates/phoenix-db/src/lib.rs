@@ -3700,8 +3700,12 @@ impl Database {
         in_memory_template::open_migrated_for_test(path).await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn open_prefix_for_test(path: &str, through: u32) -> DbResult<Self> {
+    /// Open a disposable fixture with numbered migrations through `through`.
+    ///
+    /// # Errors
+    /// Returns a [`DbError`] if opening or seeding the fixture fails.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn open_prefix_for_test(path: &str, through: u32) -> DbResult<Self> {
         in_memory_template::open_prefix_for_test(path, through).await
     }
 

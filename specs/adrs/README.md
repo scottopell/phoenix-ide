@@ -27,7 +27,7 @@ Codex reset-credit visibility and manual redemption, including resuming the stop
 
 Strict local-only selection of Kache v1.2.2 on macOS arm64 and Linux x86_64 is governed by [ADR-225](225_kache-v1-2-2-strict-local-only-selection.md) and [ADR-289](289_extend-kache-v1-2-2-local-only-qualification-to-linux-x86-64.md), superseding only ADR-224's selection conclusion; ADR-223 and ADR-224 retain their historical v1.0.0 evidence. Remote caching remains deferred.
 
-Conversation creation and task approval use one detached worktree and same-conversation checkpoint, with no approval Git writes, fork/handoff, permanent Delete, or startup resource reclamation, under [ADR-291](291_single-detached-conversation-workflow.md).
+Conversation creation and task approval use one detached worktree and same-conversation checkpoint, with no approval Git writes, fork/handoff, permanent Delete, or startup resource reclamation, under [ADR-291](291_single-detached-conversation-workflow.md). Creation-pin binding to the supplying common-directory incarnation is governed by [ADR-292](292_bind-starting-pin-to-repository-incarnation.md); it is distinct from hidden `GitRepository` identity.
 
 ## Numbering and validation
 
@@ -51,6 +51,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [292](292_bind-starting-pin-to-repository-incarnation.md) | Bind creation pins to the supplying Git common-directory incarnation | Accepted | REQ-CCR-005A; Git aggregate staging |
 | [291](291_single-detached-conversation-workflow.md) | One detached conversation worktree with in-place task approval | Accepted | REQ-CCR-005, REQ-PROJ-005, REQ-TAT-001, REQ-BED-028 |
 | [290](290_compact-model-visible-tool-output.md) | Compact model-visible tool output, separate from typed displays | Accepted | REQ-BASH-002, REQ-BASH-004, REQ-BASH-017, REQ-RQD-010 |
 | [288](288_unified-close-idempotence-and-bounded-completion-retry.md) | Unified Close is idempotent with one bounded completion-only retry | Proposed; branch-local proposal; automatic completion policy superseded by ADR-286 | REQ-WL-002f; REQ-BED-029; `close_conversation`, retained Close operation and run identity |

@@ -293,10 +293,17 @@ WHEN Git-backed creation resolves its starting commit under REQ-PROJ-022
 THE SYSTEM SHALL persist exactly one immutable starting pin for that accepted creation job
 AND SHALL use the exact OID produced by either the freshly fetched authoritative `origin` default branch or local `refs/heads/main` when no `origin` exists
 AND SHALL treat any inability to produce that exact OID as explicit retryable creation-job failure rather than as an unresolved success outcome or fallback selection
+AND SHALL persist, in the same durable write, local filesystem-incarnation evidence for the supplying Git common directory, distinct from the opaque Phoenix-local `GitRepository` identity in [REQ-GITREP-001](../git-repository/requirements.md)
+AND SHALL require that evidence to be present and match the current common directory before staging a Git-backed aggregate, adopting staging, or publishing it, even if a replacement repository at the same path contains the exact OID
+AND SHALL reject the Git aggregate staging attempt without changing the immutable pin when evidence is missing, unavailable, or mismatched
+AND SHALL retain any staging checkout and registration when materialization may already have occurred; if safe materialization state cannot be established, creation SHALL remain cleanup-ambiguous rather than remove or replace that resource
+AND SHALL NOT apply this Git-specific guard to Direct conversations or objective delivery
 AND SHALL treat that pin as immutable across retries, claim replacement, runtime bootstrap, publication, and later conversation lifecycle operations
 AND SHALL allow later repository operations to move the worktree independently without rewriting the recorded creation pin
 
-**Rationale:** Creation needs one truthful starting-point fact. The pin records where the conversation began; it is not a branch-ownership claim and it does not get recomputed after acceptance.
+**Rationale:** Creation needs one truthful starting-point fact. The pin records where the conversation began; it is not a branch-ownership claim and it does not get recomputed after acceptance. The filesystem-incarnation evidence binds that pin to the common directory that supplied it; it is not the durable hidden `GitRepository` identity or a general repository registry.
+
+A historical pin without this evidence is never rebound to the repository now present at its locator. If no materialization could have occurred, staging is rejected and the historical pin remains permanently unusable; if materialization may have occurred, retain its checkout and registration as ambiguous. Do not select a replacement pin or fall back to Direct mode.
 
 ---
 
