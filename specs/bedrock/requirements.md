@@ -1200,9 +1200,8 @@ AND the UI SHALL re-open the task-approval reader on reconnect from the conversa
 set of valid incoming events (approve, discard, feedback) and a distinct UI
 representation (the task-approval reader). `propose_task` follows the submit_result
 interception pattern — pure data carrier (its `run()` is an unreachable fallback), no
-side effects, no tool execution. The plan is a real file the agent edits with `patch`,
-so revisions are file edits; all git operations are deferred to the approval moment and
-happen when the approved task artifact is committed; approval itself does not imply a task-branch lifecycle.
+side effects, no tool execution. The plan is a real file the agent edits with `patch`.
+Approval accepts the exact reviewed file as the objective without mutating Git state.
 
 **Dependencies:** REQ-PROJ-003, REQ-PROJ-004
 

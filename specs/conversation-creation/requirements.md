@@ -339,7 +339,7 @@ THE SYSTEM SHALL NOT allow creation cancellation after durable objective accepta
 AND SHALL leave subsequent lifecycle actions to the ordinary conversation lifecycle
 
 WHEN reconciliation completes successfully after cancellation
-THE SYSTEM SHALL offer Start over and Delete for the cancelled record
+THE SYSTEM SHALL offer Start over for the cancelled record
 
 WHEN Stop wins the write race against completion of a legacy provisioning transcript
 THE SYSTEM SHALL atomically revoke its job claim and persist the cancelled job and transcript state
