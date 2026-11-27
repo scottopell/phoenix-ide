@@ -415,13 +415,9 @@ WHILE request-changes feedback remains on the current approval card
 THE SYSTEM SHALL preserve the draft across request failure
 UNTIL the user edits it or an authoritative state change replaces the card
 
-WHEN approval is chosen
-THE SYSTEM SHALL require an explicit placement choice between continuing in
-the current conversation and starting a fresh work conversation
-
-WHEN fresh-work approval hands off to a successor conversation
-THE SYSTEM SHALL retain the successor conversation identifier from the state
-AND offer navigation to that conversation
+WHEN the user approves a reviewed task
+THE SYSTEM SHALL request approval in the same conversation
+AND SHALL NOT offer a new-conversation placement or handoff action
 
 WHEN the state omits the title, priority, or plan required for review
 THE SYSTEM SHALL render a non-actionable fallback rather than approval controls

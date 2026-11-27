@@ -97,7 +97,7 @@ WHEN the user rejects or discards the task
 THE SYSTEM SHALL return a rejection result to the agent
 AND SHALL NOT perform any Git side effects
 
-**Rationale:** Approval is a user decision about placement and authority, not a hidden transition into branch-backed lifecycle modes. The system offers two deliberate placements — continue in the same conversation or start in a new conversation — while keeping branch ownership out of the approval contract.
+**Rationale:** Approval authorizes the reviewed task in the existing conversation and checkout. It neither creates another conversation nor changes branch ownership.
 
 ---
 
@@ -168,7 +168,7 @@ THE SYSTEM SHALL reject it
 
 `propose_task` is a pure data carrier intercepted at the LlmResponse handler. It never performs Git side effects directly.
 
-**Rationale:** `propose_task` is the agent's way of saying “here's a task artifact for human review.” The key distinction is whether the parent is asking for blocking approval in place or proposing a separate derived conversation — not whether the product is in one named lifecycle mode or another.
+**Rationale:** `propose_task` requests blocking human review in the parent conversation, whether the conversation is still planning or already has write authority.
 
 ---
 
