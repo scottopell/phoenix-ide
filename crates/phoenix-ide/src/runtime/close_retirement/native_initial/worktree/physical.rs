@@ -711,7 +711,7 @@ impl PhysicalDeletionDriver<'_> {
         let evidence =
             self.custody
                 .writer_probe
-                .observe_until(object, self.deadline(), |path, deadline| {
+                .observe_and_retain_until(object, self.deadline(), |path, deadline| {
                     quarantine_has_external_writer_until_with_self_descriptor(
                         path,
                         deadline,
@@ -727,7 +727,9 @@ impl PhysicalDeletionDriver<'_> {
         {
             retain_unclassified_physical(self.custody);
         }
-        if evidence?.blocks_retirement() {
+        // Only positive external authority vetoes this admitted physical step.
+        // Target checks and persistence errors are never process-inspection gaps.
+        if evidence?.is_positive() {
             return Err(format!(
                 "external writer holds confirmed worktree at {}; durable evidence retained",
                 object.display()

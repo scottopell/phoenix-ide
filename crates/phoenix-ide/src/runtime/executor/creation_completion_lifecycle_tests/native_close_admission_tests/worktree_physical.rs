@@ -1521,6 +1521,16 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             scopes[0].resource.identity(),
             &LossItemIdentity::Opaque(OpaqueIdentity::parse(scope.as_str()).unwrap())
         );
+        if matches!(journey, WorktreeJourney::RetireWithProductionDetector) {
+            assert_ordinary_linux_gap_if_requested(
+                &fixture,
+                &run,
+                &scope,
+                &snapshot,
+                &worktrees[0].resource,
+            )
+            .await;
+        }
         let cleanup_plan = fixture
             .db
             .close_worktree_cleanup_plan(&attempt, &scope, &snapshot, &worktrees[0].resource)
@@ -1834,6 +1844,59 @@ async fn durable_target_rows(fixture: &CloseFixture) -> Value {
 
 // Failure diagnostics must not replace the original outcome with a query panic.
 // Keep replay snapshots below strict: query failures there remain test failures.
+async fn assert_ordinary_linux_gap_if_requested(
+    fixture: &CloseFixture,
+    run: &CloseRunRef,
+    scope: &WorkScopeId,
+    snapshot: &CloseRetirementSnapshot,
+    resource: &phoenix_core::domain::close::RetiredResourceIdentity,
+) {
+    use phoenix_core::domain::close::{CloseWriterDetector, CloseWriterObservation};
+
+    let Ok(value) = std::env::var("PHOENIX_TEST_OPAQUE_CLOSE_PID") else {
+        return;
+    };
+    let pid: u32 = value.parse().expect("ordinary-runner opaque fixture PID");
+    let path = format!("/proc/{pid}/exe");
+    assert_eq!(
+        std::fs::read_link(&path).unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert!(
+        physical_close_diagnostics().lines().any(|line| {
+            line.contains("operation=\"process_exe_read_link\"")
+                && line.contains(&path)
+                && line.contains("error_kind=PermissionDenied")
+        }),
+        "the production scanner must encounter the opaque fixture: {path}"
+    );
+    let observations = fixture
+        .db
+        .list_close_writer_observations(run, scope)
+        .await
+        .unwrap();
+    assert_eq!(
+        observations.len(),
+        1,
+        "one representative immutable observation"
+    );
+    let entry = &observations[0];
+    assert_eq!(&entry.run, run);
+    assert_eq!(&entry.scope, scope);
+    assert_eq!(&entry.snapshot, snapshot);
+    assert_eq!(&entry.resource, resource);
+    assert!(matches!(
+        entry.observation,
+        CloseWriterObservation::InspectionGap {
+            detector: CloseWriterDetector::LinuxDescriptor,
+            ..
+        }
+    ));
+    eprintln!(
+        "ordinary Linux: production scan saw opaque process and retained a durable inspection gap"
+    );
+}
+
 async fn worktree_close_failure_evidence(fixture: &CloseFixture, run: &CloseRunRef) -> String {
     let evidence = fixture
         .db

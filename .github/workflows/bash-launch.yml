@@ -91,6 +91,8 @@ jobs:
                 or test(macos_process_inventory_excludes_foreign_uid_before_inspection)
                 or test(selected_macos_pid_with_changed_uid_fails_closed_as_process_changed)
                 or test(process_disappearance_and_pid_reuse_are_gaps_not_writers_or_clean)
+                or test(external_writer_detector_gap_does_not_mask_independent_evidence_or_target_failure)
+                or test(external_writer_entry_gap_does_not_mask_an_independent_match)
                 or test(macos_process_inventory_failures_are_absent_evidence)
                 or test(expired_macos_process_inventory_stops_before_listing)
                 or test(macos_process_inventory_retries_full_buffer_and_accepts_complete_list)

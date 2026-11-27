@@ -27,6 +27,8 @@ Codex reset-credit visibility and manual redemption, including resuming the stop
 
 Strict local-only selection of Kache v1.2.2 on macOS arm64 and Linux x86_64 is governed by [ADR-225](225_kache-v1-2-2-strict-local-only-selection.md) and [ADR-289](289_extend-kache-v1-2-2-local-only-qualification-to-linux-x86-64.md), superseding only ADR-224's selection conclusion; ADR-223 and ADR-224 retain their historical v1.0.0 evidence. Remote caching remains deferred.
 
+[ADR-293](293_native-close-requires-positive-external-writer-evidence.md) narrows only the external process-inspection blocker for admitted native physical Close; ADR-241's exact-run evidence and ADR-286's remaining safeguards still apply.
+
 ## Numbering and validation
 
 ADRs use unique three-digit numeric IDs in `NNN_<slug>.md` filenames. The
@@ -49,6 +51,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [293](293_native-close-requires-positive-external-writer-evidence.md) | Require positive external writer evidence to block admitted native physical Close on a process | Accepted | REQ-WL-002e |
 | [290](290_compact-model-visible-tool-output.md) | Compact model-visible tool output, separate from typed displays | Accepted | REQ-BASH-002, REQ-BASH-004, REQ-BASH-017, REQ-RQD-010 |
 | [288](288_unified-close-idempotence-and-bounded-completion-retry.md) | Unified Close is idempotent with one bounded completion-only retry | Proposed; branch-local proposal; automatic completion policy superseded by ADR-286 | REQ-WL-002f; REQ-BED-029; `close_conversation`, retained Close operation and run identity |
 | [287](287_native-task-approval-source-snapshot-and-receipt.md) | Bind native task approval to canonical source, snapshot and receipt | Proposed | REQ-TAT-001–008; REQ-PROJ-003; REQ-BED-028/046; REQ-COMP-001/002; REQ-DWF-043 |
