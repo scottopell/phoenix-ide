@@ -24094,7 +24094,10 @@ mod tests {
 
     #[tokio::test]
     async fn migration_192_dismisses_pending_forks_without_deleting_history_or_children() {
-        let db = crate::Database::open_in_memory_prefix_for_test(191)
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fork-retirement.db");
+        let path = path.to_str().unwrap();
+        let db = crate::Database::open_prefix_for_test(path, 191)
             .await
             .unwrap();
         let origin = db
@@ -24122,8 +24125,41 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(run_through_for_test(db.pool(), 192).await.unwrap(), 1);
-        assert_eq!(run_through_for_test(db.pool(), 192).await.unwrap(), 0);
+        db.pool().close().await;
+        drop(db);
+
+        let db = crate::Database::open(path).await.unwrap();
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+        db.pool().close().await;
+        drop(db);
+
+        let db = crate::Database::open(path).await.unwrap();
+        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+        let retained_relationships: Vec<(String, String, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, origin_conv_id, fork_conv_id, refinement_conv_id
+                 FROM fork_proposals ORDER BY id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            retained_relationships,
+            vec![
+                (
+                    "pending-proposal".to_owned(),
+                    origin.id.clone(),
+                    Some(child.id.clone()),
+                    Some(child.id.clone()),
+                ),
+                (
+                    "spawned-proposal".to_owned(),
+                    origin.id.clone(),
+                    Some(child.id.clone()),
+                    None,
+                ),
+            ]
+        );
 
         let proposals: Vec<(String, String, String, Option<String>)> =
             sqlx::query_as("SELECT id, status, body, resolved_at FROM fork_proposals ORDER BY id")
