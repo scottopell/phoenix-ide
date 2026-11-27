@@ -2239,6 +2239,9 @@ async fn require_initial_execution_tx(
             "initial Close operation is stale or has advanced".into(),
         ));
     }
+    if expected_phase == phoenix_core::domain::close::ClosePhase::RetirementRequested {
+        Database::require_no_retained_legacy_creation_tx(tx, target).await?;
+    }
     let captured_state = captured_state.ok_or_else(|| {
         DbError::CloseFoundationPrecondition("initial Close has no captured latest state".into())
     })?;
