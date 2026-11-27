@@ -95,18 +95,28 @@ pub(super) async fn acknowledge_public_initial_result(
         .expect("canonical initial result must retain captured-loss retry eligibility");
 }
 
-// Preserve the ordered public capture/retry journey: Stop cuts, physical effects,
-// durable classification, and canonical result provenance must remain causally linked.
+pub(super) enum RetryJourney<'a> {
+    Uninterrupted,
+    StopAt(Point),
+    ResumeAt(Point),
+    PreserveOriginPin(&'a phoenix_core::domain::close::GitOidIdentity),
+}
+
 #[allow(clippy::too_many_lines)]
 pub(super) async fn retry_after_public_capture(
     initial_fixture: &CloseFixture,
-    git: &DisposableGit,
+    git: &mut DisposableGit,
     backend: Arc<crate::runtime::RuntimeManager>,
     scope: &WorkScopeId,
     initial_run: &CloseRunRef,
-    stop_at: Option<Point>,
-    resume_at: Option<Point>,
+    journey: RetryJourney<'_>,
 ) {
+    let (preserve_origin_pin, stop_at, resume_at) = match journey {
+        RetryJourney::Uninterrupted => (None, None, None),
+        RetryJourney::StopAt(point) => (None, Some(point), None),
+        RetryJourney::ResumeAt(point) => (None, None, Some(point)),
+        RetryJourney::PreserveOriginPin(pin) => (Some(pin), None, None),
+    };
     install_physical_close_diagnostics();
     let source = SourceToolCall {
         message_id: "captured-loss-retry-message".into(),
@@ -234,6 +244,9 @@ pub(super) async fn retry_after_public_capture(
         .unwrap();
     let historical = captured_history(&fixture, initial_run).await;
     let before = public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await;
+    let pin_snapshot = preserve_origin_pin.map(|_| physical_snapshot(&git.root));
+    let sibling_snapshot = preserve_origin_pin
+        .map(|_| (physical_snapshot(&git.sibling), physical_snapshot(&git.sibling_admin)));
     let stale_context = context
         .clone()
         .with_tool_use_id(initial_fixture.source.tool_use_id.clone());
@@ -246,10 +259,10 @@ pub(super) async fn retry_after_public_capture(
         before
     );
 
-    let still_dirty = tool.run(input.clone(), context.clone()).await;
-    assert!(!still_dirty.is_success());
-    let still_dirty: Value = serde_json::from_str(still_dirty.output()).unwrap();
-    assert_eq!(still_dirty["code"], "storage_rejected", "{still_dirty}");
+    let refusal = tool.run(input.clone(), context.clone()).await;
+    assert!(!refusal.is_success());
+    let refusal: Value = serde_json::from_str(refusal.output()).unwrap();
+    assert_eq!(refusal["code"], "storage_rejected", "{refusal}");
     assert_eq!(
         public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
         before
@@ -257,14 +270,19 @@ pub(super) async fn retry_after_public_capture(
     assert_eq!(captured_history(&fixture, initial_run).await, historical);
     assert!(git.worktree.exists());
     assert!(git.admin.join("gitdir").is_file());
-    assert_eq!(
-        std::fs::read(git.worktree.join("untracked.txt")).unwrap(),
-        b"unpreserved new file\n"
-    );
-    assert_eq!(
-        std::fs::read(git.worktree.join("build/a.bin")).unwrap(),
-        b"retained build a"
-    );
+    if let Some(snapshot) = pin_snapshot {
+        assert_eq!(physical_snapshot(&git.root), snapshot);
+        git.assert_untargeted_state_preserved();
+    } else {
+        assert_eq!(
+            std::fs::read(git.worktree.join("untracked.txt")).unwrap(),
+            b"unpreserved new file\n"
+        );
+        assert_eq!(
+            std::fs::read(git.worktree.join("build/a.bin")).unwrap(),
+            b"retained build a"
+        );
+    }
     assert!(fixture
         .db
         .read_native_close_explicit_retry_receipt(&fixture.command)
@@ -278,9 +296,11 @@ pub(super) async fn retry_after_public_capture(
         .is_err());
 
     // These filesystem changes are independent of Close and grant it no authority.
-    git.run(&git.worktree, &["restore", "--", "tracked.txt"]);
-    std::fs::remove_file(git.worktree.join("untracked.txt")).unwrap();
-    std::fs::remove_dir_all(git.worktree.join("build")).unwrap();
+    if preserve_origin_pin.is_none() {
+        git.run(&git.worktree, &["restore", "--", "tracked.txt"]);
+        std::fs::remove_file(git.worktree.join("untracked.txt")).unwrap();
+        std::fs::remove_dir_all(git.worktree.join("build")).unwrap();
+    }
     assert_eq!(
         public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await,
         before
@@ -304,6 +324,25 @@ pub(super) async fn retry_after_public_capture(
             .unwrap()
             .archived
     );
+
+    if let Some(pin) = preserve_origin_pin {
+        let pin_ref = "refs/heads/close-test-preserve-origin-pin";
+        let pin = pin.as_str();
+        git.run(&git.repo, &["update-ref", pin_ref, pin]);
+        assert_eq!(
+            git.run(&git.repo, &["rev-parse", pin_ref]),
+            format!("{pin}\n").as_bytes()
+        );
+        let mut refs: Vec<_> = git
+            .original_refs
+            .split_inclusive(|byte| *byte == b'\n')
+            .map(<[u8]>::to_vec)
+            .collect();
+        refs.push(format!("{pin_ref} {pin}\n").into_bytes());
+        refs.sort_unstable();
+        git.original_refs = refs.concat();
+        git.assert_untargeted_state_preserved();
+    }
 
     if stop_at == Some(Point::CapturedLossAssessmentReady) {
         let counts_before = close_row_counts(&fixture).await;
@@ -844,6 +883,11 @@ pub(super) async fn retry_after_public_capture(
     );
     assert!(!git.worktree.exists());
     assert!(!git.admin.join("gitdir").is_file());
+    if let Some((checkout, registration)) = sibling_snapshot {
+        assert!(!git.admin.exists(), "the exact registration was removed");
+        assert_eq!(physical_snapshot(&git.sibling), checkout);
+        assert_eq!(physical_snapshot(&git.sibling_admin), registration);
+    }
     assert!(git.sibling.exists());
     git.assert_untargeted_state_preserved();
     event_tx.send(Event::Shutdown).await.unwrap();

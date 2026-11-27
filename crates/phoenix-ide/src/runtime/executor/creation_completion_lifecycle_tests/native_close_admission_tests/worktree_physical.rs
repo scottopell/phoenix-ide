@@ -88,8 +88,8 @@ async fn registered_native_close_with_loss_content_stops_incomplete_without_reti
 }
 
 #[tokio::test]
-async fn registered_native_close_preserves_origin_only_fetched_pin() {
-    run_public_worktree_close(WorktreeJourney::OriginOnlyFetchedPinBlocker).await;
+async fn registered_native_close_origin_only_fetched_pin_public_retry_preserves_owner_ref() {
+    run_public_worktree_close(WorktreeJourney::FetchedPinPublicRetry).await;
 }
 
 #[tokio::test]
@@ -186,7 +186,7 @@ enum WorktreeJourney {
     CapturedLossPublicRetryResumedDuringPhysicalMutation,
     RetainContentBlockers,
     ReflogOnlyBlocker,
-    OriginOnlyFetchedPinBlocker,
+    FetchedPinPublicRetry,
     ReinspectCapturedLossAfterCleanup,
     RetryLossClassification,
     StopBeforeAdmission,
@@ -918,14 +918,8 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     use tokio_util::sync::CancellationToken;
 
     let mut git = DisposableGit::new();
-    let origin_only_fetched_pin = if matches!(journey, WorktreeJourney::OriginOnlyFetchedPinBlocker)
-    {
-        Some(git.prepare_origin_only_fetched_pin())
-    } else {
-        None
-    };
-    // Start at ancestor A, create C, then leave HEAD at A. C has no ref and is
-    // reachable only through this linked checkout's HEAD reflog.
+    let origin_only_fetched_pin = matches!(journey, WorktreeJourney::FetchedPinPublicRetry)
+        .then(|| git.prepare_origin_only_fetched_pin());
     let reflog_only_commit = if matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
         let ancestor = git.run(&git.worktree, &["rev-parse", "HEAD"]);
         std::fs::write(git.worktree.join("tracked.txt"), b"reflog-only commit\n").unwrap();
@@ -973,13 +967,14 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation
             | WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation
+            | WorktreeJourney::FetchedPinPublicRetry
     );
     let mut captured_retry_run = None;
     let content_blocked = matches!(
         journey,
         WorktreeJourney::RetainContentBlockers
+            | WorktreeJourney::FetchedPinPublicRetry
             | WorktreeJourney::ReflogOnlyBlocker
-            | WorktreeJourney::OriginOnlyFetchedPinBlocker
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
             | WorktreeJourney::CapturedLossPublicRetryWithProductionDetector
@@ -993,7 +988,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     if content_blocked {
         if !matches!(
             journey,
-            WorktreeJourney::ReflogOnlyBlocker | WorktreeJourney::OriginOnlyFetchedPinBlocker
+            WorktreeJourney::ReflogOnlyBlocker | WorktreeJourney::FetchedPinPublicRetry
         ) {
             std::fs::create_dir_all(git.repo.join(".git/info")).unwrap();
             std::fs::write(git.repo.join(".git/info/exclude"), b"build/\n").unwrap();
@@ -1002,7 +997,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             std::fs::write(git.worktree.join("build/b.bin"), b"retained build b").unwrap();
             std::fs::write(git.worktree.join("tracked.txt"), b"unpreserved edits\n").unwrap();
         }
-        if public_captured_retry {
+        if public_captured_retry && origin_only_fetched_pin.is_none() {
             std::fs::write(
                 git.worktree.join("untracked.txt"),
                 b"unpreserved new file\n",
@@ -1016,7 +1011,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         WorktreeJourney::Retire
             | WorktreeJourney::RetainContentBlockers
             | WorktreeJourney::ReflogOnlyBlocker
-            | WorktreeJourney::OriginOnlyFetchedPinBlocker
+            | WorktreeJourney::FetchedPinPublicRetry
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation
@@ -1361,7 +1356,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
                     && loss.item == CloseLossItem::DetachedUnreachableCommit(commit.clone())
             }));
         }
-        if public_captured_retry {
+        if public_captured_retry && origin_only_fetched_pin.is_none() {
             assert!(losses.iter().any(|loss| {
                 loss.scope == scope
                     && loss.item
@@ -1369,6 +1364,8 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
                             b"untracked.txt".to_vec(),
                         ))
             }));
+        }
+        if public_captured_retry {
             captured_retry_run = Some(run.clone());
         }
         if reflog_only_commit.is_none() && origin_only_fetched_pin.is_none() {
@@ -1427,7 +1424,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         assert_eq!(directory_identity(&git.worktree), git.checkout_identity);
         assert_eq!(directory_identity(&git.admin), git.admin_identity);
         if let Some(pin) = origin_only_fetched_pin.as_ref() {
-            let pin = pin.as_hex();
+            let pin = pin.as_str();
             assert_eq!(
                 git.run(&git.worktree, &["rev-parse", "HEAD"]),
                 format!("{pin}\n").as_bytes(),
@@ -1925,6 +1922,9 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         .expect("source actor must shut down after qualification")
         .unwrap();
     if let Some(run) = captured_retry_run {
+        use crate::runtime::executor::native_close_retry::test_hooks::Point;
+        use captured_loss_public_retry::RetryJourney;
+
         fixture
             .db
             .update_conversation_state(&fixture.source_transcript_id, &ConvState::Idle)
@@ -1935,36 +1935,38 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             .read_native_close_captured_loss_retry_context(&fixture.target, &run)
             .await
             .expect("acknowledged initial result must remain eligible after source shutdown");
+
+        let retry_journey = match journey {
+            WorktreeJourney::FetchedPinPublicRetry => {
+                RetryJourney::PreserveOriginPin(origin_only_fetched_pin.as_ref().unwrap())
+            }
+            WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment => {
+                RetryJourney::StopAt(Point::CapturedLossAssessmentReady)
+            }
+            WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch => {
+                RetryJourney::StopAt(Point::WorktreeDispatchBeforeWriter)
+            }
+            WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation => {
+                RetryJourney::StopAt(Point::WorktreePreparationReady)
+            }
+            WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation => {
+                RetryJourney::StopAt(Point::PhysicalBeforeObservation)
+            }
+            WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation => {
+                RetryJourney::StopAt(Point::PhysicalBeforeMutation)
+            }
+            WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation => {
+                RetryJourney::ResumeAt(Point::PhysicalBeforeMutation)
+            }
+            _ => RetryJourney::Uninterrupted,
+        };
         captured_loss_public_retry::retry_after_public_capture(
             &fixture,
-            &git,
+            &mut git,
             backend,
             &scope,
             &run,
-            match journey {
-                WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::CapturedLossAssessmentReady,
-                ),
-                WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::WorktreeDispatchBeforeWriter,
-                ),
-                WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::WorktreePreparationReady,
-                ),
-                WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeObservation,
-                ),
-                WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeMutation,
-                ),
-                _ => None,
-            },
-            match journey {
-                WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeMutation,
-                ),
-                _ => None,
-            },
+            retry_journey,
         )
         .await;
     }
