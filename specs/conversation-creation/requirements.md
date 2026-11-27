@@ -352,8 +352,8 @@ THE SYSTEM SHALL report a conflict rather than claiming cancellation or applying
 WHEN Stop observes a legacy provisioning transcript already marked cancelled
 THE SYSTEM SHALL report a no-op without resuming legacy cleanup.
 
-WHEN a new Close or a generic retirement retry encounters an unreleased reservation for an unpublished legacy creation or a pending retired legacy cleanup
-THE SYSTEM SHALL refuse Close and report that operator review is required, without changing the reservation.
+WHEN Close admission, resumed retirement, or a retirement retry encounters an unreleased reservation for an unpublished legacy creation or a pending retired legacy cleanup in the ProductConversation
+THE SYSTEM SHALL refuse retirement and archival by Close and report that operator review is required, without changing the reservation.
 
 WHILE Close settlement has a captured legacy creation with such a retained obligation
 THE SYSTEM SHALL NOT advance to resource retirement.

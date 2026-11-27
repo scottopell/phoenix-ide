@@ -2678,6 +2678,14 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) async fn require_no_retained_legacy_creation_for_attempt_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<()> {
+        let obligation = close_obligation_for_update(tx, attempt_id.as_str()).await?;
+        Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id()).await
+    }
+
     pub(crate) async fn count_close_settlement_active_participants_tx(
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,
@@ -3206,6 +3214,8 @@ impl Database {
         .map(parse_close_obligation_row)
         .transpose()?
         .ok_or_else(|| DbError::CloseFoundationNotFound(request.attempt_id.as_str().to_string()))?;
+        Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id())
+            .await?;
         if obligation.phase() != ClosePhase::AwaitingRetirementInspection {
             let mut persisted_inspections = sqlx::query(
                 "SELECT attempt_id, scope, generation, fingerprint, inspected_at
@@ -3626,6 +3636,7 @@ impl Database {
                 request.attempt_id.as_str()
             )));
         }
+        Self::require_no_retained_legacy_creation_for_attempt_tx(tx, &request.attempt_id).await?;
         let original_anchor_eligible = match Self::classify_retirement_anchor_tx(
             tx,
             request.attempt_id.as_str(),
@@ -4665,6 +4676,7 @@ impl Database {
         tx: &mut Transaction<'_, Sqlite>,
         request: &RecordCloseRetirementDispatchRequest,
     ) -> DbResult<()> {
+        Self::require_no_retained_legacy_creation_for_attempt_tx(tx, &request.attempt_id).await?;
         let identity = request.resource.identity();
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO close_retirement_resource_dispatches (
@@ -6262,6 +6274,7 @@ impl Database {
                 "retry completion requires exact running run and complete successful plan",
             ));
         }
+        Self::require_no_retained_legacy_creation_for_attempt_tx(tx, &run.attempt_id).await?;
         let now = Utc::now().to_rfc3339();
         let latest: String = sqlx::query_scalar("SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')")
             .bind(run.attempt_id.as_str()).fetch_one(&mut **tx).await?;
@@ -7856,6 +7869,10 @@ impl Database {
         let promote = !initial
             && archived
             && obligation.close_outcome() == Some(CloseCompletionOutcome::CloseIncomplete);
+        if promote || (initial && archived) {
+            Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id())
+                .await?;
+        }
         let attention_in_history = !initial
             && (promote
                 || obligation.close_outcome()
@@ -7984,6 +8001,8 @@ impl Database {
             )));
         }
         let now = Utc::now().to_rfc3339();
+        Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id())
+            .await?;
         let aggregate_transcript_id: String = sqlx::query_scalar(
             "SELECT conversation_id
              FROM close_attempt_members
@@ -10026,6 +10045,76 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(status, "reserved");
+    }
+
+    #[tokio::test]
+    async fn resumed_legacy_close_cannot_retire_or_archive_with_pending_creation_cleanup() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let attempt_id = CloseAttemptId::parse("attempt-resumed").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            attempt_id.as_str(),
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: attempt_id.clone(),
+            scopes: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let obligation = db.get_close_obligation(attempt_id.as_str()).await.unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::RetirementRequested);
+        let inventory = CaptureCloseRetirementInventoryRequest {
+            attempt_id: attempt_id.clone(),
+            snapshot: obligation.snapshot().unwrap().clone(),
+            scopes: Vec::new(),
+        };
+        assert!(db
+            .capture_close_retirement_inventory(inventory.clone())
+            .await
+            .unwrap()
+            .is_empty());
+
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                 id, conversation_id, status, stage, attempt, generation,
+                 intent_json, accepted_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (
+                 'retired-delete', 'root', 'deletion_pending', 'validate_intent', 0, 1,
+                 '{}', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z',
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            db.capture_close_retirement_inventory(inventory).await,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("operator review is required")
+        ));
+        assert!(matches!(
+            db.complete_close_retirement(&attempt_id).await,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("operator review is required")
+        ));
+        let lifecycle: String = sqlx::query_scalar(
+            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = 'root'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "open");
     }
 
     #[tokio::test]

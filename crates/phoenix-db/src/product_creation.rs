@@ -6930,6 +6930,7 @@ mod product_creation_tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn git_publication_rejects_unproven_staging_before_writing_scope_or_conversation() {
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("worktree");
