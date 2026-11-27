@@ -14,7 +14,19 @@ Each cycle:
 4. **Land.** The reviewer opens a normal, non-draft PR with tests. Both sides drive it to
    CI-green and review-clean, and the worker adds the confirmation numbers to the PR thread
    or round file.
-5. **Re-measure** after the change ships, then continue with the next candidate.
+5. **Merge by quorum.** Merge only when CI is green, review is clean, **and both reviewer
+   and worker have recorded agreement**, as a line in the round file or a PR comment. Either side can
+   veto.
+6. **Re-baseline offline.** Never deploy. Apply the merged change as a transform in the
+   replay model, then pick the next candidate against the new baseline.
+
+## Constraints
+
+- **No deploys** of any kind (`./dev.py prod …` included).
+- Confirmation is **offline replay** over recorded production data. Ad-hoc LLM evals
+  are allowed only when replay cannot answer the question (for example, whether the agent
+  still recovers pending work after a shorter summary). Keep them small: at most about 20 cases and about 1M
+  tokens per eval, with the size stated up front in the round file.
 
 ## Goal state
 
