@@ -2819,6 +2819,171 @@ mod product_creation_delivery_replay_tests {
         assert_eq!(std::fs::read(fetch_head).unwrap(), fetch_head_before);
     }
 
+    async fn seed_legacy_staging(
+        initial_db: &Database,
+        first: &crate::db::ClaimedProductCreationJob,
+        root: &str,
+        worktree_string: &str,
+        oid: &str,
+    ) {
+        let request_id = first.job.request_id.as_str();
+        let reservation_id = format!("{request_id}:worktree");
+        assert!(initial_db
+            .reserve_product_creation_resource(
+                &reservation_id,
+                request_id,
+                &first.claim,
+                root,
+                worktree_string,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap());
+        assert!(initial_db
+            .record_product_creation_staging(request_id, &first.claim, worktree_string, root, oid)
+            .await
+            .unwrap());
+        assert!(initial_db
+            .record_product_creation_resource_ownership(
+                request_id,
+                &first.claim,
+                worktree_string,
+                "legacy-owner-token",
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap());
+    }
+
+    async fn assert_legacy_staging_retained(
+        restarted_db: &Database,
+        request_id: &str,
+        worktree_string: &str,
+    ) {
+        use phoenix_db::ProductCreationProvisioningStage as Stage;
+
+        let job = restarted_db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "cleanup_ambiguous");
+        assert_eq!(job.staging_path.as_deref(), Some(worktree_string));
+        assert_eq!(job.published_conversation_id, None);
+        assert_eq!(job.published_product_id, None);
+        assert_eq!(job.provisioning_stage, Stage::MaterializeWorktree);
+        let reservations = restarted_db
+            .get_product_creation_resource_reservations(request_id)
+            .await
+            .unwrap();
+        assert_eq!(reservations.len(), 1);
+        assert_eq!(reservations[0].resource_identity, worktree_string);
+        assert_eq!(
+            reservations[0].ownership_token.as_deref(),
+            Some("legacy-owner-token")
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_worker_refuses_legacy_token_only_staging_without_losing_checkout() {
+        let repo_fixture = super::product_creation_staging_ownership_tests::initialized_repo();
+        let repo = repo_fixture.path().canonicalize().unwrap();
+        let database_fixture = tempfile::tempdir().unwrap();
+        let database = database_fixture.path().join("creation.sqlite");
+        let database_path = database.to_str().unwrap();
+        let request_id = "legacy-token-only-restart";
+        let initial_db = Database::open_migrated_for_test(database_path).await.unwrap();
+        let first = accept_and_claim_product_at(&initial_db, request_id, &repo).await;
+        let root = repo.to_str().unwrap();
+        let worktree =
+            product_worktree_path(&repo, first.job.product_conversation_id.as_str()).unwrap();
+        let worktree_string = worktree.to_str().unwrap();
+        let git = |args: &[&str]| crate::git_ops::run_git(&repo, args).unwrap();
+        let oid = git(&["rev-parse", "HEAD"]);
+        let base = git(&["symbolic-ref", "--short", "HEAD"]);
+        assert!(matches!(
+            initial_db
+                .pin_product_creation_once(request_id, &first.claim, &oid, &base, "fresh")
+                .await
+                .unwrap(),
+            crate::db::ProductCreationPinOutcome::Pinned(_)
+        ));
+        seed_legacy_staging(&initial_db, &first, root, worktree_string, &oid).await;
+        git(&["worktree", "add", "--detach", worktree_string, &oid]);
+        let marker = product_creation_owner_marker_path(&worktree).unwrap();
+        std::fs::write(&marker, "legacy-owner-token").unwrap();
+        let checkout_contents = std::fs::read(worktree.join("README")).unwrap();
+        let checkout_pointer = worktree.join(".git");
+        let checkout_pointer_contents = std::fs::read(&checkout_pointer).unwrap();
+        let git_directory = PathBuf::from(
+            crate::git_ops::run_git(
+                &worktree,
+                &["rev-parse", "--path-format=absolute", "--git-dir"],
+            )
+            .unwrap()
+            .trim(),
+        );
+        let backpointer = git_directory.join("gitdir");
+        let backpointer_contents = std::fs::read(&backpointer).unwrap();
+        let registrations = git(&["worktree", "list", "--porcelain", "-z"]);
+
+        initial_db.pool().close().await;
+        drop(initial_db);
+        let restarted_db = Database::open(database_path).await.unwrap();
+        let restarted = restarted_db
+            .claim_product_creation(
+                request_id,
+                "restarted-worker",
+                "replacement-claim",
+                first.claim.lease_until + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .expect("expired claim must admit a replacement worker");
+        assert!(restarted.claim.generation > first.claim.generation);
+        assert_eq!(restarted.job.staging_path.as_deref(), Some(worktree_string));
+        assert_eq!(
+            restarted.job.pin_exact_checkout_oid.as_deref(),
+            Some(oid.as_str())
+        );
+        assert_eq!(restarted.job.pin_logical_base.as_deref(), Some(base.as_str()));
+        let manager = test_runtime_manager(restarted_db.clone());
+        let error = Box::pin(process_product_creation_until_closed(&manager, restarted.clone()))
+            .await
+            .expect_err("token-only legacy staging must not be adopted");
+        assert_eq!(
+            error,
+            "existing staging occupant did not match durable ownership"
+        );
+        cleanup_and_retry_unpublished_product_creation(
+            &manager,
+            request_id,
+            &restarted.claim,
+            &restarted.job,
+            &error,
+        )
+        .await
+        .unwrap();
+
+        assert_legacy_staging_retained(&restarted_db, request_id, worktree_string).await;
+        assert_eq!(
+            std::fs::read(worktree.join("README")).unwrap(),
+            checkout_contents
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"legacy-owner-token");
+        assert_eq!(
+            std::fs::read(checkout_pointer).unwrap(),
+            checkout_pointer_contents
+        );
+        assert_eq!(std::fs::read(&backpointer).unwrap(), backpointer_contents);
+        assert_eq!(
+            git(&["worktree", "list", "--porcelain", "-z"]),
+            registrations
+        );
+        assert!(verify_product_creation_checkout(root, &worktree, &oid).is_ok());
+    }
+
     #[tokio::test]
     async fn cancellation_while_waiting_for_repository_lock_fences_late_pin_and_stage() {
         use phoenix_db::ProductCreationProvisioningStage as Stage;
