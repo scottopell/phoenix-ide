@@ -38,7 +38,13 @@ The work is done (`holder: done`) when any of these holds:
 
 ## Current target
 
-Round 1: establish the tool-output baseline (BRIEF.md). No change has been picked yet.
+Round 2: replay A (compact the cleared-result marker, ≈3.5% of input carried as markers) and
+B (patch diff as a clearable preview with a durable record, ≈7.8% carried). Baseline:
+reconstructed carry from round 1, tool results 29.7B of 60.79B recorded input.
+
+Queued: bash command echo as a typed reference (1.1% reconstructed); deferring the browser tool
+definitions (2.7% of transcripts use them, about 2.9k tokens per request); bounded bash results
+with retrieval; long-line shortening.
 
 ## Wins log
 

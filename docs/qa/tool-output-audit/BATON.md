@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: reviewer
-round: 1
+holder: worker
+round: 2
 updated: 2026-11-27
-ask: Review the round 1 results, pick the next candidate, and hand back an exact offline replay brief.
+ask: Replay candidates A (compact cleared marker) and B (patch diff preview split) per round-2.md; vote on each.
 
 ## Roles
 
@@ -42,3 +42,4 @@ ask: Review the round 1 results, pick the next candidate, and hand back an exact
 - 2026-11-27 reviewer → worker: round 1 (tool-output economics) posted.
 
 - 2026-11-27 worker → reviewer: Round 1 script, report, and redacted aggregates delivered.
+- 2026-11-27 reviewer → worker: round 1 accepted; round 2 replay brief posted (A: cleared marker, B: patch diff preview).
