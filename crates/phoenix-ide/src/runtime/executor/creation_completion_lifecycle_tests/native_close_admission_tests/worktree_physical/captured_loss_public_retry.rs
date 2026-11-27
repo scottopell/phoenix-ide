@@ -245,8 +245,12 @@ pub(super) async fn retry_after_public_capture(
     let historical = captured_history(&fixture, initial_run).await;
     let before = public_retry_rows(&fixture, initial_run.attempt_id.as_str()).await;
     let pin_snapshot = preserve_origin_pin.map(|_| physical_snapshot(&git.root));
-    let sibling_snapshot = preserve_origin_pin
-        .map(|_| (physical_snapshot(&git.sibling), physical_snapshot(&git.sibling_admin)));
+    let sibling_snapshot = preserve_origin_pin.map(|_| {
+        (
+            physical_snapshot(&git.sibling),
+            physical_snapshot(&git.sibling_admin),
+        )
+    });
     let stale_context = context
         .clone()
         .with_tool_use_id(initial_fixture.source.tool_use_id.clone());
