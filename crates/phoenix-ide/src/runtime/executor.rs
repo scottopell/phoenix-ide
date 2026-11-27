@@ -726,16 +726,31 @@ fn required_clear_gain_tokens(reported_prompt_tokens: i64) -> usize {
     CLEAR_AT_LEAST_TOKENS.max(proportional_gain_tokens(reported_prompt_tokens))
 }
 
-/// Placeholder body sent in place of a cleared tool result. The paired
+/// Opening of every marker sent in place of a cleared tool result. The paired
 /// `tool_use` block is preserved, so this is never a silent gap (REQ-STR-004).
-const CLEARED_TOOL_RESULT_PLACEHOLDER: &str = "[tool result cleared to save context]";
+const CLEARED_TOOL_RESULT_PLACEHOLDER: &str = "[tool result cleared";
+
+/// How a cleared-result marker names its persisted source (REQ-STR-012).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClearedLocator {
+    /// `@self#seq-<n>`, resolved by `read_conversation` against the caller's
+    /// own transcript. Used in the transcript's own requests.
+    SelfRelative,
+    /// `@transcript:<conversation>#message-<message>`. Used where the text may
+    /// be carried into another transcript (continuation input).
+    Canonical,
+}
 
 /// Text sent in place of a cleared tool result. A result with a valid
 /// clearable preview keeps everything outside the preview, with the preview
 /// replaced by its kind's summary and the marker (REQ-STR-013); any other
 /// result becomes the marker alone (REQ-STR-004).
-fn cleared_tool_result_text(message: &crate::db::Message, tool: &crate::db::ToolContent) -> String {
-    let marker = cleared_tool_result_marker(message);
+fn cleared_tool_result_text(
+    message: &crate::db::Message,
+    tool: &crate::db::ToolContent,
+    locator: ClearedLocator,
+) -> String {
+    let marker = cleared_tool_result_marker(message, locator);
     let Some(preview) = tool.valid_clearable_preview() else {
         return marker;
     };
@@ -747,14 +762,20 @@ fn cleared_tool_result_text(message: &crate::db::Message, tool: &crate::db::Tool
     };
     preview
         .replace_in(&tool.content, &replacement)
-        .unwrap_or_else(|| cleared_tool_result_marker(message))
+        .unwrap_or_else(|| cleared_tool_result_marker(message, locator))
 }
 
-fn cleared_tool_result_marker(message: &crate::db::Message) -> String {
-    format!(
-        "{CLEARED_TOOL_RESULT_PLACEHOLDER} [persisted source: conversation={}, message={}, sequence={}]",
-        message.conversation_id, message.message_id, message.sequence_id
-    )
+fn cleared_tool_result_marker(message: &crate::db::Message, locator: ClearedLocator) -> String {
+    match locator {
+        ClearedLocator::SelfRelative => format!(
+            "{CLEARED_TOOL_RESULT_PLACEHOLDER}; read_conversation @self#seq-{}]",
+            message.sequence_id
+        ),
+        ClearedLocator::Canonical => format!(
+            "{CLEARED_TOOL_RESULT_PLACEHOLDER}; read_conversation @transcript:{}#message-{}]",
+            message.conversation_id, message.message_id
+        ),
+    }
 }
 
 /// Approximate wire token cost of one image block. A flattened-and-replayed
@@ -1479,7 +1500,11 @@ fn collect_tool_result_facts(
                     .copied()
                     .unwrap_or("");
                 let token_estimate = estimate_tool_result_tokens(&tc.content, tc.images.len());
-                let marker_token_estimate = estimate_text_tokens(&cleared_tool_result_text(m, tc));
+                let marker_token_estimate = estimate_text_tokens(&cleared_tool_result_text(
+                    m,
+                    tc,
+                    ClearedLocator::SelfRelative,
+                ));
                 // a preview is cleared only when that shrinks the result
                 let preview_shrinks = tc.valid_clearable_preview().is_some()
                     && marker_token_estimate < token_estimate;
@@ -1608,6 +1633,7 @@ fn clearable_sequence_ids_through_watermark(
 /// `watermark_cache` mirrors the durable watermark in memory; it is the runtime's
 /// own state (the runtime is the sole writer for its conversation), so it can
 /// never be staler than the database after a successful read or write.
+#[cfg(test)]
 async fn assemble_cleared_messages<S: StateStore>(
     storage: &S,
     conv_id: &str,
@@ -1626,6 +1652,7 @@ async fn assemble_cleared_messages<S: StateStore>(
         context_window,
         watermark_cache,
         None,
+        ClearedLocator::SelfRelative,
     )
     .await
 }
@@ -1637,6 +1664,7 @@ async fn render_existing_cleared_messages<S: StateStore>(
     excluded_message_id: Option<&str>,
     clearable_names: &std::collections::HashSet<String>,
     watermark_cache: &std::sync::Mutex<Option<i64>>,
+    locator: ClearedLocator,
 ) -> Vec<LlmMessage> {
     let watermark = match storage.get_clear_watermark(conv_id).await {
         Ok(watermark) => {
@@ -1649,11 +1677,12 @@ async fn render_existing_cleared_messages<S: StateStore>(
         }
     };
     let cleared = clearable_sequence_ids_through_watermark(db_messages, clearable_names, watermark);
-    render_messages(
+    render_messages_with_locator(
         db_messages
             .iter()
             .filter(|message| Some(message.message_id.as_str()) != excluded_message_id),
         &cleared,
+        locator,
     )
 }
 
@@ -1667,6 +1696,7 @@ async fn assemble_cleared_messages_with_pressure<S: StateStore>(
     context_window: usize,
     watermark_cache: &std::sync::Mutex<Option<i64>>,
     pressure_override: Option<i64>,
+    locator: ClearedLocator,
 ) -> Vec<LlmMessage> {
     let included_messages = || {
         db_messages
@@ -1687,7 +1717,7 @@ async fn assemble_cleared_messages_with_pressure<S: StateStore>(
                 );
                 let cleared =
                     clearable_sequence_ids_through_watermark(db_messages, clearable_names, w);
-                render_messages(included_messages(), &cleared)
+                render_messages_with_locator(included_messages(), &cleared, locator)
             } else {
                 tracing::warn!(
                     conv_id = %conv_id, error = %e,
@@ -1750,7 +1780,7 @@ async fn assemble_cleared_messages_with_pressure<S: StateStore>(
         }
     };
 
-    render_messages(included_messages(), &cleared)
+    render_messages_with_locator(included_messages(), &cleared, locator)
 }
 
 fn reproject_generated_handoff(
@@ -1784,10 +1814,22 @@ fn reproject_generated_handoff(
 /// intact, so a cleared result is never a silent gap. Every other tool result is
 /// sent verbatim with its images. The persisted messages are never mutated — the
 /// cleared form exists only in the returned list for this one request.
-#[allow(clippy::too_many_lines)] // one exhaustive DB-message to provider-message fold
 fn render_messages<'a>(
     db_messages: impl IntoIterator<Item = &'a crate::db::Message>,
     cleared_sequence_ids: &std::collections::HashSet<i64>,
+) -> Vec<LlmMessage> {
+    render_messages_with_locator(
+        db_messages,
+        cleared_sequence_ids,
+        ClearedLocator::SelfRelative,
+    )
+}
+
+#[allow(clippy::too_many_lines)] // one exhaustive DB-message to provider-message fold
+fn render_messages_with_locator<'a>(
+    db_messages: impl IntoIterator<Item = &'a crate::db::Message>,
+    cleared_sequence_ids: &std::collections::HashSet<i64>,
+    locator: ClearedLocator,
 ) -> Vec<LlmMessage> {
     use crate::db::{MessageContent, ToolContent};
     use phoenix_llm::ImageSource;
@@ -1897,7 +1939,7 @@ fn render_messages<'a>(
                 // REQ-STR-011).
                 let (text, image_sources): (String, Vec<ImageSource>) =
                     if cleared_sequence_ids.contains(&msg.sequence_id) {
-                        (cleared_tool_result_text(msg, tool), Vec::new())
+                        (cleared_tool_result_text(msg, tool, locator), Vec::new())
                     } else {
                         let sources = images
                             .iter()
@@ -10052,6 +10094,7 @@ where
             None,
             &self.clearable_names,
             &self.clear_watermark_cache,
+            ClearedLocator::SelfRelative,
         )
         .await;
 
@@ -10313,6 +10356,7 @@ where
                 input_budget,
                 &self.clear_watermark_cache,
                 pressure,
+                ClearedLocator::SelfRelative,
             )
             .await;
             overlay_trusted_tool_results(&mut frozen_messages, &trusted_results);
@@ -12380,6 +12424,7 @@ where
                 .map(|handoff| handoff.message_id.as_str()),
             &self.clearable_names,
             &self.clear_watermark_cache,
+            ClearedLocator::Canonical,
         )
         .await;
 
@@ -12481,7 +12526,7 @@ where
         let messages = if complete_fits {
             messages
         } else {
-            let cleared = assemble_cleared_messages(
+            let cleared = assemble_cleared_messages_with_pressure(
                 &self.storage,
                 &conv_id,
                 projection,
@@ -12492,6 +12537,8 @@ where
                 &self.clearable_names,
                 context_window,
                 &self.clear_watermark_cache,
+                None,
+                ClearedLocator::Canonical,
             )
             .await;
             cap_replayed_images(
@@ -34947,8 +34994,9 @@ mod stale_tool_result_clearing_tests {
         let source = db.iter().find(|m| m.sequence_id == old).unwrap();
         assert_eq!(
             plan.freed_tokens,
-            estimate_tool_result_tokens("result body", 6)
-                .saturating_sub(estimate_text_tokens(&cleared_tool_result_marker(source)))
+            estimate_tool_result_tokens("result body", 6).saturating_sub(estimate_text_tokens(
+                &cleared_tool_result_marker(source, ClearedLocator::SelfRelative)
+            ))
         );
         assert_eq!(plan.cleared_count, 1);
     }
@@ -35398,10 +35446,26 @@ mod stale_tool_result_clearing_tests {
 
         let (cleared_body, cleared_imgs) = find("old-tool");
         let source = db.iter().find(|m| m.sequence_id == cleared_seq).unwrap();
-        assert_eq!(cleared_body, cleared_tool_result_marker(source));
-        assert!(cleared_body.contains(&format!("conversation={conv}")));
-        assert!(cleared_body.contains(&format!("message={}", source.message_id)));
-        assert!(cleared_body.contains(&format!("sequence={cleared_seq}")));
+        assert_eq!(
+            cleared_body,
+            cleared_tool_result_marker(source, ClearedLocator::SelfRelative)
+        );
+        assert_eq!(
+            cleared_body,
+            format!("[tool result cleared; read_conversation @self#seq-{cleared_seq}]")
+        );
+        // Text that may be carried into another transcript names the exact row.
+        let canonical = render_messages_with_locator(&db, &cleared, ClearedLocator::Canonical);
+        assert!(canonical
+            .iter()
+            .flat_map(|m| &m.content)
+            .any(|b| matches!(b,
+                ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == "old-tool"
+                    && *content == format!(
+                        "[tool result cleared; read_conversation @transcript:{conv}#message-{}]",
+                        source.message_id
+                    )
+            )));
         assert_eq!(cleared_imgs, 0, "cleared result emits no images");
         assert!(msgs.iter().flat_map(|m| &m.content).any(|b| matches!(b,
             ContentBlock::ToolUse { id, name, .. } if id == "old-tool" && name == "read_file"

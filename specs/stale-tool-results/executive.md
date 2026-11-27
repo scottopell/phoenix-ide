@@ -110,7 +110,10 @@ the patch tool.
 
 REQ-STR-012 has deterministic backend coverage in
 `stale_tool_result_clearing_tests::render_placeholders_cleared_keeps_rest`:
-cleared text names the original persisted conversation/message/sequence, the
+cleared text names its persisted source as a `read_conversation` reference
+(`@self#seq-<n>` live, the exact transcript/message pair in continuation input,
+checked by the same test and resolved by
+`self_sequence_reference_resolves_within_the_caller_transcript`), the
 producing ToolUse/ToolResult identity survives, text and images clear together,
 and selected assistant interpretation and user corrections remain verbatim.
 Repeated rendering is identical and the stored transcript is unchanged.

@@ -51,6 +51,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | --- | --- | --- | --- |
 | [290](290_compact-model-visible-tool-output.md) | Compact model-visible tool output, separate from typed displays | Accepted | REQ-BASH-002, REQ-BASH-004, REQ-BASH-017, REQ-RQD-010 |
 | [291](291_clearable-previews-in-state-changing-results.md) | Clearable previews inside state-changing tool results | Accepted | REQ-STR-002, REQ-STR-004, REQ-STR-013, REQ-PATCH-007 |
+| [292](292_caller-relative-cleared-result-locator.md) | Cleared-result markers name their source relative to the caller | Accepted | REQ-STR-004, REQ-STR-012 |
 | [288](288_unified-close-idempotence-and-bounded-completion-retry.md) | Unified Close is idempotent with one bounded completion-only retry | Proposed; branch-local proposal; automatic completion policy superseded by ADR-286 | REQ-WL-002f; REQ-BED-029; `close_conversation`, retained Close operation and run identity |
 | [287](287_native-task-approval-source-snapshot-and-receipt.md) | Bind native task approval to canonical source, snapshot and receipt | Proposed | REQ-TAT-001–008; REQ-PROJ-003; REQ-BED-028/046; REQ-COMP-001/002; REQ-DWF-043 |
 | [286](286_close-uses-exact-blockers-and-explicit-retry-only.md) | Close uses exact blockers and explicit retry only | Accepted; supersedes branch-local ADR-288's automatic completion policy and ADR-088's in-Close discard/disposable alternative | REQ-WL-002/002a/002b/002c/002d/002e/002f/004; REQ-BED-029 |

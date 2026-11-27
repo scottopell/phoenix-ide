@@ -337,8 +337,11 @@ rule ToolResultCleared {
 
     @guidance
         -- Clearing replaces the rendered ToolResult body with a stable
-        -- marker identifying removal and its immutable persisted source
-        -- (conversation, message, sequence), and emits no
+        -- marker identifying removal and its immutable persisted source as a
+        -- read_conversation reference: `@self#seq-<n>` in the transcript's own
+        -- requests, which read_conversation resolves against the caller's
+        -- transcript, and the exact `@transcript:<conversation>#message-<message>`
+        -- pair in continuation input, which a successor may carry. It emits no
         -- image blocks; the paired assistant ToolUse block is left intact
         -- (REQ-STR-004). A result with a clearable preview keeps its text
         -- outside the preview verbatim and replaces only the preview with the

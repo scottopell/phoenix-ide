@@ -173,6 +173,7 @@ them from a result still otherwise retained.
 
 WHEN clearing eligible stale tool output
 THE SYSTEM SHALL retain the producing call identity and persisted source locator alongside the removal marker
+AND SHALL make that locator resolvable by the agent's transcript-reading tool, naming the source relative to the caller's own transcript only where the marker cannot be carried into another transcript
 AND SHALL NOT clear subsequent assistant interpretation, decisions, or user corrections merely because their source result was cleared
 AND SHALL preserve the immediate working set under REQ-STR-003 and the monotonic worthwhile sweep rules under REQ-STR-006/007.
 
