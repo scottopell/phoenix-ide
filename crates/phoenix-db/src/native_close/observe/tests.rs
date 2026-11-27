@@ -120,7 +120,10 @@ async fn observation_does_not_transfer_generic_settlement_ownership() {
         let referenced = f.begin().await;
         let attempt = referenced.attempt_id.as_str();
         f.db.begin_close_idle_settlement(attempt).await.unwrap();
-        let mut pending = f.db.list_pending_generic_close_settlements(None).await.unwrap();
+        let mut pending =
+            f.db.list_pending_generic_close_settlements(None)
+                .await
+                .unwrap();
         assert_eq!(pending.len(), 1);
         let admitted = pending.pop().unwrap();
         assert_eq!(admitted.obligation().attempt_id(), &referenced.attempt_id);
