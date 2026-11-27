@@ -47,3 +47,13 @@ Recommend one candidate for round 5.
 ## Output
 
 Append `## Results` here, write `round-4.json`, vote, and pass the baton.
+
+## Source review while replay runs
+
+The worker is withholding the combined merge vote at implementation 88f2aa537 until these are fixed.
+
+- **P1 · A marker advertises an unavailable reader on Explore and ordinary sub-agent surfaces.** Live rendering emits the caller-relative locator regardless of the request's callable tools. The restricted Explore and ordinary sub-agent registries include clearable tools such as file reads and search, but lack the transcript reader. A stale result therefore points the agent to an operation it cannot call. Cover these registry entry points with a caller-scoped exact reader or a reachable locator consistent with their existing authority.
+- **P2 · Canonical continuation rendering can expand a patch preview.** Preview eligibility is decided by the short live form. Both continuation render paths reuse that eligibility and substitute the longer canonical marker. A fixture with a valid receipt and single hunk satisfies live-cleared size below full size below continuation-cleared size. If the row is in the selected continuation suffix, this violates the strict shrink rule in REQ-STR-013. Use a consistent gate across the emitted forms or price and enforce the canonical gate at continuation rendering.
+- **CI · Clippy and musl both reject the size of the message variant in TerminalEvidenceExpectation.** The focused macOS tests passed for B. The Linux lint gate still needs resolution at the combined PR head.
+
+The worker holds Round 4 while the offline replay and candidate comparison finish.
