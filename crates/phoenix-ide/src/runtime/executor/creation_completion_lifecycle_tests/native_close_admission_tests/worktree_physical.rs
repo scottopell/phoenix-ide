@@ -1935,8 +1935,8 @@ async fn assert_public_descriptor_veto(
         .unwrap();
     assert_eq!(
         obligation.close_outcome(),
-        Some(CloseCompletionOutcome::CloseIncomplete),
-        "positive writer veto should retain actionable diagnostics: {}\n{}",
+        Some(CloseCompletionOutcome::ArchivedCleanupAttention),
+        "positive writer veto should archive with actionable cleanup attention: {}\n{}",
         worktree_close_failure_evidence(fixture, &run).await,
         physical_close_diagnostics(),
     );
