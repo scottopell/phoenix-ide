@@ -2922,6 +2922,23 @@ impl Database {
     ) -> DbResult<bool> {
         let now_micros = datetime_to_unix_micros(now);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let staged: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT product_conversation_id, published_product_id, published_conversation_id
+             FROM product_creation_jobs
+             WHERE request_id = ?1 AND status = 'delivery_pending'
+               AND objective_origin <> 'federated_conversation'",
+        )
+        .bind(request_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((reserved_id, product_id, transcript_id)) = staged {
+            let owned = Self::owned_hidden_creation_aggregate(&mut tx, &reserved_id).await?;
+            if product_id.as_deref() != Some(reserved_id.as_str())
+                || !owned.is_some_and(|(id, _)| Some(id) == transcript_id)
+            {
+                return Ok(false);
+            }
+        }
         let generation: Option<i64> = sqlx::query_scalar(
             "UPDATE product_creation_jobs
              SET status = 'cancelling', claim_generation = claim_generation + 1,
@@ -2933,20 +2950,7 @@ impl Database {
                  deletion_requested_at_unix_micros = NULL, updated_at_unix_micros = ?2
              WHERE request_id = ?1
                AND objective_origin <> 'federated_conversation'
-               AND (status IN ('accepted', 'claimed', 'retry_scheduled')
-                    OR (status = 'delivery_pending' AND EXISTS (
-                        SELECT 1 FROM conversations c
-                        JOIN product_conversations p ON p.id = c.product_conversation_id
-                        WHERE c.id = product_creation_jobs.published_conversation_id
-                          AND p.id = product_creation_jobs.product_conversation_id
-                          AND p.id = product_creation_jobs.published_product_id
-                          AND p.kind = 'ordinary' AND p.ordinary_lifecycle = 'open'
-                          AND c.archived = 1 AND c.runtime_role = 'user'
-                          AND c.parent_conversation_id IS NULL
-                          AND NOT EXISTS (SELECT 1 FROM conversations other
-                              WHERE other.product_conversation_id = p.id AND other.id <> c.id)
-                          AND NOT EXISTS (SELECT 1 FROM steering_acceptance_receipts receipt
-                              WHERE receipt.conversation_id = c.id))))
+               AND status IN ('accepted', 'claimed', 'retry_scheduled', 'delivery_pending')
              RETURNING claim_generation",
         )
         .bind(request_id)
@@ -3327,6 +3331,38 @@ impl Database {
         Ok(true)
     }
 
+    async fn owned_hidden_creation_aggregate(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        reserved_id: &str,
+    ) -> DbResult<Option<(String, String)>> {
+        let aggregate: Option<(String, String)> = sqlx::query_as(
+            "SELECT c.id, c.work_scope_id FROM conversations c
+             JOIN product_conversations p ON p.id = c.product_conversation_id
+             JOIN product_conversation_work_scopes attachment
+               ON attachment.product_conversation_id = p.id
+              AND attachment.work_scope_id = c.work_scope_id
+             WHERE p.id = ?1 AND p.kind = 'ordinary'
+               AND p.ordinary_lifecycle = 'open' AND c.archived = 1
+               AND c.runtime_role = 'user' AND c.parent_conversation_id IS NULL
+               AND NOT EXISTS (SELECT 1 FROM conversations other
+                   WHERE other.id <> c.id AND (other.product_conversation_id = p.id
+                       OR other.work_scope_id = c.work_scope_id
+                       OR other.parent_conversation_id = c.id))
+               AND NOT EXISTS (SELECT 1 FROM product_conversation_work_scopes other_attachment
+                   WHERE other_attachment.product_conversation_id = p.id
+                     AND other_attachment.work_scope_id <> c.work_scope_id)
+               AND NOT EXISTS (SELECT 1 FROM product_conversation_work_scopes other_owner
+                   WHERE other_owner.work_scope_id = c.work_scope_id
+                     AND other_owner.product_conversation_id <> p.id)
+               AND NOT EXISTS (SELECT 1 FROM steering_acceptance_receipts receipt
+                   WHERE receipt.conversation_id = c.id)",
+        )
+        .bind(reserved_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(aggregate)
+    }
+
     async fn remove_owned_hidden_creation_aggregate(
         tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         reserved_id: &str,
@@ -3337,32 +3373,9 @@ impl Database {
                 .fetch_one(&mut **tx)
                 .await?;
         if staged_product_exists {
-            let aggregate: Option<(String, String)> = sqlx::query_as(
-                "SELECT c.id, c.work_scope_id FROM conversations c
-                 JOIN product_conversations p ON p.id = c.product_conversation_id
-                 JOIN product_conversation_work_scopes attachment
-                   ON attachment.product_conversation_id = p.id
-                  AND attachment.work_scope_id = c.work_scope_id
-                 WHERE p.id = ?1 AND p.kind = 'ordinary'
-                   AND p.ordinary_lifecycle = 'open' AND c.archived = 1
-                   AND c.runtime_role = 'user' AND c.parent_conversation_id IS NULL
-                   AND NOT EXISTS (SELECT 1 FROM conversations other
-                       WHERE other.id <> c.id AND (other.product_conversation_id = p.id
-                           OR other.work_scope_id = c.work_scope_id
-                           OR other.parent_conversation_id = c.id))
-                   AND NOT EXISTS (SELECT 1 FROM product_conversation_work_scopes other_attachment
-                       WHERE other_attachment.product_conversation_id = p.id
-                         AND other_attachment.work_scope_id <> c.work_scope_id)
-                   AND NOT EXISTS (SELECT 1 FROM product_conversation_work_scopes other_owner
-                       WHERE other_owner.work_scope_id = c.work_scope_id
-                         AND other_owner.product_conversation_id <> p.id)
-                   AND NOT EXISTS (SELECT 1 FROM steering_acceptance_receipts receipt
-                       WHERE receipt.conversation_id = c.id)",
-            )
-            .bind(reserved_id)
-            .fetch_optional(&mut **tx)
-            .await?;
-            let Some((conversation_id, scope_id)) = aggregate else {
+            let Some((conversation_id, scope_id)) =
+                Self::owned_hidden_creation_aggregate(tx, reserved_id).await?
+            else {
                 return Err(DbError::Serialization(
                     "product creation cleanup staged aggregate mismatch or accepted input"
                         .to_string(),
@@ -6290,6 +6303,51 @@ mod product_creation_tests {
             unchanged.published_product_id,
             delivery.job.published_product_id
         );
+        assert_eq!(
+            unchanged.published_conversation_id,
+            delivery.job.published_conversation_id
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_cancellation_preserves_delivery_if_an_extra_scope_is_attached() {
+        let db = Database::open_in_memory().await.unwrap();
+        let delivery = staged_delivery(&db, "cancel-extra-scope").await;
+        let extra = db
+            .create_conversation("extra-owner", "extra-owner", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product_id = delivery.job.product_conversation_id.as_str();
+        sqlx::query(
+            "UPDATE product_conversation_work_scopes SET product_conversation_id = ?1
+             WHERE product_conversation_id = ?2",
+        )
+        .bind(product_id)
+        .bind(extra.product_conversation_id.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let attachments: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM product_conversation_work_scopes WHERE product_conversation_id = ?1",
+        )
+        .bind(product_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(attachments, 2);
+
+        assert!(!db
+            .cancel_product_creation(&delivery.job.request_id, Utc::now())
+            .await
+            .unwrap());
+        let unchanged = db
+            .get_product_creation_job(&delivery.job.request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.status, "delivery_pending");
+        assert_eq!(unchanged.claim_generation, delivery.claim.generation);
+        assert_eq!(unchanged.published_product_id, delivery.job.published_product_id);
         assert_eq!(
             unchanged.published_conversation_id,
             delivery.job.published_conversation_id
