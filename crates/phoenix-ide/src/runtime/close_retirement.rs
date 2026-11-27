@@ -8681,7 +8681,12 @@ fn linux_writer_candidate_until(
         Ok(LinuxProcessOwner::Unrelated | LinuxProcessOwner::Zombie) => Ok(false),
         Err(WriterScanError::Stopped(message)) => Err(WriterScanError::Stopped(message)),
         result => {
-            tracing::debug!(operation = "owner_before", detector = detector.as_str(), pid, ?result);
+            tracing::debug!(
+                operation = "owner_before",
+                detector = detector.as_str(),
+                pid,
+                ?result
+            );
             Err(WriterScanError::Gap(CloseWriterGap::Unavailable))
         }
     }

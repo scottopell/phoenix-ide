@@ -1102,21 +1102,21 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             .unwrap();
     }
     #[cfg(target_os = "linux")]
-    if let Some((_, mut pause)) = physical_witness {
+    let gap_before_removal = if let Some((_, mut pause)) = physical_witness {
         tokio::select! {
             output = close.as_mut() => panic!(
                 "ordinary physical witness completed before its deletion checkpoint: {}\n{}",
                 output.output(),
                 physical_close_diagnostics(),
             ),
-            reached = tokio::time::timeout(Duration::from_secs(10), pause.reached()) => {
-                reached.expect("timed out waiting for physical deletion checkpoint")
-                    .expect("physical deletion must reach the persistence-before-deletion witness");
-            }
+            reached = pause.reached() => reached.expect("physical deletion must reach the persistence-before-deletion witness"),
         }
-        assert_ordinary_linux_gap_before_checkout_removal(&fixture, &git, &scope).await;
+        let witness = assert_ordinary_linux_gap_before_checkout_removal(&fixture, &git, &scope).await;
         pause.release();
-    }
+        Some(witness)
+    } else {
+        None
+    };
     let output = tokio::time::timeout(Duration::from_secs(10), close.as_mut())
         .await
         .expect("public native Close must return a bounded admission result");
@@ -1659,6 +1659,23 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
                 .1,
             WorkScopeLifecycle::Retired
         );
+        #[cfg(target_os = "linux")]
+        if let Some((observation, moved_checkout)) = gap_before_removal {
+            assert_eq!(
+                fixture
+                    .db
+                    .list_close_writer_observations(&run, &scope)
+                    .await
+                    .unwrap(),
+                [observation],
+                "the exact pre-removal gap must survive terminal completion",
+            );
+            assert_eq!(
+                moved_checkout.symlink_metadata().unwrap_err().kind(),
+                std::io::ErrorKind::NotFound,
+                "the exact checkout witnessed in quarantine must no longer exist",
+            );
+        }
         // Do not let a dangling symlink masquerade as physical removal.
         assert_eq!(
             std::fs::symlink_metadata(&git.worktree).unwrap_err().kind(),
@@ -1973,7 +1990,7 @@ async fn assert_ordinary_linux_gap_before_checkout_removal(
     fixture: &CloseFixture,
     git: &DisposableGit,
     scope: &WorkScopeId,
-) {
+) -> (phoenix_db::RecordCloseWriterObservationRequest, PathBuf) {
     use crate::db::{CloseWriterDetector, CloseWriterObservation};
 
     let attempt: String = sqlx::query_scalar(
@@ -2015,11 +2032,10 @@ async fn assert_ordinary_linux_gap_before_checkout_removal(
     // The original path is absent while quarantined, so Git can label the entry
     // prunable. The exact registration itself must still exist.
     let expected_registration = [b"worktree ", git.worktree.as_os_str().as_bytes()].concat();
-    assert!(
-        git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"])
-            .split(|byte| *byte == 0)
-            .any(|field| field == expected_registration)
-    );
+    assert!(git
+        .run(&git.repo, &["worktree", "list", "--porcelain", "-z"])
+        .split(|byte| *byte == 0)
+        .any(|field| field == expected_registration));
 
     let value = std::env::var("PHOENIX_TEST_OPAQUE_CLOSE_PID").unwrap();
     let pid: u32 = value.parse().expect("ordinary-runner opaque fixture PID");
@@ -2062,6 +2078,7 @@ async fn assert_ordinary_linux_gap_before_checkout_removal(
     eprintln!(
         "ordinary Linux: opaque process witnessed; durable gap precedes removal of the exact checkout and registration"
     );
+    (entry.clone(), object)
 }
 
 // Failure diagnostics must not replace the original outcome with a query panic.

@@ -924,7 +924,7 @@ impl WorktreeDeletionDriver for PhysicalDeletionDriver<'_> {
         self.verify_confirmed_snapshot()?;
         #[cfg(test)]
         {
-            use crate::runtime::executor::native_close_retry::test_hooks::{Point, checkpoint};
+            use crate::runtime::executor::native_close_retry::test_hooks::{checkpoint, Point};
 
             let hooks = self
                 .custody
