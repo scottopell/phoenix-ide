@@ -40,6 +40,23 @@ impl GenericCloseSettlement {
     }
 }
 
+/// Identifies whether the writer transaction inserted this Close attempt.
+/// This is provenance, not permission to dispatch a retirement effect.
+#[derive(Debug)]
+pub enum CloseFoundationAdmission {
+    Inserted(CloseObligation),
+    Existing(CloseObligation),
+}
+
+impl CloseFoundationAdmission {
+    #[must_use]
+    pub fn into_obligation(self) -> CloseObligation {
+        match self {
+            Self::Inserted(obligation) | Self::Existing(obligation) => obligation,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseWriterDetector {
     LinuxDescriptor,
@@ -2176,7 +2193,7 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
-        Ok(obligation)
+        Ok(obligation.into_obligation())
     }
 
     pub async fn begin_direct_close_foundation(
@@ -2201,7 +2218,7 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
-        Ok(obligation)
+        Ok(obligation.into_obligation())
     }
 
     /// Admit and capture the first settlement phase in the same writer
@@ -2211,9 +2228,9 @@ impl Database {
         product_conversation_id: &ProductConversationId,
         expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &CloseAttemptId,
-    ) -> DbResult<CloseObligation> {
+    ) -> DbResult<CloseFoundationAdmission> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = Self::begin_close_foundation_inner(
+        let admission = Self::begin_close_foundation_inner(
             &mut tx,
             product_conversation_id,
             expected_latest_transcript_id,
@@ -2221,10 +2238,16 @@ impl Database {
             false,
         )
         .await?;
-        let obligation =
-            Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?;
+        let admission = match admission {
+            CloseFoundationAdmission::Inserted(obligation) => CloseFoundationAdmission::Inserted(
+                Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?,
+            ),
+            CloseFoundationAdmission::Existing(obligation) => CloseFoundationAdmission::Existing(
+                Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?,
+            ),
+        };
         tx.commit().await?;
-        Ok(obligation)
+        Ok(admission)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2234,7 +2257,7 @@ impl Database {
         expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &str,
         require_idle_latest: bool,
-    ) -> DbResult<CloseObligation> {
+    ) -> DbResult<CloseFoundationAdmission> {
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome,
@@ -2287,7 +2310,7 @@ impl Database {
                 )));
             }
 
-            return Ok(obligation);
+            return Ok(CloseFoundationAdmission::Existing(obligation));
         }
 
         let lifecycle: Option<String> = sqlx::query_scalar(
@@ -2465,7 +2488,7 @@ impl Database {
         .fetch_one(&mut **tx)
         .await?;
         let obligation = parse_close_obligation_row(row)?;
-        Ok(obligation)
+        Ok(CloseFoundationAdmission::Inserted(obligation))
     }
 
     pub(crate) async fn capture_close_direct_turn_settlement_targets_tx(
@@ -11187,13 +11210,53 @@ mod tests {
         let product = product_id("root");
         let latest = transcript_id("root");
         let attempt = CloseAttemptId::parse("attempt-idle").unwrap();
+        sqlx::query(
+            "INSERT INTO workflows (
+                 workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                 external_acceptance_enabled, version, generation, status,
+                 snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at
+             ) VALUES (1, 'direct_turn', 1, 1, 0, 0, 0, 'Active', 'direct_turn', 1, X'00', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO durable_turns (
+                 turn_id, workflow_id, conversation_id, client_turn_key, prepared_fingerprint,
+                 prepared_payload, disposition, generation, terminal_kind, terminal_reason,
+                 owns_conversation, canonical_message_id
+             ) VALUES (1, 1, 'root', 'turn-key', 'prepared', X'00', 'Runtime', 0, NULL, NULL, 1, NULL)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
         let (first, second) = tokio::join!(
             db.begin_generic_close_settlement(&product, &latest, &attempt),
             db.begin_generic_close_settlement(&product, &latest, &attempt),
         );
-        for prepared in [first, second] {
-            assert_eq!(prepared.unwrap().phase(), ClosePhase::SettlingActiveWork);
-        }
+        let (inserted, existing) = match (first.unwrap(), second.unwrap()) {
+            (
+                CloseFoundationAdmission::Inserted(inserted),
+                CloseFoundationAdmission::Existing(existing),
+            )
+            | (
+                CloseFoundationAdmission::Existing(existing),
+                CloseFoundationAdmission::Inserted(inserted),
+            ) => (inserted, existing),
+            outcomes => panic!("expected one inserted admission and one existing, got {outcomes:?}"),
+        };
+        assert_eq!(inserted, existing);
+        assert_eq!(inserted.phase(), ClosePhase::SettlingActiveWork);
+        let targets = db
+            .list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
+            .await
+            .unwrap();
+        let [target] = targets.as_slice() else {
+            panic!("expected one captured direct-turn target");
+        };
+        assert_eq!(target.conversation_id, "root");
+        assert_eq!(target.turn_id, 1);
+        assert_eq!(target.expected_generation, 0);
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM close_attempt_direct_turn_settlement_captures
              WHERE attempt_id = 'attempt-idle'",

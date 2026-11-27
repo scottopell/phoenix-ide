@@ -2398,8 +2398,13 @@ async fn apply_initial_tx(
     .bind(target.as_str())
     .execute(&mut **tx)
     .await?;
-    let obligation =
-        Database::begin_close_foundation_inner(tx, target, &latest, &attempt_id, false).await?;
+    let crate::CloseFoundationAdmission::Inserted(obligation) =
+        Database::begin_close_foundation_inner(tx, target, &latest, &attempt_id, false).await?
+    else {
+        return Err(DbError::CloseFoundationConflict(
+            "cannot attach a native Initial receipt to an existing Close attempt".into(),
+        ));
+    };
     super::receipts::adopt_and_insert_receipt_tx(
         tx,
         command,

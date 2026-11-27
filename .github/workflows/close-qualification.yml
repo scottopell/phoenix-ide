@@ -657,6 +657,7 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib close_foundation::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/close-foundation.log
           grep -F 'test close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules ... ok' evidence/close-foundation.log
+          grep -F 'test close_foundation::tests::concurrent_generic_close_admission_captures_direct_turns_once ... ok' evidence/close-foundation.log
           for test in \
             initial_process_first_effect_preserves_nested_error_and_confirms_release \
             initial_pty_process_first_effect_preserves_nested_error_and_confirms_release \

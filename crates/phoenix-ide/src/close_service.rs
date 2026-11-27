@@ -103,6 +103,7 @@ pub(crate) async fn run_legacy_close_compat(
                         &attempt_id,
                     )
                     .await
+                    .map(phoenix_db::CloseFoundationAdmission::into_obligation)
             };
             begin.map_err(|error| {
                 let error_type =
