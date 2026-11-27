@@ -7557,7 +7557,10 @@ impl ExternalWriterEvidence {
     }
 
     fn is_positive(&self) -> bool {
-        matches!(self, Self::Observed(CloseWriterObservation::Authority { .. }))
+        matches!(
+            self,
+            Self::Observed(CloseWriterObservation::Authority { .. })
+        )
     }
 
     // Preserve one representative unknown unless verified authority supersedes it.
@@ -7565,7 +7568,10 @@ impl ExternalWriterEvidence {
     // immutable per-detector evidence key for this run.
     fn remember_gap(&mut self, evidence: Self) {
         if matches!(self, Self::NoPositiveEvidence)
-            && matches!(evidence, Self::Observed(CloseWriterObservation::InspectionGap { .. }))
+            && matches!(
+                evidence,
+                Self::Observed(CloseWriterObservation::InspectionGap { .. })
+            )
         {
             *self = evidence;
         }
@@ -7947,9 +7953,8 @@ fn quarantine_has_writable_mappings_in_until(
                     }
                     remainder = &remainder[end..];
                 }
-                let mapped_path = PathBuf::from(std::ffi::OsStr::from_bytes(
-                    remainder.trim_ascii_start(),
-                ));
+                let mapped_path =
+                    PathBuf::from(std::ffi::OsStr::from_bytes(remainder.trim_ascii_start()));
                 if permissions.len() != 4 {
                     return Err(CloseWriterGap::Malformed.into());
                 }
@@ -8034,8 +8039,7 @@ fn quarantine_has_writable_mappings_mac_until(
                     && address > 0
                     && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL)
                 {
-                    return incomplete
-                        .map_or(Ok(None), |reason| Err(WriterScanError::Gap(reason)));
+                    return incomplete.map_or(Ok(None), |reason| Err(WriterScanError::Gap(reason)));
                 }
                 if bytes == 0 {
                     return Err(CloseWriterGap::Unavailable.into());
@@ -20465,7 +20469,9 @@ mod tests {
                 Some(borrow),
             )
             .unwrap(),
-            super::ExternalWriterEvidence::Observed(super::CloseWriterObservation::Authority { .. })
+            super::ExternalWriterEvidence::Observed(
+                super::CloseWriterObservation::Authority { .. }
+            )
         ));
     }
 
@@ -20614,10 +20620,13 @@ mod tests {
         let mapped = quarantine.join("mapped file");
         for permissions in ["r--s", "rw-p", "rw-s"] {
             let mut maps = b"1000-2000 rw-s 00000000 00:00 1 /unrelated/\xff\n".to_vec();
-            maps.extend_from_slice(format!(
-                "0000-1000 {permissions} 00000000 00:00 1 {}\n",
-                mapped.display()
-            ).as_bytes());
+            maps.extend_from_slice(
+                format!(
+                    "0000-1000 {permissions} 00000000 00:00 1 {}\n",
+                    mapped.display()
+                )
+                .as_bytes(),
+            );
             std::fs::write(process.join("maps"), maps).unwrap();
             let evidence =
                 super::quarantine_has_writable_mappings_in(&quarantine, &proc_root, 1).unwrap();

@@ -708,16 +708,17 @@ impl PhysicalDeletionDriver<'_> {
         object: &Path,
         self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
     ) -> Result<(), String> {
-        let evidence =
-            self.custody
-                .writer_probe
-                .observe_and_retain_until(object, self.deadline(), |path, deadline| {
-                    quarantine_has_external_writer_until_with_self_descriptor(
-                        path,
-                        deadline,
-                        self_descriptor,
-                    )
-                });
+        let evidence = self.custody.writer_probe.observe_and_retain_until(
+            object,
+            self.deadline(),
+            |path, deadline| {
+                quarantine_has_external_writer_until_with_self_descriptor(
+                    path,
+                    deadline,
+                    self_descriptor,
+                )
+            },
+        );
         if self
             .custody
             .writer_probe

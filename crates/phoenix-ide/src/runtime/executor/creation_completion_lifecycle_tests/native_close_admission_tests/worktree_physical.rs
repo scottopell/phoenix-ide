@@ -1419,8 +1419,14 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         assert_eq!(admitted["admitted"]["run_ordinal"], 1);
         let attempt =
             CloseAttemptId::parse(admitted["admitted"]["attempt_id"].as_str().unwrap()).unwrap();
-        assert_public_descriptor_veto(&fixture, &git, &scope, attempt, &registrations_before_admission)
-            .await;
+        assert_public_descriptor_veto(
+            &fixture,
+            &git,
+            &scope,
+            attempt,
+            &registrations_before_admission,
+        )
+        .await;
     } else {
         assert!(output.is_success(), "{}", output.output());
         let admitted: Value = serde_json::from_str(output.output()).unwrap();

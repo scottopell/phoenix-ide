@@ -272,9 +272,7 @@ jobs:
             runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_stop_during_physical_mutation_does_not_revalidate_pending_ticks \
             runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_retry_resumes_physical_mutation_after_pending_ticks \
             runtime::close_retirement::tests::anchored_native_retry_assessment_preserves_writer_inspection_gap \
-            runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_refuses_a_live_writable_descriptor \
-            runtime::close_retirement::tests::linux_writer_scan_keeps_searching_after_an_unavailable_process \
-            runtime::close_retirement::tests::linux_mapping_scan_requires_writable_shared_authority; do
+            runtime::close_retirement::tests::quarantine_rejects_live_linux_descriptor_writer_before_deletion; do
             if ! grep -Fx "$test_name: test" evidence/runtime-inventory.log; then
               failed=1
               continue
