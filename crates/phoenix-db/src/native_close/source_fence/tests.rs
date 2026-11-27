@@ -1038,7 +1038,7 @@ async fn initial_source_fence_retains_no_worktree_scope_inventory_and_dispatch()
                 scope: target.scope.clone(), resource: target.resource.clone(),
             },
         ).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(()))
+        LocalAuthorityResult::DurableFactEstablished(Ok(_))
     ));
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
     let after = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
@@ -1248,7 +1248,7 @@ async fn initial_source_fence_preserves_proofs_across_mixed_worktree_scopes() {
             attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
             scope: retired.scope.clone(), resource: retired.resource.clone(),
         },
-    ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+    ).await, LocalAuthorityResult::DurableFactEstablished(Ok(_))));
     assert!(matches!(db.record_native_close_initial_retirement_evidence(
         &command, &receipt, &source, RecordCloseRetirementEvidenceRequest {
             attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
@@ -1268,7 +1268,7 @@ async fn initial_source_fence_preserves_proofs_across_mixed_worktree_scopes() {
                 scope: dispatched.scope.clone(), resource: dispatched.resource.clone(),
             },
         ).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(()))
+        LocalAuthorityResult::DurableFactEstablished(Ok(_))
     ));
     let expected = db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str()).await.unwrap();
     assert_eq!(expected.len(), resources.len() - 1);
@@ -1489,7 +1489,7 @@ async fn initial_source_fence_inventory_fixture_with_db(
                 attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
                 scope: target.scope.clone(), resource: target.resource.clone(),
             },
-        ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+        ).await, LocalAuthorityResult::DurableFactEstablished(Ok(_))));
         if config.completion == FixtureCompletion::DispatchOnly {
             continue;
         }

@@ -23,7 +23,7 @@ use phoenix_db::{
         NativeCloseCommand, NativeCloseInitialEntryRelease, NativeCloseInitialFirstEffectError,
         NativeCloseIntent, NativeCloseReceipt,
     },
-    Database,
+    Database, DbError, DbResult, FirstCloseRetirementDispatch,
 };
 
 use phoenix_core::git::observe_linked_worktree_fingerprint;
@@ -302,7 +302,73 @@ pub(crate) struct OriginalWorktreeEffectContext {
 
 impl OriginalWorktreeEffectContext {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
+    pub(crate) fn new_initial(
+        db: Database,
+        command: NativeCloseCommand,
+        receipt: NativeCloseReceipt,
+        live_source: ConvState,
+        dispatch: FirstCloseRetirementDispatch,
+        source_entry: SourceEntryWorker,
+        deadline: Instant,
+        fatal: Arc<FatalLocalAuthorityFence>,
+    ) -> DbResult<Self> {
+        let request = dispatch.into_request();
+        if !matches!(command.intent(), NativeCloseIntent::Initial { .. })
+            || request.attempt_id != receipt.admitted.attempt_id
+            || request.resource.kind() != RetiredResourceKind::Worktree
+        {
+            return Err(DbError::CloseFoundationPrecondition(
+                "first Worktree dispatch does not match the original Close".into(),
+            ));
+        }
+        Ok(Self::new(
+            db,
+            command,
+            receipt,
+            live_source,
+            request.scope,
+            request.snapshot,
+            request.resource,
+            source_entry,
+            deadline,
+            fatal,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_retry(
+        db: Database,
+        command: NativeCloseCommand,
+        receipt: NativeCloseReceipt,
+        live_source: ConvState,
+        scope: WorkScopeId,
+        snapshot: CloseRetirementSnapshot,
+        resource: RetiredResourceIdentity,
+        source_entry: SourceEntryWorker,
+        deadline: Instant,
+        fatal: Arc<FatalLocalAuthorityFence>,
+    ) -> DbResult<Self> {
+        if !matches!(command.intent(), NativeCloseIntent::ExplicitRetry { .. }) {
+            return Err(DbError::CloseFoundationPrecondition(
+                "only an explicit Retry may enter the retry Worktree continuation".into(),
+            ));
+        }
+        Ok(Self::new(
+            db,
+            command,
+            receipt,
+            live_source,
+            scope,
+            snapshot,
+            resource,
+            source_entry,
+            deadline,
+            fatal,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new(
         db: Database,
         command: NativeCloseCommand,
         receipt: NativeCloseReceipt,

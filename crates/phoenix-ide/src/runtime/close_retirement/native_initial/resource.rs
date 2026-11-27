@@ -19,7 +19,7 @@ use phoenix_db::native_close::{
     NativeCloseCommand, NativeCloseInitialEntryRelease, NativeCloseInitialResourceEntryDecision,
     NativeCloseInitialResourceEntryResult, NativeCloseReceipt,
 };
-use phoenix_db::Database;
+use phoenix_db::{Database, FirstCloseRetirementDispatch};
 use phoenix_terminal::session::{
     EnteredTerminalRetirement, PreparedTerminalRetirement, TerminalRetirementEntryError,
 };
@@ -311,7 +311,16 @@ impl NativeInitialPreparedEntry {
         receipt: &NativeCloseReceipt,
         live_source: &phoenix_core::domain::sm_state::ConvState,
         source_entry: &SourceEntryWorker,
+        dispatch: FirstCloseRetirementDispatch,
     ) -> Result<ResourceObserver, NativeInitialStepError> {
+        let dispatch = dispatch.into_request();
+        if dispatch.attempt_id != self.expected.attempt_id
+            || dispatch.scope != self.expected.scope
+            || dispatch.snapshot != self.expected.snapshot
+            || dispatch.resource != self.expected.resource
+        {
+            return Err(NativeInitialStepError::FatalAuthority);
+        }
         let Self {
             fatal,
             expected,

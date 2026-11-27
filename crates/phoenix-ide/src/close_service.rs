@@ -97,10 +97,10 @@ pub(crate) async fn run_legacy_close_compat(
             } else {
                 state
                     .db
-                    .begin_close_foundation(
+                    .begin_generic_close_settlement(
                         &transcript.product_conversation_id,
                         &expected_latest_transcript,
-                        attempt_id.as_str(),
+                        &attempt_id,
                     )
                     .await
             };
@@ -120,42 +120,16 @@ pub(crate) async fn run_legacy_close_compat(
     };
     loop {
         obligation = match obligation.phase() {
-            ClosePhase::AwaitingBlockerResolution => {
-                if state
-                    .db
-                    .close_attempt_latest_was_busy(obligation.attempt_id().as_str())
-                    .await
-                    .map_err(|error| AppError::Internal(error.to_string()))?
-                {
-                    let awaiting_confirmation = state
-                        .db
-                        .confirm_close_stop_work(obligation.attempt_id().as_str())
-                        .await
-                        .map_err(|error| {
-                            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                                error.to_string(),
-                                "close_start_failed",
-                            )))
-                        })?;
-                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        format!(
-                            "Close attempt {} requires explicit stop-work confirmation",
-                            awaiting_confirmation.attempt_id()
-                        ),
-                        "close_stop_work_confirmation_required",
-                    ))));
-                }
-                state
-                    .db
-                    .begin_close_idle_settlement(obligation.attempt_id().as_str())
-                    .await
-                    .map_err(|error| {
-                        AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                            error.to_string(),
-                            "close_start_failed",
-                        )))
-                    })?
-            }
+            ClosePhase::AwaitingBlockerResolution => state
+                .db
+                .prepare_close_initial_settlement(obligation.attempt_id().as_str())
+                .await
+                .map_err(|error| {
+                    AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        error.to_string(),
+                        "close_start_failed",
+                    )))
+                })?,
             ClosePhase::AwaitingStopWorkConfirmation => {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                     format!(

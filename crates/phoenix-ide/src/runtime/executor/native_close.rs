@@ -602,7 +602,10 @@ impl NativeCloseInitialContinuation {
                 post_retirement::PostRetirementStep::Retiring
                 | post_retirement::PostRetirementStep::Unclassified,
             ) => Ok(NativeCloseInitialContinuationPhase::RuntimeProcessesDone),
-            Ok(post_retirement::PostRetirementStep::Completed(_)) => {
+            Ok(
+                post_retirement::PostRetirementStep::Completed(_)
+                | post_retirement::PostRetirementStep::ObserveExistingDispatch,
+            ) => {
                 self.phase = NativeCloseInitialContinuationPhase::ObservingTerminal;
                 Ok(self.phase)
             }

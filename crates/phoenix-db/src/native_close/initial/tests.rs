@@ -673,6 +673,18 @@ async fn captured_initial_retirement(
     ConvState,
     Vec<CloseExpectedRetirementResource>,
 ) {
+    captured_initial_retirement_with_pty_sessions(f, BTreeSet::new()).await
+}
+
+async fn captured_initial_retirement_with_pty_sessions(
+    f: &Fixture,
+    pty_sessions: BTreeSet<phoenix_core::domain::close::OpaqueIdentity>,
+) -> (
+    NativeCloseCommand,
+    NativeCloseReceipt,
+    ConvState,
+    Vec<CloseExpectedRetirementResource>,
+) {
     let scope = crate::close_foundation::allocate_scope_worktree(&f.db, "first-target").await;
     let (command, receipt, live_source) = prepared_initial(f).await;
     f.db.settle_native_close_initial(&command, &receipt, &live_source)
@@ -709,7 +721,8 @@ async fn captured_initial_retirement(
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(initial_completion_writes(f, &receipt).await, before);
-    let inventory = initial_inventory_request(f, &receipt).await;
+    let mut inventory = initial_inventory_request(f, &receipt).await;
+    inventory.scopes[0].inventory.pty_sessions = pty_sessions;
     // A valid inspected resource is not dispatch authority until the complete
     // original inventory and anchor have been captured atomically.
     let before_dispatch = initial_dispatch_writes(f, &receipt).await;
@@ -1267,7 +1280,7 @@ async fn initial_dispatch_records_exact_resources_and_replays_without_effects_or
                     request.clone(),
                 )
                 .await,
-                LocalAuthorityResult::DurableFactEstablished(Ok(()))
+                LocalAuthorityResult::DurableFactEstablished(Ok(_))
             ));
             let after = initial_dispatch_writes(&f, &receipt).await;
             assert_eq!(after.0, i64::try_from(index + 1).unwrap());
@@ -1289,6 +1302,87 @@ async fn initial_dispatch_records_exact_resources_and_replays_without_effects_or
         initial_completion_writes(&f, &receipt).await,
         completion_before
     );
+}
+
+#[tokio::test]
+async fn process_batch_replay_does_not_commit_other_first_dispatches() {
+    use phoenix_core::domain::close::OpaqueIdentity;
+    let f = Fixture::new().await;
+    let (command, receipt, live_source, expected) = captured_initial_retirement_with_pty_sessions(
+        &f,
+        ["test-pty-a", "test-pty-b"]
+            .into_iter()
+            .map(|id| OpaqueIdentity::parse(id).unwrap())
+            .collect(),
+    )
+    .await;
+    let requests: Vec<_> = expected
+        .iter()
+        .filter(|item| item.resource.kind() == RetiredResourceKind::PtySession)
+        .map(|item| initial_dispatch_request(&receipt, item))
+        .collect();
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(
+        f.db.record_native_close_initial_retirement_dispatch(
+            &command,
+            &receipt,
+            &live_source,
+            requests[1].clone(),
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(CloseRetirementDispatch::First(_)))
+    ));
+    let before = initial_dispatch_writes(&f, &receipt).await;
+    assert_eq!(before.0, 1);
+    assert!(matches!(
+        f.db.record_native_close_initial_process_dispatches(
+            &command,
+            &receipt,
+            &live_source,
+            &requests,
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(CloseRetirementBatchDispatch::Replay))
+    ));
+    assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
+}
+
+#[tokio::test]
+async fn concurrent_original_worktree_dispatches_yield_one_first_owner() {
+    let f = Fixture::new_file_backed().await;
+    let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
+    let worktree = expected
+        .iter()
+        .find(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
+        .unwrap();
+    let request = initial_dispatch_request(&receipt, worktree);
+    let dispatch = || {
+        f.db.record_native_close_initial_retirement_dispatch(
+            &command,
+            &receipt,
+            &live_source,
+            request.clone(),
+        )
+    };
+    let (left, right) = tokio::join!(dispatch(), dispatch());
+    let left = left.established().unwrap().unwrap();
+    let right = right.established().unwrap().unwrap();
+    let owner = match (left, right) {
+        (CloseRetirementDispatch::First(owner), CloseRetirementDispatch::Replay)
+        | (CloseRetirementDispatch::Replay, CloseRetirementDispatch::First(owner)) => owner,
+        other => panic!("expected exactly one first dispatch, got {other:?}"),
+    };
+    let claimed = owner.into_request();
+    assert_eq!(claimed.attempt_id, request.attempt_id);
+    assert_eq!(claimed.scope, request.scope);
+    assert_eq!(claimed.snapshot, request.snapshot);
+    assert_eq!(claimed.resource, request.resource);
+    assert!(matches!(
+        dispatch().await.established().unwrap().unwrap(),
+        CloseRetirementDispatch::Replay
+    ));
+    let (dispatches, _, receipts) = initial_dispatch_writes(&f, &receipt).await;
+    assert_eq!((dispatches, receipts), (1, 0));
 }
 
 #[tokio::test]
@@ -3699,16 +3793,17 @@ async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits
     .established()
     .unwrap()
     .unwrap();
-    f.db.record_native_close_initial_retirement_dispatch(
-        &command,
-        &receipt,
-        &live_source,
-        initial_dispatch_request(&receipt, work_scope),
-    )
-    .await
-    .established()
-    .unwrap()
-    .unwrap();
+    let scope_dispatches = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM close_retirement_resource_dispatches
+             WHERE attempt_id = ?1 AND scope = ?2 AND resource_kind = 'work_scope'",
+        )
+        .bind(receipt.admitted.attempt_id.as_str())
+        .bind(work_scope.scope.as_str())
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap()
+    };
     assert_eq!(lifecycle().await, "active");
     let unresolved =
         f.db.retire_work_scope_for_native_close_initial(
@@ -3737,6 +3832,7 @@ async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits
     .await
     .unwrap();
     assert_eq!(scope_proofs, 0);
+    assert_eq!(scope_dispatches().await, 0);
 
     record_initial_retirement(&f, &command, &receipt, &live_source, worktree).await;
     let retired =
@@ -3758,6 +3854,7 @@ async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits
         ))
     ));
     assert_eq!(lifecycle().await, "retired");
+    assert_eq!(scope_dispatches().await, 1);
     let proof: (String, Option<String>) = sqlx::query_as(
         "SELECT proof_kind, detail FROM close_retirement_resources
          WHERE attempt_id = ?1 AND scope = ?2 AND resource_kind = 'work_scope'",

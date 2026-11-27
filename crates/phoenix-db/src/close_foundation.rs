@@ -1571,6 +1571,29 @@ pub struct RecordCloseRetirementDispatchRequest {
     pub resource: RetiredResourceIdentity,
 }
 
+/// Proof of the first durable dispatch of an exact retirement resource.
+/// Reading or replaying the dispatch row cannot reconstruct it.
+#[derive(Debug)]
+pub struct FirstCloseRetirementDispatch(RecordCloseRetirementDispatchRequest);
+
+impl FirstCloseRetirementDispatch {
+    pub fn into_request(self) -> RecordCloseRetirementDispatchRequest {
+        self.0
+    }
+}
+
+#[derive(Debug)]
+pub enum CloseRetirementDispatch {
+    First(FirstCloseRetirementDispatch),
+    Replay,
+}
+
+#[derive(Debug)]
+pub enum CloseRetirementBatchDispatch {
+    First(Vec<FirstCloseRetirementDispatch>),
+    Replay,
+}
+
 #[derive(Debug, Clone)]
 pub struct RecordCloseWorktreeCleanupPlanRequest {
     pub attempt_id: CloseAttemptId,
@@ -2181,6 +2204,29 @@ impl Database {
         Ok(obligation)
     }
 
+    /// Admit and capture the first settlement phase in the same writer
+    /// transaction. This is a generic ingress: it creates no native receipt.
+    pub async fn begin_generic_close_settlement(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        expected_latest_transcript_id: &TranscriptConversationId,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = Self::begin_close_foundation_inner(
+            &mut tx,
+            product_conversation_id,
+            expected_latest_transcript_id,
+            attempt_id.as_str(),
+            false,
+        )
+        .await?;
+        let obligation =
+            Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn begin_close_foundation_inner(
         tx: &mut Transaction<'_, Sqlite>,
@@ -2449,6 +2495,65 @@ impl Database {
         .execute(&mut **tx)
         .await?;
         Ok(())
+    }
+
+    /// Advances an admitted Initial to its first settlement phase using the
+    /// captured target state, never a state supplied by an ingress adapter.
+    pub async fn prepare_close_initial_settlement(
+        &self,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        let obligation =
+            Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    async fn prepare_generic_close_initial_settlement_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        obligation: CloseObligation,
+    ) -> DbResult<CloseObligation> {
+        let attempt_id = obligation.attempt_id().as_str();
+        Self::require_generic_close_settlement_tx(
+            tx,
+            attempt_id,
+            obligation.product_conversation_id().as_str(),
+        )
+        .await?;
+        Self::prepare_close_initial_settlement_tx(tx, attempt_id).await?;
+        close_obligation_for_update(tx, attempt_id).await
+    }
+
+    pub(crate) async fn prepare_close_initial_settlement_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+    ) -> DbResult<ClosePhase> {
+        let phase = close_obligation_for_update(tx, attempt_id).await?.phase();
+        if phase != ClosePhase::AwaitingBlockerResolution {
+            return Ok(phase);
+        }
+        let captured_state: String = sqlx::query_scalar(
+            "SELECT captured_state_kind
+             FROM close_attempt_members
+             WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+        )
+        .bind(attempt_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        let captured_state = CapturedConversationStateKind::from_db_str(&captured_state)
+            .ok_or_else(|| DbError::Serialization("unknown captured state kind".to_string()))?;
+        let next = if captured_state.is_busy() {
+            ClosePhase::AwaitingStopWorkConfirmation
+        } else {
+            ClosePhase::SettlingActiveWork
+        };
+        set_close_phase_tx(tx, attempt_id, next).await?;
+        if next == ClosePhase::SettlingActiveWork {
+            Self::capture_close_direct_turn_settlement_targets_tx(tx, attempt_id).await?;
+        }
+        Ok(next)
     }
 
     pub async fn confirm_close_stop_work(&self, attempt_id: &str) -> DbResult<CloseObligation> {
@@ -3118,20 +3223,6 @@ impl Database {
         .into_iter()
         .map(parse_close_attempt_member_row)
         .collect()
-    }
-
-    pub async fn close_attempt_latest_was_busy(&self, attempt_id: &str) -> DbResult<bool> {
-        let captured_state: String = sqlx::query_scalar(
-            "SELECT captured_state_kind
-             FROM close_attempt_members
-             WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
-        )
-        .bind(attempt_id)
-        .fetch_one(&self.pool)
-        .await?;
-        let captured_state = CapturedConversationStateKind::from_db_str(&captured_state)
-            .ok_or_else(|| DbError::Serialization("unknown captured state kind".to_string()))?;
-        Ok(captured_state.is_busy())
     }
 
     pub async fn list_close_attempt_scopes(
@@ -4692,7 +4783,7 @@ impl Database {
     pub(crate) async fn insert_close_retirement_dispatch_tx(
         tx: &mut Transaction<'_, Sqlite>,
         request: &RecordCloseRetirementDispatchRequest,
-    ) -> DbResult<()> {
+    ) -> DbResult<CloseRetirementDispatch> {
         Self::require_no_retained_legacy_creation_for_attempt_tx(tx, &request.attempt_id).await?;
         let identity = request.resource.identity();
         let inserted = sqlx::query(
@@ -4712,34 +4803,37 @@ impl Database {
         .bind(Utc::now().timestamp_micros())
         .execute(&mut **tx)
         .await?;
-        if inserted.rows_affected() == 0 {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                     SELECT 1 FROM close_retirement_resource_dispatches
-                     WHERE attempt_id = ?1 AND scope = ?2
-                       AND inspection_generation = ?3 AND inspection_fingerprint = ?4
-                       AND resource_kind = ?5 AND identity_kind = ?6
-                       AND identity_codec = ?7 AND identity_value = ?8
-                 )",
-            )
-            .bind(request.attempt_id.as_str())
-            .bind(request.scope.as_str())
-            .bind(request.snapshot.generation())
-            .bind(request.snapshot.fingerprint())
-            .bind(request.resource.kind().as_str())
-            .bind(identity.identity_kind())
-            .bind(identity.codec())
-            .bind(identity.value())
-            .fetch_one(&mut **tx)
-            .await?;
-            if !exists {
-                return Err(close_precondition(format!(
-                    "attempt {} dispatch resource is not in the exact sealed inventory",
-                    request.attempt_id
-                )));
-            }
+        if inserted.rows_affected() == 1 {
+            return Ok(CloseRetirementDispatch::First(FirstCloseRetirementDispatch(
+                request.clone(),
+            )));
         }
-        Ok(())
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM close_retirement_resource_dispatches
+                 WHERE attempt_id = ?1 AND scope = ?2
+                   AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+                   AND resource_kind = ?5 AND identity_kind = ?6
+                   AND identity_codec = ?7 AND identity_value = ?8
+             )",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_one(&mut **tx)
+        .await?;
+        if !exists {
+            return Err(close_precondition(format!(
+                "attempt {} dispatch resource is not in the exact sealed inventory",
+                request.attempt_id
+            )));
+        }
+        Ok(CloseRetirementDispatch::Replay)
     }
 
     pub(crate) async fn record_close_worktree_cleanup_plan_tx(
@@ -11075,10 +11169,39 @@ mod tests {
 
         set_state(&db, "root", ConvState::Idle).await;
 
-        assert!(db
-            .close_attempt_latest_was_busy(obligation.attempt_id().as_str())
+        let prepared = db
+            .prepare_close_initial_settlement(obligation.attempt_id().as_str())
             .await
-            .unwrap());
+            .unwrap();
+        assert_eq!(prepared.phase(), ClosePhase::AwaitingStopWorkConfirmation);
+    }
+
+    #[tokio::test]
+    async fn concurrent_generic_close_admission_captures_direct_turns_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settlement.sqlite");
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
+        create_root(&db, "root").await;
+        let product = product_id("root");
+        let latest = transcript_id("root");
+        let attempt = CloseAttemptId::parse("attempt-idle").unwrap();
+        let (first, second) = tokio::join!(
+            db.begin_generic_close_settlement(&product, &latest, &attempt),
+            db.begin_generic_close_settlement(&product, &latest, &attempt),
+        );
+        for prepared in [first, second] {
+            assert_eq!(prepared.unwrap().phase(), ClosePhase::SettlingActiveWork);
+        }
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_attempt_direct_turn_settlement_captures
+             WHERE attempt_id = 'attempt-idle'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]

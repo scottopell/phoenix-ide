@@ -874,6 +874,7 @@ impl Database {
             },
         )
         .await
+        .map(|_| ())
     }
 
     /// Retires one pending original `WorkScope` under the live native retry authority.

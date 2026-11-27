@@ -17,7 +17,8 @@ use crate::workflow::LocalAuthorityResult;
 use crate::{
     BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     CaptureCloseRetirementInventoryRequest, CloseCleanupFailureAuthority,
-    CloseCleanupFailureResource, CloseCleanupResourceDisposition, Database, DbError, DbResult,
+    CloseCleanupFailureResource, CloseCleanupResourceDisposition, CloseRetirementBatchDispatch,
+    CloseRetirementDispatch, Database, DbError, DbResult,
     RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
     RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
     TerminalizeInitialCloseCleanupFailureRequest, WorkScopeRetirementBlocker,
@@ -277,7 +278,7 @@ enum InitialWorktreeMetadata {
     TombstoneObject(BindCloseWorktreeFinalTombstoneObjectRequest),
 }
 
-async fn require_initial_original_dispatch_tx(
+async fn require_initial_original_resource_tx(
     tx: &mut Transaction<'_, Sqlite>,
     admitted: &NativeCloseRunRef,
     scope: &WorkScopeId,
@@ -332,6 +333,17 @@ async fn require_initial_original_dispatch_tx(
             "initial metadata resource is not in the exact original inventory".into(),
         ));
     }
+    Ok(expected)
+}
+
+async fn require_initial_original_dispatch_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    admitted: &NativeCloseRunRef,
+    scope: &WorkScopeId,
+    snapshot: &phoenix_core::domain::close::CloseRetirementSnapshot,
+    resource: &RetiredResourceIdentity,
+) -> DbResult<Vec<CloseExpectedRetirementResource>> {
+    let expected = require_initial_original_resource_tx(tx, admitted, scope, snapshot, resource).await?;
     let identity = resource.identity();
     let dispatched: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches
@@ -862,7 +874,7 @@ impl Database {
                     "initial WorkScope retirement requires its exact opaque scope identity".into(),
                 ));
             }
-            let expected = require_initial_original_dispatch_tx(
+            let expected = require_initial_original_resource_tx(
                 &mut tx, &admitted, &scope, &snapshot, &resource,
             )
             .await?;
@@ -909,6 +921,18 @@ impl Database {
                     WorkScopeRetirementBlocker::CoordinatorOwned,
                 ));
             }
+            // WorkScope retirement and its proof are SQL-only. The dispatch
+            // must not commit independently of that mutation and proof.
+            Self::insert_close_retirement_dispatch_tx(
+                &mut tx,
+                &RecordCloseRetirementDispatchRequest {
+                    attempt_id: admitted.attempt_id.clone(),
+                    scope: scope.clone(),
+                    snapshot: snapshot.clone(),
+                    resource: resource.clone(),
+                },
+            )
+            .await?;
             let outcome = Database::retire_work_scope_lifecycle_tx(
                 &mut tx,
                 precondition,
@@ -1097,7 +1121,7 @@ impl Database {
         receipt: &NativeCloseReceipt,
         live_source: &phoenix_core::domain::sm_state::ConvState,
         request: RecordCloseRetirementDispatchRequest,
-    ) -> LocalAuthorityResult<DbResult<()>> {
+    ) -> LocalAuthorityResult<DbResult<CloseRetirementDispatch>> {
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
@@ -1162,14 +1186,87 @@ impl Database {
         }
         .await;
         match result {
-            Ok(()) => match tx.commit().await {
-                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+            Ok(dispatch) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(dispatch)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
             },
             Err(error) => match tx.rollback().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
             },
+        }
+    }
+
+    /// Claims a process-kind batch together. If any member is already dispatched,
+    /// roll back the entire batch instead of stranding new claims without an owner.
+    pub async fn record_native_close_initial_process_dispatches(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        requests: &[RecordCloseRetirementDispatchRequest],
+    ) -> LocalAuthorityResult<DbResult<CloseRetirementBatchDispatch>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let (admitted, _) = require_initial_execution_tx(
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                ClosePhase::RetirementRequested,
+            )
+            .await?;
+            let Some(first) = requests.first() else {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial process dispatch requires a nonempty batch".into(),
+                ));
+            };
+            let expected = require_initial_original_resource_tx(
+                &mut tx,
+                &admitted,
+                &first.scope,
+                &first.snapshot,
+                &first.resource,
+            )
+            .await?;
+            let kind = first.resource.kind();
+            let inventory = expected.iter().filter(|item| {
+                item.scope == first.scope && item.resource.kind() == kind
+            });
+            if matches!(kind, RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope)
+                || inventory.clone().count() != requests.len()
+                || !inventory.clone().all(|item| requests.iter().any(|request| {
+                    request.attempt_id == item.attempt_id
+                        && request.scope == item.scope
+                        && request.snapshot == item.snapshot
+                        && request.resource == item.resource
+                }))
+            {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial process dispatch batch must match the exact process-kind inventory".into(),
+                ));
+            }
+            let mut claimed = Vec::with_capacity(requests.len());
+            for request in requests {
+                match Self::insert_close_retirement_dispatch_tx(&mut tx, request).await? {
+                    CloseRetirementDispatch::First(dispatch) => claimed.push(dispatch),
+                    CloseRetirementDispatch::Replay => return Ok(CloseRetirementBatchDispatch::Replay),
+                }
+            }
+            Ok(CloseRetirementBatchDispatch::First(claimed))
+        }
+        .await;
+        let finalized = if matches!(&result, Ok(CloseRetirementBatchDispatch::First(_))) {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match finalized {
+            Ok(()) => LocalAuthorityResult::DurableFactEstablished(result),
+            Err(_) => LocalAuthorityResult::DurableFactUnclassified,
         }
     }
 
@@ -2096,7 +2193,7 @@ async fn prepare_initial_execution_tx(
     receipt: &NativeCloseReceipt,
     live_source: &phoenix_core::domain::sm_state::ConvState,
 ) -> DbResult<NativeCloseInitialExecution> {
-    let (admitted, busy) = require_initial_execution_tx(
+    let (admitted, _) = require_initial_execution_tx(
         tx,
         command,
         receipt,
@@ -2104,21 +2201,8 @@ async fn prepare_initial_execution_tx(
         phoenix_core::domain::close::ClosePhase::AwaitingBlockerResolution,
     )
     .await?;
-    let next_phase = if busy {
-        phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation
-    } else {
-        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-    };
-    super::super::close_foundation::set_close_phase_tx(
-        tx,
-        admitted.attempt_id.as_str(),
-        next_phase,
-    )
-    .await?;
-    if !busy {
-        Database::capture_close_direct_turn_settlement_targets_tx(tx, admitted.attempt_id.as_str())
-            .await?;
-    }
+    let next_phase =
+        Database::prepare_close_initial_settlement_tx(tx, admitted.attempt_id.as_str()).await?;
     Ok(NativeCloseInitialExecution {
         run: admitted,
         phase: next_phase,

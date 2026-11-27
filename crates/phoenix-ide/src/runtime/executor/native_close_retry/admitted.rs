@@ -629,7 +629,7 @@ impl AdmittedRetryCursor {
                         match prepared {
                             Ok(Ok(Some(prepared))) if current => {
                                 let effect = self.effect().clone();
-                                let original = OriginalWorktreeEffectContext::new(
+                                let original = OriginalWorktreeEffectContext::new_retry(
                                     self.backend.db().clone(),
                                     self.command.clone(),
                                     self.receipt.clone(),
@@ -641,7 +641,10 @@ impl AdmittedRetryCursor {
                                     self.deadline,
                                     Arc::clone(&self.backend.fatal_local_authority_fence),
                                 );
-                                match prepared.into_continuation(original) {
+                                match original
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|original| prepared.into_continuation(original))
+                                {
                                     Ok(continuation) => {
                                         let probe = self.backend.native_retry_close_writer_probe(
                                             &self.receipt,
