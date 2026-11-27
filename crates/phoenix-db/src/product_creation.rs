@@ -2934,7 +2934,7 @@ impl Database {
         if let Some((reserved_id, product_id, transcript_id)) = staged {
             let owned = Self::owned_hidden_creation_aggregate(&mut tx, &reserved_id).await?;
             if product_id.as_deref() != Some(reserved_id.as_str())
-                || !owned.is_some_and(|(id, _)| Some(id) == transcript_id)
+                || owned.is_none_or(|(id, _)| Some(id) != transcript_id)
             {
                 return Ok(false);
             }
