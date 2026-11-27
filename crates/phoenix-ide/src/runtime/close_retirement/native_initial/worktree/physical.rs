@@ -732,23 +732,19 @@ impl PhysicalDeletionDriver<'_> {
         } else {
             probe
         };
-        let evidence = probe.observe_and_retain_until(
-            object,
-            self.deadline(),
-            |path, deadline| {
-                #[cfg(all(test, target_os = "linux"))]
-                if let Some((observation, scanned_path)) = injected {
-                    let _ = scanned_path.send(path.to_path_buf());
-                    use super::super::super::ExternalWriterEvidence;
-                    return Ok(ExternalWriterEvidence::Observed(observation));
-                }
-                quarantine_has_external_writer_until_with_self_descriptor(
-                    path,
-                    deadline,
-                    self_descriptor,
-                )
-            },
-        );
+        let evidence = probe.observe_and_retain_until(object, self.deadline(), |path, deadline| {
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some((observation, scanned_path)) = injected {
+                let _ = scanned_path.send(path.to_path_buf());
+                use super::super::super::ExternalWriterEvidence;
+                return Ok(ExternalWriterEvidence::Observed(observation));
+            }
+            quarantine_has_external_writer_until_with_self_descriptor(
+                path,
+                deadline,
+                self_descriptor,
+            )
+        });
         if self
             .custody
             .writer_probe

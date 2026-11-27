@@ -964,10 +964,16 @@ async fn assert_final_gap_failure(
     assert_eq!(success_count, 0);
     let worktree = effects
         .iter()
-        .find(|effect| &effect.scope == scope && effect.resource.kind() == RetiredResourceKind::Worktree)
+        .find(|effect| {
+            &effect.scope == scope && effect.resource.kind() == RetiredResourceKind::Worktree
+        })
         .unwrap();
     assert_eq!(
-        fixture.db.list_close_writer_observations(run, scope).await.unwrap(),
+        fixture
+            .db
+            .list_close_writer_observations(run, scope)
+            .await
+            .unwrap(),
         vec![RecordCloseWriterObservationRequest {
             run: run.clone(),
             scope: scope.clone(),
@@ -985,8 +991,14 @@ async fn assert_final_gap_failure(
         .list_close_cleanup_failures(run.attempt_id.as_str())
         .await
         .unwrap();
-    let failure = failures.iter().find(|entry| entry.run_ordinal == run.ordinal).unwrap();
-    assert_eq!(failure.occurrence.failure_occurrence_id, run.failure_occurrence_id());
+    let failure = failures
+        .iter()
+        .find(|entry| entry.run_ordinal == run.ordinal)
+        .unwrap();
+    assert_eq!(
+        failure.occurrence.failure_occurrence_id,
+        run.failure_occurrence_id()
+    );
     assert_eq!(
         failure.occurrence.authority,
         CloseCleanupFailureAuthority::ExpectedResource {
@@ -1005,12 +1017,29 @@ async fn assert_final_gap_failure(
     assert!(!detail.contains("external writer holds"));
     assert!(detail.contains(&moved.display().to_string()));
     assert_eq!(
-        fixture.db.get_close_obligation(run.attempt_id.as_str()).await.unwrap().close_outcome(),
+        fixture
+            .db
+            .get_close_obligation(run.attempt_id.as_str())
+            .await
+            .unwrap()
+            .close_outcome(),
         Some(CloseCompletionOutcome::CloseIncomplete),
     );
-    assert!(!fixture.db.get_conversation(TARGET_ID).await.unwrap().archived);
+    assert!(
+        !fixture
+            .db
+            .get_conversation(TARGET_ID)
+            .await
+            .unwrap()
+            .archived
+    );
     assert_eq!(
-        fixture.db.get_conversation_work_scope_context(TARGET_ID).await.unwrap().1,
+        fixture
+            .db
+            .get_conversation_work_scope_context(TARGET_ID)
+            .await
+            .unwrap()
+            .1,
         WorkScopeLifecycle::Active,
     );
     let receipt_id = format!("close-run-outcome:{}:{}", run.ordinal.get(), run.attempt_id);
