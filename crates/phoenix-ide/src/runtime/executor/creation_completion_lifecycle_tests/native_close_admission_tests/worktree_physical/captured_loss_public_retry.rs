@@ -1016,6 +1016,10 @@ async fn assert_final_gap_failure(
     assert!(detail.contains("external writer inspection gap blocks explicit Retry"));
     assert!(!detail.contains("external writer holds"));
     assert!(detail.contains(&moved.display().to_string()));
+    assert_cleanup_attention_receipt(fixture, run).await;
+}
+
+async fn assert_cleanup_attention_receipt(fixture: &CloseFixture, run: &CloseRunRef) {
     assert_eq!(
         fixture
             .db

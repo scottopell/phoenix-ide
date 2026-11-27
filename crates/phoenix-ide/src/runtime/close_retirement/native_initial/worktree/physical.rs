@@ -21,8 +21,13 @@ use phoenix_core::{
 };
 use phoenix_db::validate_close_retirement_inspection_aggregate;
 
+#[cfg(all(test, target_os = "linux"))]
+use crate::runtime::executor::native_close_retry::test_hooks::Hooks;
+
 use std::path::{Path, PathBuf};
 
+#[cfg(all(test, target_os = "linux"))]
+use super::super::super::ExternalWriterEvidence;
 use super::super::super::{
     ensure_no_ignored_content_with_status_leaf_until, inspect_worktree_at_with_git_leaf_until,
     observe_administrative_dir_incarnation,
@@ -719,7 +724,7 @@ impl PhysicalDeletionDriver<'_> {
         let injected = original
             .test_hooks
             .as_ref()
-            .and_then(|hooks| hooks.take_final_writer_gap());
+            .and_then(Hooks::take_final_writer_gap);
         // Earlier probes can use the clean fixture. This final observation must
         // go through the same retain-before-veto path as a real detector result.
         #[cfg(all(test, target_os = "linux"))]
@@ -736,7 +741,6 @@ impl PhysicalDeletionDriver<'_> {
             #[cfg(all(test, target_os = "linux"))]
             if let Some((observation, scanned_path)) = injected {
                 let _ = scanned_path.send(path.to_path_buf());
-                use super::super::super::ExternalWriterEvidence;
                 return Ok(ExternalWriterEvidence::Observed(observation));
             }
             quarantine_has_external_writer_until_with_self_descriptor(
