@@ -88,6 +88,11 @@ async fn registered_native_close_with_loss_content_stops_incomplete_without_reti
 }
 
 #[tokio::test]
+async fn registered_native_close_preserves_origin_only_fetched_pin() {
+    run_public_worktree_close(WorktreeJourney::OriginOnlyFetchedPinBlocker).await;
+}
+
+#[tokio::test]
 async fn registered_native_close_with_reflog_only_commit_stops_incomplete_without_retirement() {
     run_public_worktree_close(WorktreeJourney::ReflogOnlyBlocker).await;
 }
@@ -181,6 +186,7 @@ enum WorktreeJourney {
     CapturedLossPublicRetryResumedDuringPhysicalMutation,
     RetainContentBlockers,
     ReflogOnlyBlocker,
+    OriginOnlyFetchedPinBlocker,
     ReinspectCapturedLossAfterCleanup,
     RetryLossClassification,
     StopBeforeAdmission,
@@ -367,6 +373,92 @@ impl DisposableGit {
         );
         git.original_registrations = git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]);
         git
+    }
+
+    fn prepare_origin_only_fetched_pin(&mut self) -> phoenix_core::domain::close::GitOidIdentity {
+        let origin = self.root.join("origin.git");
+        let origin_checkout = self.root.join("origin checkout");
+        self.run(
+            &self.root,
+            &[
+                "clone",
+                "--bare",
+                self.repo.to_str().unwrap(),
+                origin.to_str().unwrap(),
+            ],
+        );
+        self.run(
+            &self.root,
+            &["clone", origin.to_str().unwrap(), origin_checkout.to_str().unwrap()],
+        );
+        self.run(
+            &origin_checkout,
+            &["config", "user.name", "Disposable Origin Fixture"],
+        );
+        self.run(
+            &origin_checkout,
+            &["config", "user.email", "origin-fixture@example.invalid"],
+        );
+        std::fs::write(origin_checkout.join("origin-only.txt"), b"origin pin\n").unwrap();
+        self.run(&origin_checkout, &["add", "--", "origin-only.txt"]);
+        self.run(&origin_checkout, &["commit", "-m", "Origin-only pin"]);
+        let oid = self.run(&origin_checkout, &["rev-parse", "HEAD"]);
+        let oid = std::str::from_utf8(&oid).unwrap().trim().to_owned();
+        self.run(&origin_checkout, &["push", "origin", "HEAD:refs/heads/pin"]);
+        assert_eq!(
+            self.run(&origin, &["rev-parse", "refs/heads/pin"]),
+            format!("{oid}\n").as_bytes(),
+            "the fetched pin is an actual origin commit"
+        );
+        let refs_before = self.run(
+            &self.repo,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+        let origin_path = origin.to_str().unwrap();
+        self.run(&self.repo, &["remote", "add", "origin", origin_path]);
+        self.run(
+            &self.repo,
+            &[
+                "fetch",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "--refmap=",
+                "origin",
+                &oid,
+            ],
+        );
+        assert_eq!(
+            self.run(
+                &self.repo,
+                &["for-each-ref", "--format=%(refname) %(objectname)"],
+            ),
+            refs_before,
+            "fetching the exact advertised OID must not update local refs"
+        );
+        assert_eq!(
+            self.run(&self.repo, &["cat-file", "-t", &oid]),
+            b"commit\n",
+            "fetch makes the origin commit available by OID"
+        );
+        let target = self.worktree.to_str().unwrap();
+        self.run(&self.repo, &["worktree", "remove", target]);
+        self.run(&self.repo, &["worktree", "add", "--detach", target, &oid]);
+        self.worktree = self.worktree.canonicalize().unwrap();
+        self.admin = self.administrative_directory(&self.worktree);
+        self.checkout_identity = directory_identity(&self.worktree);
+        self.admin_identity = directory_identity(&self.admin);
+        self.fingerprint = phoenix_core::git::observe_linked_worktree_fingerprint(&self.worktree)
+            .expect("fetched-pin fixture has a linked worktree fingerprint");
+        assert_eq!(
+            self.run(&self.worktree, &["rev-parse", "HEAD"]),
+            format!("{oid}\n").as_bytes()
+        );
+        assert!(self
+            .run(&self.worktree, &["status", "--porcelain=v1", "--ignored"])
+            .is_empty());
+        self.original_registrations =
+            self.run(&self.repo, &["worktree", "list", "--porcelain", "-z"]);
+        phoenix_core::domain::close::GitOidIdentity::parse_hex(&oid).unwrap()
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -822,6 +914,11 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     use tokio_util::sync::CancellationToken;
 
     let mut git = DisposableGit::new();
+    let origin_only_fetched_pin = if matches!(journey, WorktreeJourney::OriginOnlyFetchedPinBlocker) {
+        Some(git.prepare_origin_only_fetched_pin())
+    } else {
+        None
+    };
     // Start at ancestor A, create C, then leave HEAD at A. C has no ref and is
     // reachable only through this linked checkout's HEAD reflog.
     let reflog_only_commit = if matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
@@ -877,6 +974,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         journey,
         WorktreeJourney::RetainContentBlockers
             | WorktreeJourney::ReflogOnlyBlocker
+            | WorktreeJourney::OriginOnlyFetchedPinBlocker
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
             | WorktreeJourney::CapturedLossPublicRetryWithProductionDetector
@@ -888,7 +986,10 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation
     );
     if content_blocked {
-        if !matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
+        if !matches!(
+            journey,
+            WorktreeJourney::ReflogOnlyBlocker | WorktreeJourney::OriginOnlyFetchedPinBlocker
+        ) {
             std::fs::create_dir_all(git.repo.join(".git/info")).unwrap();
             std::fs::write(git.repo.join(".git/info/exclude"), b"build/\n").unwrap();
             std::fs::create_dir(git.worktree.join("build")).unwrap();
@@ -910,6 +1011,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         WorktreeJourney::Retire
             | WorktreeJourney::RetainContentBlockers
             | WorktreeJourney::ReflogOnlyBlocker
+            | WorktreeJourney::OriginOnlyFetchedPinBlocker
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation
@@ -1239,13 +1341,13 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             .unwrap();
         assert_eq!(
             losses.len(),
-            if reflog_only_commit.is_some() {
+            if reflog_only_commit.is_some() || origin_only_fetched_pin.is_some() {
                 1
             } else {
                 3 + usize::from(public_captured_retry)
             }
         );
-        if let Some(commit) = &reflog_only_commit {
+        if let Some(commit) = reflog_only_commit.as_ref().or(origin_only_fetched_pin.as_ref()) {
             assert!(losses.iter().any(|loss| {
                 loss.scope == scope
                     && loss.item == CloseLossItem::DetachedUnreachableCommit(commit.clone())
@@ -1261,7 +1363,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             }));
             captured_retry_run = Some(run.clone());
         }
-        if reflog_only_commit.is_none() {
+        if reflog_only_commit.is_none() && origin_only_fetched_pin.is_none() {
             for item in [
                 CloseLossItem::UnstagedTrackedPath(GitPathIdentity::from_bytes(
                     b"tracked.txt".to_vec(),
@@ -1316,6 +1418,25 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         assert_eq!(physical_snapshot(&git.root), physical_before_admission);
         assert_eq!(directory_identity(&git.worktree), git.checkout_identity);
         assert_eq!(directory_identity(&git.admin), git.admin_identity);
+        if let Some(pin) = origin_only_fetched_pin.as_ref() {
+            let pin = pin.as_hex();
+            assert_eq!(
+                git.run(&git.worktree, &["rev-parse", "HEAD"]),
+                format!("{pin}\n").as_bytes(),
+                "the untouched target remains checked out directly at the fetched OID"
+            );
+            assert!(
+                git.worktree.is_dir(),
+                "the exact target checkout remains present"
+            );
+            assert!(
+                git.admin.is_dir(),
+                "the exact target registration remains present"
+            );
+            assert!(git
+                .run(&git.worktree, &["status", "--porcelain=v1", "--ignored"])
+                .is_empty());
+        }
         if matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
             assert_eq!(
                 git.run(&git.worktree, &["rev-parse", "HEAD"]),

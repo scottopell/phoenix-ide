@@ -2714,6 +2714,109 @@ mod product_creation_delivery_replay_tests {
     }
 
     #[tokio::test]
+    async fn reopened_creation_reuses_fetched_pin_when_origin_is_unavailable() {
+        let (_directory, repo) = initialized_product_repository();
+        let fixture = tempfile::tempdir().unwrap();
+        let origin = fixture.path().join("origin.git");
+        let publisher = fixture.path().join("publisher");
+        let database = fixture.path().join("phoenix.db");
+        let database = database.to_str().unwrap();
+        let git = |cwd: &Path, args: &[&str]| crate::git_ops::run_git(cwd, args).unwrap();
+        git(&repo, &["clone", "--bare", ".", origin.to_str().unwrap()]);
+        git(&origin, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&repo, &["remote", "add", "origin", origin.to_str().unwrap()]);
+        git(&repo, &["fetch", "origin"]);
+        let fetch_head = repo.join(".git/FETCH_HEAD");
+        let fetch_head_before = std::fs::read(&fetch_head).unwrap();
+        assert!(!fetch_head_before.is_empty());
+        let refs = [
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(symref)",
+        ];
+        let refs_before = git(&repo, &refs);
+        git(
+            fixture.path(),
+            &[
+                "clone",
+                origin.to_str().unwrap(),
+                publisher.to_str().unwrap(),
+            ],
+        );
+        git(
+            &publisher,
+            &[
+                "-c",
+                "user.name=Product Creation Test",
+                "-c",
+                "user.email=product-creation@example.invalid",
+                "-c",
+                "commit.gpgSign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "origin-only pin",
+            ],
+        );
+        git(&publisher, &["push", "origin", "HEAD:refs/heads/main"]);
+        let advertised = git(&publisher, &["rev-parse", "HEAD"]);
+        assert!(crate::git_ops::run_git(&repo, &["cat-file", "-e", advertised.trim()]).is_err());
+        let (oid, base) = strict_product_creation_pin(&repo).unwrap();
+        assert_eq!(oid, advertised.trim());
+
+        let db = Database::open_migrated_for_test(database).await.unwrap();
+        let request_id = "restart-fetched-pin";
+        let first = accept_and_claim_product_at(&db, request_id, &repo).await;
+        assert!(matches!(
+            db.pin_product_creation_once(request_id, &first.claim, &oid, &base, "fresh")
+                .await
+                .unwrap(),
+            crate::db::ProductCreationPinOutcome::Pinned(_)
+        ));
+        let worktree =
+            product_worktree_path(&repo, first.job.product_conversation_id.as_str()).unwrap();
+        assert!(!worktree.exists());
+        db.pool().close().await;
+        drop(db);
+        std::fs::rename(&origin, fixture.path().join("offline.git")).unwrap();
+        assert!(strict_product_creation_pin(&repo).is_err());
+
+        let db = Database::open(database).await.unwrap();
+        let resumed = db
+            .claim_product_creation(
+                request_id,
+                "restarted-worker",
+                "new-claim",
+                first.claim.lease_until + chrono::Duration::seconds(1),
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(resumed.claim.generation > first.claim.generation);
+        assert_eq!(
+            resumed.job.product_conversation_id,
+            first.job.product_conversation_id
+        );
+        assert_eq!(
+            resumed.job.pin_exact_checkout_oid.as_deref(),
+            Some(oid.as_str())
+        );
+        let manager = test_runtime_manager(db.clone());
+        let result = Box::pin(process_product_creation_until_closed(&manager, resumed)).await;
+        let job = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(job.published_conversation_id.is_some(), "{result:?}");
+        assert_eq!(job.pin_exact_checkout_oid.as_deref(), Some(oid.as_str()));
+        assert_eq!(job.pin_logical_base.as_deref(), Some(base.as_str()));
+        crate::api::handlers::validate_detached_task_worktree(&worktree, &oid).unwrap();
+        assert_eq!(git(&repo, &refs), refs_before);
+        assert_eq!(std::fs::read(fetch_head).unwrap(), fetch_head_before);
+    }
+
+    #[tokio::test]
     async fn cancellation_while_waiting_for_repository_lock_fences_late_pin_and_stage() {
         use phoenix_db::ProductCreationProvisioningStage as Stage;
         let (_directory, repo) = initialized_product_repository();
