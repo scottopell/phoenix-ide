@@ -43,6 +43,7 @@ jobs:
           /usr/bin/unshare --version
           /usr/bin/setpriv --version
       - name: Build and record reviewed source as the runner
+        id: prepare
         shell: bash
         run: |
           set -euo pipefail
@@ -80,6 +81,7 @@ jobs:
           grep -E '^  ✓ git_lifecycle_public_http +[0-9.]+s$' "$evidence/git-lifecycle-http.log"
           grep -F '✓ all 1 e2e scenarios passed' "$evidence/git-lifecycle-http.log"
       - name: Build and run the existing live-writer rejection control
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail

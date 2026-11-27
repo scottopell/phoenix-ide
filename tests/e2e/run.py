@@ -3026,14 +3026,14 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.self_test:
         return _run_self_tests()
-    if _run_self_tests() != 0:
-        return 1
     binary = BINARY
     if args.isolated_git_lifecycle:
         selected_scenarios = _select_scenarios(["git_lifecycle_public_http"])
         binary = Path.cwd() / "runtime-test"
         expected_sha = (Path(__file__).parent / "source.sha").read_text().strip()
     else:
+        if _run_self_tests() != 0:
+            return 1
         selected_scenarios = _select_scenarios(args.scenario)
         _build_binary()
     failures: list[tuple[str, str]] = []
