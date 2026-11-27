@@ -708,16 +708,17 @@ impl PhysicalDeletionDriver<'_> {
         object: &Path,
         self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
     ) -> Result<(), String> {
-        let evidence =
-            self.custody
-                .writer_probe
-                .observe_until(object, self.deadline(), |path, deadline| {
-                    quarantine_has_external_writer_until_with_self_descriptor(
-                        path,
-                        deadline,
-                        self_descriptor,
-                    )
-                });
+        let evidence = self.custody.writer_probe.observe_and_retain_until(
+            object,
+            self.deadline(),
+            |path, deadline| {
+                quarantine_has_external_writer_until_with_self_descriptor(
+                    path,
+                    deadline,
+                    self_descriptor,
+                )
+            },
+        );
         if self
             .custody
             .writer_probe
@@ -727,7 +728,9 @@ impl PhysicalDeletionDriver<'_> {
         {
             retain_unclassified_physical(self.custody);
         }
-        if evidence?.blocks_retirement() {
+        // Only positive external authority vetoes this admitted physical step.
+        // Target checks and persistence errors are never process-inspection gaps.
+        if evidence?.is_positive() {
             return Err(format!(
                 "external writer holds confirmed worktree at {}; durable evidence retained",
                 object.display()
@@ -919,6 +922,19 @@ impl WorktreeDeletionDriver for PhysicalDeletionDriver<'_> {
         }
         self.check_external_writers(object, self_descriptor)?;
         self.verify_confirmed_snapshot()?;
+        #[cfg(test)]
+        {
+            use crate::runtime::executor::native_close_retry::test_hooks::{checkpoint, Point};
+
+            let hooks = self
+                .custody
+                .git
+                .original_effect
+                .as_ref()
+                .and_then(|context| context.test_hooks.as_ref());
+            self.runtime
+                .block_on(checkpoint(hooks, Point::PhysicalBeforeCheckoutRemoval));
+        }
         require_absent(self.location().original_path())
     }
 }

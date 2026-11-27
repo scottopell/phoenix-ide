@@ -173,6 +173,43 @@ jobs:
           printf 'PHOENIX_RUNTIME_TEST_BINARY=%s\n' "$runtime_test_binary" >> "$GITHUB_ENV"
           (cd crates/phoenix-ide && "$runtime_test_binary" --list) 2>&1 | tee evidence/runtime-inventory.log
           grep -E 'native_close_application::tests::.*: test$|native_close_admission_tests::.*: test$' evidence/runtime-inventory.log > evidence/runtime-selected-tests.txt
+      - name: Required production writer detection on the ordinary Linux runner
+        if: success() || failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          test -n "${PHOENIX_RUNTIME_TEST_BINARY:-}"
+          for test_name in \
+            runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_with_production_detector_retires_worktree_and_replays \
+            runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_refuses_a_live_writable_descriptor \
+            runtime::close_retirement::tests::linux_writer_scan_keeps_searching_after_an_unavailable_process \
+            runtime::close_retirement::tests::linux_mapping_scan_requires_writable_shared_authority; do
+            grep -Fx "$test_name: test" evidence/runtime-inventory.log
+            (
+              cd crates/phoenix-ide
+              # Keep an unrelated, same-UID process alive whose /proc/PID/exe
+              # cannot be read. No target handle, namespaces, sudo or UID change.
+              timeout --kill-after=10s 6m python3 - "$PHOENIX_RUNTIME_TEST_BINARY" "$test_name" --exact --show-output --test-threads=1 <<'PYTHON'
+          import ctypes
+          import os
+          import subprocess
+          import sys
+
+          PR_SET_DUMPABLE = 4
+          libc = ctypes.CDLL(None, use_errno=True)
+          if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
+              raise OSError(ctypes.get_errno(), "cannot create disposable opaque process")
+          env = dict(os.environ, PHOENIX_TEST_OPAQUE_CLOSE_PID=str(os.getpid()))
+          raise SystemExit(subprocess.call(sys.argv[1:], env=env))
+          PYTHON
+            ) 2>&1 | tee "evidence/ordinary-linux-${test_name##*::}.log"
+            grep -F "$test_name ... ok" "evidence/ordinary-linux-${test_name##*::}.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "evidence/ordinary-linux-${test_name##*::}.log"
+            if [[ "$test_name" == *::registered_native_close_with_production_detector_retires_worktree_and_replays ]]; then
+              grep -F 'ordinary Linux: opaque process witnessed; durable gap precedes removal of the exact checkout and registration' "evidence/ordinary-linux-${test_name##*::}.log"
+            fi
+          done
       - name: Required public Worktree retirement with production writer detector
         if: success() || failure()
         shell: bash
@@ -981,7 +1018,6 @@ jobs:
             directory_child_swap_after_inspection_preserves_replacement_for_needs_repair
             file_child_swap_after_inspection_preserves_replacement_for_needs_repair
             detached_unreachable_commits_until_rejects_expired_deadline_before_repository_access
-            detached_head_is_unreachable_rejects_expired_deadline_before_repository_access
             detached_reachability_evidence_until_rejects_expired_deadline_before_repository_access
             staged_index_query_materializes_only_requested_dirty_paths
             detached_unreachable_commits_excludes_the_exact_stash_ref

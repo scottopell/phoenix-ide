@@ -12,6 +12,7 @@ pub(crate) enum Point {
     WorktreeDispatchBeforeWriter,
     WorktreePreparationReady,
     PhysicalBeforeMutation,
+    PhysicalBeforeCheckoutRemoval,
     PhysicalBeforeObservation,
 }
 
