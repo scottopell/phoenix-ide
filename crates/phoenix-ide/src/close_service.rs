@@ -4,6 +4,22 @@ use crate::api::handlers::AppError;
 use crate::api::{AppState, ConflictErrorResponse};
 use phoenix_core::domain::close::TranscriptConversationId;
 
+pub(crate) async fn require_close_settlement_without_retained_custody(
+    state: &AppState,
+    attempt_id: &phoenix_core::domain::close::CloseAttemptId,
+) -> Result<(), AppError> {
+    state
+        .db
+        .require_no_retained_legacy_creation_for_retirement(attempt_id)
+        .await
+        .map_err(|error| match error {
+            crate::db::DbError::CloseFoundationPrecondition(detail) => AppError::Conflict(
+                Box::new(ConflictErrorResponse::new(detail, "close_settlement_in_progress")),
+            ),
+            error => AppError::Internal(error.to_string()),
+        })
+}
+
 #[allow(clippy::too_many_lines, clippy::single_match_else)]
 pub(crate) async fn run_legacy_close_compat(
     state: &AppState,
@@ -149,7 +165,7 @@ pub(crate) async fn run_legacy_close_compat(
             ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement => {
                 state
                     .runtime
-                    .resume_pending_close_settlements()
+                    .resume_close_settlements(Some(obligation.attempt_id()))
                     .await
                     .map_err(|error| {
                         AppError::Conflict(Box::new(ConflictErrorResponse::new(
@@ -163,16 +179,8 @@ pub(crate) async fn run_legacy_close_compat(
                     .await
                     .map_err(|error| AppError::Internal(error.to_string()))?;
                 if advanced.phase() == ClosePhase::SettlingActiveWork {
-                    state
-                        .db
-                        .require_no_retained_legacy_creation_for_retirement(advanced.attempt_id())
-                        .await
-                        .map_err(|error| {
-                            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                                error.to_string(),
-                                "close_settlement_in_progress",
-                            )))
-                        })?;
+                    require_close_settlement_without_retained_custody(state, advanced.attempt_id())
+                        .await?;
                 }
                 if matches!(
                     advanced.phase(),

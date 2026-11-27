@@ -3680,13 +3680,23 @@ impl RuntimeManager {
     }
 
     pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {
+        self.resume_close_settlements(None).await
+    }
+
+    pub(crate) async fn resume_close_settlements(
+        self: &Arc<Self>,
+        attempt_id: Option<&phoenix_core::domain::close::CloseAttemptId>,
+    ) -> Result<usize, String> {
         let obligations = self
             .db
             .list_pending_generic_close_settlements()
             .await
             .map_err(|error| error.to_string())?;
         let manager = Arc::clone(self);
-        self.run_authority_units(obligations, move |obligation| {
+        let selected = obligations.into_iter().filter(|settlement| {
+            attempt_id.is_none_or(|id| settlement.obligation().attempt_id() == id)
+        });
+        self.run_authority_units(selected, move |obligation| {
             let manager = Arc::clone(&manager);
             async move { manager.settle_close_obligation(obligation).await }
         })

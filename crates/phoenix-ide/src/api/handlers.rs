@@ -14574,19 +14574,13 @@ pub(crate) mod api_test_support {
         );
     }
 
-    #[tokio::test]
-    async fn compatibility_archive_reports_cancelled_close_instead_of_success() {
-        let state = make_test_state().await;
+    async fn start_close_with_legacy_creation(
+        state: &AppState,
+        id: &str,
+    ) -> phoenix_core::domain::close::CloseObligation {
         let root = state
             .db
-            .create_conversation(
-                "chat-close-cancel",
-                "chat-close-cancel",
-                "/tmp",
-                true,
-                None,
-                None,
-            )
+            .create_conversation(id, id, "/tmp", true, None, None)
             .await
             .expect("create chat-only conversation");
         sqlx::query(
@@ -14595,12 +14589,13 @@ pub(crate) mod api_test_support {
                  intent_json, error, accepted_at, provisioning_started_at, completed_at,
                  failed_at, cancelled_at, deletion_requested_at, created_at, updated_at
              ) VALUES (
-                 'chat-close-cancel-job', ?1, NULL, 'accepted', 'validate_intent', 0, 0,
+                 ?2, ?1, NULL, 'accepted', 'validate_intent', 0, 0,
                  '{}', NULL, '2025-01-01T00:00:00Z', NULL, NULL, NULL, NULL, NULL,
                  '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
              )",
         )
         .bind(&root.id)
+        .bind(format!("{id}-job"))
         .execute(state.db.pool())
         .await
         .unwrap();
@@ -14609,15 +14604,22 @@ pub(crate) mod api_test_support {
         assert!(
             matches!(first, Err(AppError::Conflict(detail)) if detail.error_type == "close_settlement_in_progress")
         );
-        let obligation = state
+        state
             .db
             .get_active_close_obligation_for_product(&root.product_conversation_id)
             .await
             .unwrap()
-            .expect("active Close obligation");
+            .expect("active Close obligation")
+    }
+
+    #[tokio::test]
+    async fn compatibility_archive_reports_cancelled_close_instead_of_success() {
+        let state = make_test_state().await;
+        let id = "chat-close-cancel";
+        let attempt = start_close_with_legacy_creation(&state, id).await;
         state
             .db
-            .request_close_settlement_cancellation(obligation.attempt_id().as_str())
+            .request_close_settlement_cancellation(attempt.attempt_id().as_str())
             .await
             .unwrap();
         sqlx::query(
@@ -14630,12 +14632,55 @@ pub(crate) mod api_test_support {
         .await
         .unwrap();
 
-        let retry = archive_conversation(State(state.clone()), Path(root.id.clone()))
+        let retry = archive_conversation(State(state.clone()), Path(id.to_string()))
             .await
             .expect_err("cancelled Close is not archive success");
         assert!(
             matches!(retry, AppError::Conflict(detail) if detail.error_type == "close_cancelled")
         );
+        let completed = state
+            .db
+            .get_close_obligation(attempt.attempt_id().as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            completed.close_outcome(),
+            Some(phoenix_core::domain::close::CloseCompletionOutcome::Cancelled)
+        );
+        assert!(!state.db.get_conversation(id).await.unwrap().archived);
+    }
+
+    #[tokio::test]
+    async fn cancel_close_settles_only_the_requested_attempt_without_reclaiming_custody() {
+        let state = make_test_state().await;
+        let id = "chat-close-cancel";
+        let obligation = start_close_with_legacy_creation(&state, id).await;
+        let other = start_close_with_legacy_creation(&state, "other-close").await;
+        state
+            .db
+            .request_close_settlement_cancellation(other.attempt_id().as_str())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'deletion_pending', deletion_requested_at = '2025-01-01T00:00:01Z',
+                 updated_at = '2025-01-01T00:00:01Z'
+             WHERE id IN ('chat-close-cancel-job', 'other-close-job')",
+        )
+        .execute(state.db.pool())
+        .await
+        .unwrap();
+
+        let result = cancel_close_before_retirement(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(crate::api::types::CancelCloseBeforeRetirementRequest {
+                attempt_id: obligation.attempt_id().to_string(),
+            }),
+        )
+        .await
+        .expect("Cancel Close accepts a pending settlement with retained custody");
+        assert!(result.0.success);
         let completed = state
             .db
             .get_close_obligation(obligation.attempt_id().as_str())
@@ -14645,7 +14690,24 @@ pub(crate) mod api_test_support {
             completed.close_outcome(),
             Some(phoenix_core::domain::close::CloseCompletionOutcome::Cancelled)
         );
-        assert!(!state.db.get_conversation(&root.id).await.unwrap().archived);
+        let custody: String = sqlx::query_scalar(
+            "SELECT status FROM conversation_creation_jobs WHERE id = 'chat-close-cancel-job'",
+        )
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(custody, "deletion_pending");
+
+        let untouched = state
+            .db
+            .get_close_obligation(other.attempt_id().as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            untouched.phase(),
+            phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
+        );
+        assert!(!state.db.get_conversation(id).await.unwrap().archived);
     }
 
     #[tokio::test]

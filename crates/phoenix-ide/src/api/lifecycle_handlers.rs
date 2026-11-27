@@ -8,7 +8,9 @@ use super::types::{
     SuccessResponse, TaskApprovalRequest, TaskApprovalResponse, TaskFeedbackRequest,
 };
 use super::AppState;
-use crate::close_service::run_legacy_close_compat;
+use crate::close_service::{
+    require_close_settlement_without_retained_custody, run_legacy_close_compat,
+};
 #[cfg(test)]
 use crate::db::Conversation;
 use crate::state_machine::state::TaskApprovalOutcome;
@@ -343,7 +345,7 @@ pub(crate) async fn confirm_close_stop_work(
         })?;
     state
         .runtime
-        .resume_pending_close_settlements()
+        .resume_close_settlements(Some(obligation.attempt_id()))
         .await
         .map_err(|error| {
             AppError::Conflict(Box::new(ConflictErrorResponse::new(
@@ -356,6 +358,9 @@ pub(crate) async fn confirm_close_stop_work(
         .get_close_obligation(obligation.attempt_id().as_str())
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
+    if refreshed.phase() == phoenix_core::domain::close::ClosePhase::SettlingActiveWork {
+        require_close_settlement_without_retained_custody(&state, refreshed.attempt_id()).await?;
+    }
     match refreshed.phase() {
         phoenix_core::domain::close::ClosePhase::SettlingActiveWork
         | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement => {
@@ -385,7 +390,7 @@ pub(crate) async fn cancel_close_before_retirement(
         .mutation_admission(&id)
         .await
         .map_err(super::handlers::map_admission_db_error)?;
-    let _guard = admission.lock().await;
+    let guard = admission.lock().await;
     let transcript = state
         .db
         .get_conversation(&id)
@@ -434,6 +439,14 @@ pub(crate) async fn cancel_close_before_retirement(
                 "close_cancel_failed",
             )))
         })?;
+    drop(guard);
+    if let Err(error) = state
+        .runtime
+        .resume_close_settlements(Some(obligation.attempt_id()))
+        .await
+    {
+        tracing::warn!(%error, attempt_id = %obligation.attempt_id(), "accepted Close cancellation settlement remains pending");
+    }
     Ok(Json(SuccessResponse { success: true }))
 }
 
