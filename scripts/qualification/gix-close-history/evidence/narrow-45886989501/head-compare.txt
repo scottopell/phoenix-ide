@@ -1,0 +1,22 @@
+unborn: CLI[0]=unborn refs/heads/main gix[0]=unborn refs/heads/main
+changing-unborn: CLI[1]=Error: "symbolic HEAD changed during unborn inspection" gix[1]=Error: "HEAD changed during observation"
+attached: CLI[0]=attached refs/heads/main f357573e4f6f30b629396018abf1996b05092fb2 gix[0]=attached refs/heads/main f357573e4f6f30b629396018abf1996b05092fb2
+detached: CLI[0]=detached f357573e4f6f30b629396018abf1996b05092fb2 gix[0]=detached f357573e4f6f30b629396018abf1996b05092fb2
+recursive-chain: CLI[0]=attached refs/heads/main f357573e4f6f30b629396018abf1996b05092fb2 gix[0]=attached refs/heads/main f357573e4f6f30b629396018abf1996b05092fb2
+dangling-chain: CLI[0]=unborn refs/heads/absent gix[0]=unborn refs/heads/absent
+cyclic-chain: CLI[1]=Error: "cannot determine whether HEAD is detached: fatal: No such ref: HEAD" gix[1]=Error: Aborting symbolic reference cycle, path="/tmp/tmp.5WqMWSBqiu/repo/.git/refs/heads/two"
+broken-ref: CLI[1]=Error: "cannot determine whether HEAD is detached: fatal: No such ref: HEAD" gix[1]=Error: The reference at "refs/heads/broken" could not be decoded
+
+Caused by:
+    0: Reference content could not be parsed, input="not an object id\n"
+missing-nonbranch: CLI[1]=Error: "symbolic HEAD does not name a branch ref" gix[0]=unborn refs/tags/absent
+missing-branch-with-dwim-decoy: CLI[0]=unborn refs/heads/absent gix[0]=unborn refs/heads/absent
+ambiguous-HEAD-with-tag: CLI[0]=attached refs/heads/main f357573e4f6f30b629396018abf1996b05092fb2 gix[0]=attached refs/heads/main f357573e4f6f30b629396018abf1996b05092fb2
+malformed-HEAD: CLI[1]=Error: "cannot determine whether HEAD is detached: fatal: not a git repository (or any of the parent directories): .git" gix[1]=Error: The reference at "HEAD" could not be decoded
+
+Caused by:
+    0: Reference content could not be parsed, input="not a ref or object id\n"
+missing-HEAD: CLI[1]=Error: "cannot determine whether HEAD is detached: fatal: not a git repository (or any of the parent directories): .git" gix[1]=Error: "/tmp/tmp.5WqMWSBqiu/repo" does not appear to be a git repository
+
+Caused by:
+    0: Missing HEAD at ".git/HEAD"

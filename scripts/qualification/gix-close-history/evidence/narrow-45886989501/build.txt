@@ -1,0 +1,119 @@
+   Compiling libc v0.2.191
+   Compiling memchr v2.8.3
+   Compiling regex-automata v0.4.19
+   Compiling cfg-if v1.0.5
+   Compiling scopeguard v1.2.0
+   Compiling smallvec v1.16.6
+   Compiling parking_lot_core v0.9.12
+   Compiling getrandom v0.4.3
+   Compiling lock_api v0.4.14
+   Compiling fastrand v2.5.0
+   Compiling bstr v1.14.0
+   Compiling tinyvec v1.13.3
+   Compiling gix-error v0.5.3
+   Compiling parking_lot v0.12.5
+   Compiling proc-macro2 v1.0.107
+   Compiling prodash v31.0.1
+   Compiling unicode-normalization v0.1.26
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling gix-utils v0.5.3
+   Compiling syn v3.0.10
+   Compiling gix-validate v0.13.2
+   Compiling typenum v1.20.1
+   Compiling gix-trace v0.3.2
+   Compiling faster-hex v2.0.0
+   Compiling cpufeatures v0.3.1
+   Compiling parking_lot_core v0.10.0
+   Compiling lock_api v0.5.0
+   Compiling sha1dc v0.1.5
+   Compiling hybrid-array v0.4.15
+   Compiling parking_lot v0.13.0
+   Compiling block-buffer v0.12.1
+   Compiling crypto-common v0.2.2
+   Compiling gix-path v0.14.2
+   Compiling digest v0.11.3
+   Compiling bitflags v2.13.2
+   Compiling sha2 v0.11.2
+   Compiling jiff-core v1.0.2
+   Compiling itoa v1.0.19
+   Compiling once_cell v1.21.4
+   Compiling gix-macros v0.2.2
+   Compiling hashbrown v0.17.2
+   Compiling gix-hash v0.29.0
+   Compiling jiff v1.0.3
+   Compiling gix-hashtable v0.19.0
+   Compiling gix-parallel v0.50.2
+   Compiling rustix v1.1.6
+   Compiling same-file v1.0.6
+   Compiling walkdir v2.5.1
+   Compiling memmap2 v0.9.12
+   Compiling linux-raw-sys v0.12.1
+   Compiling gix-fs v1.0.0
+   Compiling gix-chunk v0.10.2
+   Compiling nonempty v0.12.0
+   Compiling gix-sec v0.17.0
+   Compiling gix-quote v0.10.2
+   Compiling crc32fast v1.5.6
+   Compiling allocator-api2 v0.2.22
+   Compiling equivalent v1.0.3
+   Compiling rustversion v1.0.23
+   Compiling foldhash v0.2.0
+   Compiling gix-date v0.19.0
+   Compiling tempfile v3.27.0
+   Compiling gix-actor v0.45.0
+   Compiling gix-object v0.67.0
+   Compiling gix-tempfile v27.0.0
+   Compiling gix-lock v27.0.0
+   Compiling gix-ref v0.70.0
+   Compiling hashbrown v0.16.1
+   Compiling gix-commitgraph v0.43.0
+   Compiling zlib-rs v0.6.9
+   Compiling percent-encoding v2.3.2
+   Compiling gix-url v0.41.0
+   Compiling gix-zlib v0.4.1
+   Compiling gix-revwalk v0.39.0
+   Compiling clru v0.6.3
+   Compiling gix-command v0.12.2
+   Compiling gix-packetline v0.24.2
+   Compiling arc-swap v1.9.5
+   Compiling gix-transport v0.63.0
+   Compiling gix-pack v0.78.0
+   Compiling gix-shallow v0.16.0
+   Compiling gix-glob v0.30.0
+   Compiling gix-config-value v0.21.2
+   Compiling unicode-bom v2.0.3
+   Compiling gix-odb v0.88.0
+   Compiling gix-config v0.63.0
+   Compiling gix-protocol v0.69.0
+   Compiling gix-revision v0.53.0
+   Compiling gix-traverse v0.65.0
+   Compiling gix-discover v0.58.0
+   Compiling gix-diff v0.71.0
+   Compiling gix-refspec v0.48.0
+   Compiling gix v0.91.0
+   Compiling gix-close-history-probe v0.0.0 (/home/runner/work/phoenix-ide/phoenix-ide/scripts/qualification/gix-close-history)
+    Finished `release` profile [optimized] target(s) in 38.18s
+	Command being timed: "cargo build --locked --release --bin typed-head"
+	User time (seconds): 131.02
+	System time (seconds): 9.28
+	Percent of CPU this job got: 367%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 0:38.21
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 499740
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 92
+	Minor (reclaiming a frame) page faults: 2313890
+	Voluntary context switches: 7831
+	Involuntary context switches: 25781
+	Swaps: 0
+	File system inputs: 6640
+	File system outputs: 500408
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

@@ -1,0 +1,30 @@
+block-buffer v0.12.1
+cfg-if v1.0.5
+cpufeatures v0.3.1
+crypto-common v0.2.2
+decode-probe v0.0.0 (/home/runner/work/phoenix-ide/phoenix-ide/scripts/qualification/gix-close-history/decoder-build)
+digest v0.11.3
+faster-hex v2.0.0
+fastrand v2.5.0
+getrandom v0.4.3
+gix-error v0.5.3
+gix-hash v0.29.0
+gix-macros v0.2.2 (proc-macro)
+gix-utils v0.5.3
+hybrid-array v0.4.15
+libc v0.2.191
+lock_api v0.4.14
+parking_lot v0.12.5
+parking_lot_core v0.9.12
+proc-macro2 v1.0.107
+prodash v31.0.1
+quote v1.0.47
+scopeguard v1.2.0
+sha1dc v0.1.5
+sha2 v0.11.2
+smallvec v1.16.6
+syn v3.0.10
+tinyvec v1.13.3
+typenum v1.20.1
+unicode-ident v1.0.27
+unicode-normalization v0.1.26

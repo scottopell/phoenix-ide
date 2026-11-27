@@ -1,0 +1,30 @@
+commits=1 sample=1
+git elapsed_s=0.00 peak_rss_kib=5620
+gix elapsed_s=0.00 peak_rss_kib=4084
+commits=1 sample=2
+git elapsed_s=0.00 peak_rss_kib=5552
+gix elapsed_s=0.00 peak_rss_kib=4104
+commits=1 sample=3
+git elapsed_s=0.00 peak_rss_kib=5640
+gix elapsed_s=0.00 peak_rss_kib=4168
+commits=1 sample=4
+git elapsed_s=0.00 peak_rss_kib=5548
+gix elapsed_s=0.00 peak_rss_kib=4204
+commits=1 sample=5
+git elapsed_s=0.00 peak_rss_kib=5456
+gix elapsed_s=0.00 peak_rss_kib=4104
+commits=25000 sample=1
+git elapsed_s=0.00 peak_rss_kib=7260
+gix elapsed_s=0.05 peak_rss_kib=10680
+commits=25000 sample=2
+git elapsed_s=0.00 peak_rss_kib=7304
+gix elapsed_s=0.06 peak_rss_kib=10612
+commits=25000 sample=3
+git elapsed_s=0.00 peak_rss_kib=7112
+gix elapsed_s=0.05 peak_rss_kib=10656
+commits=25000 sample=4
+git elapsed_s=0.00 peak_rss_kib=7684
+gix elapsed_s=0.05 peak_rss_kib=10696
+commits=25000 sample=5
+git elapsed_s=0.00 peak_rss_kib=7296
+gix elapsed_s=0.05 peak_rss_kib=10712

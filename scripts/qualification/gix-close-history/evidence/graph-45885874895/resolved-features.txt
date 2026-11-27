@@ -1,0 +1,593 @@
+gix-close-history-probe v0.0.0 (/home/runner/work/phoenix-ide/phoenix-ide/scripts/qualification/gix-close-history)
+├── gix feature "sha1"
+│   ├── gix v0.91.0
+│   │   ├── gix-diff v0.71.0
+│   │   │   ├── bstr v1.14.0
+│   │   │   │   ├── memchr v2.8.3
+│   │   │   │   └── regex-automata feature "dfa-search"
+│   │   │   │       └── regex-automata v0.4.19
+│   │   │   ├── gix-error feature "default"
+│   │   │   │   └── gix-error v0.5.3
+│   │   │   │       └── bstr feature "std"
+│   │   │   │           ├── bstr v1.14.0 (*)
+│   │   │   │           ├── bstr feature "alloc"
+│   │   │   │           │   ├── bstr v1.14.0 (*)
+│   │   │   │           │   └── memchr feature "alloc"
+│   │   │   │           │       └── memchr v2.8.3
+│   │   │   │           └── memchr feature "std"
+│   │   │   │               ├── memchr v2.8.3
+│   │   │   │               └── memchr feature "alloc" (*)
+│   │   │   ├── gix-hash feature "default"
+│   │   │   │   ├── gix-hash v0.29.0
+│   │   │   │   │   ├── sha2 v0.11.2
+│   │   │   │   │   │   ├── cfg-if feature "default"
+│   │   │   │   │   │   │   └── cfg-if v1.0.5
+│   │   │   │   │   │   ├── cpufeatures feature "default"
+│   │   │   │   │   │   │   └── cpufeatures v0.3.1
+│   │   │   │   │   │   └── digest feature "default"
+│   │   │   │   │   │       ├── digest v0.11.3
+│   │   │   │   │   │       │   ├── block-buffer feature "default"
+│   │   │   │   │   │       │   │   └── block-buffer v0.12.1
+│   │   │   │   │   │       │   │       └── hybrid-array feature "default"
+│   │   │   │   │   │       │   │           └── hybrid-array v0.4.15
+│   │   │   │   │   │       │   │               ├── typenum feature "const-generics"
+│   │   │   │   │   │       │   │               │   └── typenum v1.20.1
+│   │   │   │   │   │       │   │               └── typenum feature "default"
+│   │   │   │   │   │       │   │                   └── typenum v1.20.1
+│   │   │   │   │   │       │   └── crypto-common feature "default"
+│   │   │   │   │   │       │       └── crypto-common v0.2.2
+│   │   │   │   │   │       │           └── hybrid-array feature "default" (*)
+│   │   │   │   │   │       └── digest feature "block-api"
+│   │   │   │   │   │           └── digest v0.11.3 (*)
+│   │   │   │   │   ├── gix-error feature "default" (*)
+│   │   │   │   │   ├── gix-macros feature "default"
+│   │   │   │   │   │   └── gix-macros v0.2.2 (proc-macro)
+│   │   │   │   │   │       ├── proc-macro2 feature "default"
+│   │   │   │   │   │       │   ├── proc-macro2 v1.0.107
+│   │   │   │   │   │       │   │   └── unicode-ident feature "default"
+│   │   │   │   │   │       │   │       └── unicode-ident v1.0.27
+│   │   │   │   │   │       │   └── proc-macro2 feature "proc-macro"
+│   │   │   │   │   │       │       └── proc-macro2 v1.0.107 (*)
+│   │   │   │   │   │       ├── quote feature "default"
+│   │   │   │   │   │       │   ├── quote v1.0.47
+│   │   │   │   │   │       │   │   └── proc-macro2 v1.0.107 (*)
+│   │   │   │   │   │       │   └── quote feature "proc-macro"
+│   │   │   │   │   │       │       ├── quote v1.0.47 (*)
+│   │   │   │   │   │       │       └── proc-macro2 feature "proc-macro" (*)
+│   │   │   │   │   │       ├── syn feature "default"
+│   │   │   │   │   │       │   ├── syn v3.0.10
+│   │   │   │   │   │       │   │   ├── proc-macro2 v1.0.107 (*)
+│   │   │   │   │   │       │   │   ├── quote v1.0.47 (*)
+│   │   │   │   │   │       │   │   └── unicode-ident feature "default" (*)
+│   │   │   │   │   │       │   ├── syn feature "clone-impls"
+│   │   │   │   │   │       │   │   └── syn v3.0.10 (*)
+│   │   │   │   │   │       │   ├── syn feature "derive"
+│   │   │   │   │   │       │   │   └── syn v3.0.10 (*)
+│   │   │   │   │   │       │   ├── syn feature "parsing"
+│   │   │   │   │   │       │   │   └── syn v3.0.10 (*)
+│   │   │   │   │   │       │   ├── syn feature "printing"
+│   │   │   │   │   │       │   │   └── syn v3.0.10 (*)
+│   │   │   │   │   │       │   └── syn feature "proc-macro"
+│   │   │   │   │   │       │       ├── syn v3.0.10 (*)
+│   │   │   │   │   │       │       ├── proc-macro2 feature "proc-macro" (*)
+│   │   │   │   │   │       │       └── quote feature "proc-macro" (*)
+│   │   │   │   │   │       ├── syn feature "fold"
+│   │   │   │   │   │       │   └── syn v3.0.10 (*)
+│   │   │   │   │   │       └── syn feature "full"
+│   │   │   │   │   │           └── syn v3.0.10 (*)
+│   │   │   │   │   ├── faster-hex feature "std"
+│   │   │   │   │   │   ├── faster-hex v2.0.0
+│   │   │   │   │   │   └── faster-hex feature "alloc"
+│   │   │   │   │   │       └── faster-hex v2.0.0
+│   │   │   │   │   ├── gix-utils feature "default"
+│   │   │   │   │   │   └── gix-utils v0.5.3
+│   │   │   │   │   │       ├── fastrand v2.5.0
+│   │   │   │   │   │       ├── unicode-normalization v0.1.26
+│   │   │   │   │   │       │   ├── tinyvec feature "alloc"
+│   │   │   │   │   │       │   │   └── tinyvec v1.13.3
+│   │   │   │   │   │       │   └── tinyvec feature "default"
+│   │   │   │   │   │       │       └── tinyvec v1.13.3
+│   │   │   │   │   │       ├── bstr feature "std" (*)
+│   │   │   │   │   │       ├── gix-error feature "default" (*)
+│   │   │   │   │   │       ├── getrandom feature "default"
+│   │   │   │   │   │       │   └── getrandom v0.4.3
+│   │   │   │   │   │       │       ├── libc v0.2.191
+│   │   │   │   │   │       │       └── cfg-if feature "default" (*)
+│   │   │   │   │   │       └── prodash feature "default"
+│   │   │   │   │   │           ├── prodash v31.0.1
+│   │   │   │   │   │           │   └── parking_lot v0.12.5
+│   │   │   │   │   │           │       ├── lock_api feature "default"
+│   │   │   │   │   │           │       │   ├── lock_api v0.4.14
+│   │   │   │   │   │           │       │   │   └── scopeguard v1.2.0
+│   │   │   │   │   │           │       │   └── lock_api feature "atomic_usize"
+│   │   │   │   │   │           │       │       └── lock_api v0.4.14 (*)
+│   │   │   │   │   │           │       └── parking_lot_core feature "default"
+│   │   │   │   │   │           │           └── parking_lot_core v0.9.12
+│   │   │   │   │   │           │               ├── cfg-if feature "default" (*)
+│   │   │   │   │   │           │               ├── libc feature "default"
+│   │   │   │   │   │           │               │   ├── libc v0.2.191
+│   │   │   │   │   │           │               │   └── libc feature "std"
+│   │   │   │   │   │           │               │       └── libc v0.2.191
+│   │   │   │   │   │           │               └── smallvec feature "default"
+│   │   │   │   │   │           │                   └── smallvec v1.16.6
+│   │   │   │   │   │           └── prodash feature "progress-tree"
+│   │   │   │   │   │               ├── prodash v31.0.1 (*)
+│   │   │   │   │   │               └── prodash feature "parking_lot"
+│   │   │   │   │   │                   └── prodash v31.0.1 (*)
+│   │   │   │   │   ├── gix-utils feature "progress"
+│   │   │   │   │   │   └── gix-utils v0.5.3 (*)
+│   │   │   │   │   └── sha1dc feature "std"
+│   │   │   │   │       └── sha1dc v0.1.5
+│   │   │   │   └── gix-hash feature "unstable"
+│   │   │   │       └── gix-hash v0.29.0 (*)
+│   │   │   └── gix-object feature "default"
+│   │   │       └── gix-object v0.67.0
+│   │   │           ├── gix-actor feature "default"
+│   │   │           │   ├── gix-actor v0.45.0
+│   │   │           │   │   ├── bstr feature "std" (*)
+│   │   │           │   │   ├── bstr feature "unicode"
+│   │   │           │   │   │   └── bstr v1.14.0 (*)
+│   │   │           │   │   ├── gix-date feature "default"
+│   │   │           │   │   │   ├── gix-date v0.19.0
+│   │   │           │   │   │   │   ├── bstr feature "std" (*)
+│   │   │           │   │   │   │   ├── gix-error feature "default" (*)
+│   │   │           │   │   │   │   ├── gix-macros feature "default" (*)
+│   │   │           │   │   │   │   ├── itoa feature "default"
+│   │   │           │   │   │   │   │   └── itoa v1.0.19
+│   │   │           │   │   │   │   └── jiff feature "default"
+│   │   │           │   │   │   │       ├── jiff v1.0.3
+│   │   │           │   │   │   │       │   └── jiff-core v1.0.2
+│   │   │           │   │   │   │       ├── jiff feature "perf-inline"
+│   │   │           │   │   │   │       │   └── jiff v1.0.3 (*)
+│   │   │           │   │   │   │       ├── jiff feature "std"
+│   │   │           │   │   │   │       │   ├── jiff v1.0.3 (*)
+│   │   │           │   │   │   │       │   ├── jiff feature "alloc"
+│   │   │           │   │   │   │       │   │   ├── jiff v1.0.3 (*)
+│   │   │           │   │   │   │       │   │   └── jiff-core feature "alloc"
+│   │   │           │   │   │   │       │   │       └── jiff-core v1.0.2
+│   │   │           │   │   │   │       │   └── jiff-core feature "std"
+│   │   │           │   │   │   │       │       ├── jiff-core v1.0.2
+│   │   │           │   │   │   │       │       └── jiff-core feature "alloc" (*)
+│   │   │           │   │   │   │       ├── jiff feature "tz-fat"
+│   │   │           │   │   │   │       │   ├── jiff v1.0.3 (*)
+│   │   │           │   │   │   │       │   └── jiff-core feature "tz-fat"
+│   │   │           │   │   │   │       │       └── jiff-core v1.0.2
+│   │   │           │   │   │   │       ├── jiff feature "tz-system"
+│   │   │           │   │   │   │       │   ├── jiff v1.0.3 (*)
+│   │   │           │   │   │   │       │   └── jiff feature "std" (*)
+│   │   │           │   │   │   │       ├── jiff feature "tzdb-bundle-platform"
+│   │   │           │   │   │   │       │   ├── jiff v1.0.3 (*)
+│   │   │           │   │   │   │       │   └── jiff feature "alloc" (*)
+│   │   │           │   │   │   │       ├── jiff feature "tzdb-concatenated"
+│   │   │           │   │   │   │       │   ├── jiff v1.0.3 (*)
+│   │   │           │   │   │   │       │   └── jiff feature "std" (*)
+│   │   │           │   │   │   │       └── jiff feature "tzdb-zoneinfo"
+│   │   │           │   │   │   │           ├── jiff v1.0.3 (*)
+│   │   │           │   │   │   │           └── jiff feature "std" (*)
+│   │   │           │   │   │   └── gix-date feature "unstable"
+│   │   │           │   │   │       └── gix-date v0.19.0 (*)
+│   │   │           │   │   ├── gix-error feature "bstr"
+│   │   │           │   │   │   └── gix-error v0.5.3 (*)
+│   │   │           │   │   ├── gix-error feature "default" (*)
+│   │   │           │   │   └── gix-macros feature "default" (*)
+│   │   │           │   └── gix-actor feature "unstable"
+│   │   │           │       └── gix-actor v0.45.0 (*)
+│   │   │           ├── bstr feature "std" (*)
+│   │   │           ├── bstr feature "unicode" (*)
+│   │   │           ├── gix-date feature "default" (*)
+│   │   │           ├── gix-error feature "bstr" (*)
+│   │   │           ├── gix-error feature "default" (*)
+│   │   │           ├── itoa feature "default" (*)
+│   │   │           ├── gix-hash feature "default" (*)
+│   │   │           ├── gix-utils feature "default" (*)
+│   │   │           ├── gix-utils feature "progress" (*)
+│   │   │           ├── smallvec feature "default" (*)
+│   │   │           ├── smallvec feature "write"
+│   │   │           │   └── smallvec v1.16.6
+│   │   │           ├── gix-validate feature "default"
+│   │   │           │   └── gix-validate v0.13.2
+│   │   │           │       ├── bstr feature "std" (*)
+│   │   │           │       └── gix-error feature "default" (*)
+│   │   │           └── gix-hashtable feature "default"
+│   │   │               └── gix-hashtable v0.19.0
+│   │   │                   ├── gix-hash feature "default" (*)
+│   │   │                   ├── parking_lot feature "default"
+│   │   │                   │   └── parking_lot v0.13.0
+│   │   │                   │       ├── lock_api feature "default"
+│   │   │                   │       │   ├── lock_api v0.5.0
+│   │   │                   │       │   │   └── scopeguard v1.2.0
+│   │   │                   │       │   └── lock_api feature "atomic_usize"
+│   │   │                   │       │       └── lock_api v0.5.0 (*)
+│   │   │                   │       └── parking_lot_core feature "default"
+│   │   │                   │           └── parking_lot_core v0.10.0
+│   │   │                   │               ├── libc feature "default" (*)
+│   │   │                   │               └── smallvec feature "default" (*)
+│   │   │                   └── hashbrown feature "inline-more"
+│   │   │                       └── hashbrown v0.17.2
+│   │   ├── gix-revision v0.53.0
+│   │   │   ├── bstr feature "std" (*)
+│   │   │   ├── gix-date feature "default" (*)
+│   │   │   ├── gix-error feature "bstr" (*)
+│   │   │   ├── gix-error feature "default" (*)
+│   │   │   ├── gix-commitgraph feature "default"
+│   │   │   │   └── gix-commitgraph v0.43.0
+│   │   │   │       ├── bstr feature "std" (*)
+│   │   │   │       ├── gix-error feature "default" (*)
+│   │   │   │       ├── gix-chunk feature "default"
+│   │   │   │       │   └── gix-chunk v0.10.2
+│   │   │   │       │       ├── gix-error feature "bstr" (*)
+│   │   │   │       │       └── gix-error feature "default" (*)
+│   │   │   │       ├── gix-hash feature "default" (*)
+│   │   │   │       ├── memmap2 feature "default"
+│   │   │   │       │   └── memmap2 v0.9.12
+│   │   │   │       │       └── libc feature "default" (*)
+│   │   │   │       └── nonempty feature "default"
+│   │   │   │           ├── nonempty v0.12.0
+│   │   │   │           └── nonempty feature "std"
+│   │   │   │               └── nonempty v0.12.0
+│   │   │   ├── gix-hash feature "default" (*)
+│   │   │   ├── nonempty feature "default" (*)
+│   │   │   ├── gix-object feature "default" (*)
+│   │   │   └── gix-revwalk feature "default"
+│   │   │       └── gix-revwalk v0.39.0
+│   │   │           ├── gix-date feature "default" (*)
+│   │   │           ├── gix-error feature "default" (*)
+│   │   │           ├── gix-commitgraph feature "default" (*)
+│   │   │           ├── gix-hash feature "default" (*)
+│   │   │           ├── smallvec feature "default" (*)
+│   │   │           ├── gix-object feature "default" (*)
+│   │   │           └── gix-hashtable feature "default" (*)
+│   │   ├── gix-tempfile v27.0.0
+│   │   │   ├── libc v0.2.191
+│   │   │   ├── gix-fs feature "default"
+│   │   │   │   └── gix-fs v1.0.0
+│   │   │   │       ├── bstr feature "default"
+│   │   │   │       │   ├── bstr v1.14.0 (*)
+│   │   │   │       │   ├── bstr feature "std" (*)
+│   │   │   │       │   └── bstr feature "unicode" (*)
+│   │   │   │       ├── gix-error feature "default" (*)
+│   │   │   │       ├── gix-macros feature "default" (*)
+│   │   │   │       ├── gix-utils feature "default" (*)
+│   │   │   │       ├── libc feature "default" (*)
+│   │   │   │       ├── gix-path feature "default"
+│   │   │   │       │   └── gix-path v0.14.2
+│   │   │   │       │       ├── bstr feature "std" (*)
+│   │   │   │       │       ├── gix-error feature "bstr" (*)
+│   │   │   │       │       ├── gix-error feature "default" (*)
+│   │   │   │       │       ├── gix-trace feature "default"
+│   │   │   │       │       │   └── gix-trace v0.3.2
+│   │   │   │       │       └── gix-validate feature "default" (*)
+│   │   │   │       ├── gix-parallel feature "default"
+│   │   │   │       │   └── gix-parallel v0.50.2
+│   │   │   │       │       ├── gix-trace feature "default" (*)
+│   │   │   │       │       └── once_cell feature "default"
+│   │   │   │       │           ├── once_cell v1.21.4
+│   │   │   │       │           └── once_cell feature "std"
+│   │   │   │       │               ├── once_cell v1.21.4
+│   │   │   │       │               └── once_cell feature "alloc"
+│   │   │   │       │                   ├── once_cell v1.21.4
+│   │   │   │       │                   └── once_cell feature "race"
+│   │   │   │       │                       └── once_cell v1.21.4
+│   │   │   │       └── walkdir feature "default"
+│   │   │   │           └── walkdir v2.5.1
+│   │   │   │               └── same-file feature "default"
+│   │   │   │                   └── same-file v1.0.6
+│   │   │   ├── parking_lot feature "default" (*)
+│   │   │   └── tempfile feature "default"
+│   │   │       ├── tempfile v3.27.0
+│   │   │       │   ├── getrandom v0.4.3 (*)
+│   │   │       │   ├── fastrand feature "default"
+│   │   │       │   │   ├── fastrand v2.5.0
+│   │   │       │   │   └── fastrand feature "std"
+│   │   │       │   │       ├── fastrand v2.5.0
+│   │   │       │   │       └── fastrand feature "alloc"
+│   │   │       │   │           └── fastrand v2.5.0
+│   │   │       │   ├── once_cell feature "std" (*)
+│   │   │       │   ├── rustix feature "default"
+│   │   │       │   │   ├── rustix v1.1.6
+│   │   │       │   │   │   ├── bitflags v2.13.2
+│   │   │       │   │   │   ├── linux-raw-sys feature "auxvec"
+│   │   │       │   │   │   │   └── linux-raw-sys v0.12.1
+│   │   │       │   │   │   ├── linux-raw-sys feature "elf"
+│   │   │       │   │   │   │   └── linux-raw-sys v0.12.1
+│   │   │       │   │   │   ├── linux-raw-sys feature "errno"
+│   │   │       │   │   │   │   └── linux-raw-sys v0.12.1
+│   │   │       │   │   │   ├── linux-raw-sys feature "general"
+│   │   │       │   │   │   │   └── linux-raw-sys v0.12.1
+│   │   │       │   │   │   ├── linux-raw-sys feature "ioctl"
+│   │   │       │   │   │   │   └── linux-raw-sys v0.12.1
+│   │   │       │   │   │   └── linux-raw-sys feature "no_std"
+│   │   │       │   │   │       └── linux-raw-sys v0.12.1
+│   │   │       │   │   └── rustix feature "std"
+│   │   │       │   │       ├── rustix v1.1.6 (*)
+│   │   │       │   │       ├── bitflags feature "std"
+│   │   │       │   │       │   └── bitflags v2.13.2
+│   │   │       │   │       └── rustix feature "alloc"
+│   │   │       │   │           └── rustix v1.1.6 (*)
+│   │   │       │   └── rustix feature "fs"
+│   │   │       │       └── rustix v1.1.6 (*)
+│   │   │       └── tempfile feature "getrandom"
+│   │   │           └── tempfile v3.27.0 (*)
+│   │   ├── gix-actor feature "default" (*)
+│   │   ├── gix-date feature "default" (*)
+│   │   ├── gix-error feature "bstr" (*)
+│   │   ├── gix-error feature "default" (*)
+│   │   ├── gix-macros feature "default" (*)
+│   │   ├── gix-commitgraph feature "default" (*)
+│   │   ├── gix-hash feature "default" (*)
+│   │   ├── gix-utils feature "bstr"
+│   │   │   └── gix-utils v0.5.3 (*)
+│   │   ├── gix-utils feature "default" (*)
+│   │   ├── gix-utils feature "interrupt"
+│   │   │   └── gix-utils v0.5.3 (*)
+│   │   ├── gix-utils feature "progress" (*)
+│   │   ├── smallvec feature "default" (*)
+│   │   ├── nonempty feature "default" (*)
+│   │   ├── gix-config feature "default"
+│   │   │   └── gix-config v0.63.0
+│   │   │       ├── bstr feature "std" (*)
+│   │   │       ├── gix-error feature "bstr" (*)
+│   │   │       ├── gix-error feature "default" (*)
+│   │   │       ├── gix-utils feature "bstr" (*)
+│   │   │       ├── gix-utils feature "default" (*)
+│   │   │       ├── smallvec feature "default" (*)
+│   │   │       ├── gix-config-value feature "default"
+│   │   │       │   └── gix-config-value v0.21.2
+│   │   │       │       ├── bstr feature "std" (*)
+│   │   │       │       ├── gix-error feature "bstr" (*)
+│   │   │       │       ├── gix-error feature "default" (*)
+│   │   │       │       ├── gix-utils feature "bstr" (*)
+│   │   │       │       ├── gix-utils feature "default" (*)
+│   │   │       │       ├── libc feature "default" (*)
+│   │   │       │       ├── bitflags feature "default"
+│   │   │       │       │   └── bitflags v2.13.2
+│   │   │       │       └── gix-path feature "default" (*)
+│   │   │       ├── gix-path feature "default" (*)
+│   │   │       ├── gix-trace feature "default" (*)
+│   │   │       ├── gix-glob feature "default"
+│   │   │       │   └── gix-glob v0.30.0
+│   │   │       │       ├── bstr feature "std" (*)
+│   │   │       │       ├── gix-utils feature "default" (*)
+│   │   │       │       ├── bitflags feature "default" (*)
+│   │   │       │       ├── gix-path feature "default" (*)
+│   │   │       │       ├── gix-trace feature "default" (*)
+│   │   │       │       ├── gix-fs feature "default" (*)
+│   │   │       │       └── gix-fs feature "unstable"
+│   │   │       │           └── gix-fs v1.0.0 (*)
+│   │   │       ├── gix-parallel feature "default" (*)
+│   │   │       ├── gix-ref feature "default"
+│   │   │       │   └── gix-ref v0.70.0
+│   │   │       │       ├── gix-actor feature "default" (*)
+│   │   │       │       ├── gix-error feature "bstr" (*)
+│   │   │       │       ├── gix-error feature "default" (*)
+│   │   │       │       ├── gix-hash feature "default" (*)
+│   │   │       │       ├── gix-utils feature "default" (*)
+│   │   │       │       ├── memmap2 feature "default" (*)
+│   │   │       │       ├── gix-path feature "default" (*)
+│   │   │       │       ├── gix-validate feature "default" (*)
+│   │   │       │       ├── gix-fs feature "default" (*)
+│   │   │       │       ├── gix-fs feature "unstable" (*)
+│   │   │       │       ├── gix-parallel feature "default" (*)
+│   │   │       │       ├── gix-lock feature "default"
+│   │   │       │       │   └── gix-lock v27.0.0
+│   │   │       │       │       ├── gix-tempfile v27.0.0 (*)
+│   │   │       │       │       ├── gix-utils v0.5.3 (*)
+│   │   │       │       │       ├── gix-error feature "default" (*)
+│   │   │       │       │       ├── gix-macros feature "default" (*)
+│   │   │       │       │       └── gix-fs feature "default" (*)
+│   │   │       │       └── gix-object feature "default" (*)
+│   │   │       ├── gix-sec feature "default"
+│   │   │       │   └── gix-sec v0.17.0
+│   │   │       │       ├── libc feature "default" (*)
+│   │   │       │       └── bitflags feature "default" (*)
+│   │   │       └── unicode-bom feature "default"
+│   │   │           └── unicode-bom v2.0.3
+│   │   ├── gix-path feature "default" (*)
+│   │   ├── gix-trace feature "default" (*)
+│   │   ├── gix-validate feature "default" (*)
+│   │   ├── gix-glob feature "default" (*)
+│   │   ├── gix-fs feature "default" (*)
+│   │   ├── gix-fs feature "unstable" (*)
+│   │   ├── gix-parallel feature "default" (*)
+│   │   ├── gix-parallel feature "once_cell"
+│   │   │   └── gix-parallel v0.50.2 (*)
+│   │   ├── gix-ref feature "default" (*)
+│   │   ├── gix-lock feature "default" (*)
+│   │   ├── gix-object feature "default" (*)
+│   │   ├── gix-hashtable feature "default" (*)
+│   │   ├── gix-sec feature "default" (*)
+│   │   ├── gix-discover feature "default"
+│   │   │   └── gix-discover v0.58.0
+│   │   │       ├── bstr feature "std" (*)
+│   │   │       ├── bstr feature "unicode" (*)
+│   │   │       ├── gix-error feature "default" (*)
+│   │   │       ├── gix-path feature "default" (*)
+│   │   │       ├── gix-fs feature "default" (*)
+│   │   │       ├── gix-fs feature "unstable" (*)
+│   │   │       ├── gix-ref feature "default" (*)
+│   │   │       └── gix-sec feature "default" (*)
+│   │   ├── gix-odb feature "default"
+│   │   │   └── gix-odb v0.88.0
+│   │   │       ├── gix-pack v0.78.0
+│   │   │       │   ├── gix-error feature "default" (*)
+│   │   │       │   ├── gix-chunk feature "default" (*)
+│   │   │       │   ├── gix-hash feature "default" (*)
+│   │   │       │   ├── gix-utils feature "default" (*)
+│   │   │       │   ├── gix-utils feature "interrupt" (*)
+│   │   │       │   ├── gix-utils feature "progress" (*)
+│   │   │       │   ├── smallvec feature "default" (*)
+│   │   │       │   ├── memmap2 feature "default" (*)
+│   │   │       │   ├── gix-path feature "default" (*)
+│   │   │       │   ├── gix-trace feature "default" (*)
+│   │   │       │   ├── gix-parallel feature "default" (*)
+│   │   │       │   ├── gix-object feature "default" (*)
+│   │   │       │   ├── gix-hashtable feature "default" (*)
+│   │   │       │   ├── crc32fast feature "default"
+│   │   │       │   │   ├── crc32fast v1.5.6
+│   │   │       │   │   │   └── cfg-if feature "default" (*)
+│   │   │       │   │   └── crc32fast feature "std"
+│   │   │       │   │       └── crc32fast v1.5.6 (*)
+│   │   │       │   ├── clru feature "default"
+│   │   │       │   │   └── clru v0.6.3
+│   │   │       │   │       └── hashbrown feature "default"
+│   │   │       │   │           ├── hashbrown v0.16.1
+│   │   │       │   │           │   ├── equivalent v1.0.3
+│   │   │       │   │           │   ├── foldhash v0.2.0
+│   │   │       │   │           │   └── allocator-api2 feature "alloc"
+│   │   │       │   │           │       └── allocator-api2 v0.2.22
+│   │   │       │   │           ├── hashbrown feature "allocator-api2"
+│   │   │       │   │           │   └── hashbrown v0.16.1 (*)
+│   │   │       │   │           ├── hashbrown feature "default-hasher"
+│   │   │       │   │           │   └── hashbrown v0.16.1 (*)
+│   │   │       │   │           ├── hashbrown feature "equivalent"
+│   │   │       │   │           │   └── hashbrown v0.16.1 (*)
+│   │   │       │   │           ├── hashbrown feature "inline-more"
+│   │   │       │   │           │   └── hashbrown v0.16.1 (*)
+│   │   │       │   │           └── hashbrown feature "raw-entry"
+│   │   │       │   │               └── hashbrown v0.16.1 (*)
+│   │   │       │   └── gix-zlib feature "default"
+│   │   │       │       └── gix-zlib v0.4.1
+│   │   │       │           ├── gix-error feature "default" (*)
+│   │   │       │           └── zlib-rs feature "default"
+│   │   │       │               ├── zlib-rs v0.6.9
+│   │   │       │               ├── zlib-rs feature "c-allocator"
+│   │   │       │               │   └── zlib-rs v0.6.9
+│   │   │       │               └── zlib-rs feature "std"
+│   │   │       │                   ├── zlib-rs v0.6.9
+│   │   │       │                   └── zlib-rs feature "rust-allocator"
+│   │   │       │                       └── zlib-rs v0.6.9
+│   │   │       ├── gix-error feature "default" (*)
+│   │   │       ├── gix-hash feature "default" (*)
+│   │   │       ├── gix-utils feature "default" (*)
+│   │   │       ├── gix-utils feature "progress" (*)
+│   │   │       ├── memmap2 feature "default" (*)
+│   │   │       ├── gix-path feature "default" (*)
+│   │   │       ├── gix-trace feature "default" (*)
+│   │   │       ├── gix-fs feature "default" (*)
+│   │   │       ├── gix-fs feature "unstable" (*)
+│   │   │       ├── gix-fs feature "walkdir"
+│   │   │       │   ├── gix-fs v1.0.0 (*)
+│   │   │       │   └── gix-fs feature "unstable" (*)
+│   │   │       ├── gix-parallel feature "default" (*)
+│   │   │       ├── parking_lot feature "default" (*)
+│   │   │       ├── tempfile feature "default" (*)
+│   │   │       ├── gix-object feature "default" (*)
+│   │   │       ├── gix-hashtable feature "default" (*)
+│   │   │       ├── arc-swap feature "default"
+│   │   │       │   └── arc-swap v1.9.5
+│   │   │       │       └── rustversion feature "default"
+│   │   │       │           └── rustversion v1.0.23 (proc-macro)
+│   │   │       ├── crc32fast feature "default" (*)
+│   │   │       ├── gix-zlib feature "default" (*)
+│   │   │       └── gix-quote feature "default"
+│   │   │           └── gix-quote v0.10.2
+│   │   │               ├── bstr feature "std" (*)
+│   │   │               ├── gix-error feature "bstr" (*)
+│   │   │               ├── gix-error feature "default" (*)
+│   │   │               └── gix-utils feature "default" (*)
+│   │   ├── gix-pack feature "object-cache-dynamic"
+│   │   │   └── gix-pack v0.78.0 (*)
+│   │   ├── gix-zlib feature "default" (*)
+│   │   ├── gix-quote feature "default" (*)
+│   │   ├── gix-protocol feature "default"
+│   │   │   └── gix-protocol v0.69.0
+│   │   │       ├── bstr feature "std" (*)
+│   │   │       ├── bstr feature "unicode" (*)
+│   │   │       ├── gix-date feature "default" (*)
+│   │   │       ├── gix-error feature "default" (*)
+│   │   │       ├── gix-macros feature "default" (*)
+│   │   │       ├── gix-hash feature "default" (*)
+│   │   │       ├── gix-utils feature "default" (*)
+│   │   │       ├── gix-utils feature "progress" (*)
+│   │   │       ├── nonempty feature "default" (*)
+│   │   │       ├── gix-fs feature "default" (*)
+│   │   │       ├── gix-ref feature "default" (*)
+│   │   │       ├── gix-shallow feature "default"
+│   │   │       │   └── gix-shallow v0.16.0
+│   │   │       │       ├── bstr v1.14.0 (*)
+│   │   │       │       ├── gix-error feature "default" (*)
+│   │   │       │       ├── gix-hash feature "default" (*)
+│   │   │       │       ├── nonempty feature "default" (*)
+│   │   │       │       └── gix-lock feature "default" (*)
+│   │   │       └── gix-transport feature "default"
+│   │   │           └── gix-transport v0.63.0
+│   │   │               ├── bstr feature "std" (*)
+│   │   │               ├── bstr feature "unicode" (*)
+│   │   │               ├── gix-error feature "default" (*)
+│   │   │               ├── gix-utils feature "bstr" (*)
+│   │   │               ├── gix-utils feature "default" (*)
+│   │   │               ├── gix-path feature "default" (*)
+│   │   │               ├── gix-trace feature "default" (*)
+│   │   │               ├── gix-sec feature "default" (*)
+│   │   │               ├── gix-quote feature "default" (*)
+│   │   │               ├── gix-command feature "default"
+│   │   │               │   └── gix-command v0.12.2
+│   │   │               │       ├── bstr feature "std" (*)
+│   │   │               │       ├── bstr feature "unicode" (*)
+│   │   │               │       ├── gix-error feature "default" (*)
+│   │   │               │       ├── gix-path feature "default" (*)
+│   │   │               │       ├── gix-trace feature "default" (*)
+│   │   │               │       └── gix-quote feature "default" (*)
+│   │   │               ├── gix-packetline feature "default"
+│   │   │               │   └── gix-packetline v0.24.2
+│   │   │               │       ├── bstr feature "std" (*)
+│   │   │               │       ├── gix-error feature "default" (*)
+│   │   │               │       ├── faster-hex feature "std" (*)
+│   │   │               │       └── gix-trace feature "default" (*)
+│   │   │               └── gix-url feature "default"
+│   │   │                   └── gix-url v0.41.0
+│   │   │                       ├── bstr feature "std" (*)
+│   │   │                       ├── gix-error feature "bstr" (*)
+│   │   │                       ├── gix-error feature "default" (*)
+│   │   │                       ├── gix-utils feature "bstr" (*)
+│   │   │                       ├── gix-utils feature "default" (*)
+│   │   │                       ├── gix-path feature "default" (*)
+│   │   │                       └── percent-encoding feature "default"
+│   │   │                           ├── percent-encoding v2.3.2
+│   │   │                           └── percent-encoding feature "std"
+│   │   │                               ├── percent-encoding v2.3.2
+│   │   │                               └── percent-encoding feature "alloc"
+│   │   │                                   └── percent-encoding v2.3.2
+│   │   ├── gix-shallow feature "default" (*)
+│   │   ├── gix-url feature "default" (*)
+│   │   ├── gix-refspec feature "default"
+│   │   │   └── gix-refspec v0.48.0
+│   │   │       ├── bstr feature "std" (*)
+│   │   │       ├── gix-error feature "bstr" (*)
+│   │   │       ├── gix-error feature "default" (*)
+│   │   │       ├── gix-hash feature "default" (*)
+│   │   │       ├── smallvec feature "default" (*)
+│   │   │       └── gix-validate feature "default" (*)
+│   │   ├── gix-revwalk feature "default" (*)
+│   │   └── gix-traverse feature "default"
+│   │       └── gix-traverse v0.65.0
+│   │           ├── gix-date feature "default" (*)
+│   │           ├── gix-error feature "default" (*)
+│   │           ├── gix-commitgraph feature "default" (*)
+│   │           ├── gix-hash feature "default" (*)
+│   │           ├── smallvec feature "default" (*)
+│   │           ├── bitflags feature "default" (*)
+│   │           ├── gix-object feature "default" (*)
+│   │           ├── gix-hashtable feature "default" (*)
+│   │           └── gix-revwalk feature "default" (*)
+│   ├── gix-hash feature "sha1"
+│   │   └── gix-hash v0.29.0 (*)
+│   └── gix-pack feature "sha1"
+│       ├── gix-pack v0.78.0 (*)
+│       └── gix-hash feature "sha1" (*)
+├── gix feature "sha256"
+│   ├── gix v0.91.0 (*)
+│   ├── gix-hash feature "sha256"
+│   │   └── gix-hash v0.29.0 (*)
+│   ├── gix-object feature "sha256"
+│   │   ├── gix-object v0.67.0 (*)
+│   │   └── gix-hash feature "sha256" (*)
+│   └── gix-pack feature "sha256"
+│       ├── gix-pack v0.78.0 (*)
+│       └── gix-hash feature "sha256" (*)
+├── gix-ref feature "sha1"
+│   ├── gix-ref v0.70.0 (*)
+│   └── gix-hash feature "sha1" (*)
+└── gix-ref feature "sha256"
+    ├── gix-ref v0.70.0 (*)
+    └── gix-hash feature "sha256" (*)
