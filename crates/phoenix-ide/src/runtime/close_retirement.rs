@@ -9175,7 +9175,13 @@ fn mac_vnode_fd_info(
     // libproc returns zero on syscall failure and leaves errno from that call.
     if bytes == 0 {
         let errno = std::io::Error::last_os_error().raw_os_error();
-        tracing::warn!(pid, fd, recheck, ?errno, "Close macOS vnode FD read unavailable");
+        tracing::warn!(
+            pid,
+            fd,
+            recheck,
+            ?errno,
+            "Close macOS vnode FD read unavailable"
+        );
         return Err(CloseWriterGap::Unavailable);
     }
     if bytes != length {
