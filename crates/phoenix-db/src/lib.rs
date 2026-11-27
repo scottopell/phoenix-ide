@@ -3453,12 +3453,11 @@ impl Database {
         .transpose()
     }
 
-    /// Reconcile persisted worktree identity with the current Git administrative marker.
+    /// Enroll worktree identities for legacy scopes that have never recorded one.
     ///
-    /// Inaccessible worktrees remain unresolved instead of receiving fabricated continuity.
+    /// Startup does not clear or replace a recorded identity when the marker cannot be verified.
     /// # Errors
     /// Returns a database error when an observed identity cannot be persisted.
-    #[allow(clippy::too_many_lines)]
     pub async fn reconcile_worktree_identities(&self) -> DbResult<()> {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
@@ -3468,6 +3467,8 @@ impl Database {
              WHERE lifecycle = 'active'
                AND environment_kind = 'allocated_worktree'
                AND worktree_path IS NOT NULL
+               AND worktree_id IS NULL
+               AND worktree_fingerprint IS NULL
              ORDER BY id",
         )
         .fetch_all(&mut *tx)
@@ -3480,38 +3481,7 @@ impl Database {
             })
             .collect::<Vec<_>>();
 
-        for (scope_id, path, observed_fingerprint) in &observations {
-            let revalidated = Self::observe_worktree_fingerprint(path);
-            let stable_fingerprint = match (observed_fingerprint, revalidated) {
-                (Some(observed), Some(revalidated)) if observed == &revalidated => Some(observed),
-                _ => None,
-            };
-            sqlx::query(
-                "UPDATE work_scopes
-                 SET worktree_id = NULL, worktree_fingerprint = NULL
-                 WHERE id = ?1
-                   AND lifecycle = 'active'
-                   AND environment_kind = 'allocated_worktree'
-                   AND worktree_path = ?2
-                   AND (?3 IS NULL OR NOT (worktree_id IS NOT NULL AND worktree_fingerprint = ?3))
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM close_attempt_scopes captured
-                       JOIN close_obligations obligation
-                         ON obligation.attempt_id = captured.attempt_id
-                       WHERE captured.scope = work_scopes.id
-                         AND (obligation.phase <> 'completed'
-                              OR obligation.close_outcome IN ('archived_cleanup_attention', 'close_incomplete'))
-                         AND obligation.topology_sealed = 1
-                   )",
-            )
-            .bind(scope_id)
-            .bind(path)
-            .bind(stable_fingerprint)
-            .execute(&mut *tx)
-            .await?;
-        }
-
+        let mut enrolled = Vec::new();
         for (scope_id, path, observed_fingerprint) in &observations {
             let Some(observed_fingerprint) = observed_fingerprint else {
                 continue;
@@ -3552,7 +3522,9 @@ impl Database {
             .bind(path)
             .execute(&mut *tx)
             .await?;
-            if result.rows_affected() == 0 {
+            if result.rows_affected() == 1 {
+                enrolled.push((scope_id, path, observed_fingerprint));
+            } else {
                 tracing::debug!(
                     work_scope_id = %scope_id,
                     "worktree identity reconciliation deferred or unresolved"
@@ -3560,8 +3532,8 @@ impl Database {
             }
         }
 
-        for (scope_id, path, observed_fingerprint) in &observations {
-            if Self::observe_worktree_fingerprint(path).as_ref() == observed_fingerprint.as_ref() {
+        for (scope_id, path, enrolled_fingerprint) in enrolled {
+            if Self::observe_worktree_fingerprint(path).as_ref() == Some(enrolled_fingerprint) {
                 continue;
             }
             sqlx::query(
@@ -16943,7 +16915,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worktree_reconciliation_releases_stale_owner_before_claim_arbitration() {
+    async fn worktree_reconciliation_preserves_recorded_owner_across_ambiguous_observations() {
         let db = Database::open_in_memory().await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let claimant = temp.path().join("claimant");
@@ -16952,10 +16924,12 @@ mod tests {
         std::fs::create_dir_all(&stale_owner).unwrap();
         std::fs::write(claimant.join(".git"), "gitdir: /tmp/original\n").unwrap();
         std::fs::write(stale_owner.join(".git"), "gitdir: /tmp/replacement\n").unwrap();
-        let released_fingerprint =
+        let recorded_fingerprint =
             Database::observe_worktree_fingerprint(claimant.to_str().unwrap()).unwrap();
-        let replacement_fingerprint =
-            Database::observe_worktree_fingerprint(stale_owner.to_str().unwrap()).unwrap();
+        assert_ne!(
+            Database::observe_worktree_fingerprint(stale_owner.to_str().unwrap()).as_ref(),
+            Some(&recorded_fingerprint)
+        );
 
         sqlx::query(
             "INSERT INTO work_scopes (
@@ -16970,33 +16944,44 @@ mod tests {
         .bind(claimant.to_str().unwrap())
         .bind(stale_owner.to_str().unwrap())
         .bind(Utc::now().to_rfc3339())
-        .bind(&released_fingerprint)
+        .bind(&recorded_fingerprint)
         .execute(db.pool())
         .await
         .unwrap();
 
-        db.reconcile_worktree_identities().await.unwrap();
+        for change in ["replacement", "malformed-marker", "missing"] {
+            match change {
+                "replacement" => {}
+                "malformed-marker" => {
+                    std::fs::write(stale_owner.join(".git"), b"invalid").unwrap();
+                }
+                "missing" => std::fs::rename(&stale_owner, temp.path().join("moved")).unwrap(),
+                _ => unreachable!(),
+            }
+            db.reconcile_worktree_identities().await.unwrap();
 
-        let identities = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-            "SELECT id, worktree_id, worktree_fingerprint
-             FROM work_scopes
-             WHERE id IN ('a-claimant', 'b-stale-owner')
-             ORDER BY id",
-        )
-        .fetch_all(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(identities.len(), 2);
-        assert!(identities[0].1.is_some());
-        assert_eq!(
-            identities[0].2.as_deref(),
-            Some(released_fingerprint.as_str())
-        );
-        assert!(identities[1].1.is_some());
-        assert_eq!(
-            identities[1].2.as_deref(),
-            Some(replacement_fingerprint.as_str())
-        );
+            let identities = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+                "SELECT id, worktree_id, worktree_fingerprint
+                 FROM work_scopes
+                 WHERE id IN ('a-claimant', 'b-stale-owner')
+                 ORDER BY id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                identities,
+                vec![
+                    ("a-claimant".into(), None, None),
+                    (
+                        "b-stale-owner".into(),
+                        Some("stale-id".into()),
+                        Some(recorded_fingerprint.clone()),
+                    ),
+                ],
+                "{change} must not transfer the recorded identity"
+            );
+        }
     }
 
     #[tokio::test]
