@@ -5128,6 +5128,85 @@ mod product_pin_tests {
     }
 
     #[test]
+    fn origin_fetch_pins_advertised_default_without_mutating_refs_or_fetch_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("origin.git");
+        let seed = dir.path().join("seed");
+        let checkout = dir.path().join("checkout");
+        std::fs::create_dir_all(&seed).unwrap();
+        git(&seed, &["init", "-b", "main"]);
+        git(&seed, &["config", "user.email", "test@example.com"]);
+        git(&seed, &["config", "user.name", "Test"]);
+        std::fs::write(seed.join("README"), "initial\n").unwrap();
+        git(&seed, &["add", "README"]);
+        git(&seed, &["commit", "-m", "initial"]);
+        let initial_oid = git(&seed, &["rev-parse", "HEAD"]);
+
+        git(dir.path(), &["init", "--bare", bare.to_str().unwrap()]);
+        git(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        git(&seed, &["push", "origin", "main"]);
+        git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(
+            dir.path(),
+            &["clone", bare.to_str().unwrap(), checkout.to_str().unwrap()],
+        );
+        git(&checkout, &["fetch", "origin"]);
+        git(&checkout, &["tag", "local-only"]);
+        git(&checkout, &["config", "fetch.prune", "true"]);
+        git(&checkout, &["config", "fetch.pruneTags", "true"]);
+        git(
+            &checkout,
+            &[
+                "config",
+                "--replace-all",
+                "remote.origin.fetch",
+                "+refs/heads/*:refs/remotes/origin/*",
+            ],
+        );
+        git(
+            &checkout,
+            &["update-ref", "refs/remotes/origin/stale", initial_oid.trim()],
+        );
+
+        std::fs::write(seed.join("README"), "advanced default\n").unwrap();
+        git(&seed, &["add", "README"]);
+        git(&seed, &["commit", "-m", "advance advertised default"]);
+        let advertised_oid = git(&seed, &["rev-parse", "HEAD"]);
+        git(&seed, &["push", "origin", "main"]);
+        assert_ne!(initial_oid.trim(), advertised_oid.trim());
+
+        let fetch_head_path = git(&checkout, &["rev-parse", "--git-path", "FETCH_HEAD"]);
+        let fetch_head_path = checkout.join(fetch_head_path.trim());
+        let fetch_head_before = std::fs::read(&fetch_head_path).unwrap();
+        assert!(
+            !fetch_head_before.is_empty(),
+            "the preceding fetch should leave real FETCH_HEAD data"
+        );
+        let refs_before = git(
+            &checkout,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+
+        let (selected_oid, logical_base) = strict_product_creation_pin(&checkout).unwrap();
+
+        assert_eq!(selected_oid, advertised_oid.trim());
+        assert_eq!(logical_base, "main");
+        assert_eq!(
+            git(
+                &checkout,
+                &["for-each-ref", "--format=%(refname) %(objectname)"],
+            ),
+            refs_before,
+            "exact-pin fetch must not apply configured refmaps or prune refs"
+        );
+        assert_eq!(
+            std::fs::read(&fetch_head_path).unwrap(),
+            fetch_head_before,
+            "exact-pin fetch must preserve the prior FETCH_HEAD"
+        );
+    }
+
+    #[test]
     fn no_origin_pins_only_local_main() {
         let dir = tempfile::tempdir().unwrap();
         git(dir.path(), &["init", "-b", "main"]);
