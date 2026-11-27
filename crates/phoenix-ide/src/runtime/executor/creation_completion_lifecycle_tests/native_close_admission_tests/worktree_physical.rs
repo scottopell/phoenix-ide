@@ -85,6 +85,7 @@ async fn registered_native_close_physically_retires_worktree_only_and_replays_wi
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn registered_native_close_refuses_a_live_writable_descriptor() {
+    install_physical_close_diagnostics();
     run_public_worktree_close(WorktreeJourney::RefuseDescriptorWriter).await;
 }
 
@@ -944,6 +945,26 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             startup_llm_recovery_ack: Arc::new(Mutex::new(None)),
         },
     );
+    #[cfg(target_os = "linux")]
+    let physical_witness = if matches!(journey, WorktreeJourney::RetireWithProductionDetector)
+        && std::env::var_os("PHOENIX_TEST_OPAQUE_CLOSE_PID").is_some()
+    {
+        use crate::runtime::executor::native_close_retry::test_hooks::{Hooks, Point};
+
+        let hooks = Hooks::default();
+        let pause = hooks.arm(Point::PhysicalBeforeCheckoutRemoval);
+        Some((hooks, pause))
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let running = if let Some((hooks, _)) = physical_witness.as_ref() {
+        let hooks = hooks.clone();
+        tokio::spawn(async move { hooks.scope(actor.run()).await })
+    } else {
+        tokio::spawn(actor.run())
+    };
+    #[cfg(not(target_os = "linux"))]
     let running = tokio::spawn(actor.run());
     tokio::time::timeout(std::time::Duration::from_secs(10), started)
         .await
@@ -1079,6 +1100,22 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             .execute(fixture.db.pool())
             .await
             .unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    if let Some((_, mut pause)) = physical_witness {
+        tokio::select! {
+            output = close.as_mut() => panic!(
+                "ordinary physical witness completed before its deletion checkpoint: {}\n{}",
+                output.output(),
+                physical_close_diagnostics(),
+            ),
+            reached = tokio::time::timeout(Duration::from_secs(10), pause.reached()) => {
+                reached.expect("timed out waiting for physical deletion checkpoint")
+                    .expect("physical deletion must reach the persistence-before-deletion witness");
+            }
+        }
+        assert_ordinary_linux_gap_before_checkout_removal(&fixture, &git, &scope).await;
+        pause.release();
     }
     let output = tokio::time::timeout(Duration::from_secs(10), close.as_mut())
         .await
@@ -1550,16 +1587,6 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             scopes[0].resource.identity(),
             &LossItemIdentity::Opaque(OpaqueIdentity::parse(scope.as_str()).unwrap())
         );
-        if matches!(journey, WorktreeJourney::RetireWithProductionDetector) {
-            assert_ordinary_linux_gap_if_requested(
-                &fixture,
-                &run,
-                &scope,
-                &snapshot,
-                &worktrees[0].resource,
-            )
-            .await;
-        }
         let cleanup_plan = fixture
             .db
             .close_worktree_cleanup_plan(&attempt, &scope, &snapshot, &worktrees[0].resource)
@@ -1871,8 +1898,6 @@ async fn durable_target_rows(fixture: &CloseFixture) -> Value {
     })
 }
 
-// Failure diagnostics must not replace the original outcome with a query panic.
-// Keep replay snapshots below strict: query failures there remain test failures.
 async fn assert_public_descriptor_veto(
     fixture: &CloseFixture,
     git: &DisposableGit,
@@ -1892,11 +1917,17 @@ async fn assert_public_descriptor_veto(
         .unwrap();
     assert_eq!(
         obligation.close_outcome(),
-        Some(CloseCompletionOutcome::CloseIncomplete)
+        Some(CloseCompletionOutcome::CloseIncomplete),
+        "positive writer veto should retain actionable diagnostics: {}\n{}",
+        worktree_close_failure_evidence(fixture, &run).await,
+        physical_close_diagnostics(),
     );
     assert_eq!(
         fixture.db.get_close_run(&run).await.unwrap().status,
         CloseRunStatus::Stopped,
+        "positive writer veto must stop the exact run: {}\n{}",
+        worktree_close_failure_evidence(fixture, &run).await,
+        physical_close_diagnostics(),
     );
     let observations = fixture
         .db
@@ -1937,47 +1968,90 @@ async fn assert_public_descriptor_veto(
     );
 }
 
-async fn assert_ordinary_linux_gap_if_requested(
+#[cfg(target_os = "linux")]
+async fn assert_ordinary_linux_gap_before_checkout_removal(
     fixture: &CloseFixture,
-    run: &CloseRunRef,
+    git: &DisposableGit,
     scope: &WorkScopeId,
-    snapshot: &CloseRetirementSnapshot,
-    resource: &phoenix_core::domain::close::RetiredResourceIdentity,
 ) {
     use crate::db::{CloseWriterDetector, CloseWriterObservation};
 
-    let Ok(value) = std::env::var("PHOENIX_TEST_OPAQUE_CLOSE_PID") else {
-        return;
-    };
+    let attempt: String = sqlx::query_scalar(
+        "SELECT attempt_id FROM native_close_initial_receipts WHERE request_id = ?1",
+    )
+    .bind(fixture.command.request_id().to_string())
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    let attempt = CloseAttemptId::parse(attempt).unwrap();
+    let run = CloseRunRef::initial(attempt.clone());
+    assert_eq!(
+        fixture.db.get_close_run(&run).await.unwrap().status,
+        CloseRunStatus::Running,
+    );
+    let expected = fixture
+        .db
+        .list_close_expected_retirement_resources(attempt.as_str())
+        .await
+        .unwrap();
+    let worktree = expected
+        .iter()
+        .find(|item| &item.scope == scope && item.resource.kind() == RetiredResourceKind::Worktree)
+        .expect("sealed capture must contain the exact Worktree");
+    let cleanup = fixture
+        .db
+        .close_worktree_cleanup_plan(&attempt, scope, &worktree.snapshot, &worktree.resource)
+        .await
+        .unwrap()
+        .unwrap();
+    let object = cleanup.final_tombstone.unwrap().root.join("object");
+    assert_eq!(directory_identity(&object), git.checkout_identity);
+    assert_eq!(
+        std::fs::read(object.join("tracked.txt")).unwrap(),
+        b"durable content\n",
+    );
+    assert_eq!(cleanup.administrative_dir, git.admin);
+    assert_eq!(directory_identity(&git.admin), git.admin_identity);
+    // The original path is absent while quarantined, so Git can label the entry
+    // prunable. The exact registration itself must still exist.
+    let expected_registration = [b"worktree ", git.worktree.as_os_str().as_bytes()].concat();
+    assert!(
+        git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"])
+            .split(|byte| *byte == 0)
+            .any(|field| field == expected_registration)
+    );
+
+    let value = std::env::var("PHOENIX_TEST_OPAQUE_CLOSE_PID").unwrap();
     let pid: u32 = value.parse().expect("ordinary-runner opaque fixture PID");
     let path = format!("/proc/{pid}/exe");
     assert_eq!(
         std::fs::read_link(&path).unwrap_err().kind(),
         std::io::ErrorKind::PermissionDenied
     );
+    let observations = fixture
+        .db
+        .list_close_writer_observations(&run, scope)
+        .await
+        .unwrap();
+    let diagnostics = physical_close_diagnostics();
     assert!(
-        physical_close_diagnostics().lines().any(|line| {
+        diagnostics.lines().any(|line| {
             line.contains("operation=\"process_exe_read_link\"")
                 && line.contains(&path)
                 && line.contains("error_kind=PermissionDenied")
         }),
-        "the production scanner must encounter the opaque fixture: {path}"
+        "the production scanner must encounter the opaque fixture: {path}\n{observations:?}\n{diagnostics}",
     );
-    let observations = fixture
-        .db
-        .list_close_writer_observations(run, scope)
-        .await
-        .unwrap();
     assert_eq!(
         observations.len(),
         1,
         "one representative immutable observation"
     );
     let entry = &observations[0];
-    assert_eq!(&entry.run, run);
+    assert_eq!(entry.run, run);
     assert_eq!(&entry.scope, scope);
-    assert_eq!(&entry.snapshot, snapshot);
-    assert_eq!(&entry.resource, resource);
+    assert_eq!(entry.snapshot, worktree.snapshot);
+    assert_eq!(entry.resource, worktree.resource);
     assert!(matches!(
         entry.observation,
         CloseWriterObservation::InspectionGap {
@@ -1986,10 +2060,12 @@ async fn assert_ordinary_linux_gap_if_requested(
         }
     ));
     eprintln!(
-        "ordinary Linux: production scan saw opaque process and retained a durable inspection gap"
+        "ordinary Linux: opaque process witnessed; durable gap precedes removal of the exact checkout and registration"
     );
 }
 
+// Failure diagnostics must not replace the original outcome with a query panic.
+// Replay snapshots remain strict: a query failure there is itself a test failure.
 async fn worktree_close_failure_evidence(fixture: &CloseFixture, run: &CloseRunRef) -> String {
     let evidence = fixture
         .db
@@ -2086,6 +2162,20 @@ async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) ->
     .fetch_one(fixture.db.pool())
     .await
     .unwrap();
+    let writer_observations: Vec<String> = sqlx::query_scalar(
+        "SELECT json_array(product_conversation_id, attempt_id, run_ordinal, scope,
+                           inspection_generation, inspection_fingerprint, resource_kind,
+                           identity_kind, identity_codec, quote(identity_value), detector, pid,
+                           incarnation, quote(executable), quote(matched_path), matched_kind,
+                           access, authority, gap)
+         FROM close_writer_observations WHERE attempt_id = ?1 AND run_ordinal = ?2
+         ORDER BY scope, detector",
+    )
+    .bind(attempt)
+    .bind(run.ordinal.get())
+    .fetch_all(fixture.db.pool())
+    .await
+    .unwrap();
     let process_successes: Vec<(String, String, String, String, i64)> = sqlx::query_as(
         "SELECT scope, resource_kind, identity_value, outcome, observed_at_us
          FROM close_process_step_successes WHERE attempt_id = ?1 AND run_ordinal = ?2
@@ -2111,6 +2201,7 @@ async fn durable_native_close_rows(fixture: &CloseFixture, run: &CloseRunRef) ->
         "counts": close_row_counts(fixture).await,
         "receipt": receipt,
         "run_times": run_times,
+        "writer_observations": writer_observations,
         "process_successes": process_successes,
         "history": history,
         "obligation": obligation,

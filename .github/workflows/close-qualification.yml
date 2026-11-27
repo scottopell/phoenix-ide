@@ -207,7 +207,7 @@ jobs:
             grep -F "$test_name ... ok" "evidence/ordinary-linux-${test_name##*::}.log"
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "evidence/ordinary-linux-${test_name##*::}.log"
             if [[ "$test_name" == *::registered_native_close_with_production_detector_retires_worktree_and_replays ]]; then
-              grep -F 'ordinary Linux: production scan saw opaque process and retained a durable inspection gap' "evidence/ordinary-linux-${test_name##*::}.log"
+              grep -F 'ordinary Linux: opaque process witnessed; durable gap precedes removal of the exact checkout and registration' "evidence/ordinary-linux-${test_name##*::}.log"
             fi
           done
       - name: Required public Worktree retirement with production writer detector

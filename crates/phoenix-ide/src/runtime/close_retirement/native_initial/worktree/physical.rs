@@ -922,6 +922,19 @@ impl WorktreeDeletionDriver for PhysicalDeletionDriver<'_> {
         }
         self.check_external_writers(object, self_descriptor)?;
         self.verify_confirmed_snapshot()?;
+        #[cfg(test)]
+        {
+            use crate::runtime::executor::native_close_retry::test_hooks::{Point, checkpoint};
+
+            let hooks = self
+                .custody
+                .git
+                .original_effect
+                .as_ref()
+                .and_then(|context| context.test_hooks.as_ref());
+            self.runtime
+                .block_on(checkpoint(hooks, Point::PhysicalBeforeCheckoutRemoval));
+        }
         require_absent(self.location().original_path())
     }
 }

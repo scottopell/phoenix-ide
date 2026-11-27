@@ -7876,8 +7876,8 @@ fn scan_writer_detectors(
     mut cwd: impl FnMut() -> Result<ExternalWriterEvidence, String>,
     mut mapping: impl FnMut() -> Result<ExternalWriterEvidence, String>,
 ) -> Result<ExternalWriterEvidence, String> {
-    let mut incomplete = ExternalWriterEvidence::NoPositiveEvidence;
     type Probe<'a> = dyn FnMut() -> Result<ExternalWriterEvidence, String> + 'a;
+    let mut incomplete = ExternalWriterEvidence::NoPositiveEvidence;
     let probes: [&mut Probe<'_>; 3] = [&mut descriptor, &mut cwd, &mut mapping];
     for probe in probes {
         check_directory_deletion_deadline(Some(deadline))?;
@@ -8595,24 +8595,12 @@ fn linux_writer_scan_until(
         else {
             continue;
         };
-        let owner = linux_process_owner_until(&process, effective_uid, detector.as_str(), deadline);
-        check_directory_deletion_deadline(Some(deadline))?;
-        match owner {
+        match linux_writer_candidate_until(&process, effective_uid, detector, pid, deadline) {
+            Ok(true) => {}
+            Ok(false) => continue,
             Err(WriterScanError::Stopped(message)) => return Err(message),
-            Ok(LinuxProcessOwner::Unrelated | LinuxProcessOwner::Zombie) => continue,
-            Ok(LinuxProcessOwner::Relevant) => {}
-            result => {
-                tracing::debug!(
-                    operation = "owner_before",
-                    detector = detector.as_str(),
-                    pid,
-                    ?result
-                );
-                incomplete.remember_gap(writer_gap(
-                    detector,
-                    Some(pid),
-                    CloseWriterGap::Unavailable,
-                ));
+            Err(WriterScanError::Gap(reason)) => {
+                incomplete.remember_gap(writer_gap(detector, Some(pid), reason));
                 continue;
             }
         }
@@ -8676,6 +8664,27 @@ fn linux_writer_scan_until(
     }
     check_directory_deletion_deadline(Some(deadline))?;
     Ok(incomplete)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_writer_candidate_until(
+    process: &std::fs::DirEntry,
+    effective_uid: libc::uid_t,
+    detector: CloseWriterDetector,
+    pid: u32,
+    deadline: std::time::Instant,
+) -> Result<bool, WriterScanError> {
+    let owner = linux_process_owner_until(process, effective_uid, detector.as_str(), deadline);
+    writer_scan_check(deadline)?;
+    match owner {
+        Ok(LinuxProcessOwner::Relevant) => Ok(true),
+        Ok(LinuxProcessOwner::Unrelated | LinuxProcessOwner::Zombie) => Ok(false),
+        Err(WriterScanError::Stopped(message)) => Err(WriterScanError::Stopped(message)),
+        result => {
+            tracing::debug!(operation = "owner_before", detector = detector.as_str(), pid, ?result);
+            Err(WriterScanError::Gap(CloseWriterGap::Unavailable))
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -17476,8 +17485,6 @@ mod tests {
         assert!(super::classify_fsmonitor_stop(&output(128, b"unexpected", unsupported)).is_err());
     }
 
-    /// Deterministic quarantine/removal effects for tests: the supplied
-    /// `stop_fsmonitor` observation replaces the real fsmonitor shutdown, while
     #[test]
     fn external_writer_detector_gap_does_not_mask_independent_evidence_or_target_failure() {
         use super::{CloseWriterDetector, CloseWriterGap, ExternalWriterEvidence};
@@ -17552,6 +17559,7 @@ mod tests {
         })
     }
 
+    /// Deterministic effects for tests: inject fsmonitor shutdown and report no writers.
     pub(super) fn injected_close_worktree_effects(
         stop_fsmonitor: impl FnOnce(&Path) -> Result<super::FsmonitorStop, String> + Send + 'static,
     ) -> super::CloseWorktreeEffects {
