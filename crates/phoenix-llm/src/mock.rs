@@ -129,9 +129,9 @@ impl Scenario {
                 Self::GitLifecycleFollowUpProposal => Some(1),
                 _ => None,
             };
-            if proposal_ordinal.is_some_and(|ordinal| {
-                prior_tool_call_count(request, "propose_task") != ordinal
-            }) {
+            if proposal_ordinal
+                .is_some_and(|ordinal| prior_tool_call_count(request, "propose_task") != ordinal)
+            {
                 return Self::PlainText;
             }
             if matches!(s, Self::AskUserQuestion { .. }) {

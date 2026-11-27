@@ -162,6 +162,18 @@ pub(crate) async fn run_legacy_close_compat(
                     .get_close_obligation(obligation.attempt_id().as_str())
                     .await
                     .map_err(|error| AppError::Internal(error.to_string()))?;
+                if advanced.phase() == ClosePhase::SettlingActiveWork {
+                    state
+                        .db
+                        .require_no_retained_legacy_creation_for_retirement(advanced.attempt_id())
+                        .await
+                        .map_err(|error| {
+                            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                                error.to_string(),
+                                "close_settlement_in_progress",
+                            )))
+                        })?;
+                }
                 if matches!(
                     advanced.phase(),
                     ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
