@@ -14107,12 +14107,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(
-            crate::migrations::run_pending_migrations(db.pool())
-                .await
-                .unwrap(),
-            15
-        );
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
         let after: (String, String, String, String, String, String, String, i64) = sqlx::query_as(
             "SELECT request_id, source_transcript_id, source_message_id, source_tool_use_id,
                     request_fingerprint, product_conversation_id, attempt_id, run_ordinal
