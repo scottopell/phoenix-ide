@@ -4444,8 +4444,17 @@ mod product_creation_staging_ownership_tests {
 
         let root = repo.path().to_str().unwrap();
         assert!(verify_product_creation_checkout(root, &path, &oid).is_ok());
-        let adoption = verify_existing_product_creation_staging(root, &path, &oid, Some("owner-token"));
-        assert!(adoption.is_err());
+        let error = verify_existing_product_creation_staging(
+            root,
+            &path,
+            &oid,
+            Some("owner-token"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "existing staging occupant did not match durable ownership"
+        );
         assert_eq!(std::fs::read(&marker).unwrap(), b"owner-token");
         assert_eq!(std::fs::read(path.join("README")).unwrap(), b"test");
         assert_eq!(
@@ -5167,8 +5176,8 @@ mod product_pin_tests {
 
         git(dir.path(), &["init", "--bare", bare.to_str().unwrap()]);
         git(&seed, &["remote", "add", "origin", bare.to_str().unwrap()]);
-        git(&seed, &["push", "origin", "main"]);
-        git(&bare, &["symbolic-ref", "HEAD", "refs/heads/main"]);
+        git(&seed, &["push", "origin", "main", "HEAD:refs/heads/trunk"]);
+        git(&bare, &["symbolic-ref", "HEAD", "refs/heads/trunk"]);
         git(
             dir.path(),
             &["clone", bare.to_str().unwrap(), checkout.to_str().unwrap()],
@@ -5188,14 +5197,18 @@ mod product_pin_tests {
         );
         git(
             &checkout,
-            &["update-ref", "refs/remotes/origin/stale", initial_oid.trim()],
+            &[
+                "update-ref",
+                "refs/remotes/origin/stale",
+                initial_oid.trim(),
+            ],
         );
 
         std::fs::write(seed.join("README"), "advanced default\n").unwrap();
         git(&seed, &["add", "README"]);
         git(&seed, &["commit", "-m", "advance advertised default"]);
         let advertised_oid = git(&seed, &["rev-parse", "HEAD"]);
-        git(&seed, &["push", "origin", "main"]);
+        git(&seed, &["push", "origin", "HEAD:refs/heads/trunk"]);
         assert_ne!(initial_oid.trim(), advertised_oid.trim());
 
         let fetch_head_path = git(&checkout, &["rev-parse", "--git-path", "FETCH_HEAD"]);
@@ -5213,7 +5226,7 @@ mod product_pin_tests {
         let (selected_oid, logical_base) = strict_product_creation_pin(&checkout).unwrap();
 
         assert_eq!(selected_oid, advertised_oid.trim());
-        assert_eq!(logical_base, "main");
+        assert_eq!(logical_base, "trunk");
         assert_eq!(
             git(
                 &checkout,
