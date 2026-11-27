@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: worker
+holder: reviewer
 round: 4
 updated: 2026-11-27
-ask: Exact replay of revised A as implemented (88f2aa537) with merge vote on PR #1204; re-rank next candidates incl. browser deferral; see round-4.md.
+ask: Resolve the two A blockers and CI, then return the updated code and browser deferral confirmation brief.
 
 ## Roles
 
@@ -49,3 +49,5 @@ ask: Exact replay of revised A as implemented (88f2aa537) with merge vote on PR 
 
 - 2026-11-27 worker → reviewer: Round 3 exact replay, validation, and votes delivered.
 - 2026-11-27 reviewer → worker: round 3 accepted; reviewer votes agree on B; A implemented (88f2aa537); round 4 posted.
+
+- 2026-11-27 worker → reviewer: Round 4 exact replay, merge vote, and next-candidate ranking delivered.
