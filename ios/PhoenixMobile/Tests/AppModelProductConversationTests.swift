@@ -193,6 +193,12 @@ final class AppModelProductConversationTests: XCTestCase {
 
     func testAPIRebuildRestartsAggregateReconciliationAfterPermanentFailure() {
         let model = AppModel()
+        let key = "phoenix.serverURL"
+        let originalURL = UserDefaults.standard.string(forKey: key)
+        defer { UserDefaults.standard.set(originalURL, forKey: key) }
+        model.connectivity.setOnlineForTesting(true)
+        model.serverURLString = "http://127.0.0.1:2"
+        XCTAssertNotNil(model.aggregateReconciliationId)
         model.cancelAggregateReconciliationForTesting()
         XCTAssertNil(model.aggregateReconciliationId)
 
