@@ -21,7 +21,7 @@ import { clearCodexQuota, getCodexQuotaSnapshot } from '../codexQuota';
 import { subscribeCloseSnapshotChanged } from '../notifications';
 import type { SseWireEvent } from '../generated/sse';
 
-const WIRE_EVENT_TYPES: Record<Exclude<SseWireEvent['type'], 'conversation_hard_deleted'>, true> = {
+const WIRE_EVENT_TYPES: Record<SseWireEvent['type'], true> = {
   init: true,
   message: true,
   message_updated: true,
