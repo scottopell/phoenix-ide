@@ -2929,6 +2929,45 @@ class ParallelDispatchTests(unittest.TestCase):
         self.assertIn("synthetic e2e failure", failures[0][1])
 
 
+def _close_descriptor_diagnostic_tail(log_text: str) -> list[str]:
+    tail = []
+    for line in reversed(log_text.splitlines()):
+        if "phoenix_ide::runtime::close_retirement" not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or record.get("target") != "phoenix_ide::runtime::close_retirement":
+            continue
+        fields = record.get("fields")
+        if isinstance(fields, dict) and (
+            fields.get("detector") == "linux_descriptor"
+            or fields.get("message") == "Linux Close writer scan I/O failed"
+        ):
+            tail.append(line)
+            if len(tail) == 12:
+                break
+    return list(reversed(tail))
+
+
+class CloseDescriptorDiagnosticsTests(unittest.TestCase):
+    def test_keeps_bounded_json_tail_including_non_io_gaps(self):
+        target = "phoenix_ide::runtime::close_retirement"
+        entries = [
+            json.dumps({"target": target, "fields": {
+                "operation": operation, "detector": "linux_descriptor", "pid": pid,
+            }})
+            for pid, operation in enumerate(["identity_before", "process_revalidation"] * 7)
+        ]
+        io_error = json.dumps({"target": target, "fields": {
+            "message": "Linux Close writer scan I/O failed", "raw_os_error": "Some(13)",
+        }})
+        noise = [f"{target} is not JSON", json.dumps({"target": "other", "fields": {"detector": "linux_descriptor"}})]
+        log = "\n".join([*entries, *noise, io_error])
+        self.assertEqual(_close_descriptor_diagnostic_tail(log), [*entries[-11:], io_error])
+
+
 def _run_self_tests() -> int:
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromTestCase(case)
@@ -2941,6 +2980,7 @@ def _run_self_tests() -> int:
             PublicLiteralChatPreflightTests,
             ScenarioSelectorTests,
             ParallelDispatchTests,
+            CloseDescriptorDiagnosticsTests,
         )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)
@@ -3016,9 +3056,31 @@ def main(argv: list[str] | None = None) -> int:
                         extra={"kind": "e2e_scenario", "process_role": "server", "scenario": name, "status": scenario_status},
                     )
 
+        lifecycle_close_failed = any(
+            name == "git_lifecycle_public_http" and "physical Close returned HTTP" in detail
+            for name, detail in failures
+        )
+        if lifecycle_close_failed and sys.platform == "linux":
+            for role, pid in (("harness", os.getpid()), ("server", server_pid)):
+                proc = Path("/proc") / str(pid)
+                try:
+                    namespace = (proc / "ns/pid").readlink()
+                    status = (proc / "status").read_text()
+                    pids = next(
+                        (line for line in status.splitlines() if line.startswith("NSpid:")),
+                        "NSpid: unavailable",
+                    )
+                    print(f"[e2e] Close {role} pid={pid} namespace={namespace} {pids}")
+                except OSError as error:
+                    print(f"[e2e] Close {role} pid={pid} namespace unavailable (errno={error.errno})")
+
         # Read log inside the context — the tempdir may be cleaned up after.
         if log_path.exists():
             log_text = log_path.read_text()
+
+    if lifecycle_close_failed:
+        for line in _close_descriptor_diagnostic_tail(log_text):
+            print(f"  | {line}")
 
     external_mcp_lines = [
         line
