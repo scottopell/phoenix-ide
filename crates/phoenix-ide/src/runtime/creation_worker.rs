@@ -2719,7 +2719,7 @@ mod product_creation_delivery_replay_tests {
         let fixture = tempfile::tempdir().unwrap();
         let origin = fixture.path().join("origin.git");
         let publisher = fixture.path().join("publisher");
-        let database = fixture.path().join("phoenix.db");
+        let database = fixture.path().join("creation-restart.sqlite");
         let database = database.to_str().unwrap();
         let git = |cwd: &Path, args: &[&str]| crate::git_ops::run_git(cwd, args).unwrap();
         git(&repo, &["clone", "--bare", ".", origin.to_str().unwrap()]);

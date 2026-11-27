@@ -3486,10 +3486,7 @@ impl Database {
             let Some(observed_fingerprint) = observed_fingerprint else {
                 continue;
             };
-            let Some(revalidated_fingerprint) = Self::observe_worktree_fingerprint(path) else {
-                continue;
-            };
-            if &revalidated_fingerprint != observed_fingerprint {
+            if Self::observe_worktree_fingerprint(path).as_ref() != Some(observed_fingerprint) {
                 continue;
             }
             let result = sqlx::query(
