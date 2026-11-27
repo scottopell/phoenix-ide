@@ -1111,7 +1111,8 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             ),
             reached = pause.reached() => reached.expect("physical deletion must reach the persistence-before-deletion witness"),
         }
-        let witness = assert_ordinary_linux_gap_before_checkout_removal(&fixture, &git, &scope).await;
+        let witness =
+            assert_ordinary_linux_gap_before_checkout_removal(&fixture, &git, &scope).await;
         pause.release();
         Some(witness)
     } else {
@@ -1971,8 +1972,25 @@ async fn assert_public_descriptor_veto(
     assert_eq!(std::fs::read(matched_path).unwrap(), b"durable content\n");
     assert_eq!(directory_identity(&git.admin), git.admin_identity);
     assert_eq!(
-        git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]),
-        registrations,
+        std::fs::read(git.admin.join("gitdir")).unwrap(),
+        format!("{}\n", git.worktree.join(".git").display()).into_bytes(),
+    );
+    let listing = git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]);
+    let checkout_entry = [b"worktree ", git.worktree.as_os_str().as_bytes()].concat();
+    let mut in_checkout_entry = false;
+    let actual: Vec<_> = listing
+        .split(|byte| *byte == 0)
+        .filter(|field| {
+            if field.starts_with(b"worktree ") {
+                in_checkout_entry = *field == checkout_entry;
+            }
+            // With the original path absent, Git may mark the retained entry prunable.
+            !(in_checkout_entry && field.starts_with(b"prunable "))
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        registrations.split(|byte| *byte == 0).collect::<Vec<_>>()
     );
     assert_eq!(
         fixture
