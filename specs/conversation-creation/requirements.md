@@ -324,7 +324,7 @@ THE SYSTEM SHALL leave the job non-ready and retryable or failed according to th
 
 ### REQ-CCR-007: Cancellation
 
-WHEN a user cancels an accepted, claimed, retry-scheduled, or `delivery_pending` creation before durable objective acceptance
+WHEN a user cancels an accepted, claimed, retry-scheduled, or `delivery_pending` ProductConversation creation before durable objective acceptance
 THE SYSTEM SHALL immediately revoke the active generation
 AND SHALL preserve a visible creation record with its original creation intent and the outcome of reconciliation
 AND SHALL reconcile owned resources asynchronously, including removing the exactly owned hidden staged ProductConversation, transcript, and attached `WorkScope` aggregate without publishing it
@@ -340,6 +340,20 @@ AND SHALL leave subsequent lifecycle actions to the ordinary conversation lifecy
 
 WHEN reconciliation completes successfully after cancellation
 THE SYSTEM SHALL offer Start over and Delete for the cancelled record
+
+WHEN Stop wins the write race against completion of a legacy provisioning transcript
+THE SYSTEM SHALL atomically revoke its job claim and persist the cancelled job and transcript state
+AND SHALL leave existing resource reservations and physical resources unchanged
+AND SHALL NOT treat this outcome as proof that active work stopped or retained resources are safe to retire.
+
+WHEN provisioning completes before a Stop admitted against the provisioning transcript
+THE SYSTEM SHALL report a conflict rather than claiming cancellation or applying Stop to the new state.
+
+WHEN Stop observes a legacy provisioning transcript already marked cancelled
+THE SYSTEM SHALL report a no-op without resuming legacy cleanup.
+
+WHILE Close settlement has a captured legacy cancelled creation with an unreleased resource reservation
+THE SYSTEM SHALL NOT advance to resource retirement on the basis of the cancellation alone.
 
 ### REQ-CCR-008: Deletion During Creation
 

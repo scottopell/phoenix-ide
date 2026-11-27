@@ -3724,7 +3724,7 @@ impl RuntimeManager {
                 .cancel_conversation_creation(conversation_id, Utc::now())
                 .await
             {
-                Ok(()) | Err(crate::db::DbError::Sqlx(sqlx::Error::RowNotFound)) => {}
+                Ok(_) => {}
                 Err(error) => return Err(error.to_string()),
             }
         }

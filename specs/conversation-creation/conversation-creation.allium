@@ -8,7 +8,8 @@
 --
 -- Creation has no unresolved success outcome, no visible shell before publication,
 -- no stale/local canonical fallback, and no creation-time file or skill expansion.
--- Excludes: Git command details, database representation, HTTP and UI layout.
+-- Excludes: legacy transcript Stop (REQ-CCR-007), Git command details,
+-- database representation, HTTP and UI layout.
 --
 -- Requirement traceability: REQ-CCR-001 through REQ-CCR-015.
 

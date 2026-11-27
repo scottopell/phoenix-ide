@@ -17980,14 +17980,19 @@ mod tests {
         )
         .await
         .unwrap();
-        sqlx::query("UPDATE conversation_creation_jobs SET status = 'cancelling' WHERE id = ?")
-            .bind("job-cancel")
-            .execute(db.pool())
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'cancelling', generation = generation + 1,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL
+             WHERE id = ?",
+        )
+        .bind("job-cancel")
+        .execute(db.pool())
+        .await
+        .unwrap();
         sqlx::query(
             "UPDATE conversation_creation_resource_reservations
-             SET status = 'cleanup_required' WHERE job_id = ?",
+             SET status = 'cleanup_required', generation = generation + 1 WHERE job_id = ?",
         )
         .bind("job-cancel")
         .execute(db.pool())
@@ -18638,7 +18643,9 @@ mod tests {
 
     #[tokio::test]
     async fn competing_legacy_stops_settle_once_without_changing_reservations() {
-        let db = Database::open_in_memory().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stop.db");
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
         let job_id = "job-stop";
         let conversation_id = "conv-stop";
         insert_test_creation_job(&db, job_id, conversation_id).await;

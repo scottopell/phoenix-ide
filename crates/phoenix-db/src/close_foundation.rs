@@ -2676,7 +2676,7 @@ impl Database {
                    WHERE creation.conversation_id = participant.id
                      AND (
                        creation.status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling')
-                       OR (creation.status = 'failed' AND EXISTS (
+                       OR (creation.status IN ('failed', 'cancelled') AND EXISTS (
                          SELECT 1 FROM conversation_creation_resource_reservations reservation
                          WHERE reservation.job_id = creation.id AND reservation.status != 'released'
                        ))
@@ -9934,9 +9934,35 @@ mod tests {
             DbError::CloseFoundationPrecondition(_)
         ));
         sqlx::query(
+            "INSERT INTO conversation_creation_resource_reservations (
+                 id, job_id, generation, repository_identity, resource_identity,
+                 status, created_at, updated_at
+             ) VALUES (
+                 'reservation', 'creation-job', 1, '/repo', '/repo/staging',
+                 'reserved', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
             "UPDATE conversation_creation_jobs
              SET status = 'cancelled', cancelled_at = '2025-01-01T00:00:01Z'
              WHERE id = 'creation-job'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(matches!(
+            db.advance_close_settlement_when_quiescent("attempt-creation")
+                .await
+                .unwrap_err(),
+            DbError::CloseFoundationPrecondition(message)
+                if message.contains("active durable member obligation")
+        ));
+        sqlx::query(
+            "UPDATE conversation_creation_resource_reservations
+             SET status = 'released' WHERE id = 'reservation'",
         )
         .execute(db.pool())
         .await
