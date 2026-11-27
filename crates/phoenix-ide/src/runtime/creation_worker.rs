@@ -4432,6 +4432,29 @@ mod product_creation_staging_ownership_tests {
     }
 
     #[test]
+    fn token_only_staging_marker_cannot_prove_checkout_continuity() {
+        let repo = initialized_repo();
+        let path = repo.path().join(".phoenix/worktrees/recorded");
+        add_detached_worktree(repo.path(), &path);
+        let git = |args: &[&str]| crate::git_ops::run_git(repo.path(), args).unwrap();
+        let oid = git(&["rev-parse", "HEAD"]);
+        let registrations = git(&["worktree", "list", "--porcelain", "-z"]);
+        let marker = product_creation_owner_marker_path(&path).unwrap();
+        std::fs::write(&marker, b"owner-token").unwrap();
+
+        let root = repo.path().to_str().unwrap();
+        assert!(verify_product_creation_checkout(root, &path, &oid).is_ok());
+        let adoption = verify_existing_product_creation_staging(root, &path, &oid, Some("owner-token"));
+        assert!(adoption.is_err());
+        assert_eq!(std::fs::read(&marker).unwrap(), b"owner-token");
+        assert_eq!(std::fs::read(path.join("README")).unwrap(), b"test");
+        assert_eq!(
+            git(&["worktree", "list", "--porcelain", "-z"]),
+            registrations
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
     fn adoption_rejects_a_copied_pointer_even_with_the_same_backpointer() {
         let repo = initialized_repo();
