@@ -3895,6 +3895,7 @@ mod product_creation_delivery_replay_tests {
         let delivery =
             seed_live_delivery(&db, directory.path(), "renew-delivery", "renew-root").await;
         let now = chrono::Utc::now();
+        db.test_set_product_creation_now(now);
         assert!(db
             .renew_product_creation_claim(
                 "renew-delivery",

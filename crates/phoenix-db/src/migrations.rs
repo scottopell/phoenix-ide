@@ -24142,12 +24142,12 @@ mod tests {
         drop(db);
 
         let db = crate::Database::open(path).await.unwrap();
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 192).await.unwrap(), 1);
         db.pool().close().await;
         drop(db);
 
         let db = crate::Database::open(path).await.unwrap();
-        assert_eq!(run_pending_migrations(db.pool()).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(db.pool(), 192).await.unwrap(), 0);
         let retained_relationships: Vec<(String, String, Option<String>, Option<String>)> =
             sqlx::query_as(
                 "SELECT id, origin_conv_id, fork_conv_id, refinement_conv_id

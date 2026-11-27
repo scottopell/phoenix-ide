@@ -1986,6 +1986,10 @@ impl Database {
         error: &str,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let fence_now = self
+            .product_creation_fence_now()
+            .max(datetime_to_unix_micros(now));
         let attempt: Option<(i64, bool)> = sqlx::query_as(
             "SELECT attempt_count, pin_exact_checkout_oid IS NOT NULL AND pin_repository_identity IS NULL
              FROM product_creation_jobs
@@ -1997,16 +2001,20 @@ impl Database {
         .bind(claim.generation)
         .bind(&claim.worker_id)
         .bind(&claim.token)
-        .bind(datetime_to_unix_micros(now))
-        .fetch_optional(&self.pool)
+        .bind(fence_now)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some((current_attempt_count, unbound_pin)) = attempt else {
+            tx.rollback().await?;
             return Ok(false);
         };
         let retry_at = if unbound_pin {
             None
         } else {
-            next_product_creation_retry_at(current_attempt_count, now)
+            next_product_creation_retry_at(
+                current_attempt_count,
+                unix_micros_to_datetime(fence_now)?,
+            )
         };
         let Some(retry_at) = retry_at else {
             let updated = sqlx::query(
@@ -2022,10 +2030,11 @@ impl Database {
             .bind(claim.generation)
             .bind(&claim.worker_id)
             .bind(error)
-            .bind(datetime_to_unix_micros(now))
+            .bind(fence_now)
             .bind(&claim.token)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+            tx.commit().await?;
             return Ok(updated.rows_affected() == 1);
         };
         let updated = sqlx::query(
@@ -2044,12 +2053,13 @@ impl Database {
         .bind(&claim.worker_id)
         .bind(datetime_to_unix_micros(retry_at))
         .bind(error)
-        .bind(datetime_to_unix_micros(now))
+        .bind(fence_now)
         .bind(&claim.token)
         .bind(current_attempt_count)
         .bind(PRODUCT_CREATION_MAX_ATTEMPTS)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(updated.rows_affected() == 1)
     }
 
@@ -2099,6 +2109,14 @@ impl Database {
         now: DateTime<Utc>,
         lease_duration: chrono::Duration,
     ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let fence_now = self
+            .product_creation_fence_now()
+            .max(datetime_to_unix_micros(now));
+        let renewal_time = unix_micros_to_datetime(fence_now)?;
+        let Some(lease_until) = renewal_time.checked_add_signed(lease_duration) else {
+            return Ok(false);
+        };
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET claim_lease_until_unix_micros = ?1,
@@ -2110,14 +2128,15 @@ impl Database {
                AND (status = 'claimed' OR EXISTS (SELECT 1 FROM conversations c
                     WHERE c.id = product_creation_jobs.published_conversation_id))",
         )
-        .bind(datetime_to_unix_micros(now + lease_duration))
-        .bind(datetime_to_unix_micros(now))
+        .bind(datetime_to_unix_micros(lease_until))
+        .bind(fence_now)
         .bind(request_id)
         .bind(claim.generation)
         .bind(&claim.worker_id)
         .bind(&claim.token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(updated.rows_affected() == 1)
     }
 
@@ -2145,6 +2164,10 @@ impl Database {
             3 => 10,
             _ => 30,
         };
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let fence_now = self
+            .product_creation_fence_now()
+            .max(datetime_to_unix_micros(now));
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET delivery_attempt_count = ?2,
@@ -2165,16 +2188,17 @@ impl Database {
         .bind(next_attempt)
         .bind(exhausted)
         .bind(datetime_to_unix_micros(
-            now + chrono::Duration::seconds(delay_seconds),
+            unix_micros_to_datetime(fence_now)? + chrono::Duration::seconds(delay_seconds),
         ))
         .bind(delivery_error)
-        .bind(datetime_to_unix_micros(now))
+        .bind(fence_now)
         .bind(record.delivery_attempt_count)
         .bind(claim.generation)
         .bind(&claim.worker_id)
         .bind(&claim.token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(updated.rows_affected() == 1)
     }
 
@@ -2185,6 +2209,10 @@ impl Database {
         cleanup_error: &str,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let fence_now = self
+            .product_creation_fence_now()
+            .max(datetime_to_unix_micros(now));
         let updated = sqlx::query(
             "UPDATE product_creation_jobs
              SET status = 'cleanup_ambiguous', claim_worker_id = NULL, claim_token = NULL,
@@ -2198,10 +2226,11 @@ impl Database {
         .bind(claim.generation)
         .bind(&claim.worker_id)
         .bind(cleanup_error)
-        .bind(datetime_to_unix_micros(now))
+        .bind(fence_now)
         .bind(&claim.token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(updated.rows_affected() == 1)
     }
 
@@ -2909,6 +2938,10 @@ impl Database {
         resource_identity: &str,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let fence_now = self
+            .product_creation_fence_now()
+            .max(datetime_to_unix_micros(now));
         let updated = sqlx::query(
             "UPDATE product_creation_resource_reservations
              SET status = 'reserved', ownership_token = NULL, updated_at_unix_micros = ?1
@@ -2922,14 +2955,15 @@ impl Database {
                      AND job.claim_token = ?6 AND job.claim_lease_until_unix_micros > ?1
                )",
         )
-        .bind(datetime_to_unix_micros(now))
+        .bind(fence_now)
         .bind(request_id)
         .bind(claim.generation)
         .bind(resource_identity)
         .bind(&claim.worker_id)
         .bind(&claim.token)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(updated.rows_affected() == 1)
     }
 
@@ -3242,6 +3276,10 @@ impl Database {
             ProductCreationResourceCleanupDisposition::Released => "released",
             ProductCreationResourceCleanupDisposition::Conflict => "conflict",
         };
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let fence_now = self
+            .product_creation_fence_now()
+            .max(datetime_to_unix_micros(now));
         let result = sqlx::query(
             "UPDATE product_creation_resource_reservations
              SET status = ?7, updated_at_unix_micros = ?1
@@ -3255,15 +3293,16 @@ impl Database {
                      AND j.cleanup_lease_until_unix_micros > ?1
                )",
         )
-        .bind(datetime_to_unix_micros(now))
+        .bind(fence_now)
         .bind(reservation_id)
         .bind(&cleanup.job.request_id)
         .bind(cleanup.claim.generation)
         .bind(&cleanup.claim.worker_id)
         .bind(&cleanup.claim.token)
         .bind(status)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -3273,8 +3312,10 @@ impl Database {
         cleanup: &ProductCreationCleanupJob,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
-        let now_micros = datetime_to_unix_micros(now);
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let now_micros = self
+            .product_creation_fence_now()
+            .max(datetime_to_unix_micros(now));
         let authoritative: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT product_conversation_id, published_product_id, published_conversation_id
              FROM product_creation_jobs
@@ -3522,6 +3563,7 @@ mod product_creation_tests {
     use phoenix_core::domain::db_schema::{Message, MessageContent, UserContent};
     use phoenix_core::domain::sm_state::ConvState;
     use phoenix_core::llm_language::LlmLanguage;
+    use std::future::Future;
 
     #[test]
     fn creation_locators_reject_empty_and_nul_text() {
@@ -4171,6 +4213,92 @@ mod product_creation_tests {
         )
         .unwrap();
         fingerprint
+    }
+
+    #[tokio::test]
+    async fn claim_renewal_rechecks_expiry_after_waiting_for_sqlite_writer() {
+        assert_contended_claim_renewal(true).await;
+        assert_contended_claim_renewal(false).await;
+    }
+
+    async fn assert_contended_claim_renewal(expired: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let db = Database::open_migrated_for_test(
+            directory
+                .path()
+                .join("renew-after-writer.db")
+                .to_str()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+        let request_id = "renew-after-writer";
+        db.accept_product_creation(request_id, &intent("/repo/a", "inspect"))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let claimed = db
+            .claim_product_creation(
+                request_id,
+                "worker",
+                "token",
+                now,
+                chrono::Duration::seconds(1),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        db.test_set_product_creation_now(now);
+
+        let mut writer = db.pool.acquire().await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+
+        let mut renewal = Box::pin(db.renew_product_creation_claim(
+            request_id,
+            &claimed.claim,
+            now,
+            chrono::Duration::minutes(1),
+        ));
+        let pending = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(renewal.as_mut().poll(cx).is_pending())
+        })
+        .await;
+        assert!(pending, "renewal should wait behind the held SQLite writer");
+
+        let sampled = if expired {
+            claimed.claim.lease_until
+        } else {
+            claimed.claim.lease_until - chrono::Duration::microseconds(1)
+        };
+        db.test_set_product_creation_now(sampled);
+        sqlx::query("COMMIT")
+            .execute(&mut *writer)
+            .await
+            .unwrap();
+        assert_eq!(renewal.await.unwrap(), !expired);
+
+        let job = db
+            .get_product_creation_job(request_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(job.status, "claimed");
+        assert_eq!(job.claim_generation, claimed.claim.generation);
+        assert_eq!(job.claim_token, claimed.job.claim_token);
+        assert_eq!(job.claim_worker_id, claimed.job.claim_worker_id);
+        if expired {
+            assert_eq!(job.claim_lease_until, Some(claimed.claim.lease_until));
+            assert_eq!(job.updated_at, claimed.job.updated_at);
+        } else {
+            assert_eq!(
+                job.claim_lease_until,
+                Some(sampled + chrono::Duration::minutes(1))
+            );
+            assert_eq!(job.updated_at, sampled);
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8032,6 +8160,7 @@ mod product_creation_tests {
             .await
             .unwrap();
         let now = Utc::now();
+        db.test_set_product_creation_now(now);
         let mut claim = db
             .claim_next_product_creation("worker", "token-1", now, chrono::Duration::minutes(5))
             .await
@@ -8094,6 +8223,7 @@ mod product_creation_tests {
             .await
             .unwrap();
         let now = Utc::now();
+        db.test_set_product_creation_now(now);
         let claim = db
             .claim_next_product_creation("worker", "token", now, chrono::Duration::seconds(30))
             .await
@@ -8399,6 +8529,7 @@ mod product_creation_tests {
             .unwrap()
             .is_none());
         let now = Utc::now();
+        db.test_set_product_creation_now(now);
         let mut delivery_claim = claim.claim;
         assert!(db
             .schedule_product_creation_delivery_retry(
