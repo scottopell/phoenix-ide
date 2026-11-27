@@ -20268,7 +20268,7 @@ mod approved_explore_follow_up_tests {
         assert!(error.starts_with("FATAL_LOCAL_AUTHORITY_UNCLASSIFIED:"));
         assert_eq!(
             *fatal_rx.borrow_and_update(),
-            Some("follow_up_approval_authority_establishment")
+            Some("approval_authority_establishment")
         );
     }
 
