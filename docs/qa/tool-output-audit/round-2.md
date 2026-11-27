@@ -65,6 +65,6 @@ and B going to a PR. The privacy rules in `BATON.md` apply.
 
 ## Reviewer side (in parallel)
 
-Implement A on a separate branch, `claude/compact-cleared-marker`, with tests. If the replay confirms
+Implement A on this branch (`claude/data-loss-token-waste-hunt-3enn9f`; the only branch the reviewer may push), with tests. If the replay confirms
 it, the PR opens against main. Prototype the record/preview split for B and check that it can be
 done by construction (a typed two-part tool output), not by string surgery.
