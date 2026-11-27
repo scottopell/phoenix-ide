@@ -2,7 +2,18 @@ use super::*;
 use crate::coordinator_tools;
 use crate::runtime::executor::native_close_retry::test_hooks::{Hooks, Pause, Point};
 use crate::send_chat_service::SendChatApplicationService;
+use phoenix_db::{
+    CloseCleanupFailureAuthority, CloseCleanupResourceDisposition, CloseWriterDetector,
+    CloseWriterGap, CloseWriterObservation, RecordCloseWriterObservationRequest,
+};
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy)]
+pub(super) enum RetryCompletion {
+    Normal,
+    ResumePhysicalMutation,
+    FinalWriterGap,
+}
 
 pub(super) async fn acknowledge_public_initial_result(
     fixture: &CloseFixture,
@@ -105,7 +116,7 @@ pub(super) async fn retry_after_public_capture(
     scope: &WorkScopeId,
     initial_run: &CloseRunRef,
     stop_at: Option<Point>,
-    resume_at: Option<Point>,
+    completion: RetryCompletion,
 ) {
     install_physical_close_diagnostics();
     let source = SourceToolCall {
@@ -437,8 +448,8 @@ pub(super) async fn retry_after_public_capture(
         return;
     }
 
-    let resumed = if let Some(point) = resume_at {
-        let mut pause = hooks.arm(point);
+    let resumed = if matches!(completion, RetryCompletion::ResumePhysicalMutation) {
+        let mut pause = hooks.arm(Point::PhysicalBeforeMutation);
         let retry_tool = Arc::clone(&tool);
         let retry_input = input.clone();
         let retry_context = context.clone();
@@ -666,6 +677,77 @@ pub(super) async fn retry_after_public_capture(
         return;
     }
 
+    if matches!(completion, RetryCompletion::FinalWriterGap) {
+        let checkout = physical_snapshot(&git.worktree);
+        let admin = physical_snapshot(&git.admin);
+        let registrations = git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]);
+        let initial_observations = fixture
+            .db
+            .list_close_writer_observations(initial_run, scope)
+            .await
+            .unwrap();
+        let gap = CloseWriterObservation::InspectionGap {
+            detector: CloseWriterDetector::LinuxDescriptor,
+            pid: None,
+            reason: CloseWriterGap::Unavailable,
+        };
+        let mut scanned = hooks.inject_final_writer_gap(gap.clone());
+        let refused = tokio::time::timeout(Duration::from_secs(10), tool.run(input, context))
+            .await
+            .expect("admitted Retry must stop at its final writer gate");
+        let moved = scanned
+            .try_recv()
+            .expect("the actual moved checkout must be scanned");
+        assert!(!refused.is_success(), "{}", refused.output());
+        let refused: Value = serde_json::from_str(refused.output()).unwrap();
+        assert_eq!(refused["code"], "storage_rejected");
+        let receipt = fixture
+            .db
+            .read_native_close_explicit_retry_receipt(&fixture.command)
+            .await
+            .unwrap()
+            .expect("the moved-object scan must belong to a durably admitted Retry");
+        assert_eq!(receipt.attempt_id, initial_run.attempt_id);
+        assert_eq!(receipt.run_ordinal.get(), initial_run.ordinal.get() + 1);
+        let successor = CloseRunRef {
+            attempt_id: receipt.attempt_id,
+            ordinal: receipt.run_ordinal,
+        };
+        assert_final_gap_failure(&fixture, &successor, scope, gap, &moved).await;
+        assert_eq!(
+            fixture
+                .db
+                .list_close_writer_observations(initial_run, scope)
+                .await
+                .unwrap(),
+            initial_observations,
+        );
+        assert_eq!(captured_history(&fixture, initial_run).await, historical);
+        assert_eq!(moved.file_name().unwrap(), "object");
+        assert_eq!(
+            std::fs::symlink_metadata(&git.worktree).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound,
+        );
+        assert_eq!(physical_snapshot(&moved), checkout);
+        assert_eq!(
+            std::fs::read(moved.join("tracked.txt")).unwrap(),
+            b"durable content\n",
+        );
+        assert_eq!(physical_snapshot(&git.admin), admin);
+        assert_eq!(
+            std::fs::read(git.admin.join("gitdir")).unwrap(),
+            format!("{}\n", git.worktree.join(".git").display()).into_bytes(),
+        );
+        assert_retained_registration(git, &registrations);
+        git.assert_untargeted_state_preserved();
+        event_tx.send(Event::Shutdown).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(10), running)
+            .await
+            .expect("Retry source actor must shut down after terminal failure")
+            .unwrap();
+        return;
+    }
+
     let diagnostics_before_clean_retry = physical_close_diagnostics();
     let completed = if let Some(output) = resumed {
         output
@@ -851,6 +933,100 @@ pub(super) async fn retry_after_public_capture(
         .await
         .expect("retry source actor must shut down")
         .unwrap();
+}
+
+async fn assert_final_gap_failure(
+    fixture: &CloseFixture,
+    run: &CloseRunRef,
+    scope: &WorkScopeId,
+    observation: CloseWriterObservation,
+    moved: &Path,
+) {
+    let (generation, fingerprint): (String, String) = sqlx::query_as(
+        "SELECT inspection_generation, inspection_fingerprint FROM native_close_retry_plans
+         WHERE attempt_id = ?1 AND run_ordinal = ?2",
+    )
+    .bind(run.attempt_id.as_str())
+    .bind(run.ordinal.get())
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    let snapshot = CloseRetirementSnapshot::parse(generation, fingerprint).unwrap();
+    let effects = fixture.db.list_close_safe_retry_effects(run).await.unwrap();
+    let success_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_run_retry_successes WHERE attempt_id = ?1 AND run_ordinal = ?2",
+    )
+    .bind(run.attempt_id.as_str())
+    .bind(run.ordinal.get())
+    .fetch_one(fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(success_count, 0);
+    let worktree = effects
+        .iter()
+        .find(|effect| &effect.scope == scope && effect.resource.kind() == RetiredResourceKind::Worktree)
+        .unwrap();
+    assert_eq!(
+        fixture.db.list_close_writer_observations(run, scope).await.unwrap(),
+        vec![RecordCloseWriterObservationRequest {
+            run: run.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: worktree.resource.clone(),
+            observation,
+        }],
+    );
+    assert_eq!(
+        fixture.db.get_close_run(run).await.unwrap().status,
+        CloseRunStatus::Stopped,
+    );
+    let failures = fixture
+        .db
+        .list_close_cleanup_failures(run.attempt_id.as_str())
+        .await
+        .unwrap();
+    let failure = failures.iter().find(|entry| entry.run_ordinal == run.ordinal).unwrap();
+    assert_eq!(failure.occurrence.failure_occurrence_id, run.failure_occurrence_id());
+    assert_eq!(
+        failure.occurrence.authority,
+        CloseCleanupFailureAuthority::ExpectedResource {
+            scope: scope.clone(),
+            snapshot,
+            resource: worktree.resource.clone(),
+        },
+    );
+    assert!(failure.occurrence.remaining_resources.iter().any(|entry| {
+        &entry.scope == scope
+            && entry.resource == worktree.resource
+            && entry.disposition == CloseCleanupResourceDisposition::Failed
+    }));
+    let detail = &failure.occurrence.detail;
+    assert!(detail.contains("external writer inspection gap blocks explicit Retry"));
+    assert!(!detail.contains("external writer holds"));
+    assert!(detail.contains(&moved.display().to_string()));
+    assert_eq!(
+        fixture.db.get_close_obligation(run.attempt_id.as_str()).await.unwrap().close_outcome(),
+        Some(CloseCompletionOutcome::CloseIncomplete),
+    );
+    assert!(!fixture.db.get_conversation(TARGET_ID).await.unwrap().archived);
+    assert_eq!(
+        fixture.db.get_conversation_work_scope_context(TARGET_ID).await.unwrap().1,
+        WorkScopeLifecycle::Active,
+    );
+    let receipt_id = format!("close-run-outcome:{}:{}", run.ordinal.get(), run.attempt_id);
+    let receipt = fixture
+        .db
+        .get_messages(TARGET_ID)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|message| message.message_id == receipt_id)
+        .unwrap();
+    assert!(receipt
+        .content
+        .to_json()
+        .to_string()
+        .contains("original Close remains incomplete; cleanup needs attention"));
 }
 
 async fn require_retry_barrier(

@@ -22,11 +22,17 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod captured_loss_public_retry;
+use captured_loss_public_retry::RetryCompletion;
 
 #[tokio::test]
 async fn registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays(
 ) {
     run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryWithProductionDetector).await;
+}
+
+#[tokio::test]
+async fn registered_native_close_captured_loss_retry_final_writer_gap_preserves_checkout() {
+    run_public_worktree_close(WorktreeJourney::CapturedLossPublicRetryFinalWriterGap).await;
 }
 
 #[tokio::test]
@@ -181,6 +187,7 @@ enum WorktreeJourney {
     RetireWithProductionDetector,
     RefuseDescriptorWriter,
     CapturedLossPublicRetryWithProductionDetector,
+    CapturedLossPublicRetryFinalWriterGap,
     CapturedLossPublicRetryStoppedDuringAssessment,
     CapturedLossPublicRetryStoppedDuringPreparation,
     CapturedLossPublicRetryStoppedBeforeWorktreeDispatch,
@@ -818,6 +825,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     let public_captured_retry = matches!(
         journey,
         WorktreeJourney::CapturedLossPublicRetryWithProductionDetector
+            | WorktreeJourney::CapturedLossPublicRetryFinalWriterGap
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation
             | WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch
@@ -833,6 +841,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
             | WorktreeJourney::CapturedLossPublicRetryWithProductionDetector
+            | WorktreeJourney::CapturedLossPublicRetryFinalWriterGap
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation
             | WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch
@@ -865,6 +874,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::ReflogOnlyBlocker
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
+            | WorktreeJourney::CapturedLossPublicRetryFinalWriterGap
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation
             | WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation
     ) {
@@ -1853,10 +1863,13 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
                 _ => None,
             },
             match journey {
-                WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeMutation,
-                ),
-                _ => None,
+                WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation => {
+                    RetryCompletion::ResumePhysicalMutation
+                }
+                WorktreeJourney::CapturedLossPublicRetryFinalWriterGap => {
+                    RetryCompletion::FinalWriterGap
+                }
+                _ => RetryCompletion::Normal,
             },
         )
         .await;
@@ -1975,6 +1988,19 @@ async fn assert_public_descriptor_veto(
         std::fs::read(git.admin.join("gitdir")).unwrap(),
         format!("{}\n", git.worktree.join(".git").display()).into_bytes(),
     );
+    assert_retained_registration(git, registrations);
+    assert_eq!(
+        fixture
+            .db
+            .read_ordinary_product_conversation_metadata(TARGET_ID)
+            .await
+            .unwrap()
+            .lifecycle,
+        OrdinaryProductConversationLifecycle::History,
+    );
+}
+
+fn assert_retained_registration(git: &DisposableGit, registrations: &[u8]) {
     let listing = git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]);
     let checkout_entry = [b"worktree ", git.worktree.as_os_str().as_bytes()].concat();
     let mut in_checkout_entry = false;
@@ -1991,15 +2017,6 @@ async fn assert_public_descriptor_veto(
     assert_eq!(
         actual,
         registrations.split(|byte| *byte == 0).collect::<Vec<_>>()
-    );
-    assert_eq!(
-        fixture
-            .db
-            .read_ordinary_product_conversation_metadata(TARGET_ID)
-            .await
-            .unwrap()
-            .lifecycle,
-        OrdinaryProductConversationLifecycle::History,
     );
 }
 
