@@ -25,7 +25,6 @@ import json
 import sqlite3
 import statistics
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -76,11 +75,10 @@ def open_db(path: Path, snapshot: bool) -> sqlite3.Connection:
     src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     if not snapshot:
         return src
-    tmp = Path(tempfile.mkdtemp(prefix="phoenix-audit-")) / "snapshot.db"
-    dst = sqlite3.connect(tmp)
+    # in-memory copy: no second copy of the database is left on disk
+    dst = sqlite3.connect(":memory:")
     src.backup(dst)
     src.close()
-    print(f"(snapshot copied to {tmp})", file=sys.stderr)
     return dst
 
 
@@ -130,7 +128,7 @@ def classify(row, tool_names: dict[str, str], images_by_msg: dict[str, int], wat
         return None  # skipped by render_messages
     text = d.get("llm_text") or d.get("text") or ""
     nbytes = len(text.encode()) + 60  # provenance header approximation
-    first = text.lstrip()[:80].replace("\n", " ")
+    first = ""  # never surface message text: reports must not contain transcript content
     if origin in ("user_api", "coordinator_question_reply"):
         cat = "user_typed" if not d.get("is_meta") else "system_other"
     elif origin == "subscription_event":
@@ -195,7 +193,10 @@ def main() -> int:
     ap.add_argument("--default-tokens-per-byte", type=float, default=0.27)
     args = ap.parse_args()
 
-    conn = open_db(Path(args.db).expanduser(), args.snapshot)
+    db_path = Path(args.db).expanduser()
+    if args.json and Path(args.json).expanduser().resolve() == db_path.resolve():
+        sys.exit("--json must not point at the database")
+    conn = open_db(db_path, args.snapshot)
     cur = conn.cursor()
 
     conv_rows = cur.execute(
@@ -359,7 +360,7 @@ def main() -> int:
     top = sorted((m for m in all_msgs if m.category in INJECTED), key=token_turns, reverse=True)[: args.top]
     for m in top:
         p(f"| {m.conv[:8]} | {m.seq} | {m.category} | {m.detail[:50].replace('|', '/')} | {m.tokens:,.0f} | {m.carries} | {token_turns(m):,.0f} |")
-    out["top"] = [{"conv": m.conv, "seq": m.seq, "category": m.category, "detail": m.detail,
+    out["top"] = [{"conv": m.conv[:8], "seq": m.seq, "category": m.category, "detail": m.detail,
                    "tokens": m.tokens, "carries": m.carries} for m in top]
 
     # 6. redundancy -------------------------------------------------------------------
@@ -378,10 +379,10 @@ def main() -> int:
                 kind = "duplicate_skill" if m.category == "skill" else "superseded_event"
                 redundant[kind] += waste
                 if len(examples[kind]) < 5:
-                    examples[kind].append(f"{conv[:8]} seq {prev.seq}→{m.seq} ({m.detail[:30] or m.key})")
+                    examples[kind].append(f"{conv[:8]} seq {prev.seq}→{m.seq} ({m.detail[:30] or m.category})")
             if m.key:
                 last_by_key[m.key] = m
-    # detail holds only 80 chars; re-scan full text for the stale-question marker
+    # detail carries no text, so scan content for the stale-question marker
     for (conv, seq, content) in cur.execute(
         "SELECT conversation_id, sequence_id, content FROM messages WHERE origin_kind='subscription_event'"
     ):

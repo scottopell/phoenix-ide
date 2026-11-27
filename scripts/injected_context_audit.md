@@ -28,7 +28,7 @@ say so.
 The script is read-only, uses only the standard library and needs only `uv`:
 
 ```bash
-# Live production DB: --snapshot takes a consistent copy first (SQLite backup API)
+# Live production DB: --snapshot takes a consistent in-memory copy first (SQLite backup API)
 uv run scripts/injected_context_audit.py ~/.phoenix-ide/prod.db --snapshot \
     --json /tmp/injected_audit.json > /tmp/injected_audit.md
 
@@ -118,6 +118,6 @@ a transcript has too few requests to fit).
     expected savings as a share of total input tokens. Give a one-line rationale
     for each, and say which ones are not worth building.
 
-Deliver the answers as a short markdown report. Attach the `--json` output too, after
-checking that it contains no message text (it does not by design; check again if you
-modify the script).
+Deliver the answers as a short markdown report. Attach the `--json` output too. The
+script never emits message text and truncates transcript IDs to 8 characters; if you
+modify it, check the output again before sharing.
