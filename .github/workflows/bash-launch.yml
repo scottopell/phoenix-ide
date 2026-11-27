@@ -87,6 +87,7 @@ jobs:
                 or test(real_bash_wait_zero_and_normal_bounds_preserve_child_without_replay)
                 or test(conversation_runtime_dispatches_real_zero_and_normal_bash_waits)
                 or test(macos_disposable_writer_scan_finds_same_user_process_cwd)
+                or test(macos_vnode_fd_read_unavailable_is_not_a_changed_sample)
                 or test(macos_process_inventory_excludes_foreign_uid_before_inspection)
                 or test(selected_macos_pid_with_changed_uid_fails_closed_as_process_changed)
                 or test(process_disappearance_and_pid_reuse_are_gaps_not_writers_or_clean)
