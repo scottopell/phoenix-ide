@@ -18646,7 +18646,9 @@ mod tests {
     async fn legacy_stop_and_completion_have_one_winner() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("stop-completion.db");
-        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        let db = Database::open_migrated_for_test(db_path.to_str().unwrap())
+            .await
+            .unwrap();
         let job_id = "job-stop-completion";
         let conversation_id = "conv-stop-completion";
         insert_test_creation_job(&db, job_id, conversation_id).await;
@@ -18695,7 +18697,9 @@ mod tests {
     async fn competing_legacy_stops_settle_once_without_changing_reservations() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("stop.db");
-        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        let db = Database::open_migrated_for_test(db_path.to_str().unwrap())
+            .await
+            .unwrap();
         let job_id = "job-stop";
         let conversation_id = "conv-stop";
         insert_test_creation_job(&db, job_id, conversation_id).await;

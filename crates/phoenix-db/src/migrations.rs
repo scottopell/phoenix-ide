@@ -17330,6 +17330,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (192, "dismiss_pending_fork_proposals"),
             (191, "native_close_origin_owner_cleanup"),
             (190, "native_close_retry_origin_gate"),
             (189, "native_close_retry_tmux_dispatch"),
@@ -17674,7 +17675,10 @@ mod tests {
         assert_eq!(run_pending_migrations(cached.pool()).await.unwrap(), 0);
 
         let dir = tempfile::tempdir().unwrap();
-        for (prefix, pending) in [(171, 20), (172, 19)] {
+        for prefix in [171, 172] {
+            let pending = migration_identities()
+                .filter(|(version, _)| *version > prefix)
+                .count() as u32;
             let path = dir.path().join(format!("prefix-{prefix}.db"));
             let path = path.to_str().unwrap();
             let db = crate::Database::open(path).await.unwrap();

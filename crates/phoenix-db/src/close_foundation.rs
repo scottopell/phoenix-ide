@@ -10090,16 +10090,39 @@ mod tests {
         .unwrap();
         let obligation = db.get_close_obligation(attempt_id.as_str()).await.unwrap();
         assert_eq!(obligation.phase(), ClosePhase::RetirementRequested);
+        let captured_scopes = db
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap();
+        let [captured] = captured_scopes.as_slice() else {
+            panic!("expected the single direct scope")
+        };
+        assert!(captured.captured_worktree.is_none());
         let inventory = CaptureCloseRetirementInventoryRequest {
             attempt_id: attempt_id.clone(),
             snapshot: obligation.snapshot().unwrap().clone(),
-            scopes: Vec::new(),
+            scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                scope: captured.scope.clone(),
+                inventory: CloseOwnedResourceInventory {
+                    worktree: None,
+                    work_scopes: std::collections::BTreeSet::default(),
+                    bash_process_groups: std::collections::BTreeSet::default(),
+                    tmux_servers: std::collections::BTreeSet::default(),
+                    pty_sessions: std::collections::BTreeSet::default(),
+                    browser_sessions: std::collections::BTreeSet::default(),
+                    equivalent_live_resources: std::collections::BTreeSet::default(),
+                },
+            }],
         };
-        assert!(db
+        let resources = db
             .capture_close_retirement_inventory(inventory.clone())
             .await
-            .unwrap()
-            .is_empty());
+            .unwrap();
+        let [resource] = resources.as_slice() else {
+            panic!("expected the single WorkScope retirement resource")
+        };
+        assert_eq!(resource.scope, captured.scope);
+        assert_eq!(resource.resource.kind(), RetiredResourceKind::WorkScope);
 
         sqlx::query(
             "INSERT INTO conversation_creation_jobs (
