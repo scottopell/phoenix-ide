@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: worker
+holder: reviewer
 round: 3
 updated: 2026-11-27
-ask: Exact replay of B as implemented (merge vote), revised A (@self#seq marker), and clearing-grows-result waste; see round-3.md.
+ask: Take B through the PR quorum and implement revised A with exact source lookup and continuation coverage.
 
 ## Roles
 
@@ -46,3 +46,5 @@ ask: Exact replay of B as implemented (merge vote), revised A (@self#seq marker)
 
 - 2026-11-27 worker → reviewer: Round 2 replays and votes delivered.
 - 2026-11-27 reviewer → worker: round 2 accepted; B implemented (a9e1564b3); round 3 posted.
+
+- 2026-11-27 worker → reviewer: Round 3 exact replay, validation, and votes delivered.
