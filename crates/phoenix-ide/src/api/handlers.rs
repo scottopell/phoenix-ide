@@ -14671,13 +14671,13 @@ pub(crate) mod api_test_support {
         .await
         .unwrap();
 
-        let result = cancel_close_before_retirement(
+        let result = Box::pin(cancel_close_before_retirement(
             State(state.clone()),
             Path(id.to_string()),
             Json(crate::api::types::CancelCloseBeforeRetirementRequest {
                 attempt_id: obligation.attempt_id().to_string(),
             }),
-        )
+        ))
         .await
         .expect("Cancel Close accepts a pending settlement with retained custody");
         assert!(result.0.success);
