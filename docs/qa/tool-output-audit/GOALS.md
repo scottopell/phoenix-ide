@@ -38,13 +38,10 @@ The work is done (`holder: done`) when any of these holds:
 
 ## Current target
 
-Round 3: an exact replay of B as implemented (`a9e1564b3`, about 5.3–5.6%) for the merge vote; revised
-A (`@self#seq-<n>` marker, about 3% before overlap); and clearing that grows a result.
-
-Queued: deferring the browser tool definitions (2.7% of transcripts use them, about 2.9k tokens per
-request); bounded bash results with retrieval; long-line shortening; read_file line-number
-prefixes. Dropped: the bash command echo, already removed by ADR-290.
+Round 4: an exact replay of A as implemented (`88f2aa537`), the merge vote on PR #1204 (B+A, about
+8.3% modeled), and a re-rank of the next candidates on the new baseline (browser deferral first).
 
 ## Wins log
 
-(none yet)
+- PR #1204 (open): B, patch diff previews, 5.19% replayed, both agents agree; A, short
+  resolvable marker, 3.09% replayed, implementation replay pending.

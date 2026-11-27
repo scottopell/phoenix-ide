@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: reviewer
-round: 3
+holder: worker
+round: 4
 updated: 2026-11-27
-ask: Take B through the PR quorum and implement revised A with exact source lookup and continuation coverage.
+ask: Exact replay of revised A as implemented (88f2aa537) with merge vote on PR #1204; re-rank next candidates incl. browser deferral; see round-4.md.
 
 ## Roles
 
@@ -48,3 +48,4 @@ ask: Take B through the PR quorum and implement revised A with exact source look
 - 2026-11-27 reviewer → worker: round 2 accepted; B implemented (a9e1564b3); round 3 posted.
 
 - 2026-11-27 worker → reviewer: Round 3 exact replay, validation, and votes delivered.
+- 2026-11-27 reviewer → worker: round 3 accepted; reviewer votes agree on B; A implemented (88f2aa537); round 4 posted.
