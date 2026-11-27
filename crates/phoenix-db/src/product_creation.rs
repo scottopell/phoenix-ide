@@ -4057,6 +4057,18 @@ mod product_creation_tests {
         assert_eq!(count, 0);
     }
 
+    async fn assert_publication_rejected_changed_checkout(
+        db: &Database,
+        input: &ProductCreationPublishInput,
+        scope_id: &WorkScopeId,
+    ) {
+        assert!(matches!(
+            db.publish_product_creation_atomically(input).await,
+            Err(DbError::Serialization(message)) if message.contains("checkout identity changed")
+        ));
+        assert_unproven_publication_left_no_rows(db, scope_id).await;
+    }
+
     fn fixture_checkout_fingerprint(path: &str, oid: &str) -> String {
         let checkout = std::path::Path::new(path);
         let admin = checkout
@@ -6982,19 +6994,11 @@ mod product_creation_tests {
         let original = dir.path().join("original-marker");
         std::fs::rename(&marker, &original).unwrap();
         std::fs::copy(&original, &marker).unwrap();
-        assert!(matches!(
-            db.publish_product_creation_atomically(&input).await,
-            Err(DbError::Serialization(message)) if message.contains("checkout identity changed")
-        ));
-        assert_unproven_publication_left_no_rows(&db, &scope_id).await;
+        assert_publication_rejected_changed_checkout(&db, &input, &scope_id).await;
         std::fs::rename(&original, &marker).unwrap();
         let head = dir.path().join("worktree.git/worktrees/registration/HEAD");
         std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
-        assert!(matches!(
-            db.publish_product_creation_atomically(&input).await,
-            Err(DbError::Serialization(message)) if message.contains("checkout identity changed")
-        ));
-        assert_unproven_publication_left_no_rows(&db, &scope_id).await;
+        assert_publication_rejected_changed_checkout(&db, &input, &scope_id).await;
         std::fs::write(&head, "unpersisted-oid\n").unwrap();
         assert!(db
             .publish_product_creation_atomically(&input)
