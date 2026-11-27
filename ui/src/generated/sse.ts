@@ -97,10 +97,6 @@ export type SseConversationUpdateData = Omit<
   'type'
 >;
 export type SseErrorData = Omit<Extract<SseWireEvent, { type: 'error' }>, 'type'>;
-export type SseConversationHardDeletedData = Omit<
-  Extract<SseWireEvent, { type: 'conversation_hard_deleted' }>,
-  'type'
->;
 export type SseBrowserSessionStateData = Omit<
   Extract<SseWireEvent, { type: 'browser_session_state' }>,
   'type'

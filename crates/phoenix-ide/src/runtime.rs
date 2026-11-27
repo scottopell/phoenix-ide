@@ -6642,7 +6642,6 @@ impl RuntimeManager {
             runtime
         };
 
-        // Fork proposals are bound to top-level (parent) origins; sub-agents
         let runtime = if let Some((job_id, claim)) = startup_creation_completion {
             runtime.with_startup_creation_completion(job_id, claim)
         } else {
