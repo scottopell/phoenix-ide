@@ -18642,6 +18642,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_stop_and_completion_have_one_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stop-completion.db");
+        let db = Database::open(db_path.to_str().unwrap()).await.unwrap();
+        let job_id = "job-stop-completion";
+        let conversation_id = "conv-stop-completion";
+        insert_test_creation_job(&db, job_id, conversation_id).await;
+        db.update_conversation_state(
+            conversation_id,
+            &ConvState::Provisioning {
+                job_id: job_id.into(),
+                phase: ConversationCreationPhase::Provisioning,
+            },
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let CreationClaimOutcome::Claimed(job) = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker".into()),
+                &CreationClaimToken("token".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected provisioning claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        let (stopped, completed) = tokio::join!(
+            db.cancel_conversation_creation(conversation_id, now),
+            db.complete_seeded_empty_conversation_creation(job_id, &claim, conversation_id, now),
+        );
+        let state = db.get_conversation(conversation_id).await.unwrap().state;
+        match (stopped.unwrap(), completed.unwrap()) {
+            (true, CreationCasOutcome::ClaimLost) => {
+                assert!(matches!(state, ConvState::CreationCancelled { .. }));
+            }
+            (false, CreationCasOutcome::Applied) => {
+                assert_eq!(state, ConvState::Idle);
+            }
+            outcome => panic!("Stop and completion must have exactly one winner: {outcome:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn competing_legacy_stops_settle_once_without_changing_reservations() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("stop.db");

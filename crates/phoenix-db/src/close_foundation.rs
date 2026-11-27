@@ -2312,6 +2312,8 @@ impl Database {
             )));
         }
 
+        Self::require_no_retained_legacy_creation_tx(tx, product_conversation_id).await?;
+
         let now_utc = Utc::now();
         let now = now_utc.to_rfc3339();
         let captured_at_unix_micros = now_utc.timestamp_micros();
@@ -2649,6 +2651,33 @@ impl Database {
         Ok(unsettled)
     }
 
+    async fn require_no_retained_legacy_creation_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<()> {
+        let retained: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM conversations member
+                 JOIN conversation_creation_jobs creation ON creation.conversation_id = member.id
+                 WHERE member.product_conversation_id = ?1
+                   AND (creation.status IN ('cancelling', 'deletion_pending')
+                        OR (creation.status != 'ready' AND EXISTS (
+                            SELECT 1 FROM conversation_creation_resource_reservations reservation
+                            WHERE reservation.job_id = creation.id AND reservation.status != 'released'
+                        )))
+             )",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if retained {
+            return Err(close_precondition(
+                "Close cannot retire retained legacy creation resources or finish retired creation cleanup; operator review is required",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) async fn count_close_settlement_active_participants_tx(
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,
@@ -2657,6 +2686,7 @@ impl Database {
             "SELECT COUNT(*)
              FROM close_attempt_participants captured
              JOIN conversations participant ON participant.id = captured.conversation_id
+             JOIN close_obligations obligation ON obligation.attempt_id = captured.attempt_id
              WHERE captured.attempt_id = ?1
                AND captured.settlement_state = 'live'
                AND (
@@ -2675,10 +2705,13 @@ impl Database {
                    SELECT 1 FROM conversation_creation_jobs creation
                    WHERE creation.conversation_id = participant.id
                      AND (
-                       creation.status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling')
-                       OR (creation.status IN ('failed', 'cancelled') AND EXISTS (
-                         SELECT 1 FROM conversation_creation_resource_reservations reservation
-                         WHERE reservation.job_id = creation.id AND reservation.status != 'released'
+                       creation.status IN ('accepted', 'claimed', 'retry_scheduled')
+                       OR (obligation.phase != 'cancel_requested_during_settlement' AND (
+                         creation.status IN ('cancelling', 'deletion_pending')
+                         OR (creation.status != 'ready' AND EXISTS (
+                           SELECT 1 FROM conversation_creation_resource_reservations reservation
+                           WHERE reservation.job_id = creation.id AND reservation.status != 'released'
+                         ))
                        ))
                      )
                  )
@@ -5893,6 +5926,10 @@ impl Database {
                 "safe retry requires the latest stopped run, fresh evidence, and no running run",
             ));
         }
+        let obligation =
+            close_obligation_for_update(tx, request.failed_run.attempt_id.as_str()).await?;
+        Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id())
+            .await?;
         let completion_only = request.remaining_effects.is_empty();
         if completion_only && !verified_completion_source_tx(tx, &request.failed_run).await? {
             return Err(close_precondition(
@@ -8040,6 +8077,8 @@ impl Database {
                 "attempt {attempt_id} retry requires needs_repair"
             )));
         }
+        Self::require_no_retained_legacy_creation_tx(&mut tx, obligation.product_conversation_id())
+            .await?;
         set_close_phase_tx(
             &mut tx,
             attempt_id.as_str(),
@@ -9896,7 +9935,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_work_settlement_remains_fenced_until_creation_job_is_terminal() {
+    async fn retained_legacy_creation_blocks_retirement_but_not_close_cancellation() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         sqlx::query(
@@ -9960,20 +9999,33 @@ mod tests {
             DbError::CloseFoundationPrecondition(message)
                 if message.contains("active durable member obligation")
         ));
-        sqlx::query(
-            "UPDATE conversation_creation_resource_reservations
-             SET status = 'released' WHERE id = 'reservation'",
-        )
-        .execute(db.pool())
-        .await
-        .unwrap();
+        db.cancel_close_before_retirement("attempt-creation")
+            .await
+            .unwrap();
         assert_eq!(
             db.advance_close_settlement_when_quiescent("attempt-creation")
                 .await
                 .unwrap()
                 .phase(),
-            ClosePhase::AwaitingRetirementInspection
+            ClosePhase::Completed
         );
+        assert!(matches!(
+            db.begin_close_foundation(
+                &product_id("root"),
+                &transcript_id("root"),
+                "attempt-retained",
+            )
+            .await,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("operator review is required")
+        ));
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM conversation_creation_resource_reservations WHERE id = 'reservation'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "reserved");
     }
 
     #[tokio::test]

@@ -352,8 +352,13 @@ THE SYSTEM SHALL report a conflict rather than claiming cancellation or applying
 WHEN Stop observes a legacy provisioning transcript already marked cancelled
 THE SYSTEM SHALL report a no-op without resuming legacy cleanup.
 
-WHILE Close settlement has a captured legacy cancelled creation with an unreleased resource reservation
-THE SYSTEM SHALL NOT advance to resource retirement on the basis of the cancellation alone.
+WHEN a new Close or a generic retirement retry encounters an unreleased reservation for an unpublished legacy creation or a pending retired legacy cleanup
+THE SYSTEM SHALL refuse Close and report that operator review is required, without changing the reservation.
+
+WHILE Close settlement has a captured legacy creation with such a retained obligation
+THE SYSTEM SHALL NOT advance to resource retirement.
+WHEN the user cancels that Close during settlement
+THE SYSTEM SHALL allow cancellation once active work settles without requiring the passive reservation or retired cleanup to disappear.
 
 ### REQ-CCR-008: Deletion During Creation
 

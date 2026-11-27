@@ -7001,9 +7001,7 @@ mod product_creation_tests {
             Err(DbError::Serialization(message)) if message.contains("durable creation pin")
         ));
         let mut direct = input.clone();
-        direct.environment = EnvironmentContext::UnownedCwd {
-            cwd: repo.into(),
-        };
+        direct.environment = EnvironmentContext::UnownedCwd { cwd: repo.into() };
         direct.git_publication = None;
         assert!(matches!(
             db.publish_product_creation_atomically(&direct).await,
@@ -9948,12 +9946,7 @@ mod product_creation_tests {
             .unwrap();
         let scope = WorkScopeId::new();
         let product_id = accepted.product_conversation_id.clone();
-        let conv = published_conversation(
-            "conv-cascade",
-            product_id.clone(),
-            scope.clone(),
-            repo,
-        );
+        let conv = published_conversation("conv-cascade", product_id.clone(), scope.clone(), repo);
         advance_to_metadata(&db, "req-cascade", &claim.claim).await;
         record_git_publication_fixture(
             &db,
