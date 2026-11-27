@@ -9152,7 +9152,11 @@ struct MacVnodeFdInfoWithPath {
 }
 
 #[cfg(target_os = "macos")]
-fn mac_vnode_fd_info(pid: libc::pid_t, fd: i32) -> Result<MacVnodeFdInfoWithPath, CloseWriterGap> {
+fn mac_vnode_fd_info(
+    pid: libc::pid_t,
+    fd: i32,
+    recheck: bool,
+) -> Result<MacVnodeFdInfoWithPath, CloseWriterGap> {
     use std::mem::{size_of, MaybeUninit};
 
     const PROC_PIDFDVNODEPATHINFO: i32 = 2;
@@ -9168,8 +9172,28 @@ fn mac_vnode_fd_info(pid: libc::pid_t, fd: i32) -> Result<MacVnodeFdInfoWithPath
             length,
         )
     };
+    // libproc returns zero on syscall failure and leaves errno from that call.
+    if bytes == 0 {
+        let errno = std::io::Error::last_os_error().raw_os_error();
+        tracing::warn!(
+            pid,
+            fd,
+            recheck,
+            ?errno,
+            "Close macOS vnode FD read unavailable"
+        );
+        return Err(CloseWriterGap::Unavailable);
+    }
     if bytes != length {
-        return Err(CloseWriterGap::DescriptorChanged);
+        tracing::warn!(
+            pid,
+            fd,
+            recheck,
+            bytes,
+            expected_bytes = length,
+            "Close macOS vnode FD read malformed"
+        );
+        return Err(CloseWriterGap::Malformed);
     }
     // SAFETY: the complete structure was initialized by the successful call.
     Ok(unsafe { output.assume_init() })
@@ -9246,7 +9270,7 @@ fn mac_inspect_open_descriptors_until(
 
     for descriptor in mac_vnode_descriptors_until(pid, deadline)? {
         writer_scan_check(deadline)?;
-        let info_result = mac_vnode_fd_info(pid, descriptor.proc_fd);
+        let info_result = mac_vnode_fd_info(pid, descriptor.proc_fd, false);
         writer_scan_check(deadline)?;
         let info = info_result.map_err(WriterScanError::from)?;
         let path_bytes = info.vnode.vip_path.as_flattened();
@@ -9262,19 +9286,30 @@ fn mac_inspect_open_descriptors_until(
             continue;
         }
         writer_scan_check(deadline)?;
-        let repeated_result = mac_vnode_fd_info(pid, descriptor.proc_fd);
+        let repeated_result = mac_vnode_fd_info(pid, descriptor.proc_fd, true);
         writer_scan_check(deadline)?;
         let repeated = repeated_result.map_err(WriterScanError::from)?;
-        if info.file.open_flags != repeated.file.open_flags
-            || info.vnode.vip_vi.vi_stat.vst_dev != repeated.vnode.vip_vi.vi_stat.vst_dev
-            || info.vnode.vip_vi.vi_stat.vst_ino != repeated.vnode.vip_vi.vi_stat.vst_ino
-            || info.vnode.vip_vi.vi_stat.vst_mode != repeated.vnode.vip_vi.vi_stat.vst_mode
-            || info.vnode.vip_path != repeated.vnode.vip_path
-        {
+        let stat = info.vnode.vip_vi.vi_stat;
+        let repeated_stat = repeated.vnode.vip_vi.vi_stat;
+        let flags_changed = info.file.open_flags != repeated.file.open_flags;
+        let device_changed = stat.vst_dev != repeated_stat.vst_dev;
+        let inode_changed = stat.vst_ino != repeated_stat.vst_ino;
+        let mode_changed = stat.vst_mode != repeated_stat.vst_mode;
+        let path_buffer_changed = info.vnode.vip_path != repeated.vnode.vip_path;
+        if flags_changed || device_changed || inode_changed || mode_changed || path_buffer_changed {
             writer_scan_check(deadline)?;
+            tracing::warn!(
+                pid,
+                fd = descriptor.proc_fd,
+                flags_changed,
+                device_changed,
+                inode_changed,
+                mode_changed,
+                path_buffer_changed,
+                "Close macOS vnode FD samples differ"
+            );
             return Err(WriterScanError::Gap(CloseWriterGap::DescriptorChanged));
         }
-        let stat = info.vnode.vip_vi.vi_stat;
         let is_exact_self_borrow = self_descriptor.is_some_and(|borrow| {
             self_descriptor_borrow_matches(
                 borrow,
@@ -19599,6 +19634,24 @@ mod tests {
                 "accepted ambiguous status: {status:?}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_vnode_fd_read_unavailable_is_not_a_changed_sample() {
+        use std::os::fd::AsRawFd as _;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let pid = i32::try_from(std::process::id()).unwrap();
+        assert!(super::mac_vnode_fd_info(pid, file.as_file().as_raw_fd(), false).is_ok());
+        assert!(matches!(
+            super::mac_vnode_fd_info(pid, -1, false),
+            Err(super::CloseWriterGap::Unavailable)
+        ));
+        assert!(matches!(
+            super::mac_vnode_fd_info(pid, -1, true),
+            Err(super::CloseWriterGap::Unavailable)
+        ));
     }
 
     #[test]
