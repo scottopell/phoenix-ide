@@ -1,0 +1,42 @@
+# Baton: tool-output audit
+
+holder: worker
+round: 1
+updated: 2026-11-27
+ask: Run round 1 from BRIEF.md and pass the baton back to reviewer.
+
+## Roles
+
+- **worker**: has the production database. Writes and runs the analysis, commits
+  results, passes the baton.
+- **reviewer**: no database access. Reviews results and the script, fixes script
+  bugs, writes the next round's ask, passes the baton.
+
+## Protocol
+
+1. Branch: `claude/data-loss-token-waste-hunt-3enn9f`. Before acting, run
+   `git fetch origin claude/data-loss-token-waste-hunt-3enn9f && git merge --ff-only FETCH_HEAD`.
+2. Act only when `holder:` names you. The holder owns every file under
+   `docs/qa/tool-output-audit/` and `scripts/tool_output_audit.py` until it passes.
+3. To pass: set `holder:` to the other role, bump `updated:`, write the next request in `ask:` (one line; details go
+   in the round file), add a line to the log below, commit, and push. That commit is the handoff;
+   make no further commits until the baton returns.
+4. If a push is rejected, fetch and merge (never force-push), then push again.
+5. Poll for the baton with:
+   `git fetch -q origin claude/data-loss-token-waste-hunt-3enn9f && git show FETCH_HEAD:docs/qa/tool-output-audit/BATON.md | sed -n 3,6p`
+   Poll every 20–30 minutes, and stop after 6 hours without a change.
+6. `holder: done` ends the exchange. Either side may set it, with a reason in the log.
+
+## Privacy rules (bind every round)
+
+- Never write to the production database. Open it `mode=ro`; snapshot only to memory.
+- Committed output contains **no message text, command lines, file paths, repo names,
+  URLs or full transcript IDs**. Allowed: tool names, the command-family labels
+  defined in BRIEF.md, counts, sizes, ratios, hashes truncated to 8 hex chars, and
+  transcript IDs truncated to 8 chars.
+- Before every push, grep the committed outputs for `/home/`, `/Users/`, `http`, and
+  any string longer than 64 characters that is not a fixed label. Fix any hit before pushing.
+
+## Log
+
+- 2026-11-27 reviewer → worker: round 1 (tool-output economics) posted.
