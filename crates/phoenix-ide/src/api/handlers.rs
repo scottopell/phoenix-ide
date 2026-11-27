@@ -9522,9 +9522,10 @@ mod conversation_cwd_validation_tests {
     async fn create_conversation_preserves_explicit_model_in_durable_intent() {
         let state = api_test_support::make_test_state().await;
         let conversation_id = uuid::Uuid::new_v4().to_string();
-        let mut request = create_request("/".to_string());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut request = create_request(tmp.path().to_string_lossy().into_owned());
         request.conversation_id = Some(conversation_id.clone());
-        request.mode = Some("managed".to_string());
+        request.mode = None;
 
         let _response = create_conversation_with_id(state.clone(), request, Vec::new())
             .await
@@ -9576,15 +9577,15 @@ mod conversation_cwd_validation_tests {
     }
 
     #[tokio::test]
-    async fn explicit_worktree_mode_outside_git_returns_provisioning_shell() {
+    async fn omitted_mode_outside_git_returns_provisioning_shell() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = api_test_support::make_test_state().await;
-        let mut req = create_request(tmp.path().to_string_lossy().to_string());
-        req.mode = Some("managed".to_string());
+        let mut req = create_request(tmp.path().to_string_lossy().into_owned());
+        req.mode = None;
 
         let Json(response) = create_conversation_with_id(state, req, Vec::new())
             .await
-            .expect("managed intent accepted before git validation");
+            .expect("ordinary creation accepts a non-Git directory");
         assert_eq!(
             response.conversation["state"]["type"].as_str(),
             Some("provisioning")

@@ -13784,7 +13784,7 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    fn registered_after(prefix: u32) -> u32 {
+    pub(super) fn registered_after(prefix: u32) -> u32 {
         u32::try_from(
             super::MIGRATIONS
                 .iter()
@@ -24721,7 +24721,9 @@ mod close_completion_allowance_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::{
-        run_pending_migrations, tests::setup_real_pre_176_schema, MIGRATIONS, MIGRATION_174,
+        run_pending_migrations,
+        tests::{registered_after, setup_real_pre_176_schema},
+        MIGRATIONS, MIGRATION_174,
     };
 
     #[tokio::test]
@@ -25073,7 +25075,10 @@ mod close_completion_allowance_tests {
             2
         );
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 16);
+        assert_eq!(
+            run_pending_migrations(&pool).await.unwrap(),
+            registered_after(175)
+        );
         let migrated: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"
