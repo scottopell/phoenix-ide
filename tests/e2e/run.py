@@ -1659,10 +1659,12 @@ def scenario_git_lifecycle_public_http(base_url: str) -> None:
         repo.mkdir()
         _git(repo, "init", "-q", "-b", "main")
         (repo / ".gitignore").write_text("*.ignored\n")
-        (repo / "e2e-task.md").write_text(
-            "# Disposable Git lifecycle task\n\nPrepared by the E2E fixture for approval.\n"
+        reviewed_tasks = (
+            ("e2e-task.md", b"# Disposable Git lifecycle task\n\nPrepared by the E2E fixture for approval.\n"),
+            ("e2e-follow-up.md", b"# Disposable follow-up\n\nReview the second plan.\n\n"),
         )
-        (repo / "e2e-follow-up.md").write_text("# Disposable follow-up\n\nReview the second plan.\n")
+        for task_path, reviewed_bytes in reviewed_tasks:
+            (repo / task_path).write_bytes(reviewed_bytes)
         _git(repo, "add", ".gitignore", "e2e-task.md", "e2e-follow-up.md")
         subprocess.run(
             ["git", "-c", "user.name=Phoenix E2E", "-c", "user.email=e2e@example.invalid",
@@ -1710,11 +1712,12 @@ def scenario_git_lifecycle_public_http(base_url: str) -> None:
         checkout = Path(first["conversation"]["cwd"])
         assert checkout != repo and checkout.exists(), f"Git route did not publish a disposable checkout: {checkout}"
         assert checkout in _git_worktree_paths(repo), "created checkout is not registered as a Git worktree"
-        assert (checkout / "e2e-task.md").is_file(), "prepared task markdown was not present in checkout"
         root_before_approval = _git_lifecycle_snapshot(repo)
         checkout_before_approval = _git_lifecycle_snapshot(checkout)
+        approval_prefix = f"Task approved in the current environment at {checkout}.\n\n"
 
-        for approval_number in (1, 2):
+        for approval_number, (task_path, reviewed_bytes) in enumerate(reviewed_tasks, start=1):
+            assert (checkout / task_path).read_bytes() == reviewed_bytes
             approval = httpx.post(
                 f"{base_url}/api/conversations/{conv_id}/approve-task", json={}, timeout=10.0,
             )
@@ -1722,6 +1725,20 @@ def scenario_git_lifecycle_public_http(base_url: str) -> None:
             assert approval.json().get("success") is True
             idle = _wait_for_idle(base_url, conv_id)
             assert Path(idle["conversation"]["cwd"]) == checkout, "approval changed the checkout path"
+            approval_messages = [
+                message["content"]["text"].removeprefix(approval_prefix)
+                for message in _user_messages(idle["messages"])
+                if message["content"]["text"].startswith(approval_prefix)
+            ]
+            assert len(approval_messages) == approval_number, "expected one published message per approval"
+            accepted_bodies = []
+            for message in approval_messages:
+                heading, priority, body = message.split("\n\n", maxsplit=2)
+                assert heading.startswith("## Approved plan: ") and priority.startswith("Priority: ")
+                accepted_bodies.append(body.encode("utf-8"))
+            assert accepted_bodies == [body for _, body in reviewed_tasks[:approval_number]], (
+                "published approval did not carry the exact reviewed bytes"
+            )
             assert _git_lifecycle_snapshot(repo) == root_before_approval, (
                 f"approval {approval_number} mutated the source repository/index/refs/ignores"
             )
