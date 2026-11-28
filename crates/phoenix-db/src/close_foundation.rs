@@ -21647,7 +21647,7 @@ mod tests {
         for observe in [false, true] {
             let db = Database::open_in_memory().await.unwrap();
             create_root(&db, "root").await;
-            allocate_scope_worktree(&db, "root").await;
+            let scope = allocate_scope_worktree(&db, "root").await;
             let attempt = CloseAttemptId::parse("legacy-repair").unwrap();
             db.begin_close_foundation(
                 &product_id("root"),
@@ -21656,7 +21656,7 @@ mod tests {
             )
             .await
             .unwrap();
-            set_close_phase(&db, attempt.as_str(), ClosePhase::NeedsRepair).await;
+            record_test_worktree_residual(&db, &attempt, scope).await;
             if observe {
                 observe_retained_run(&db, &CloseRunRef::initial(attempt.clone())).await;
             }
@@ -21690,21 +21690,13 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn retry_reopens_reinspection_so_resources_admitted_during_repair_are_resealed() {
-        let db = Database::open_in_memory().await.unwrap();
-        create_root(&db, "root").await;
-        let scope = allocate_scope_worktree(&db, "root").await;
-        let attempt = CloseAttemptId::parse("attempt-reseal-after-repair").unwrap();
-        db.begin_close_foundation(
-            &product_id("root"),
-            &transcript_id("root"),
-            attempt.as_str(),
-        )
-        .await
-        .unwrap();
-        set_close_phase(&db, attempt.as_str(), ClosePhase::RetirementRequested).await;
-        let snapshot = current_test_snapshot(&db, attempt.as_str()).await;
+    async fn record_test_worktree_residual(
+        db: &Database,
+        attempt: &CloseAttemptId,
+        scope: WorkScopeId,
+    ) -> CloseRetirementSnapshot {
+        set_close_phase(db, attempt.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(db, attempt.as_str()).await;
         let resources = db
             .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
                 attempt_id: attempt.clone(),
@@ -21712,7 +21704,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
-                        worktree: Some(current_test_worktree(&db, &scope).await),
+                        worktree: Some(current_test_worktree(db, &scope).await),
                         work_scopes: std::collections::BTreeSet::default(),
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -21740,6 +21732,23 @@ mod tests {
         })
         .await
         .unwrap();
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn retry_reopens_reinspection_so_resources_admitted_during_repair_are_resealed() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt = CloseAttemptId::parse("attempt-reseal-after-repair").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        let snapshot = record_test_worktree_residual(&db, &attempt, scope).await;
 
         let retried = db.retry_close_retirement(&attempt).await.unwrap();
         assert_eq!(retried.phase(), ClosePhase::AwaitingRetirementInspection);
