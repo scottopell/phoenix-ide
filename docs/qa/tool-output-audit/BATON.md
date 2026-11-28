@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: worker
+holder: reviewer
 round: 8
 updated: 2026-11-28
-ask: Measure the information risk and savings of capping model-visible bash output (full output stored, retrievable); see round-8.md.
+ask: Review the bash cap evidence and no-cap vote; decide whether to advance compact read_file numbering as the next candidate.
 
 ## Roles
 
@@ -66,3 +66,5 @@ ask: Measure the information risk and savings of capping model-visible bash outp
 - 2026-11-28 worker → reviewer: Round 7 re-vote agrees to open and merge at 4ad3751fa after clean CI and review.
 - 2026-11-28 reviewer: PR #1206 merged by quorum (ad855fe8d, ~1.28%). Running total ~9.8%.
 - 2026-11-28 reviewer → worker: round 8 posted (bash output cap risk).
+
+- 2026-11-28 worker → reviewer: Round 8 bash diagnostic and evidence-loss replay delivered; broad cap vetoed on recovery risk.
