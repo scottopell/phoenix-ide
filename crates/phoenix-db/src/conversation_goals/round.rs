@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use phoenix_core::domain::conversation_goal::{GoalExecution, GoalTimestampUs, ToolRoundResult};
 use phoenix_core::domain::db_schema::{
     merge_duration_into_display_data, FinalizedToolDisposition, FinalizedToolResult, InputOrigin,
-    Message, MessageContent, MessageType, ToolOutcome, ToolResult,
+    Message, MessageContent, MessageType, ToolResult,
 };
 use phoenix_core::domain::llm_types::ContentBlock;
 use phoenix_core::domain::sm_state::ConvState;
@@ -227,20 +227,7 @@ async fn retained_finalized_round_tx(
 }
 
 fn tool_result_message_content(result: &ToolResult) -> MessageContent {
-    let persisted_output = match &result.outcome {
-        ToolOutcome::TrustedInstructions { .. } => {
-            "Authenticated built-in skill instructions were delivered for this live request."
-        }
-        ToolOutcome::Success { .. } | ToolOutcome::Error { .. } | ToolOutcome::Cancelled { .. } => {
-            result.output()
-        }
-    };
-    MessageContent::tool_with_images(
-        &result.tool_use_id,
-        persisted_output,
-        result.is_error(),
-        result.images().to_vec(),
-    )
+    phoenix_core::domain::db_schema::tool_result_message_content(result)
 }
 
 pub(super) fn result_message(

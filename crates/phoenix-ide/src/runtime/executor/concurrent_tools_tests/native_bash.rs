@@ -136,11 +136,11 @@ fn assert_native_results(storage: &InMemoryStorage, llm: &MockLlmClient) {
         ("fast-result", "independent-fast"),
     ]) {
         assert!(!result.is_error);
-        let output: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        let output: serde_json::Value = serde_json::from_str(result.content()).unwrap();
         assert_eq!(output["status"], "exited");
         assert_eq!(output["exit_code"], 0);
         assert_eq!(output["label"], label);
-        assert!(result.content.contains(expected_output));
+        assert!(result.content().contains(expected_output));
     }
     let requests = llm.recorded_requests();
     assert_eq!(requests.len(), 2);

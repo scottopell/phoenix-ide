@@ -253,7 +253,7 @@ fn status(message: &Message) -> serde_json::Value {
     let MessageContent::Tool(content) = &message.content else {
         panic!("not a canonical tool result")
     };
-    serde_json::from_str(&content.content).unwrap()
+    serde_json::from_str(content.content()).unwrap()
 }
 
 async fn effect_counts(db: &Database) -> (i64, i64, i64, i64) {

@@ -1,0 +1,166 @@
+{
+  "partial_run": false,
+  "recorded_input": 60822008803,
+  "corpus": {
+    "transcripts": 12711,
+    "response_anchors": 562065
+  },
+  "candidate_b": {
+    "results": 71619,
+    "unmodified_carry": 4733968388.134718,
+    "previews_cleared": 38117,
+    "calibrated_savings": 3157509805.8193393,
+    "local_savings": 2879458970,
+    "shape_groups": {
+      "preview": {
+        "results": 61722,
+        "unmodified_carry": 4599941114.548886,
+        "crossed_sweep": 38117
+      },
+      "error": {
+        "results": 7812,
+        "unmodified_carry": 131081957.01201814,
+        "crossed_sweep": 4777
+      },
+      "shrink_gate": {
+        "results": 342,
+        "unmodified_carry": 569615.9351692579,
+        "crossed_sweep": 170,
+        "local_added_avoided": 1128466,
+        "calibrated_added_avoided": 1259805.8719721257
+      },
+      "no_preview": {
+        "results": 1743,
+        "unmodified_carry": 2375700.6386272497,
+        "crossed_sweep": 498
+      }
+    },
+    "calibrated_savings_share": 0.05191393490547779,
+    "local_savings_share": 0.04734238521003885,
+    "net_bytes_per_cleared_preview": {
+      "p50": 1316,
+      "p90": 3864,
+      "p99": 7807,
+      "max": 16728
+    }
+  },
+  "revised_a_after_b": {
+    "result_rows": 271341,
+    "marker_turns": 50153219,
+    "current_carry": 2650865091.649085,
+    "revised_carry": 769613582.7998759,
+    "current_local_carry": 2379969191,
+    "revised_local_carry": 702072095,
+    "by_carrier": {
+      "whole_outputs": {
+        "result_rows": 233224,
+        "marker_turns": 43363054,
+        "current_carry": 2310563276.191832,
+        "revised_carry": 667821974.7227012,
+        "current_local_carry": 2067369202,
+        "revised_local_carry": 607009830
+      },
+      "patch_previews": {
+        "result_rows": 38117,
+        "marker_turns": 6790165,
+        "current_carry": 340301815.4572532,
+        "revised_carry": 101791608.0771747,
+        "current_local_carry": 312599989,
+        "revised_local_carry": 95062265
+      }
+    },
+    "calibrated_savings": 1881251508.8492093,
+    "calibrated_savings_share": 0.03093044024478879,
+    "local_savings": 1677897096,
+    "local_savings_share": 0.02758700557613347,
+    "foreign_clearances_in_grouped_replay": 0
+  },
+  "growing_clearances": {
+    "current": {
+      "rows_at_or_below_marker": 12965,
+      "rows_that_grow": 12849,
+      "marker_turns": 2463032,
+      "local_tokens_added": 76268374,
+      "calibrated_extra_for_growing_rows": 86071389.00366196,
+      "share_of_recorded_input": 0.0014151355849236034
+    },
+    "revised": {
+      "rows_at_or_below_marker": 7247,
+      "rows_that_grow": 7181,
+      "marker_turns": 1242076,
+      "local_tokens_added": 8970380,
+      "calibrated_extra_for_growing_rows": 10074393.510329925,
+      "share_of_recorded_input": 0.00016563730315058276
+    }
+  },
+  "bash_echo_by_epoch": {
+    "before": {
+      "all": {
+        "outputs": 220192,
+        "with_command_echo": 217595,
+        "echo_carry": 672091400.7375711,
+        "echo_upper": 4004770689.513893
+      },
+      "run": {
+        "outputs": 197943,
+        "with_command_echo": 195623,
+        "echo_carry": 603059270.2567582,
+        "echo_upper": 3501180998.432382
+      },
+      "wait": {
+        "outputs": 20640,
+        "with_command_echo": 20411,
+        "echo_carry": 63018111.833104536,
+        "echo_upper": 465980049.2311384
+      },
+      "peek": {
+        "outputs": 1001,
+        "with_command_echo": 963,
+        "echo_carry": 3805338.2643734994,
+        "echo_upper": 20306306.158524595
+      },
+      "kill": {
+        "outputs": 608,
+        "with_command_echo": 598,
+        "echo_carry": 2208680.383335085,
+        "echo_upper": 17303335.691882264
+      }
+    },
+    "on_or_after": {
+      "all": {
+        "outputs": 14599,
+        "with_command_echo": 9580,
+        "echo_carry": 12335546.535194527,
+        "echo_upper": 28235287.20471386
+      },
+      "run": {
+        "outputs": 13997,
+        "with_command_echo": 8993,
+        "echo_carry": 11146712.002233475,
+        "echo_upper": 24877120.112229567
+      },
+      "wait": {
+        "outputs": 529,
+        "with_command_echo": 516,
+        "echo_carry": 1043921.3150642854,
+        "echo_upper": 2741088.7771029416
+      },
+      "peek": {
+        "outputs": 63,
+        "with_command_echo": 61,
+        "echo_carry": 127457.02199487748,
+        "echo_upper": 576883.0762730914
+      },
+      "kill": {
+        "outputs": 10,
+        "with_command_echo": 10,
+        "echo_carry": 17456.195901868636,
+        "echo_upper": 40195.23910825894
+      }
+    }
+  },
+  "recorded_input_by_epoch": {
+    "before": 59194391475,
+    "on_or_after": 1627617328
+  }
+}

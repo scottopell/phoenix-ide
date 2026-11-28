@@ -400,7 +400,7 @@ mod tests {
             reopened.reset_all_to_idle().await.unwrap();
             let messages = reopened.get_messages("owner").await.unwrap();
             assert_eq!(messages.len(), 3);
-            assert!(messages.iter().any(|message| matches!(&message.content, MessageContent::Tool(tool) if tool.tool_use_id == "done" && tool.content == "Ready" && !tool.is_error)));
+            assert!(messages.iter().any(|message| matches!(&message.content, MessageContent::Tool(tool) if tool.tool_use_id == "done" && tool.content() == "Ready" && !tool.is_error)));
             let tool = messages
                 .iter()
                 .find_map(|message| {
@@ -414,7 +414,7 @@ mod tests {
             if stored_assistant == Some("current-assistant") {
                 assert!(!tool.is_error);
                 let reference: phoenix_svg::SvgArtifactReference =
-                    serde_json::from_str(&tool.content).unwrap();
+                    serde_json::from_str(tool.content()).unwrap();
                 assert_eq!(
                     reference,
                     published.as_ref().unwrap().clone().into_reference()
@@ -429,7 +429,7 @@ mod tests {
                 );
             } else {
                 assert!(tool.is_error);
-                assert!(tool.content.contains("interrupted by server restart"));
+                assert!(tool.content().contains("interrupted by server restart"));
             }
         }
     }
@@ -510,17 +510,19 @@ mod tests {
                 .unwrap()
         };
         let done = find_tool("done");
-        assert_eq!(done.content, "Ready");
+        assert_eq!(done.content(), "Ready");
         assert!(!done.is_error);
         let unfinished = find_tool("unfinished");
         assert!(unfinished.is_error);
-        assert!(unfinished.content.contains("interrupted by server restart"));
+        assert!(unfinished
+            .content()
+            .contains("interrupted by server restart"));
         let svg = find_tool("svg");
         assert!(!svg.is_error);
         let reference: phoenix_svg::SvgArtifactReference =
-            serde_json::from_str(&svg.content).unwrap();
+            serde_json::from_str(svg.content()).unwrap();
         assert_eq!(reference, published.clone().into_reference());
-        assert!(!svg.content.contains("<svg"));
+        assert!(!svg.content().contains("<svg"));
         assert_eq!(
             db.svg_artifact("owner", &reference.artifact_id)
                 .await

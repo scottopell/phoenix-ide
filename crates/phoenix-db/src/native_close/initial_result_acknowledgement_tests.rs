@@ -138,7 +138,7 @@ async fn pending_canonical_round_acknowledges_finalized_initial_close_result() {
     let (db, command, run) = retained_loss_origin().await;
     let (assistant, result) = initial_result_round(&command, &run);
     let MessageContent::Tool(tool) = &result.row().content else { panic!("tool result"); };
-    let results = [ToolRoundResult::Finalized(ToolResult::success(tool.tool_use_id.clone(), tool.content.clone()))];
+    let results = [ToolRoundResult::Finalized(ToolResult::success(tool.tool_use_id.clone(), tool.content().to_owned()))];
     let checkpoint = crate::conversation_goals::GoalRoundCheckpoint {
         assistant: &assistant,
         execution: GoalExecution::parse(1, 1).unwrap(),
@@ -221,7 +221,7 @@ async fn serial_tool_progress_preserves_initial_origin_until_canonical_acknowled
     let (db, command, run) = retained_loss_origin().await;
     let (mut assistant, result) = initial_result_round(&command, &run);
     let MessageContent::Tool(row) = &result.row().content else { panic!("tool result"); };
-    let completed = ToolResult::success(row.tool_use_id.clone(), row.content.clone());
+    let completed = ToolResult::success(row.tool_use_id.clone(), row.content().to_owned());
     let next_tool = ToolCall::new("after-close", ToolInput::Unknown {
         name: "next_tool".into(), input: serde_json::json!({}),
     });
@@ -253,7 +253,7 @@ async fn stop_during_serial_tool_progress_still_suppresses_initial_origin() {
     let progressing = ConvState::ToolExecuting {
         current_tool: ToolCall::new("after-close", ToolInput::Unknown { name: "next_tool".into(), input: serde_json::json!({}) }),
         remaining_tools: Vec::new(),
-        completed_results: vec![ToolRoundResult::Finalized(ToolResult::success(row.tool_use_id.clone(), row.content.clone()))],
+        completed_results: vec![ToolRoundResult::Finalized(ToolResult::success(row.tool_use_id.clone(), row.content().to_owned()))],
         pending_sub_agents: Vec::new(), assistant_message: AssistantMessage::new(command.source().message_id.clone(), blocks.clone(), None, None),
     };
     db.update_conversation_state(command.source_transcript_id(), &progressing).await.unwrap();

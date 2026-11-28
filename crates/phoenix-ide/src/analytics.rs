@@ -300,10 +300,7 @@ fn project_tool_calls(messages: &[Message]) -> Vec<AnalyticsToolCall> {
                     (
                         content.is_error,
                         content.is_error
-                            && is_deterministic_denial(
-                                content.content.as_str(),
-                                m.display_data.as_ref(),
-                            ),
+                            && is_deterministic_denial(content.content(), m.display_data.as_ref()),
                         duration_ms(m.display_data.as_ref()),
                     )
                 });

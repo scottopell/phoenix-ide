@@ -1,0 +1,156 @@
+{
+  "ledger": {
+    "rows": 567674,
+    "fresh": 9317500653,
+    "cache_write": 0,
+    "cache_read": 51554222592,
+    "recorded_input": 60871723245
+  },
+  "corpus": {
+    "transcripts": 12729,
+    "ordinary_anchors": 562768,
+    "compaction_anchors": 0,
+    "compaction_anchor_input": 0,
+    "browser_calling_transcripts": 344
+  },
+  "live_replay": {
+    "whole_marker_turns": 43379692,
+    "whole_savings": 1643455630.768639,
+    "b_patch_marker_turns": 6790732,
+    "b_savings": 3157718397.3489337,
+    "patch_marker_savings": 238532513.1741493,
+    "added_patch_marker_turns": 621,
+    "added_patch_rows": 3,
+    "added_patch_savings": 27354.70690607735,
+    "a_live_savings": 1882015498.6496944,
+    "a_live_share": 0.03091772991335978,
+    "b_plus_a_live_savings": 5039733895.998629,
+    "b_plus_a_live_share": 0.08279269301633566
+  },
+  "continuation": {
+    "classified_ledger_attempts": 891,
+    "classified_ledger_input": 70040685
+  },
+  "locator_availability": {
+    "positioned_history": {
+      "requests_with_markers": 158930,
+      "requests_without_advertised_reader": 12560,
+      "missing_reader_sub_agent": 12156,
+      "missing_reader_user": 404
+    },
+    "no_tool_snapshot": {
+      "requests_with_markers": 121095
+    },
+    "latest_snapshot_proxy": {
+      "requests_with_markers": 1793
+    }
+  },
+  "browser_deferral": {
+    "positioned_history": {
+      "transcripts": 7758,
+      "requests": 301199,
+      "requests_with_browser_definitions": 268084,
+      "requests_before_or_through_first_browser_call": 255622,
+      "with_any_cache_read": 238929,
+      "input_on_saving_requests": 23674928459,
+      "read_on_saving_requests": 20385380736,
+      "full_saved_fresh": 119802620.302937,
+      "full_saved_write": 0.0,
+      "full_saved_read": 696838471.2276937,
+      "stub_saved_fresh": 71520457.97224508,
+      "stub_saved_write": 0.0,
+      "stub_saved_read": 415925747.34136593,
+      "blanket_full_bundle_gross": 898514986.0156122,
+      "transcripts_with_browser_definitions": 7448,
+      "browser_calling_transcripts": 186,
+      "discovery_requests_priced": 186,
+      "extra_fresh": 2039582.0,
+      "extra_write": 0.0,
+      "extra_read": 10959488.0,
+      "blanket_one_discovery_cost": 12999070,
+      "full_net_tokens": 803642021.5306307,
+      "stub_net_tokens": 474447135.31361103,
+      "weighted_scenarios": {
+        "0.1": {
+          "full": 186350936.62570637,
+          "stub": 109977501.90638168
+        },
+        "0.5": {
+          "full": 460702529.9167838,
+          "stub": 271964005.64292806
+        }
+      }
+    },
+    "no_tool_snapshot": {
+      "transcripts": 4926,
+      "requests": 258357,
+      "blanket_full_bundle_gross": 705476065.307455,
+      "transcripts_with_browser_definitions": 0,
+      "browser_calling_transcripts": 152,
+      "discovery_requests_priced": 0,
+      "blanket_one_discovery_cost": 13181575,
+      "full_net_tokens": 0,
+      "stub_net_tokens": 0,
+      "weighted_scenarios": {
+        "0.1": {
+          "full": 0.0,
+          "stub": 0.0
+        },
+        "0.5": {
+          "full": 0.0,
+          "stub": 0.0
+        }
+      }
+    },
+    "latest_snapshot_proxy": {
+      "transcripts": 45,
+      "requests": 3212,
+      "requests_with_browser_definitions": 3212,
+      "requests_before_or_through_first_browser_call": 3083,
+      "with_any_cache_read": 2756,
+      "input_on_saving_requests": 303132485,
+      "read_on_saving_requests": 247366784,
+      "full_saved_fresh": 1876396.2692273937,
+      "full_saved_write": 0.0,
+      "full_saved_read": 8344340.742709984,
+      "stub_saved_fresh": 1119562.0983345744,
+      "stub_saved_write": 0.0,
+      "stub_saved_read": 4979194.37500811,
+      "blanket_full_bundle_gross": 9905582.6668615,
+      "transcripts_with_browser_definitions": 45,
+      "browser_calling_transcripts": 6,
+      "discovery_requests_priced": 6,
+      "extra_fresh": 132694.0,
+      "extra_write": 0.0,
+      "extra_read": 194432.0,
+      "blanket_one_discovery_cost": 327126,
+      "full_net_tokens": 9893611.011937378,
+      "stub_net_tokens": 5771630.473342684,
+      "weighted_scenarios": {
+        "0.1": {
+          "full": 2558693.143498392,
+          "stub": 1465344.3358353854
+        },
+        "0.5": {
+          "full": 5818656.6405823855,
+          "stub": 3379249.285838629
+        }
+      }
+    }
+  },
+  "cache_read_weights": [
+    0.1,
+    0.5
+  ],
+  "discovery_fresh_token_allowance": 256,
+  "continuation_at_ledger_time": {
+    "dated_ledger_attempts": 891,
+    "matched_time_to_history_attempts": 891,
+    "matched_time_input": 70040685,
+    "candidate_marker_occurrences": 71272,
+    "canonical_savings_ceiling": 678174.7304885845,
+    "compactions_exposed_to_patch_gate_mismatch_upper": 1,
+    "nonstrict_patch_occurrences_if_retained_in_suffix": 1,
+    "growing_patch_occurrences_if_retained_in_suffix": 1
+  }
+}
