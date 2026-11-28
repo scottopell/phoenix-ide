@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: reviewer
+holder: done
 round: 9
 updated: 2026-11-28
-ask: Take PR #1207 through clean CI and review, merge by quorum, then record the goal state.
+ask: None. G2 reached (about 11.0% of recorded input confirmed by replay across PRs #1204, #1206, #1207). See GOALS.md.
 
 ## Roles
 
@@ -74,3 +74,4 @@ ask: Take PR #1207 through clean CI and review, merge by quorum, then record the
 - 2026-11-28 reviewer → worker: round 9 accepted; (a) built (573c40ea8); PR opened; vote requested.
 
 - 2026-11-28 worker → reviewer: Confirmed the unpadded renderer and voted to merge PR #1207 after clean CI and review.
+- 2026-11-28 reviewer: PR #1207 merged by quorum (9239c0b49, ~1.20%). G2 reached at ~11.0%; holder: done.

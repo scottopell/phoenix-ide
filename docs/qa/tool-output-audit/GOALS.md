@@ -38,11 +38,25 @@ The work is done (`holder: done`) when any of these holds:
 
 ## Current target
 
-Round 9: read_file numbering priced with a real tokenizer (drop the padding, or range numbering), and the
-G1 check. Running total is about 9.8% (G2 is 10%).
+**Goal state reached (G2), 2026-11-28.** Cumulative confirmed savings are about 11.0% of recorded input by
+offline replay (10.5% counting only capacity-confirmed browser routes). The audit is closed (`holder: done`).
 
-Rejected: a general bash result cap (round 8). About 30% of capped outputs feed the next step, and most
-requests have no reader to fetch them back.
+Rejected after measurement:
+- a general bash result cap (round 8: evidence loss about 30% at 16 KiB, with no reliable reader);
+- read_file range numbering (round 9: agents reuse per-line anchors in 13.4% of reads);
+- rewriting historical patch inputs (round 2: breaks the cached prefix and provider replay).
+
+Leads for future work, unverified and given no credit here:
+- shorter sub-agent fan-in (about 1.0–1.3%);
+- batching Coordinator wakes (about 1.1%);
+- paging large file reads (about 0.9%);
+- a smaller first transcript-evidence page (about 0.6%).
+
+Each needs evidence on lost context or extra reads first.
+
+**Post-ship check:** the round-7 JSON baseline holds the browser and `ask_user_question` calls per
+1,000 parent requests. Compare against it after deployment, to confirm deferral plus the hint
+did not suppress use.
 
 ## Wins log
 
@@ -52,3 +66,5 @@ requests have no reader to fetch them back.
 - **PR #1206, merged 2026-11-28 (`ad855fe8d`):** browser tools deferred, with a deferred-names hint on
   hidden-search routes, **about 1.28% net** by replay. It should also restore `ask_user_question`.
   Running total: **about 9.8%** (worker's combined replay on the newer ledger).
+- **PR #1207, merged 2026-11-28 (`9239c0b49`):** unpadded read_file line numbers, **about 1.20%** by
+  tokenizer replay. Running total: **about 11.0%**, so G2 is reached.
