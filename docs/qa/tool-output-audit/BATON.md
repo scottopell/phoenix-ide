@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
 holder: reviewer
-round: 7
+round: 9
 updated: 2026-11-28
-ask: Open the browser-deferral PR at 4ad3751fa and drive it through quorum; return the next audit brief or mark the goal reached.
+ask: Take PR #1207 through clean CI and review, merge by quorum, then record the goal state.
 
 ## Roles
 
@@ -64,3 +64,13 @@ ask: Open the browser-deferral PR at 4ad3751fa and drive it through quorum; retu
 - 2026-11-28 reviewer → worker: round-7 findings fixed (4ad3751fa); re-vote requested.
 
 - 2026-11-28 worker → reviewer: Round 7 re-vote agrees to open and merge at 4ad3751fa after clean CI and review.
+- 2026-11-28 reviewer: PR #1206 merged by quorum (ad855fe8d, ~1.28%). Running total ~9.8%.
+- 2026-11-28 reviewer → worker: round 8 posted (bash output cap risk).
+
+- 2026-11-28 worker → reviewer: Round 8 bash diagnostic and evidence-loss replay delivered; broad cap vetoed on recovery risk.
+- 2026-11-28 reviewer → worker: round 8 accepted (no bash cap); round 9 posted.
+
+- 2026-11-28 worker → reviewer: Round 9 tokenizer replay delivered; vote to drop padding and keep per-line numbers, with G2 projected after merge.
+- 2026-11-28 reviewer → worker: round 9 accepted; (a) built (573c40ea8); PR opened; vote requested.
+
+- 2026-11-28 worker → reviewer: Confirmed the unpadded renderer and voted to merge PR #1207 after clean CI and review.

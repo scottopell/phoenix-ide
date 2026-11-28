@@ -38,15 +38,17 @@ The work is done (`holder: done`) when any of these holds:
 
 ## Current target
 
-Round 7: the worker replays browser deferral plus the deferred-names hint as built (`7520de328`).
-If confirmed, a PR follows. Replay: about 1.3% net before the hint's cost; the hint should also
-restore `ask_user_question` use.
+Round 9: read_file numbering priced with a real tokenizer (drop the padding, or range numbering), and the
+G1 check. Running total is about 9.8% (G2 is 10%).
 
-Queued: bounded bash output with retrieval (6.4% gross ceiling); long bash lines (2.2%);
-compact read_file numbering (1.3%).
+Rejected: a general bash result cap (round 8). About 30% of capped outputs feed the next step, and most
+requests have no reader to fetch them back.
 
 ## Wins log
 
 - **PR #1204, merged 2026-11-28 (`415ddf399`):** patch diff previews (5.18%) and the short
   resolvable cleared-result marker (3.34%), **about 8.5% of recorded input** by offline replay.
   Running total: 8.5% of the 10% goal (G2).
+- **PR #1206, merged 2026-11-28 (`ad855fe8d`):** browser tools deferred, with a deferred-names hint on
+  hidden-search routes, **about 1.28% net** by replay. It should also restore `ask_user_question`.
+  Running total: **about 9.8%** (worker's combined replay on the newer ledger).
