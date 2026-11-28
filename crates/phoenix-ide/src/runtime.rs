@@ -10024,9 +10024,9 @@ mod scope_liveness_tests {
             target.resource.identity(),
             &LossItemIdentity::Worktree(worktree.clone())
         );
-        let first = manager
+        manager
             .db()
-            .claim_generic_original_worktree_dispatch(
+            .record_close_retirement_dispatch(
                 crate::db::RecordCloseRetirementDispatchRequest {
                     attempt_id: attempt_id.clone(),
                     scope: captured.scope,
@@ -10036,8 +10036,6 @@ mod scope_liveness_tests {
             )
             .await
             .unwrap();
-        assert!(matches!(first, crate::db::CloseRetirementDispatch::First(_)));
-        drop(first);
 
         let error = manager
             .retire_close_runtime_resources(attempt_id.clone())

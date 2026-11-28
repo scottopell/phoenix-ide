@@ -2874,12 +2874,27 @@ impl RuntimeManager {
                             };
                             let is_original = prepared.inspection_path == worktree_path(identity);
                             if is_original {
-                                let (fresh, _) = inspect_worktree_at_until(
+                                let (fresh, _) = match inspect_worktree_at_until(
                                     identity,
                                     prepared.inspection_path.clone(),
                                     prepared.deadline,
                                 )
-                                .await?;
+                                .await
+                                {
+                                    Ok(inspection) => inspection,
+                                    Err(detail) => {
+                                        return self
+                                            .record_close_cleanup_failure(
+                                                run,
+                                                snapshot,
+                                                &scope,
+                                                target.resource.clone(),
+                                                RetirementFailureReason::IdentityNotProven,
+                                                &detail,
+                                            )
+                                            .await;
+                                    }
+                                };
                                 if fresh.fingerprint() != confirmed.snapshot.fingerprint() {
                                     drop(prepared);
                                     self.db()
@@ -2890,15 +2905,56 @@ impl RuntimeManager {
                                     return Err("worktree changed before dispatch; fresh confirmation is required".to_string());
                                 }
                             }
+                            let cleanup_plan = match existing_cleanup_plan {
+                                Some(plan)
+                                    if plan.administrative_dir == administrative_dir
+                                        && plan.administrative_dir_incarnation == incarnation =>
+                                {
+                                    plan
+                                }
+                                Some(_) => {
+                                    return self
+                                        .record_close_cleanup_failure(
+                                            run,
+                                            snapshot,
+                                            &scope,
+                                            target.resource.clone(),
+                                            RetirementFailureReason::IdentityNotProven,
+                                            "prepared worktree no longer matches the durable cleanup plan",
+                                        )
+                                        .await;
+                                }
+                                None if is_original => crate::db::CloseWorktreeCleanupPlan {
+                                    administrative_dir,
+                                    administrative_dir_incarnation: incarnation,
+                                    final_tombstone: None,
+                                },
+                                None => {
+                                    return self
+                                        .record_close_cleanup_failure(
+                                            run,
+                                            snapshot,
+                                            &scope,
+                                            target.resource.clone(),
+                                            RetirementFailureReason::IdentityNotProven,
+                                            "quarantined worktree lacks an exact durable cleanup plan",
+                                        )
+                                        .await;
+                                }
+                            };
                             let removal_entry = if is_original {
                                 match self
                                     .db()
                                     .claim_generic_original_worktree_dispatch(
-                                        RecordCloseRetirementDispatchRequest {
+                                        RecordCloseWorktreeCleanupPlanRequest {
                                             attempt_id: attempt_id.clone(),
                                             scope: scope.clone(),
                                             snapshot: snapshot.clone(),
                                             resource: target.resource.clone(),
+                                            administrative_dir: cleanup_plan.administrative_dir.clone(),
+                                            administrative_dir_incarnation: cleanup_plan
+                                                .administrative_dir_incarnation
+                                                .clone(),
                                         },
                                     )
                                     .await
@@ -2920,55 +2976,8 @@ impl RuntimeManager {
                                             .await;
                                     }
                                 }
-                            } else if existing_cleanup_plan.is_some() {
+                            } else {
                                 WorktreeRemovalEntry::RetainedQuarantine
-                            } else {
-                                return self
-                                    .record_close_cleanup_failure(
-                                        run,
-                                        snapshot,
-                                        &scope,
-                                        target.resource.clone(),
-                                        RetirementFailureReason::IdentityNotProven,
-                                        "quarantined worktree lacks an exact durable cleanup plan",
-                                    )
-                                    .await;
-                            };
-                            let cleanup_plan = if let Some(plan) = existing_cleanup_plan {
-                                if plan.administrative_dir != administrative_dir
-                                    || plan.administrative_dir_incarnation != incarnation
-                                {
-                                    return self
-                                        .record_close_cleanup_failure(
-                                            run,
-                                            snapshot,
-                                            &scope,
-                                            target.resource.clone(),
-                                            RetirementFailureReason::IdentityNotProven,
-                                            "prepared worktree no longer matches the durable cleanup plan",
-                                        )
-                                        .await;
-                                }
-                                plan
-                            } else {
-                                self.db()
-                                    .record_close_worktree_cleanup_plan(
-                                        RecordCloseWorktreeCleanupPlanRequest {
-                                            attempt_id: attempt_id.clone(),
-                                            scope: scope.clone(),
-                                            snapshot: snapshot.clone(),
-                                            resource: target.resource.clone(),
-                                            administrative_dir: administrative_dir.clone(),
-                                            administrative_dir_incarnation: incarnation.clone(),
-                                        },
-                                    )
-                                    .await
-                                    .map_err(|error| error.to_string())?;
-                                crate::db::CloseWorktreeCleanupPlan {
-                                    administrative_dir,
-                                    administrative_dir_incarnation: incarnation,
-                                    final_tombstone: None,
-                                }
                             };
                             let confirmed_snapshot = confirmed.snapshot.clone();
                             let db = self.db().clone();

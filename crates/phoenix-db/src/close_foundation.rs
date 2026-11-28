@@ -4722,7 +4722,7 @@ type WorktreeCleanupPlanColumns = (
 
 enum GenericCloseDispatchKind {
     Legacy,
-    OriginalWorktree,
+    OriginalWorktree(Box<RecordCloseWorktreeCleanupPlanRequest>),
 }
 
 impl Database {
@@ -4743,18 +4743,28 @@ impl Database {
         Ok(())
     }
 
-    /// Claims the first generic dispatch of an exact original worktree. A replay
-    /// grants no ownership. Neither result authorizes relaxed writer inspection.
+    /// Claims the first generic dispatch and commits its exact cleanup plan
+    /// together. A replay grants no ownership and cannot install a plan. Neither
+    /// result authorizes relaxed writer inspection.
     ///
     /// # Errors
     /// Returns an error unless the request matches a sealed worktree in the
     /// exact snapshot of a requested generic retirement.
     pub async fn claim_generic_original_worktree_dispatch(
         &self,
-        request: RecordCloseRetirementDispatchRequest,
+        plan: RecordCloseWorktreeCleanupPlanRequest,
     ) -> DbResult<CloseRetirementDispatch> {
-        self.record_generic_close_dispatch(request, GenericCloseDispatchKind::OriginalWorktree)
-            .await
+        let request = RecordCloseRetirementDispatchRequest {
+            attempt_id: plan.attempt_id.clone(),
+            scope: plan.scope.clone(),
+            snapshot: plan.snapshot.clone(),
+            resource: plan.resource.clone(),
+        };
+        self.record_generic_close_dispatch(
+            request,
+            GenericCloseDispatchKind::OriginalWorktree(Box::new(plan)),
+        )
+        .await
     }
 
     async fn record_generic_close_dispatch(
@@ -4791,7 +4801,7 @@ impl Database {
                 ));
             }
         }
-        if matches!(kind, GenericCloseDispatchKind::OriginalWorktree)
+        if matches!(kind, GenericCloseDispatchKind::OriginalWorktree(_))
             && (current.phase() != ClosePhase::RetirementRequested
                 || request.resource.kind() != RetiredResourceKind::Worktree)
         {
@@ -4799,7 +4809,7 @@ impl Database {
                 "original worktree claim requires requested worktree retirement",
             ));
         }
-        if matches!(kind, GenericCloseDispatchKind::OriginalWorktree) {
+        if matches!(kind, GenericCloseDispatchKind::OriginalWorktree(_)) {
             let initial_run_active: bool = sqlx::query_scalar(
                 "SELECT EXISTS (
                      SELECT 1 FROM close_runs
@@ -4854,8 +4864,8 @@ impl Database {
         }
         ensure_close_retirement_loss_free_tx(&mut tx, request.attempt_id.as_str()).await?;
         let dispatch = Self::insert_close_retirement_dispatch_tx(&mut tx, &request).await?;
-        if matches!(kind, GenericCloseDispatchKind::OriginalWorktree)
-            && matches!(&dispatch, CloseRetirementDispatch::First(_))
+        if let (GenericCloseDispatchKind::OriginalWorktree(plan), CloseRetirementDispatch::First(_)) =
+            (kind, &dispatch)
         {
             let prior_dispatch: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
@@ -4878,6 +4888,7 @@ impl Database {
                 tx.rollback().await?;
                 return Ok(CloseRetirementDispatch::Replay);
             }
+            Self::record_close_worktree_cleanup_plan_tx(&mut tx, *plan).await?;
         }
         tx.commit().await?;
         Ok(dispatch)
@@ -18529,9 +18540,24 @@ mod tests {
             snapshot,
             resource,
         };
+        let plan = RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: request.attempt_id.clone(),
+            scope: request.scope.clone(),
+            snapshot: request.snapshot.clone(),
+            resource: request.resource.clone(),
+            administrative_dir: std::path::PathBuf::from("/example/git/worktrees/legacy"),
+            administrative_dir_incarnation: "legacy-admin".to_string(),
+        };
+        let mut invalid_plan = plan.clone();
+        invalid_plan.administrative_dir_incarnation.clear();
+        let error = db
+            .claim_generic_original_worktree_dispatch(invalid_plan)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("length(administrative_dir_incarnation)"));
         let (left, right) = tokio::join!(
-            db.claim_generic_original_worktree_dispatch(request.clone()),
-            db.claim_generic_original_worktree_dispatch(request.clone()),
+            db.claim_generic_original_worktree_dispatch(plan.clone()),
+            db.claim_generic_original_worktree_dispatch(plan),
         );
         let first = match (left.unwrap(), right.unwrap()) {
             (CloseRetirementDispatch::First(first), CloseRetirementDispatch::Replay)
@@ -18542,6 +18568,14 @@ mod tests {
         assert_eq!(first.request().scope, request.scope);
         assert_eq!(first.request().snapshot, request.snapshot);
         assert_eq!(first.request().attempt_id, request.attempt_id);
+        let persisted_incarnation: String = sqlx::query_scalar(
+            "SELECT administrative_dir_incarnation FROM close_worktree_cleanup_plans WHERE attempt_id = ?1",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(persisted_incarnation, "legacy-admin");
         let before: i64 = sqlx::query_scalar(
             "SELECT dispatched_at_us FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
         )
