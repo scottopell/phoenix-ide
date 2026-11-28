@@ -2873,6 +2873,23 @@ impl RuntimeManager {
                                 }
                             };
                             let is_original = prepared.inspection_path == worktree_path(identity);
+                            if is_original {
+                                let (fresh, _) = inspect_worktree_at_until(
+                                    identity,
+                                    prepared.inspection_path.clone(),
+                                    prepared.deadline,
+                                )
+                                .await?;
+                                if fresh.fingerprint() != confirmed.snapshot.fingerprint() {
+                                    drop(prepared);
+                                    self.db()
+                                        .return_close_attempt_to_reinspection(attempt_id)
+                                        .await
+                                        .map_err(|error| error.to_string())?;
+                                    self.persist_close_retirement_inspection(attempt_id).await?;
+                                    return Err("worktree changed before dispatch; fresh confirmation is required".to_string());
+                                }
+                            }
                             let removal_entry = if is_original {
                                 match self
                                     .db()
@@ -3060,25 +3077,16 @@ impl RuntimeManager {
                                             .await;
                                     }
                                     Ok(ExactWorktreeRemoval::ReinspectionRequired { detail }) => {
-                                        if run.ordinal != CloseRunOrdinal::INITIAL {
-                                            return self
-                                                .record_close_cleanup_failure(
-                                                    run,
-                                                    snapshot,
-                                                    &scope,
-                                                    target.resource.clone(),
-                                                    RetirementFailureReason::IdentityNotProven,
-                                                    &detail,
-                                                )
-                                                .await;
-                                        }
-                                        self.db()
-                                            .return_close_attempt_to_reinspection(attempt_id)
-                                            .await
-                                            .map_err(|error| error.to_string())?;
-                                        self.persist_close_retirement_inspection(attempt_id)
-                                            .await?;
-                                        return Err(detail);
+                                        return self
+                                            .record_close_cleanup_failure(
+                                                run,
+                                                snapshot,
+                                                &scope,
+                                                target.resource.clone(),
+                                                RetirementFailureReason::IdentityNotProven,
+                                                &detail,
+                                            )
+                                            .await;
                                     }
                                     Ok(ExactWorktreeRemoval::Residual { detail }) => {
                                         return self
