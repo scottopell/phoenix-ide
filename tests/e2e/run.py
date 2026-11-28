@@ -1766,9 +1766,15 @@ def scenario_git_lifecycle_public_http(base_url: str) -> None:
         except httpx.RequestError as error:
             raise AssertionError(f"physical Close request failed: {error}") from error
         assert closed.is_success, f"physical Close returned HTTP {closed.status_code}: {closed.text}"
-        assert closed.json().get("success") is True
-        assert not checkout.exists(), f"physical Close retained the checkout: {checkout}"
-        assert checkout not in _git_worktree_paths(repo), "physical Close retained the Git registration"
+        assert closed.json().get("success") is True, (
+            f"physical Close did not return success for {product_id}: {closed.text}"
+        )
+        assert not checkout.exists(), (
+            f"physical Close retained the checkout {checkout} for {product_id}: {closed.text}"
+        )
+        assert checkout not in _git_worktree_paths(repo), (
+            f"physical Close retained the Git registration for {product_id}: {closed.text}"
+        )
         assert _git_lifecycle_snapshot(repo) == original, "Close or approval changed the original repository"
         assert (repo / "staged.txt").read_text() == "unstaged source bytes\n"
         assert ignored.read_text() == "ignored source bytes\n"
@@ -2971,6 +2977,26 @@ class ParallelDispatchTests(unittest.TestCase):
         self.assertIn("synthetic e2e failure", failures[0][1])
 
 
+def _report_disposable_close_state(db_path: Path) -> None:
+    import sqlite3
+
+    # Only read the hermetic server's disposable database, before it is removed.
+    queries = (
+        ("attempts", "SELECT product_conversation_id, attempt_id, phase, close_outcome "
+                     "FROM close_obligations ORDER BY chronology_ordinal DESC LIMIT 4"),
+        ("failures", "SELECT attempt_id, cleanup_run_ordinal, resource_kind, reason, substr(detail, 1, 1200) "
+                     "FROM close_cleanup_failures ORDER BY occurred_at_us DESC LIMIT 4"),
+        ("writers", "SELECT attempt_id, run_ordinal, detector, pid, authority, gap "
+                    "FROM close_writer_observations ORDER BY attempt_id, run_ordinal, detector LIMIT 12"),
+    )
+    try:
+        with contextlib.closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
+            for label, query in queries:
+                print(f"[e2e] Close durable {label}: {db.execute(query).fetchall()!r}", flush=True)
+    except sqlite3.Error as error:
+        print(f"[e2e] Close durable diagnostics unavailable: {error}", flush=True)
+
+
 def _close_descriptor_diagnostic_tail(log_text: str) -> list[str]:
     tail = []
     for line in reversed(log_text.splitlines()):
@@ -3144,6 +3170,8 @@ def main(argv: list[str] | None = None) -> int:
             name == "git_lifecycle_public_http" and "physical Close " in detail
             for name, detail in failures
         )
+        if lifecycle_close_failed:
+            _report_disposable_close_state(log_path.parent / "phoenix.db")
         if lifecycle_close_failed and sys.platform == "linux":
             for role, pid in (("harness", os.getpid()), ("server", server_pid)):
                 proc = Path("/proc") / str(pid)
