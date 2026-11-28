@@ -16,8 +16,8 @@ use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId, WorkScopeRetiremen
 use phoenix_db::native_close::{NativeCloseCommand, NativeCloseReceipt};
 use phoenix_db::workflow::LocalAuthorityResult;
 use phoenix_db::{
-    CloseCleanupFailureAuthority, CloseCleanupResourceDisposition, CloseRetirementDispatch, Database,
-    DbError, DbResult, FirstCloseRetirementDispatch,
+    CloseCleanupFailureAuthority, CloseCleanupResourceDisposition, CloseRetirementDispatch,
+    Database, DbError, DbResult, FirstCloseRetirementDispatch,
     RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
     TerminalizeInitialCloseCleanupFailureRequest,
 };
@@ -482,9 +482,7 @@ impl PostRetirement {
             })
             .await
             {
-                AuthoritativeCommand::Established(Ok(CloseRetirementDispatch::First(
-                    dispatch,
-                ))) => {
+                AuthoritativeCommand::Established(Ok(CloseRetirementDispatch::First(dispatch))) => {
                     self.stage = Stage::WorktreePreparing(dispatch);
                     Ok(PostRetirementStep::Retiring)
                 }

@@ -17,12 +17,12 @@ use crate::runtime::close_retirement::GenericCloseRetryError;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
 
+use crate::runtime::close_retirement::{
+    GenericCloseIngress, GenericCloseIngressError, GenericCloseIngressOutcome,
+};
 use axum::{
     extract::{Path, State},
     Json,
-};
-use crate::runtime::close_retirement::{
-    GenericCloseIngress, GenericCloseIngressError, GenericCloseIngressOutcome,
 };
 use phoenix_core::domain::close::ClosePhase;
 use phoenix_core::domain::product_conversation::ProductConversationId;
@@ -379,7 +379,9 @@ pub(crate) async fn confirm_close_stop_work(
             obligation.attempt_id(),
         )
         .await
-        .map_err(|error| close_target_control_conflict(error.to_string(), "close_stop_work_confirmation_failed"))?;
+        .map_err(|error| {
+            close_target_control_conflict(error.to_string(), "close_stop_work_confirmation_failed")
+        })?;
     match route {
         CloseTargetControlResolution::ParkedNativeInitial(route) => {
             state
@@ -416,19 +418,26 @@ pub(crate) async fn confirm_close_stop_work(
     match worker.await {
         Ok(Ok(GenericCloseIngressOutcome::Continued)) => {}
         Ok(Ok(GenericCloseIngressOutcome::Observed(_))) => {
-            return Err(AppError::Internal("expected committed Close stop-work".into()));
+            return Err(AppError::Internal(
+                "expected committed Close stop-work".into(),
+            ));
         }
         Ok(Err(GenericCloseIngressError::Admission(error))) => {
-            let error_type = if matches!(error, crate::db::DbError::CloseFoundationStaleLatest { .. }) {
-                "inactive_close_transcript"
-            } else {
-                "close_stop_work_confirmation_failed"
-            };
+            let error_type =
+                if matches!(error, crate::db::DbError::CloseFoundationStaleLatest { .. }) {
+                    "inactive_close_transcript"
+                } else {
+                    "close_stop_work_confirmation_failed"
+                };
             return Err(close_target_control_conflict(error.to_string(), error_type));
         }
         Ok(Err(GenericCloseIngressError::Worker(error))) => {
-            crate::close_service::project_close_worker_failure(&state, obligation.attempt_id(), error)
-                .await?;
+            crate::close_service::project_close_worker_failure(
+                &state,
+                obligation.attempt_id(),
+                error,
+            )
+            .await?;
             return Ok(Json(SuccessResponse { success: true }));
         }
         Err(error) => {
@@ -452,7 +461,8 @@ pub(crate) async fn confirm_close_stop_work(
             Ok(Json(SuccessResponse { success: true }))
         }
         ClosePhase::SettlingActiveWork => {
-            require_close_settlement_without_retained_custody(&state, refreshed.attempt_id()).await?;
+            require_close_settlement_without_retained_custody(&state, refreshed.attempt_id())
+                .await?;
             Err(close_settlement_in_progress())
         }
         ClosePhase::AwaitingLossConfirmation => {
@@ -859,11 +869,9 @@ mod tests {
         assert!(run_legacy_close_compat(&state, &child.id, "abandon")
             .await
             .is_err());
-        assert!(
-            run_legacy_close_compat(&state, &child.id, "mark as merged")
-                .await
-                .is_err()
-        );
+        assert!(run_legacy_close_compat(&state, &child.id, "mark as merged")
+            .await
+            .is_err());
         let retained_parent = state.db.get_conversation(id).await.unwrap();
         assert_eq!(
             retained_parent.attached_work_scope_id,

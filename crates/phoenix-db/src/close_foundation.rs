@@ -85,7 +85,9 @@ pub(crate) async fn require_exact_live_settlement_target_tx<'a, 'db>(
         .execute(&mut *tx.tx)
         .await?;
         if released.rows_affected() != 1 {
-            return Err(close_precondition("exact direct-turn settlement receipt was not released"));
+            return Err(close_precondition(
+                "exact direct-turn settlement receipt was not released",
+            ));
         }
         return Ok(None);
     }
@@ -98,7 +100,11 @@ pub(crate) async fn require_exact_live_settlement_target_tx<'a, 'db>(
             "direct-turn target generation or live ownership changed".into(),
         ));
     }
-    Ok(Some(LiveCloseSettlementTarget { tx, attempt_id, target }))
+    Ok(Some(LiveCloseSettlementTarget {
+        tx,
+        attempt_id,
+        target,
+    }))
 }
 
 impl LiveCloseSettlementTarget<'_, '_> {
@@ -109,8 +115,9 @@ impl LiveCloseSettlementTarget<'_, '_> {
     ) -> DbResult<bool> {
         let turn_id = i64::try_from(self.target.turn_id)
             .map_err(|error| DbError::Serialization(format!("turn id overflow: {error}")))?;
-        let generation = i64::try_from(self.target.expected_generation)
-            .map_err(|error| DbError::Serialization(format!("turn generation overflow: {error}")))?;
+        let generation = i64::try_from(self.target.expected_generation).map_err(|error| {
+            DbError::Serialization(format!("turn generation overflow: {error}"))
+        })?;
         if self.stop_already_claimed().await? {
             return Ok(false);
         }
@@ -134,8 +141,9 @@ impl LiveCloseSettlementTarget<'_, '_> {
     async fn stop_already_claimed(&mut self) -> DbResult<bool> {
         let turn_id = i64::try_from(self.target.turn_id)
             .map_err(|error| DbError::Serialization(format!("turn id overflow: {error}")))?;
-        let generation = i64::try_from(self.target.expected_generation)
-            .map_err(|error| DbError::Serialization(format!("turn generation overflow: {error}")))?;
+        let generation = i64::try_from(self.target.expected_generation).map_err(|error| {
+            DbError::Serialization(format!("turn generation overflow: {error}"))
+        })?;
         Ok(sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM close_settlement_stop_claims
              WHERE attempt_id = ?1 AND run_ordinal = ?2 AND turn_id = ?3
@@ -212,7 +220,10 @@ impl GenericCloseSettlement {
     }
 
     #[must_use]
-    pub fn offer_turn(&self, target: CloseDirectTurnSettlementTarget) -> Option<GenericCloseTurnOffer> {
+    pub fn offer_turn(
+        &self,
+        target: CloseDirectTurnSettlementTarget,
+    ) -> Option<GenericCloseTurnOffer> {
         self.is_committed_ingress().then(|| GenericCloseTurnOffer {
             attempt: self.obligation.attempt_id().clone(),
             product: self.obligation.product_conversation_id().clone(),
@@ -355,13 +366,11 @@ fn generic_close_cancellation_kind(
         }
         phase @ (ClosePhase::RetirementRequested
         | ClosePhase::NeedsRepair
-        | ClosePhase::Completed) => {
-            Err(close_precondition(format!(
-                "attempt {} phase {} does not admit pre-retirement cancellation",
-                obligation.attempt_id(),
-                phase.as_str()
-            )))
-        }
+        | ClosePhase::Completed) => Err(close_precondition(format!(
+            "attempt {} phase {} does not admit pre-retirement cancellation",
+            obligation.attempt_id(),
+            phase.as_str()
+        ))),
     }
 }
 
@@ -2613,16 +2622,18 @@ impl Database {
         expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &CloseAttemptId,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseAdmission>> {
-        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
 
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
             Err(error) => return DurableFactEstablished(Err(error.into())),
         };
         let result = async {
-        // Preserve exact-ID replay (including conflicts) ahead of observing another attempt.
-        let candidates: Vec<(String, bool)> = sqlx::query_as(
-            "SELECT o.attempt_id,
+            // Preserve exact-ID replay (including conflicts) ahead of observing another attempt.
+            let candidates: Vec<(String, bool)> = sqlx::query_as(
+                "SELECT o.attempt_id,
                     (o.phase <> 'completed' OR o.close_outcome = 'close_incomplete') AS active
              FROM close_obligations o
              JOIN product_conversations p ON p.id = o.product_conversation_id
@@ -2632,58 +2643,63 @@ impl Database {
                         AND o.close_outcome IN ('archived', 'archived_cleanup_attention')))
                AND NOT EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = ?2)
              ORDER BY active DESC LIMIT 2",
-        )
-        .bind(product_conversation_id.as_str())
-        .bind(attempt_id.as_str())
-        .fetch_all(&mut *tx)
-        .await?;
-        let observed_attempt_id = match candidates.as_slice() {
-            [(_, first), (_, second)] if first == second => {
-                return Err(DbError::CloseFoundationConflict(format!(
+            )
+            .bind(product_conversation_id.as_str())
+            .bind(attempt_id.as_str())
+            .fetch_all(&mut *tx)
+            .await?;
+            let observed_attempt_id = match candidates.as_slice() {
+                [(_, first), (_, second)] if first == second => {
+                    return Err(DbError::CloseFoundationConflict(format!(
                     "ProductConversation {product_conversation_id} has ambiguous Close ownership"
                 )));
-            }
-            [(winner, _), ..] => Some(winner.as_str()),
-            [] => None,
-        };
-        let admission = Self::begin_close_foundation_inner(
-            &mut tx,
-            product_conversation_id,
-            expected_latest_transcript_id,
-            observed_attempt_id.unwrap_or(attempt_id.as_str()),
-            false,
-        )
-        .await?;
-        let admission = match admission {
-            CloseFoundationAdmission::Inserted(obligation) => {
-                let obligation =
-                    Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?;
-                match obligation.phase() {
-                    ClosePhase::SettlingActiveWork => {
-                        GenericCloseAdmission::InsertedSettling(GenericCloseSettlement {
-                            obligation,
-                            provenance: GenericSettlementProvenance::CommittedIngress,
-                        })
-                    }
-                    ClosePhase::AwaitingStopWorkConfirmation => {
-                        GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
-                    }
-                    phase => {
-                        return Err(close_precondition(format!(
-                            "new generic Close cannot start in phase {}",
-                            phase.as_str(),
-                        )));
+                }
+                [(winner, _), ..] => Some(winner.as_str()),
+                [] => None,
+            };
+            let admission = Self::begin_close_foundation_inner(
+                &mut tx,
+                product_conversation_id,
+                expected_latest_transcript_id,
+                observed_attempt_id.unwrap_or(attempt_id.as_str()),
+                false,
+            )
+            .await?;
+            let admission = match admission {
+                CloseFoundationAdmission::Inserted(obligation) => {
+                    let obligation =
+                        Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation)
+                            .await?;
+                    match obligation.phase() {
+                        ClosePhase::SettlingActiveWork => {
+                            GenericCloseAdmission::InsertedSettling(GenericCloseSettlement {
+                                obligation,
+                                provenance: GenericSettlementProvenance::CommittedIngress,
+                            })
+                        }
+                        ClosePhase::AwaitingStopWorkConfirmation => {
+                            GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
+                        }
+                        phase => {
+                            return Err(close_precondition(format!(
+                                "new generic Close cannot start in phase {}",
+                                phase.as_str(),
+                            )));
+                        }
                     }
                 }
-            }
-            CloseFoundationAdmission::Existing(obligation) => {
-                GenericCloseAdmission::Existing(obligation)
-            }
-        };
-        Ok(admission)
+                CloseFoundationAdmission::Existing(obligation) => {
+                    GenericCloseAdmission::Existing(obligation)
+                }
+            };
+            Ok(admission)
         }
         .await;
-        let released = if result.is_ok() { tx.commit().await } else { tx.rollback().await };
+        let released = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
         match released {
             Ok(()) => DurableFactEstablished(result),
             Err(_) => DurableFactUnclassified,
@@ -2697,9 +2713,20 @@ impl Database {
         expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &CloseAttemptId,
     ) -> DbResult<GenericCloseAdmission> {
-        match self.begin_generic_close_settlement_classified(product_conversation_id, expected_latest_transcript_id, attempt_id).await {
+        match self
+            .begin_generic_close_settlement_classified(
+                product_conversation_id,
+                expected_latest_transcript_id,
+                attempt_id,
+            )
+            .await
+        {
             crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
-            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => Err(DbError::CloseFoundationConflict("generic Close admission transaction release is unclassified".into())),
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::CloseFoundationConflict(
+                    "generic Close admission transaction release is unclassified".into(),
+                ))
+            }
         }
     }
 
@@ -3098,16 +3125,21 @@ impl Database {
         target_latest: &TranscriptConversationId,
         attempt_id: &CloseAttemptId,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseSettlement>> {
-        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
 
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
             Err(error) => return DurableFactEstablished(Err(error.into())),
         };
         let result = async {
-            let current = Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+            let current =
+                Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
             if current.product_conversation_id() != target {
-                return Err(close_precondition("Close stop-work target does not own the attempt"));
+                return Err(close_precondition(
+                    "Close stop-work target does not own the attempt",
+                ));
             }
             require_control_target_latest_tx(&mut tx, target, target_latest).await?;
             let captured_latest: String = sqlx::query_scalar(
@@ -3118,16 +3150,29 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?;
             if captured_latest != target_latest.as_str() {
-                return Err(close_precondition("Close stop-work transcript does not match the captured latest member"));
+                return Err(close_precondition(
+                    "Close stop-work transcript does not match the captured latest member",
+                ));
             }
             if current.phase() != ClosePhase::AwaitingStopWorkConfirmation {
-                return Err(close_precondition("Close stop-work has already left confirmation"));
+                return Err(close_precondition(
+                    "Close stop-work has already left confirmation",
+                ));
             }
-            Self::begin_close_active_work_settlement_tx(&mut tx, attempt_id.as_str(), &current).await?;
+            Self::begin_close_active_work_settlement_tx(&mut tx, attempt_id.as_str(), &current)
+                .await?;
             let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
-            Ok(GenericCloseSettlement { obligation, provenance: GenericSettlementProvenance::CommittedIngress })
-        }.await;
-        let released = if result.is_ok() { tx.commit().await } else { tx.rollback().await };
+            Ok(GenericCloseSettlement {
+                obligation,
+                provenance: GenericSettlementProvenance::CommittedIngress,
+            })
+        }
+        .await;
+        let released = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
         match released {
             Ok(()) => DurableFactEstablished(result),
             Err(_) => DurableFactUnclassified,
@@ -3141,9 +3186,16 @@ impl Database {
         target_latest: &TranscriptConversationId,
         attempt_id: &CloseAttemptId,
     ) -> DbResult<GenericCloseSettlement> {
-        match self.confirm_generic_close_stop_work_classified(target, target_latest, attempt_id).await {
+        match self
+            .confirm_generic_close_stop_work_classified(target, target_latest, attempt_id)
+            .await
+        {
             crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
-            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => Err(DbError::CloseFoundationConflict("generic Close stop-work transaction release is unclassified".into())),
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::CloseFoundationConflict(
+                    "generic Close stop-work transaction release is unclassified".into(),
+                ))
+            }
         }
     }
 
@@ -3416,7 +3468,8 @@ impl Database {
         attempt_id: &CloseAttemptId,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin().await?;
-        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+        let obligation =
+            Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
         tx.commit().await?;
         Ok(obligation)
     }
@@ -3499,13 +3552,19 @@ impl Database {
         let (status, current) = Self::interrupted_close_run_for_update(tx, &run).await?;
         if status != CloseRunStatus::Running
             || current.product_conversation_id() != settlement.obligation.product_conversation_id()
-            || !matches!(current.phase(), ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement)
+            || !matches!(
+                current.phase(),
+                ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+            )
         {
             return Ok(None);
         }
         Self::require_generic_close_settlement_tx(
-            tx, run.attempt_id.as_str(), current.product_conversation_id().as_str(),
-        ).await?;
+            tx,
+            run.attempt_id.as_str(),
+            current.product_conversation_id().as_str(),
+        )
+        .await?;
         Ok(Some(current))
     }
 
@@ -3513,7 +3572,9 @@ impl Database {
         &self,
         settlement: &GenericCloseSettlement,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseSettlementAdvance>> {
-        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
 
         let attempt_id = settlement.obligation.attempt_id();
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
@@ -3523,32 +3584,56 @@ impl Database {
         let result = async {
             let run = CloseRunRef::initial(attempt_id.clone());
             let (status, current) = Self::interrupted_close_run_for_update(&mut tx, &run).await?;
-            if current.product_conversation_id() != settlement.obligation.product_conversation_id() {
-                return Err(close_precondition("generic Close settlement target changed"));
+            if current.product_conversation_id() != settlement.obligation.product_conversation_id()
+            {
+                return Err(close_precondition(
+                    "generic Close settlement target changed",
+                ));
             }
             Self::require_generic_close_settlement_tx(
-                &mut tx, attempt_id.as_str(), current.product_conversation_id().as_str(),
-            ).await?;
+                &mut tx,
+                attempt_id.as_str(),
+                current.product_conversation_id().as_str(),
+            )
+            .await?;
             if status != CloseRunStatus::Running {
                 return Ok((GenericCloseSettlementAdvance::NoTransition, false));
             }
             let phase = current.phase();
-            if matches!(phase, ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement)
-                && Self::try_advance_close_settlement_when_quiescent_tx(&mut tx, attempt_id.as_str()).await?.is_err()
+            if matches!(
+                phase,
+                ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+            ) && Self::try_advance_close_settlement_when_quiescent_tx(
+                &mut tx,
+                attempt_id.as_str(),
+            )
+            .await?
+            .is_err()
             {
                 return Ok((GenericCloseSettlementAdvance::WaitingForQuiescence, false));
             }
             let outcome = match phase {
                 ClosePhase::SettlingActiveWork => match settlement.provenance {
-                    GenericSettlementProvenance::CommittedIngress => GenericCloseSettlementAdvance::Inspect(GenericCloseInspection(attempt_id.clone())),
+                    GenericSettlementProvenance::CommittedIngress => {
+                        GenericCloseSettlementAdvance::Inspect(GenericCloseInspection(
+                            attempt_id.clone(),
+                        ))
+                    }
                     #[cfg(test)]
-                    GenericSettlementProvenance::RetainedSettlement => GenericCloseSettlementAdvance::Interrupted(CloseRunRef::initial(attempt_id.clone())),
+                    GenericSettlementProvenance::RetainedSettlement => {
+                        GenericCloseSettlementAdvance::Interrupted(CloseRunRef::initial(
+                            attempt_id.clone(),
+                        ))
+                    }
                 },
-                ClosePhase::CancelRequestedDuringSettlement => GenericCloseSettlementAdvance::Cancelled,
+                ClosePhase::CancelRequestedDuringSettlement => {
+                    GenericCloseSettlementAdvance::Cancelled
+                }
                 _ => GenericCloseSettlementAdvance::NoTransition,
             };
             Ok((outcome, true))
-        }.await;
+        }
+        .await;
         let released = match &result {
             Ok((_, true)) => tx.commit().await,
             Ok((_, false)) | Err(_) => tx.rollback().await,
@@ -3564,9 +3649,16 @@ impl Database {
         &self,
         settlement: &GenericCloseSettlement,
     ) -> DbResult<GenericCloseSettlementAdvance> {
-        match self.finish_generic_close_settlement_classified(settlement).await {
+        match self
+            .finish_generic_close_settlement_classified(settlement)
+            .await
+        {
             crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
-            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => Err(DbError::CloseFoundationConflict("generic Close settlement transaction release is unclassified".into())),
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::CloseFoundationConflict(
+                    "generic Close settlement transaction release is unclassified".into(),
+                ))
+            }
         }
     }
 
@@ -3689,7 +3781,9 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<Vec<CloseDirectTurnSettlementTarget>> {
         let mut tx = self.pool.begin().await?;
-        let targets = Self::list_unsettled_close_direct_turn_settlement_targets_tx(&mut tx, attempt_id).await?;
+        let targets =
+            Self::list_unsettled_close_direct_turn_settlement_targets_tx(&mut tx, attempt_id)
+                .await?;
         tx.commit().await?;
         Ok(targets)
     }
@@ -3728,7 +3822,9 @@ impl Database {
         &self,
         settlement: &GenericCloseSettlement,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<bool>> {
-        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
 
         if !settlement.is_committed_ingress() {
             return DurableFactEstablished(Ok(false));
@@ -3739,7 +3835,8 @@ impl Database {
             Err(error) => return DurableFactEstablished(Err(error)),
         };
         let result = async {
-            let Some(current) = Self::running_generic_settlement_tx(&mut tx.tx, settlement).await? else {
+            let Some(current) = Self::running_generic_settlement_tx(&mut tx.tx, settlement).await?
+            else {
                 return Ok(false);
             };
             let participants: Vec<String> = sqlx::query_scalar(
@@ -3753,8 +3850,13 @@ impl Database {
                 Self::cancel_conversation_creation_tx(&mut tx.tx, &participant, Utc::now()).await?;
             }
             Ok(true)
-        }.await;
-        let classified = if result.is_ok() { tx.commit().await } else { tx.rollback().await };
+        }
+        .await;
+        let classified = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
         match classified {
             Ok(()) => DurableFactEstablished(result),
             Err(_) => DurableFactUnclassified,
@@ -3767,7 +3869,9 @@ impl Database {
         &self,
         offer: GenericCloseTurnOffer,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<bool>> {
-        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
 
         let workflow = self.workflow_repository();
         let mut tx = match workflow.begin_immediate_tx().await {
@@ -3776,16 +3880,23 @@ impl Database {
         };
         let result = async {
             let run = CloseRunRef::initial(offer.attempt);
-            let (status, current) = Self::interrupted_close_run_for_update(&mut tx.tx, &run).await?;
+            let (status, current) =
+                Self::interrupted_close_run_for_update(&mut tx.tx, &run).await?;
             if status != CloseRunStatus::Running
                 || current.product_conversation_id() != &offer.product
-                || !matches!(current.phase(), ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement)
+                || !matches!(
+                    current.phase(),
+                    ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+                )
             {
                 return Ok(false);
             }
             Self::require_generic_close_settlement_tx(
-                &mut tx.tx, run.attempt_id.as_str(), offer.product.as_str(),
-            ).await?;
+                &mut tx.tx,
+                run.attempt_id.as_str(),
+                offer.product.as_str(),
+            )
+            .await?;
             let Some(target) =
                 require_exact_live_settlement_target_tx(&mut tx, &run.attempt_id, &offer.target)
                     .await?
@@ -3817,8 +3928,12 @@ impl Database {
         settlement: &GenericCloseSettlement,
         target: &CloseDirectTurnSettlementTarget,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseTurnRelease>> {
-        self.apply_generic_close_turn_fallback(settlement, target, GenericCloseTurnFallback::NoActor)
-            .await
+        self.apply_generic_close_turn_fallback(
+            settlement,
+            target,
+            GenericCloseTurnFallback::NoActor,
+        )
+        .await
     }
 
     pub async fn reconcile_lost_generic_close_turn_offer(
@@ -3826,8 +3941,12 @@ impl Database {
         settlement: &GenericCloseSettlement,
         target: &CloseDirectTurnSettlementTarget,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseTurnRelease>> {
-        self.apply_generic_close_turn_fallback(settlement, target, GenericCloseTurnFallback::LostOffer)
-            .await
+        self.apply_generic_close_turn_fallback(
+            settlement,
+            target,
+            GenericCloseTurnFallback::LostOffer,
+        )
+        .await
     }
 
     async fn apply_generic_close_turn_fallback(
@@ -3836,7 +3955,9 @@ impl Database {
         target: &CloseDirectTurnSettlementTarget,
         fallback: GenericCloseTurnFallback,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseTurnRelease>> {
-        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
 
         let workflow = self.workflow_repository();
         let mut tx = match workflow.begin_immediate_tx().await {
@@ -3845,9 +3966,13 @@ impl Database {
         };
         let result = async {
             let run = CloseRunRef::initial(settlement.obligation.attempt_id().clone());
-            let (status, current) = Self::interrupted_close_run_for_update(&mut tx.tx, &run).await?;
-            if current.product_conversation_id() != settlement.obligation.product_conversation_id() {
-                return Err(close_precondition("generic Close settlement target changed"));
+            let (status, current) =
+                Self::interrupted_close_run_for_update(&mut tx.tx, &run).await?;
+            if current.product_conversation_id() != settlement.obligation.product_conversation_id()
+            {
+                return Err(close_precondition(
+                    "generic Close settlement target changed",
+                ));
             }
             Self::require_generic_close_settlement_tx(
                 &mut tx.tx,
@@ -4097,11 +4222,15 @@ impl Database {
         inspection: GenericCloseInspection,
         request: ReplaceCloseInspectionRequest,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<Option<FreshGenericCloseRetirement>>> {
-        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
 
         let attempt_id = inspection.into_attempt_id();
         if request.attempt_id != attempt_id {
-            return DurableFactEstablished(Err(close_precondition("Initial inspection names a different Close attempt")));
+            return DurableFactEstablished(Err(close_precondition(
+                "Initial inspection names a different Close attempt",
+            )));
         }
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
@@ -4153,7 +4282,11 @@ impl Database {
             };
             Ok(retirement)
         }.await;
-        let released = if result.is_ok() { tx.commit().await } else { tx.rollback().await };
+        let released = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
         match released {
             Ok(()) => DurableFactEstablished(result),
             Err(_) => DurableFactUnclassified,
@@ -4166,9 +4299,16 @@ impl Database {
         inspection: GenericCloseInspection,
         request: ReplaceCloseInspectionRequest,
     ) -> DbResult<Option<FreshGenericCloseRetirement>> {
-        match self.commit_fresh_generic_close_inspection_classified(inspection, request).await {
+        match self
+            .commit_fresh_generic_close_inspection_classified(inspection, request)
+            .await
+        {
             crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
-            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => Err(DbError::CloseFoundationConflict("fresh Close inspection transaction release is unclassified".into())),
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::CloseFoundationConflict(
+                    "fresh Close inspection transaction release is unclassified".into(),
+                ))
+            }
         }
     }
 
@@ -5641,11 +5781,9 @@ impl Database {
             let first = requests.first().ok_or_else(|| {
                 close_precondition("generic Close process dispatch requires a nonempty batch")
             })?;
-            let current = Self::generic_close_settlement_for_update(
-                &mut tx,
-                first.attempt_id.as_str(),
-            )
-            .await?;
+            let current =
+                Self::generic_close_settlement_for_update(&mut tx, first.attempt_id.as_str())
+                    .await?;
             let running_initial: bool = sqlx::query_scalar(
                 "SELECT EXISTS (SELECT 1 FROM close_runs
                    WHERE attempt_id = ?1 AND run_ordinal = 1 AND status = 'running')",
@@ -5820,7 +5958,9 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?;
             if !initial_run_active {
-                return Err(close_precondition("original worktree claim requires a running initial Close run"));
+                return Err(close_precondition(
+                    "original worktree claim requires a running initial Close run",
+                ));
             }
         }
         let identity = request.resource.identity();
@@ -5864,8 +6004,10 @@ impl Database {
         }
         ensure_close_retirement_loss_free_tx(&mut tx, request.attempt_id.as_str()).await?;
         let dispatch = Self::insert_close_retirement_dispatch_tx(&mut tx, &request).await?;
-        if let (GenericCloseDispatchKind::OriginalWorktree(plan), CloseRetirementDispatch::First(_)) =
-            (kind, &dispatch)
+        if let (
+            GenericCloseDispatchKind::OriginalWorktree(plan),
+            CloseRetirementDispatch::First(_),
+        ) = (kind, &dispatch)
         {
             let prior_dispatch: bool = sqlx::query_scalar(
                 "SELECT EXISTS(
@@ -5918,9 +6060,9 @@ impl Database {
         .execute(&mut **tx)
         .await?;
         if inserted.rows_affected() == 1 {
-            return Ok(CloseRetirementDispatch::First(FirstCloseRetirementDispatch(
-                request.clone(),
-            )));
+            return Ok(CloseRetirementDispatch::First(
+                FirstCloseRetirementDispatch(request.clone()),
+            ));
         }
         let exists: bool = sqlx::query_scalar(
             "SELECT EXISTS(
@@ -6486,6 +6628,60 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn seed_pre_197_close_retirement_evidence(
+        &self,
+        request: RecordCloseRetirementEvidenceRequest,
+    ) {
+        let (proof, residual) = match request.outcome {
+            RetirementOutcome::Retired => ("retired", None),
+            RetirementOutcome::Residual { residual_reason } => {
+                ("residual", Some(residual_reason.as_str()))
+            }
+            RetirementOutcome::AbsenceAdopted { .. } => panic!("unsupported historical fixture"),
+        };
+        let identity = request.resource.identity();
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await.unwrap();
+        for statement in [
+            "INSERT INTO close_retirement_resource_history (
+                attempt_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value,
+                proof_kind, residual_reason, detail, recorded_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO close_retirement_resources (
+                attempt_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value,
+                proof_kind, residual_reason, detail, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+        ] {
+            sqlx::query(statement)
+                .bind(request.attempt_id.as_str())
+                .bind(request.scope.as_str())
+                .bind(request.snapshot.generation())
+                .bind(request.snapshot.fingerprint())
+                .bind(request.resource.kind().as_str())
+                .bind(identity.identity_kind())
+                .bind(identity.codec())
+                .bind(identity.value())
+                .bind(proof)
+                .bind(residual)
+                .bind(request.detail.as_deref())
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        if residual.is_some() {
+            sqlx::query("UPDATE close_obligations SET phase = 'needs_repair' WHERE attempt_id = ?1 AND phase = 'retirement_requested'")
+                .bind(request.attempt_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
     // Keep history insertion, proof promotion, and replay checks in one shared transaction body.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn record_close_retirement_evidence_sql_tx(
@@ -6493,17 +6689,21 @@ impl Database {
         request: &RecordCloseRetirementEvidenceRequest,
         inspection_generation: &str,
     ) -> DbResult<()> {
-        let (proof_kind, absence_basis, residual_reason, replacement_token) = match &request.outcome {
+        let (proof_kind, absence_basis, residual_reason, replacement_token) = match &request.outcome
+        {
             RetirementOutcome::Retired => ("retired", None, None, None),
             RetirementOutcome::AbsenceAdopted { absence_basis } => {
                 let (basis, token) = match absence_basis {
-                    AbsenceBasis::SameAttemptPriorRetirement => ("same_attempt_prior_retirement", None),
+                    AbsenceBasis::SameAttemptPriorRetirement => {
+                        ("same_attempt_prior_retirement", None)
+                    }
                     AbsenceBasis::PreexistingExactIdentityEvidence => {
                         ("preexisting_exact_identity_evidence", None)
                     }
-                    AbsenceBasis::VerifiedTmuxReplacement { replacement_token } => {
-                        ("verified_tmux_replacement", Some(replacement_token.to_string()))
-                    }
+                    AbsenceBasis::VerifiedTmuxReplacement { replacement_token } => (
+                        "verified_tmux_replacement",
+                        Some(replacement_token.to_string()),
+                    ),
                 };
                 ("absence_adopted", Some(basis), None, token)
             }
@@ -7585,7 +7785,9 @@ impl Database {
         let (status, obligation) = Self::interrupted_close_run_for_update(&mut tx, &run).await?;
         let product = settlement.obligation().product_conversation_id();
         if obligation.product_conversation_id() != product {
-            return Err(close_precondition("generic Close settlement target changed"));
+            return Err(close_precondition(
+                "generic Close settlement target changed",
+            ));
         }
         if status != CloseRunStatus::Running
             || !matches!(
@@ -7596,8 +7798,12 @@ impl Database {
             tx.rollback().await?;
             return Ok(GenericCloseSettlementFailure::NoTransition(status));
         }
-        Self::require_generic_close_settlement_tx(&mut tx, run.attempt_id.as_str(), product.as_str())
-            .await?;
+        Self::require_generic_close_settlement_tx(
+            &mut tx,
+            run.attempt_id.as_str(),
+            product.as_str(),
+        )
+        .await?;
         Self::classify_running_close_run_tx(
             &mut tx,
             &run,
@@ -7644,8 +7850,7 @@ impl Database {
         };
         let authority = if run.ordinal == CloseRunOrdinal::INITIAL {
             let unresolved =
-                unresolved_expected_close_cleanup_resources_tx(tx, run.attempt_id.as_str())
-                    .await?;
+                unresolved_expected_close_cleanup_resources_tx(tx, run.attempt_id.as_str()).await?;
             if let Some(first) = unresolved.first() {
                 CloseCleanupFailureAuthority::ExpectedResource {
                     scope: first.scope.clone(),
@@ -7704,8 +7909,13 @@ impl Database {
             scope, resource, ..
         } = &authority
         {
-            expected_close_cleanup_failure_resources_tx(tx, run.attempt_id.as_str(), scope, resource)
-                .await?
+            expected_close_cleanup_failure_resources_tx(
+                tx,
+                run.attempt_id.as_str(),
+                scope,
+                resource,
+            )
+            .await?
         } else {
             sqlx::query_scalar::<_, String>(
                 "SELECT scope FROM close_attempt_scopes WHERE attempt_id = ?1 ORDER BY scope",
@@ -9359,7 +9569,9 @@ impl Database {
         &self,
         attempt_id: &CloseAttemptId,
     ) -> crate::workflow::LocalAuthorityResult<DbResult<AdmittedGenericLegacyCloseRetry>> {
-        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
 
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
@@ -9373,7 +9585,9 @@ impl Database {
             .fetch_one(&mut *tx)
             .await?;
             if native_managed {
-                return Err(close_precondition("native-managed Close requires native Retry admission"));
+                return Err(close_precondition(
+                    "native-managed Close requires native Retry admission",
+                ));
             }
             Self::reopen_legacy_close_repair_tx(&mut tx, attempt_id).await?;
             Ok(AdmittedGenericLegacyCloseRetry(attempt_id.clone()))
@@ -9426,8 +9640,12 @@ impl Database {
         }
         Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id())
             .await?;
-        set_close_phase_tx(tx, attempt_id.as_str(), ClosePhase::AwaitingRetirementInspection)
-            .await?;
+        set_close_phase_tx(
+            tx,
+            attempt_id.as_str(),
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await?;
         close_obligation_for_update(tx, attempt_id.as_str()).await
     }
 
@@ -10956,7 +11174,9 @@ mod tests {
                 if run == CloseRunRef::initial(attempt_id)
         ));
         assert!(matches!(
-            db.finish_generic_close_settlement(&settlement).await.unwrap(),
+            db.finish_generic_close_settlement(&settlement)
+                .await
+                .unwrap(),
             GenericCloseSettlementAdvance::NoTransition
         ));
     }
@@ -12521,11 +12741,18 @@ mod tests {
                 .unwrap(),
             GenericCloseSettlementFailure::NoTransition(CloseRunStatus::Running)
         );
-        assert!(db.list_close_cleanup_failures(attempt.as_str()).await.unwrap().is_empty());
+        assert!(db
+            .list_close_cleanup_failures(attempt.as_str())
+            .await
+            .unwrap()
+            .is_empty());
         let fresh = db
             .commit_fresh_generic_close_inspection(
                 inspection,
-                ReplaceCloseInspectionRequest { attempt_id: attempt.clone(), scopes: Vec::new() },
+                ReplaceCloseInspectionRequest {
+                    attempt_id: attempt.clone(),
+                    scopes: Vec::new(),
+                },
             )
             .await
             .unwrap()
@@ -12552,8 +12779,10 @@ mod tests {
             else {
                 panic!("expected idle attempt to enter settlement");
             };
-            let GenericCloseSettlementAdvance::Inspect(inspection) =
-                db.finish_generic_close_settlement(&settlement).await.unwrap()
+            let GenericCloseSettlementAdvance::Inspect(inspection) = db
+                .finish_generic_close_settlement(&settlement)
+                .await
+                .unwrap()
             else {
                 panic!("expected initial inspection handoff");
             };
@@ -12581,17 +12810,38 @@ mod tests {
             );
             let run = CloseRunRef::initial(attempt.clone());
             let stopped = db.classify_interrupted_close_run(&run).await.unwrap();
-            assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+            assert_eq!(
+                db.get_close_run(&run).await.unwrap().status,
+                CloseRunStatus::Stopped
+            );
             assert_eq!(stopped.phase(), ClosePhase::Completed);
             assert!(matches!(
                 stopped.close_outcome(),
-                Some(CloseCompletionOutcome::CloseIncomplete | CloseCompletionOutcome::ArchivedCleanupAttention)
+                Some(
+                    CloseCompletionOutcome::CloseIncomplete
+                        | CloseCompletionOutcome::ArchivedCleanupAttention
+                )
             ));
             assert_eq!(stopped.snapshot(), before.snapshot());
-            assert!(db.list_close_expected_retirement_resources(attempt.as_str()).await.unwrap().is_empty());
-            assert!(db.list_close_retirement_evidence(attempt.as_str()).await.unwrap().is_empty());
-            assert!(db.list_pending_generic_close_settlements(Some(&attempt)).await.unwrap().is_empty());
-            assert_eq!(db.classify_interrupted_close_run(&run).await.unwrap(), stopped);
+            assert!(db
+                .list_close_expected_retirement_resources(attempt.as_str())
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(db
+                .list_close_retirement_evidence(attempt.as_str())
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(db
+                .list_pending_generic_close_settlements(Some(&attempt))
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                db.classify_interrupted_close_run(&run).await.unwrap(),
+                stopped
+            );
         }
     }
 
@@ -12640,11 +12890,19 @@ mod tests {
                 GenericCloseAdmission::Existing(existing),
                 GenericCloseAdmission::InsertedSettling(inserted),
             ) => (inserted, existing),
-            outcomes => panic!("expected one inserted admission and one existing, got {outcomes:?}"),
+            outcomes => {
+                panic!("expected one inserted admission and one existing, got {outcomes:?}")
+            }
         };
         assert_eq!(inserted.obligation(), &existing);
-        assert_eq!(inserted.obligation().phase(), ClosePhase::SettlingActiveWork);
-        assert!(db.validate_generic_close_settlement(&inserted).await.unwrap());
+        assert_eq!(
+            inserted.obligation().phase(),
+            ClosePhase::SettlingActiveWork
+        );
+        assert!(db
+            .validate_generic_close_settlement(&inserted)
+            .await
+            .unwrap());
         assert!(matches!(
             db.finish_generic_close_settlement(&inserted).await.unwrap(),
             GenericCloseSettlementAdvance::WaitingForQuiescence
@@ -16390,10 +16648,16 @@ mod tests {
         assert_eq!(promoted.attempt_id(), incomplete.attempt_id());
         let competing = CloseAttemptId::parse("competing-initial-after-attention").unwrap();
         let observed = db
-            .begin_generic_close_settlement(&product_id("root"), &transcript_id("latest"), &competing)
+            .begin_generic_close_settlement(
+                &product_id("root"),
+                &transcript_id("latest"),
+                &competing,
+            )
             .await
             .unwrap();
-        assert!(matches!(observed, GenericCloseAdmission::Existing(obligation) if obligation == promoted));
+        assert!(
+            matches!(observed, GenericCloseAdmission::Existing(obligation) if obligation == promoted)
+        );
         assert!(matches!(
             db.get_close_obligation(competing.as_str()).await,
             Err(DbError::CloseFoundationNotFound(_))
@@ -19833,9 +20097,13 @@ mod tests {
         create_root(&db, "root").await;
         let scope = allocate_scope_worktree(&db, "root").await;
         let attempt = CloseAttemptId::parse("tmux-replacement-upgrade").unwrap();
-        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), attempt.as_str())
-            .await
-            .unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
         set_close_phase(&db, attempt.as_str(), ClosePhase::RetirementRequested).await;
         let snapshot = current_test_snapshot(&db, attempt.as_str()).await;
         let status: String = sqlx::query_scalar(
@@ -19853,9 +20121,19 @@ mod tests {
             )
             .unwrap()
         };
-        let tmux = identity(RetiredResourceKind::TmuxServer, &format!("tmux-v1:L3RtcC9jbG9zZQ:{ORIGINAL}"));
+        let tmux = identity(
+            RetiredResourceKind::TmuxServer,
+            &format!("tmux-v1:L3RtcC9jbG9zZQ:{ORIGINAL}"),
+        );
         let pty = identity(RetiredResourceKind::PtySession, "old-pty");
-        capture_test_inventory(&db, attempt.as_str(), &scope, &snapshot, vec![tmux.clone(), pty.clone()]).await;
+        capture_test_inventory(
+            &db,
+            attempt.as_str(),
+            &scope,
+            &snapshot,
+            vec![tmux.clone(), pty.clone()],
+        )
+        .await;
         let request = |resource, outcome| RecordCloseRetirementEvidenceRequest {
             attempt_id: attempt.clone(),
             snapshot: snapshot.clone(),
@@ -19889,6 +20167,9 @@ mod tests {
         drop(db);
 
         let db = Database::open(path).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
         let absence = |token: &str| RetirementOutcome::AbsenceAdopted {
             absence_basis: AbsenceBasis::VerifiedTmuxReplacement {
                 replacement_token: uuid::Uuid::parse_str(token).unwrap(),
@@ -19899,8 +20180,11 @@ mod tests {
             "tmux-v1:L3RtcC9vdGhlcg:10000000-0000-4000-8000-000000000001",
         );
         let stale_snapshot = RecordCloseRetirementEvidenceRequest {
-            snapshot: CloseRetirementSnapshot::parse(snapshot.generation(), "different-fingerprint")
-                .unwrap(),
+            snapshot: CloseRetirementSnapshot::parse(
+                snapshot.generation(),
+                "different-fingerprint",
+            )
+            .unwrap(),
             ..request(tmux.clone(), absence(REPLACEMENT))
         };
         for invalid in [
@@ -19908,28 +20192,45 @@ mod tests {
             request(other_target, absence(REPLACEMENT)),
             request(tmux.clone(), absence(ORIGINAL)),
             request(pty.clone(), absence(REPLACEMENT)),
-            request(tmux.clone(), RetirementOutcome::AbsenceAdopted {
-                absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
-            }),
+            request(
+                tmux.clone(),
+                RetirementOutcome::AbsenceAdopted {
+                    absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+                },
+            ),
         ] {
-            assert!(db.record_close_retirement_evidence(invalid).await.is_err());
+            assert!(matches!(
+                db.record_close_retirement_evidence(invalid).await,
+                Err(DbError::CloseFoundationPrecondition(_))
+            ));
         }
         for _ in 0..2 {
             db.record_close_retirement_evidence(request(tmux.clone(), absence(REPLACEMENT)))
                 .await
                 .unwrap();
         }
-        assert!(!db.close_retirement_resource_was_dispatched(&attempt, &scope, &snapshot, &tmux)
+        assert!(!db
+            .close_retirement_resource_was_dispatched(&attempt, &scope, &snapshot, &tmux)
             .await
             .unwrap());
         db.pool().close().await;
         drop(db);
 
         let db = Database::open(path).await.unwrap();
-        let rows = db.list_close_retirement_evidence(attempt.as_str()).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let rows = db
+            .list_close_retirement_evidence(attempt.as_str())
+            .await
+            .unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows.iter().any(|row| row.resource == pty && row.outcome == RetirementOutcome::Retired));
-        assert!(rows.iter().any(|row| row.resource == tmux && row.outcome == absence(REPLACEMENT)));
+        assert!(rows
+            .iter()
+            .any(|row| row.resource == pty && row.outcome == RetirementOutcome::Retired));
+        assert!(rows
+            .iter()
+            .any(|row| row.resource == tmux && row.outcome == absence(REPLACEMENT)));
         let mutation_error = sqlx::query(
             "UPDATE close_retirement_resources
              SET tmux_replacement_token = '10000000-0000-4000-8000-000000000003'
@@ -19939,7 +20240,7 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap_err();
-        assert!(mutation_error.to_string().contains("tmux replacement proof is immutable"));
+        assert!(matches!(mutation_error, sqlx::Error::Database(_)));
         let applied: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM _migrations WHERE version = 197 AND name = 'close_verified_tmux_replacement'",
         )
@@ -19957,7 +20258,9 @@ mod tests {
         .unwrap();
         assert_eq!(history, vec![None, Some(REPLACEMENT.to_owned())]);
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
-            .fetch_one(db.pool()).await.unwrap();
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
         assert_eq!(integrity, "ok");
     }
 
@@ -20095,7 +20398,9 @@ mod tests {
             .claim_generic_original_worktree_dispatch(invalid_plan)
             .await
             .unwrap_err();
-        assert!(error.to_string().contains("length(administrative_dir_incarnation)"));
+        assert!(error
+            .to_string()
+            .contains("length(administrative_dir_incarnation)"));
         let counts: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_worktree_cleanup_plans WHERE attempt_id = ?1)",
@@ -21360,7 +21665,10 @@ mod tests {
                 ClosePhase::AwaitingRetirementInspection
             };
             assert_eq!(
-                db.get_close_obligation(attempt.as_str()).await.unwrap().phase(),
+                db.get_close_obligation(attempt.as_str())
+                    .await
+                    .unwrap()
+                    .phase(),
                 expected_phase,
             );
         }

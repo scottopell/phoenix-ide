@@ -5999,7 +5999,8 @@ impl Database {
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let cancelled = Self::cancel_conversation_creation_tx(&mut tx, conversation_id, now).await?;
+        let cancelled =
+            Self::cancel_conversation_creation_tx(&mut tx, conversation_id, now).await?;
         tx.commit().await?;
         Ok(cancelled)
     }
@@ -6042,10 +6043,14 @@ impl Database {
         native_close::fence_native_retry_sources_tx(
             tx,
             conversation_id,
-            &ConvState::CreationCancelled { job_id: job_id.clone() },
+            &ConvState::CreationCancelled {
+                job_id: job_id.clone(),
+            },
         )
         .await?;
-        let cancelled_state = ConvState::CreationCancelled { job_id: job_id.clone() };
+        let cancelled_state = ConvState::CreationCancelled {
+            job_id: job_id.clone(),
+        };
         let state = serde_json::to_string(&cancelled_state)
             .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(

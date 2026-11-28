@@ -107,11 +107,12 @@ pub async fn close_product_conversation(
             .aggregate;
         #[cfg(test)]
         crate::close_service::pause_after_close_observation(
-            product_conversation.product_conversation.ordinary_lifecycle(),
+            product_conversation
+                .product_conversation
+                .ordinary_lifecycle(),
         )
         .await;
-        match crate::close_service::run_observed_close(&state, &product_conversation).await
-        {
+        match crate::close_service::run_observed_close(&state, &product_conversation).await {
             Ok(()) => break,
             Err(AppError::Conflict(conflict))
                 if should_retry_aggregate_close(attempt, &conflict.error_type) => {}

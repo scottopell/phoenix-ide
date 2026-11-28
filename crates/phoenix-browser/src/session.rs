@@ -2988,10 +2988,7 @@ impl BrowserSessionManager {
     /// retirement permit. Startup uses this for observation-only Close recovery.
     pub async fn fence_retirement_admission(&self, work_scope: &ResourceScopeKey) {
         let mut state = self.state.write().await;
-        Self::mark_retirement_fenced(
-            &mut state,
-            Self::scope_retirement_fence_key(work_scope),
-        );
+        Self::mark_retirement_fenced(&mut state, Self::scope_retirement_fence_key(work_scope));
     }
 
     pub async fn begin_retirement(&self, work_scope: &ResourceScopeKey) -> BrowserRetirementPermit {

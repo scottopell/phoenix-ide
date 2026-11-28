@@ -6,8 +6,8 @@ mod process_retirement;
 pub(super) mod source_entry;
 
 use super::{
-    CancellationToken, ConvState, ConversationRuntime, LlmClient, RuntimeSettlementAuthority, Storage,
-    ToolExecutor,
+    CancellationToken, ConvState, ConversationRuntime, LlmClient, RuntimeSettlementAuthority,
+    Storage, ToolExecutor,
 };
 use crate::db::CaptureCloseRetirementInventoryRequest;
 use crate::runtime::close_retirement::{
@@ -96,7 +96,8 @@ pub(super) struct NativeCloseInitialContinuation {
     inspection_collection_test_barrier: Option<InspectionCollectionTestBarrier>,
     inspection_failure: Option<NativeInitialInspectionFailureIntent>,
     loss_terminalization: Option<NativeInitialLossTerminalizationIntent>,
-    confirmed_settlement_deliveries: std::collections::HashMap<u64, crate::runtime::CloseSettlementDelivery>,
+    confirmed_settlement_deliveries:
+        std::collections::HashMap<u64, crate::runtime::CloseSettlementDelivery>,
     pub(super) terminal_observation_retry: bool,
     pub(super) authority: RuntimeSettlementAuthority,
     pub(super) target_gate: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
@@ -222,8 +223,11 @@ impl NativeCloseInitialContinuation {
             && self.settlement_source_entry.is_none()
         {
             let deadline = tokio::time::Instant::now() + super::CANCELLATION_DEADLINE;
-            let mut entry = source_entry::SourceEntryController::new(self.command.clone(), deadline);
-            if entry.revalidate(live_state, &self.command) != source_entry::ActorEntryResult::Updated {
+            let mut entry =
+                source_entry::SourceEntryController::new(self.command.clone(), deadline);
+            if entry.revalidate(live_state, &self.command)
+                != source_entry::ActorEntryResult::Updated
+            {
                 self.begin_exit_interruption();
                 return Ok(());
             }
@@ -287,7 +291,13 @@ impl NativeCloseInitialContinuation {
         }
         match self
             .db
-            .apply_native_initial_close_control(&self.command, &self.receipt, live_source, route, action)
+            .apply_native_initial_close_control(
+                &self.command,
+                &self.receipt,
+                live_source,
+                route,
+                action,
+            )
             .await
         {
             LocalAuthorityResult::DurableFactEstablished(Ok(_)) => {
@@ -305,7 +315,9 @@ impl NativeCloseInitialContinuation {
                 tracing::debug!(%error, "native Close target control rejected");
                 Err(NativeCloseApplicationError::Storage)
             }
-            LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
+            LocalAuthorityResult::DurableFactUnclassified => {
+                Err(NativeCloseApplicationError::FatalAuthority)
+            }
         }
     }
 
@@ -764,20 +776,28 @@ impl NativeCloseInitialContinuation {
                 }
             },
             Phase::DispatchConfirmedSettlement => {
-                let (deadline, source_entry) = self.settlement_source_entry.as_ref()
+                let (deadline, source_entry) = self
+                    .settlement_source_entry
+                    .as_ref()
                     .expect("confirmed settlement source entry");
                 if tokio::time::Instant::now() >= *deadline {
                     self.begin_exit_interruption();
                     return Ok(self.phase);
                 }
-                match self.backend.dispatch_native_close_settlement_work(
-                    &self.command,
-                    &self.receipt,
-                    live_source,
-                    source_entry,
-                    &mut self.confirmed_settlement_deliveries,
-                ).await {
-                    LocalAuthorityResult::DurableFactEstablished(Ok(true)) => self.phase = Phase::Settle,
+                match self
+                    .backend
+                    .dispatch_native_close_settlement_work(
+                        &self.command,
+                        &self.receipt,
+                        live_source,
+                        source_entry,
+                        &mut self.confirmed_settlement_deliveries,
+                    )
+                    .await
+                {
+                    LocalAuthorityResult::DurableFactEstablished(Ok(true)) => {
+                        self.phase = Phase::Settle
+                    }
                     LocalAuthorityResult::DurableFactEstablished(Ok(false)) => {}
                     LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
                         tracing::warn!(%error, "native Close settlement dispatch stopped; classifying exact run");

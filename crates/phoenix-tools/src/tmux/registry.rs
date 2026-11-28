@@ -361,15 +361,28 @@ pub enum TmuxRetirementOutcome {
 pub enum TmuxRetirementRehydration {
     Permit(Box<TmuxRetirementPermit>),
     EndpointAbsent,
-    ReplacementLive { replacement_token: uuid::Uuid },
+    ReplacementLive(TmuxReplacementObservation),
     Residual { reason: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TmuxReplacementObservation {
+    sealed: TmuxServerInstanceIdentity,
+    replacement_token: uuid::Uuid,
+}
+
+impl TmuxReplacementObservation {
+    #[must_use]
+    pub fn into_parts(self) -> (TmuxServerInstanceIdentity, uuid::Uuid) {
+        (self.sealed, self.replacement_token)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExactTmuxIdentityState {
     Live,
     EndpointAbsent,
-    ReplacementLive { replacement_token: uuid::Uuid },
+    ReplacementLive(TmuxReplacementObservation),
     Ambiguous { reason: String },
 }
 
@@ -1399,7 +1412,10 @@ impl TmuxRegistry {
                             Ok(ExactTmuxIdentityState::Live)
                         }
                         Some(replacement_token) => {
-                            Ok(ExactTmuxIdentityState::ReplacementLive { replacement_token })
+                            Ok(ExactTmuxIdentityState::ReplacementLive(TmuxReplacementObservation {
+                                sealed: identity.clone(),
+                                replacement_token,
+                            }))
                         }
                         None => Ok(ExactTmuxIdentityState::Ambiguous {
                             reason: format!(
@@ -1412,7 +1428,8 @@ impl TmuxRegistry {
                     }
                 }
                 None => Ok(ExactTmuxIdentityState::Ambiguous {
-                    reason: "tmux exact-identity token read exceeded the Close deadline".to_string(),
+                    reason: "tmux exact-identity token read exceeded the Close deadline"
+                        .to_string(),
                 }),
             },
         }
@@ -1675,8 +1692,8 @@ impl TmuxRegistry {
                     ExactTmuxIdentityState::EndpointAbsent => {
                         Ok(TmuxRetirementRehydration::EndpointAbsent)
                     }
-                    ExactTmuxIdentityState::ReplacementLive { replacement_token } => {
-                        Ok(TmuxRetirementRehydration::ReplacementLive { replacement_token })
+                    ExactTmuxIdentityState::ReplacementLive(observation) => {
+                        Ok(TmuxRetirementRehydration::ReplacementLive(observation))
                     }
                     ExactTmuxIdentityState::Ambiguous { reason } => {
                         Ok(TmuxRetirementRehydration::Residual { reason })
@@ -1768,8 +1785,8 @@ impl TmuxRegistry {
                 ExactTmuxIdentityState::EndpointAbsent => {
                     Ok(TmuxRetirementRehydration::EndpointAbsent)
                 }
-                ExactTmuxIdentityState::ReplacementLive { replacement_token } => {
-                    Ok(TmuxRetirementRehydration::ReplacementLive { replacement_token })
+                ExactTmuxIdentityState::ReplacementLive(observation) => {
+                    Ok(TmuxRetirementRehydration::ReplacementLive(observation))
                 }
                 ExactTmuxIdentityState::Live => Ok(TmuxRetirementRehydration::Residual {
                     reason: format!(
@@ -1806,11 +1823,9 @@ impl TmuxRegistry {
         expires: tokio::time::Instant,
     ) -> Result<TmuxRetirementRehydration, TmuxError> {
         match self.exact_identity_state(persisted, expires).await? {
-            ExactTmuxIdentityState::EndpointAbsent => {
-                Ok(TmuxRetirementRehydration::EndpointAbsent)
-            }
-            ExactTmuxIdentityState::ReplacementLive { replacement_token } => {
-                Ok(TmuxRetirementRehydration::ReplacementLive { replacement_token })
+            ExactTmuxIdentityState::EndpointAbsent => Ok(TmuxRetirementRehydration::EndpointAbsent),
+            ExactTmuxIdentityState::ReplacementLive(observation) => {
+                Ok(TmuxRetirementRehydration::ReplacementLive(observation))
             }
             ExactTmuxIdentityState::Ambiguous { reason } => {
                 Ok(TmuxRetirementRehydration::Residual { reason })
@@ -1866,8 +1881,8 @@ impl TmuxRegistry {
                     ExactTmuxIdentityState::EndpointAbsent => {
                         Ok(TmuxRetirementRehydration::EndpointAbsent)
                     }
-                    ExactTmuxIdentityState::ReplacementLive { replacement_token } => {
-                        Ok(TmuxRetirementRehydration::ReplacementLive { replacement_token })
+                    ExactTmuxIdentityState::ReplacementLive(observation) => {
+                        Ok(TmuxRetirementRehydration::ReplacementLive(observation))
                     }
                     ExactTmuxIdentityState::Ambiguous { reason } => {
                         Ok(TmuxRetirementRehydration::Residual { reason })
@@ -2988,7 +3003,7 @@ impl TmuxRegistry {
                     }
                 }
                 Ok(TmuxRetirementRehydration::EndpointAbsent
-                | TmuxRetirementRehydration::ReplacementLive { .. }) => {
+                | TmuxRetirementRehydration::ReplacementLive(_)) => {
                     return CascadeReport {
                         socket_path: identity.socket_path,
                         kill_server_error: None,
@@ -4573,7 +4588,10 @@ mod tests {
             ..identity.clone()
         };
         assert!(matches!(
-            registry.exact_identity_state(&malformed, close_deadline()).await.unwrap(),
+            registry
+                .exact_identity_state(&malformed, close_deadline())
+                .await
+                .unwrap(),
             ExactTmuxIdentityState::Ambiguous { .. },
         ));
         assert_eq!(
@@ -5062,9 +5080,10 @@ mod tests {
                 .exact_identity_state(&persisted, close_deadline())
                 .await
                 .unwrap(),
-            ExactTmuxIdentityState::ReplacementLive {
+            ExactTmuxIdentityState::ReplacementLive(TmuxReplacementObservation {
+                sealed: persisted.clone(),
                 replacement_token: uuid::Uuid::parse_str(&replacement.server_token).unwrap(),
-            },
+            }),
         );
         assert!(restarted.get_existing(&work_scope).await.is_none());
         assert_eq!(
@@ -5072,9 +5091,10 @@ mod tests {
                 .rehydrate_retirement(&work_scope, &persisted, close_deadline())
                 .await
                 .unwrap(),
-            TmuxRetirementRehydration::ReplacementLive {
+            TmuxRetirementRehydration::ReplacementLive(TmuxReplacementObservation {
+                sealed: persisted.clone(),
                 replacement_token: uuid::Uuid::parse_str(&replacement.server_token).unwrap(),
-            },
+            }),
         );
         let survivor = fake.server(&persisted.socket_path).unwrap();
         assert!(survivor.live);
@@ -5122,13 +5142,18 @@ mod tests {
                 .unwrap(),
         )
         .await;
-        let alternate = uuid::Uuid::parse_str(&spelling.server_token).unwrap().simple().to_string();
-        fake.set_global_env(&spelling.socket_path, SERVER_TOKEN_VAR, &alternate).await;
+        let alternate = uuid::Uuid::parse_str(&spelling.server_token)
+            .unwrap()
+            .simple()
+            .to_string();
+        fake.set_global_env(&spelling.socket_path, SERVER_TOKEN_VAR, &alternate)
+            .await;
         assert_eq!(
             bootstrap.exact_identity_state(&spelling, close_deadline()).await.unwrap(),
             ExactTmuxIdentityState::Live,
         );
-        fake.set_global_env(&spelling.socket_path, SERVER_TOKEN_VAR, "not-a-uuid").await;
+        fake.set_global_env(&spelling.socket_path, SERVER_TOKEN_VAR, "not-a-uuid")
+            .await;
         assert!(matches!(
             bootstrap.exact_identity_state(&spelling, close_deadline()).await.unwrap(),
             ExactTmuxIdentityState::Ambiguous { .. },

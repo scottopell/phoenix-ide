@@ -50,7 +50,10 @@ async fn process_exit_and_reopen_observes_persisted_generic_close_without_redriv
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        assert!(Instant::now() < deadline, "admission child did not commit in time");
+        assert!(
+            Instant::now() < deadline,
+            "admission child did not commit in time"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
@@ -82,17 +85,33 @@ async fn process_exit_and_reopen_observes_persisted_generic_close_without_redriv
         .expect("fresh child exceeded deadline")
         .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
-        assert!(output.status.success(), "{mode}: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
-        assert!(stdout.lines().any(|line| line == COMPLETE), "{mode} did not complete: {stdout}");
-        assert!(stdout.contains("1 passed; 0 failed; 0 ignored"), "unexpected {mode} result: {stdout}");
+        assert!(
+            output.status.success(),
+            "{mode}: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.lines().any(|line| line == COMPLETE),
+            "{mode} did not complete: {stdout}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "unexpected {mode} result: {stdout}"
+        );
     }
 }
 
 async fn run_child(mode: &str) {
     let database_path = std::env::var(DATABASE_PATH).expect("database path must be supplied");
     let marker_path = std::env::var(MARKER_PATH).expect("marker path must be supplied");
-    let db = Database::open(&database_path).await.unwrap();
-    crate::db::run_pending_migrations(db.pool()).await.unwrap();
+    let db = if mode == "admit-and-wait" {
+        Database::open_prefix_for_test(&database_path, 195).await.unwrap()
+    } else {
+        let db = Database::open(&database_path).await.unwrap();
+        crate::db::run_pending_migrations(db.pool()).await.unwrap();
+        assert_migrated_stop_claim(&db, &marker_path).await;
+        db
+    };
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
         .fetch_one(db.pool())
         .await
@@ -109,9 +128,12 @@ async fn run_child(mode: &str) {
             let product_id = conversation.product_conversation_id;
             let transcript_id = TranscriptConversationId::parse("startup-close").unwrap();
             let attempt = CloseAttemptId::parse(ATTEMPT).unwrap();
+            accept_startup_turn(&db).await;
             assert!(matches!(
                 db.begin_generic_close_settlement_classified(&product_id, &transcript_id, &attempt)
-                    .await.established().expect("classified fixture transaction")
+                    .await
+                    .established()
+                    .expect("classified fixture transaction")
                     .unwrap(),
                 GenericCloseAdmission::InsertedSettling(_)
             ));
@@ -122,8 +144,39 @@ async fn run_child(mode: &str) {
             .fetch_one(db.pool())
             .await
             .unwrap();
-            assert_eq!(running, 1, "generic admission must durably own the exact running run");
-            std::fs::write(marker_path, b"generic close admission committed").unwrap();
+            assert_eq!(
+                running, 1,
+                "generic admission must durably own the exact running run"
+            );
+            db.confirm_generic_close_stop_work(&product_id, &transcript_id, &attempt)
+                .await
+                .unwrap();
+            let captured: Vec<(i64, i64)> = sqlx::query_as(
+                "SELECT turn_id, expected_generation FROM close_attempt_direct_turn_settlements
+                 WHERE attempt_id = ?1",
+            )
+            .bind(ATTEMPT)
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            let [(turn, generation)] = captured.as_slice() else {
+                panic!("expected one exact captured turn: {captured:?}");
+            };
+            sqlx::query(
+                "INSERT INTO native_close_initial_settlement_stop_claims
+                    (attempt_id, run_ordinal, turn_id, expected_generation)
+                 VALUES (?1, 1, ?2, ?3)",
+            )
+            .bind(ATTEMPT)
+            .bind(turn)
+            .bind(generation)
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let marker = std::path::Path::new(&marker_path);
+            let pending_marker = marker.with_extension("pending");
+            std::fs::write(&pending_marker, format!("{turn}:{generation}")).unwrap();
+            std::fs::rename(pending_marker, marker).unwrap();
             loop {
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }
@@ -160,7 +213,10 @@ async fn run_child(mode: &str) {
                     .unwrap(),
                 0
             );
-            assert_eq!(commits, 1, "reopening an already classified run must be idempotent");
+            assert_eq!(
+                commits, 1,
+                "reopening an already classified run must be idempotent"
+            );
 
             let run_status: String = sqlx::query_scalar(
                 "SELECT status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1",
@@ -170,13 +226,12 @@ async fn run_child(mode: &str) {
             .await
             .unwrap();
             assert_eq!(run_status, "stopped");
-            let run_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1",
-            )
-            .bind(ATTEMPT)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+            let run_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1")
+                    .bind(ATTEMPT)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
             assert_eq!(run_count, 1, "startup must not create a successor run");
             assert_eq!(
                 sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures")
@@ -221,13 +276,12 @@ async fn run_child(mode: &str) {
             .await
             .unwrap();
             assert_eq!(run_status, "stopped");
-            let run_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1",
-            )
-            .bind(ATTEMPT)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+            let run_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM close_runs WHERE attempt_id = ?1")
+                    .bind(ATTEMPT)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
             assert_eq!(run_count, 1);
             assert_eq!(
                 sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_cleanup_failures")
@@ -275,6 +329,87 @@ async fn run_child(mode: &str) {
 async fn captured_work_scope(db: &Database) -> ResourceScopeKey {
     let target = db.get_conversation("startup-close").await.unwrap();
     let scope = target.attached_work_scope_id.expect("target WorkScope");
-    assert_eq!(db.list_close_execution_fence_scopes().await.unwrap(), [scope.clone()]);
+    assert_eq!(
+        db.list_close_execution_fence_scopes().await.unwrap(),
+        [scope.clone()]
+    );
     ResourceScopeKey::Work(scope)
+}
+
+async fn accept_startup_turn(db: &Database) {
+    use phoenix_core::domain::db_schema::InputOrigin;
+    use phoenix_core::domain::sm_event::{
+        PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
+        SubmittedDirectTurnIdentity,
+    };
+    use phoenix_workflow::{
+        AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp,
+        TurnOutcome,
+    };
+
+    let payload = PreparedDirectTurnPayload::from_parts(
+        SubmittedDirectTurnIdentity {
+            message_id: "close-target-input".into(),
+            origin: InputOrigin::UserApi,
+            text: "target work".into(),
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            skill_invocation: None,
+            expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+        },
+        PreparedDirectTurnDelivery {
+            text: "target work".into(),
+            llm_text: None,
+            images: vec![],
+            files: vec![],
+            user_agent: None,
+            skill_invocation: None,
+        },
+    );
+    let accepted = db
+        .workflow_repository()
+        .accept_authoritative_turn(&phoenix_db::workflow::AcceptAuthoritativeTurn {
+            client_key: ClientTurnKey::new("close-target-input").unwrap(),
+            prepared: PreparedTurn::from_exact_payload(
+                &ConversationAuthority("startup-close".to_string()),
+                payload.to_exact_bytes().unwrap(),
+            ),
+            disposition: AcceptedDisposition::Runtime,
+            accepted_at: Timestamp(1),
+        })
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    let TurnOutcome::Created { .. } = accepted.outcome else {
+        panic!("expected an authoritative target turn");
+    };
+}
+
+async fn assert_migrated_stop_claim(db: &Database, marker_path: &str) {
+    let marker = std::fs::read_to_string(marker_path).unwrap();
+    let (turn, generation) = marker.split_once(':').unwrap();
+    let claim: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT run_ordinal, turn_id, expected_generation FROM close_settlement_stop_claims
+         WHERE attempt_id = ?1",
+    )
+    .bind(ATTEMPT)
+    .fetch_all(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(claim, vec![(1, turn.parse::<i64>().unwrap(), generation.parse::<i64>().unwrap())]);
+    let migration: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 196")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(migration, 1);
+    let old_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'native_close_initial_settlement_stop_claims'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(old_table, 0);
+    assert!(sqlx::query("PRAGMA foreign_key_check").fetch_all(db.pool()).await.unwrap().is_empty());
 }

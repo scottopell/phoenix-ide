@@ -84,11 +84,11 @@ use crate::db::{
     CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
     CloseProcessResourceKind, CloseProcessStepOutcome, CloseProcessStepSuccess,
     CloseRetirementBatchDispatch, CloseRetirementDispatch, CloseSafeRetryEffect,
-    CloseWorktreeFinalTombstone,
-    FirstCloseRetirementDispatch, RecordCloseRetirementDispatchRequest,
-    RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
-    ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
-    StoppedCloseOriginalRetirementProof, TerminalizeInitialCloseCleanupFailureRequest,
+    CloseWorktreeFinalTombstone, FirstCloseRetirementDispatch,
+    RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
+    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
+    ReplaceCloseInspectionScopeRequest, StoppedCloseOriginalRetirementProof,
+    TerminalizeInitialCloseCleanupFailureRequest,
 };
 use crate::db::{
     CloseDescriptorAccess, CloseFileWriteAccess, CloseWriterAuthority, CloseWriterDetector,
@@ -259,8 +259,12 @@ pub(crate) async fn collect_native_initial_inspection(
         let Some(captured_worktree) = captured.captured_worktree else {
             continue;
         };
-        match inspect_captured_close_worktree(&scope, captured_worktree, empty_generation.as_deref())
-            .await
+        match inspect_captured_close_worktree(
+            &scope,
+            captured_worktree,
+            empty_generation.as_deref(),
+        )
+        .await
         {
             Ok(CapturedCloseWorktreeInspection::Present(inspection)) => requests.push(inspection),
             Ok(CapturedCloseWorktreeInspection::Absent(_)) => {
@@ -315,7 +319,9 @@ async fn inspect_captured_close_worktree(
         detail,
     };
     let CapturedWorktreeIdentity::Resolved(identity) = captured else {
-        return Err(identity_failure("captured worktree identity is unresolved".into()));
+        return Err(identity_failure(
+            "captured worktree identity is unresolved".into(),
+        ));
     };
     let path = worktree_path(&identity);
     let exists = |path: &Path| {
@@ -335,7 +341,8 @@ async fn inspect_captured_close_worktree(
         }
         quarantine
     };
-    if observe_worktree_fingerprint(&actual_path).as_deref() != Some(identity.fingerprint().as_str())
+    if observe_worktree_fingerprint(&actual_path).as_deref()
+        != Some(identity.fingerprint().as_str())
     {
         return Err(identity_failure(
             "captured worktree administrative incarnation changed".into(),
@@ -344,8 +351,8 @@ async fn inspect_captured_close_worktree(
     let (snapshot, losses) = inspect_worktree_at(&identity, actual_path)
         .await
         .map_err(repair_required)?;
-    let snapshot = rotate_inspection_generation(snapshot, inspection_generation)
-        .map_err(repair_required)?;
+    let snapshot =
+        rotate_inspection_generation(snapshot, inspection_generation).map_err(repair_required)?;
     Ok(CapturedCloseWorktreeInspection::Present(
         ReplaceCloseInspectionScopeRequest {
             scope: scope.clone(),
@@ -1225,7 +1232,10 @@ impl RuntimeManager {
     }
 
     pub(crate) async fn wait_for_close_owner(&self, attempt_id: &CloseAttemptId) {
-        let _execution = self.close_retirement_execution.lock(attempt_id.as_str()).await;
+        let _execution = self
+            .close_retirement_execution
+            .lock(attempt_id.as_str())
+            .await;
     }
 
     pub(super) async fn continue_settled_generic_close(
@@ -1259,9 +1269,12 @@ impl RuntimeManager {
             .collect_close_retirement_inspection(inspection.attempt_id())
             .await?
         else {
-            return Err("Initial Close cannot resume a dispatched absence".to_string().into());
+            return Err("Initial Close cannot resume a dispatched absence"
+                .to_string()
+                .into());
         };
-        match self.db()
+        match self
+            .db()
             .commit_fresh_generic_close_inspection_classified(inspection, request)
             .await
         {
@@ -1335,10 +1348,15 @@ impl RuntimeManager {
             .await
             .map_err(|error| error.to_string())?;
         if current.phase() == ClosePhase::RetirementRequested {
-            let snapshot = current.snapshot().cloned()
+            let snapshot = current
+                .snapshot()
+                .cloned()
                 .ok_or_else(|| "Close Retry has no committed inspection snapshot".to_string())?;
-            self.run_close_runtime_retirement(GenericRetirementAuthority::Retry { admission, snapshot })
-                .await?;
+            self.run_close_runtime_retirement(GenericRetirementAuthority::Retry {
+                admission,
+                snapshot,
+            })
+            .await?;
         }
         Ok(())
     }
@@ -1348,7 +1366,8 @@ impl RuntimeManager {
         &self,
         attempt_id: CloseAttemptId,
     ) -> Result<CloseRetirementSnapshot, String> {
-        self.persist_close_retirement_inspection(&attempt_id).await?;
+        self.persist_close_retirement_inspection(&attempt_id)
+            .await?;
         self.db()
             .get_close_obligation(attempt_id.as_str())
             .await
@@ -1363,9 +1382,15 @@ impl RuntimeManager {
         attempt_id: &CloseAttemptId,
     ) -> Result<Option<DispatchedWorktreeAbsence>, String> {
         match self.collect_close_retirement_inspection(attempt_id).await? {
-            CollectedCloseInspection::Present { request, replacement_generation } => {
+            CollectedCloseInspection::Present {
+                request,
+                replacement_generation,
+            } => {
                 self.db()
-                    .replace_close_inspection_with_empty_generation(request, replacement_generation.as_deref())
+                    .replace_close_inspection_with_empty_generation(
+                        request,
+                        replacement_generation.as_deref(),
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
                 Ok(None)
@@ -1459,19 +1484,20 @@ impl RuntimeManager {
                     .await
                     .map_err(|error| error.to_string())?
                 {
-                    let replacement_generation = if obligation.phase()
-                        == ClosePhase::AwaitingRetirementInspection
-                    {
-                        Some(reinspection_generation.ok_or_else(|| {
-                            "dispatched absence retry lacks replacement generation".to_string()
-                        })?)
-                    } else {
-                        None
-                    };
-                    return Ok(CollectedCloseInspection::DispatchedAbsence(DispatchedWorktreeAbsence {
-                        snapshot: prior_snapshot,
-                        replacement_generation,
-                    }));
+                    let replacement_generation =
+                        if obligation.phase() == ClosePhase::AwaitingRetirementInspection {
+                            Some(reinspection_generation.ok_or_else(|| {
+                                "dispatched absence retry lacks replacement generation".to_string()
+                            })?)
+                        } else {
+                            None
+                        };
+                    return Ok(CollectedCloseInspection::DispatchedAbsence(
+                        DispatchedWorktreeAbsence {
+                            snapshot: prior_snapshot,
+                            replacement_generation,
+                        },
+                    ));
                 }
             }
             return self
@@ -1769,9 +1795,9 @@ impl RuntimeManager {
         self.start_generic_close_worker(attempt_id, |manager, attempt_id| async move {
             manager.run_close_runtime_retirement(GenericRetirementAuthority::Fixture(attempt_id)).await
         })
-            .await?
-            .await
-            .map_err(|error| format!("Close retirement worker failed: {error}"))?
+        .await?
+        .await
+        .map_err(|error| format!("Close retirement worker failed: {error}"))?
     }
 
     pub(crate) async fn retry_generic_close_retirement(
@@ -1784,7 +1810,9 @@ impl RuntimeManager {
         .await
         .map_err(GenericCloseRetryError::Admission)?
         .await
-        .map_err(|error| GenericCloseRetryError::Internal(format!("Close Retry worker failed: {error}")))?
+        .map_err(|error| {
+            GenericCloseRetryError::Internal(format!("Close Retry worker failed: {error}"))
+        })?
     }
 
     async fn run_generic_close_retry(
@@ -1795,7 +1823,11 @@ impl RuntimeManager {
 
         self.require_local_authority_admission()
             .map_err(GenericCloseRetryError::Admission)?;
-        let admission = match self.db().admit_generic_legacy_close_retry(&attempt_id).await {
+        let admission = match self
+            .db()
+            .admit_generic_legacy_close_retry(&attempt_id)
+            .await
+        {
             LocalAuthorityResult::DurableFactEstablished(Ok(admission)) => admission,
             LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
                 return Err(GenericCloseRetryError::Admission(error.to_string()));
@@ -1813,20 +1845,33 @@ impl RuntimeManager {
         if self.fatal_local_authority_is_latched() {
             return Err(GenericCloseRetryError::Internal(error));
         }
-        let current = self.db().get_close_obligation(attempt_id.as_str()).await
+        let current = self
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
             .map_err(|error| GenericCloseRetryError::Internal(error.to_string()))?;
         if current.phase() == ClosePhase::RetirementRequested {
-            let scope = self.db().list_close_attempt_scopes(attempt_id.as_str()).await
+            let scope = self
+                .db()
+                .list_close_attempt_scopes(attempt_id.as_str())
+                .await
                 .map_err(|error| GenericCloseRetryError::Internal(error.to_string()))?
-                .into_iter().next()
-                .ok_or_else(|| GenericCloseRetryError::Internal("Close retry has no captured scope".to_string()))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    GenericCloseRetryError::Internal(
+                        "Close retry has no captured scope".to_string(),
+                    )
+                })?
                 .scope;
-            let _ = self.route_close_attempt_to_repair::<()>(
-                &attempt_id,
-                &scope,
-                RetirementFailureReason::ManualRepairRequired,
-                error.clone(),
-            ).await;
+            let _ = self
+                .route_close_attempt_to_repair::<()>(
+                    &attempt_id,
+                    &scope,
+                    RetirementFailureReason::ManualRepairRequired,
+                    error.clone(),
+                )
+                .await;
         }
         Err(GenericCloseRetryError::Continuation(error))
     }
@@ -1918,7 +1963,11 @@ impl RuntimeManager {
         attempt_id: CloseAttemptId,
     ) -> Result<tokio::task::JoinHandle<Result<bool, String>>, String> {
         self.spawn_generic_close_owner(attempt_id.clone(), None, move |manager, _| async move {
-            let owner = manager.waiting_generic_close_owners.lock().await.remove(&attempt_id);
+            let owner = manager
+                .waiting_generic_close_owners
+                .lock()
+                .await
+                .remove(&attempt_id);
             match owner {
                 Some(owner) => manager.settle_close_obligation(owner).await,
                 None => Ok(false),
@@ -1948,9 +1997,14 @@ impl RuntimeManager {
                 Some(admission) => Some(admission.lock_owned().await),
                 None => None,
             };
-            let _execution = manager.close_retirement_execution.lock(attempt_id.as_str()).await;
+            let _execution = manager
+                .close_retirement_execution
+                .lock(attempt_id.as_str())
+                .await;
             use futures::FutureExt as _;
-            manager.require_local_authority_admission().map_err(E::from)?;
+            manager
+                .require_local_authority_admission()
+                .map_err(E::from)?;
             match std::panic::AssertUnwindSafe(operation(Arc::clone(&manager), stop_guard))
                 .catch_unwind()
                 .await
@@ -1958,7 +2012,10 @@ impl RuntimeManager {
                 Ok(result) => result,
                 Err(_) => {
                     manager.signal_fatal_local_authority("generic Close settlement panic");
-                    Err(E::from("Close settlement worker panicked; recovery must use retained facts".to_string()))
+                    Err(E::from(
+                        "Close settlement worker panicked; recovery must use retained facts"
+                            .to_string(),
+                    ))
                 }
             }
         }))
@@ -2011,7 +2068,11 @@ impl RuntimeManager {
                 resource: resource.clone(),
             })
             .collect();
-        match self.db().claim_generic_close_process_dispatches(&requests).await {
+        match self
+            .db()
+            .claim_generic_close_process_dispatches(&requests)
+            .await
+        {
             LocalAuthorityResult::DurableFactEstablished(Ok(
                 CloseRetirementBatchDispatch::First(claimed),
             )) => {
@@ -2039,7 +2100,10 @@ impl RuntimeManager {
                 let (attempt_id, snapshot) = fresh.into_parts();
                 (attempt_id, Some(snapshot), GenericRemovalPolicy::Initial)
             }
-            GenericRetirementAuthority::Retry { admission, snapshot } => (
+            GenericRetirementAuthority::Retry {
+                admission,
+                snapshot,
+            } => (
                 admission.into_attempt_id(),
                 Some(snapshot),
                 GenericRemovalPolicy::RetainedOnly,
@@ -2073,8 +2137,11 @@ impl RuntimeManager {
             .cloned()
             .ok_or_else(|| "retirement requested without an inspection snapshot".to_string())?;
         if policy == GenericRemovalPolicy::RetainedOnly
-            && !self.db().close_retirement_inventory_is_complete(attempt_id.as_str())
-                .await.map_err(|error| error.to_string())?
+            && !self
+                .db()
+                .close_retirement_inventory_is_complete(attempt_id.as_str())
+                .await
+                .map_err(|error| error.to_string())?
         {
             return Err("Close Retry cannot create a new retirement inventory".into());
         }
@@ -2108,9 +2175,10 @@ impl RuntimeManager {
                 !retired.contains(&(target.scope.clone(), resource_key(&target.resource)))
             })
             .collect::<Vec<_>>();
-        if let Some(target) = runtime_targets.iter().find(|target| {
-            target.resource.kind() == RetiredResourceKind::EquivalentLiveResource
-        }) {
+        if let Some(target) = runtime_targets
+            .iter()
+            .find(|target| target.resource.kind() == RetiredResourceKind::EquivalentLiveResource)
+        {
             return self
                 .record_close_residual(
                     &run,
@@ -2160,7 +2228,9 @@ impl RuntimeManager {
             }
             if !has_lease {
                 if expected.len() != 1
-                    || expected.iter().any(|resource| resource.kind() != RetiredResourceKind::TmuxServer)
+                    || expected
+                        .iter()
+                        .any(|resource| resource.kind() != RetiredResourceKind::TmuxServer)
                 {
                     return self
                         .record_close_process_failure(
@@ -2204,18 +2274,24 @@ impl RuntimeManager {
                     let tmux = self.tmux_registry();
                     let prepared = match policy {
                         GenericRemovalPolicy::Initial => Some(
-                            tmux.rehydrate_retirement(&key, &instance, tmux_expires).await,
+                            tmux.rehydrate_retirement(&key, &instance, tmux_expires)
+                                .await,
                         ),
                         GenericRemovalPolicy::RetainedOnly => None,
                     };
                     let rehydration = match prepared {
                         None | Some(Ok(TmuxRetirementRehydration::EndpointAbsent
-                            | TmuxRetirementRehydration::ReplacementLive { .. })) => {
+                            | TmuxRetirementRehydration::ReplacementLive(_))) => {
                             if tokio::time::timeout_at(
                                 tmux_expires,
                                 tmux.fence_retirement_admission(&key),
-                            ).await.is_err() {
-                                return Err("tmux Close admission fence exceeded the deadline".into());
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return Err(
+                                    "tmux Close admission fence exceeded the deadline".into()
+                                );
                             }
                             tmux.exact_identity_state(&instance, tmux_expires)
                                 .await
@@ -2223,8 +2299,8 @@ impl RuntimeManager {
                                     ExactTmuxIdentityState::EndpointAbsent => {
                                         TmuxRetirementRehydration::EndpointAbsent
                                     }
-                                    ExactTmuxIdentityState::ReplacementLive { replacement_token } => {
-                                        TmuxRetirementRehydration::ReplacementLive { replacement_token }
+                                    ExactTmuxIdentityState::ReplacementLive(observation) => {
+                                        TmuxRetirementRehydration::ReplacementLive(observation)
                                     }
                                     ExactTmuxIdentityState::Ambiguous { reason } => {
                                         TmuxRetirementRehydration::Residual { reason }
@@ -2289,27 +2365,19 @@ impl RuntimeManager {
                                 }
                             }
                         }
-                        Ok(TmuxRetirementRehydration::ReplacementLive { replacement_token })
+                        Ok(TmuxRetirementRehydration::ReplacementLive(observation))
                             if policy == GenericRemovalPolicy::Initial =>
                         {
-                            self.db()
-                                .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
-                                    attempt_id: run.attempt_id.clone(),
-                                    snapshot: snapshot.clone(),
-                                    scope: scope.clone(),
-                                    resource: resource.clone(),
-                                    outcome: RetirementOutcome::AbsenceAdopted {
-                                        absence_basis: AbsenceBasis::VerifiedTmuxReplacement {
-                                            replacement_token,
-                                        },
-                                    },
-                                    detail: None,
-                                })
-                                .await
-                                .map_err(|error| error.to_string())?;
+                            self.record_close_tmux_replacement(
+                                &run,
+                                &snapshot,
+                                &scope,
+                                observation,
+                            )
+                            .await?;
                         }
                         Ok(TmuxRetirementRehydration::EndpointAbsent
-                            | TmuxRetirementRehydration::ReplacementLive { .. }) => {
+                            | TmuxRetirementRehydration::ReplacementLive(_)) => {
                             let dispatched = self
                                 .db()
                                 .close_retirement_resource_was_dispatched(
@@ -3426,7 +3494,9 @@ impl RuntimeManager {
                                             scope: scope.clone(),
                                             snapshot: snapshot.clone(),
                                             resource: target.resource.clone(),
-                                            administrative_dir: cleanup_plan.administrative_dir.clone(),
+                                            administrative_dir: cleanup_plan
+                                                .administrative_dir
+                                                .clone(),
                                             administrative_dir_incarnation: cleanup_plan
                                                 .administrative_dir_incarnation
                                                 .clone(),
@@ -3517,7 +3587,11 @@ impl RuntimeManager {
                                         }
                                     },
                                     |_| {},
-                                    CloseWorktreeEffects::production(writer_probe, removal_entry, policy)?,
+                                    CloseWorktreeEffects::production(
+                                        writer_probe,
+                                        removal_entry,
+                                        policy,
+                                    )?,
                                 )
                             })
                             .await;
@@ -3730,6 +3804,37 @@ impl RuntimeManager {
                 resource,
                 outcome: RetirementOutcome::Retired,
                 detail: Some(detail.to_string()),
+            })
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn record_close_tmux_replacement(
+        &self,
+        run: &CloseRunRef,
+        snapshot: &CloseRetirementSnapshot,
+        scope: &WorkScopeId,
+        observation: phoenix_tools::tmux::registry::TmuxReplacementObservation,
+    ) -> Result<(), String> {
+        let (sealed, replacement_token) = observation.into_parts();
+        let identity = OpaqueIdentity::parse(sealed.stable_identity())
+            .map_err(|error| error.to_string())?;
+        let resource = RetiredResourceIdentity::parse(
+            RetiredResourceKind::TmuxServer,
+            LossItemIdentity::Opaque(identity),
+        )
+        .map_err(|error| error.to_string())?;
+        self.require_local_authority_admission()?;
+        self.db()
+            .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                attempt_id: run.attempt_id.clone(),
+                snapshot: snapshot.clone(),
+                scope: scope.clone(),
+                resource,
+                outcome: RetirementOutcome::AbsenceAdopted {
+                    absence_basis: AbsenceBasis::VerifiedTmuxReplacement { replacement_token },
+                },
+                detail: None,
             })
             .await
             .map_err(|error| error.to_string())
@@ -4275,8 +4380,12 @@ impl RuntimeManager {
             .filter(|resource| resource.kind() == RetiredResourceKind::TmuxServer)
             .collect::<Vec<_>>();
         if expected.len() != durable_lease_targets.len()
-            || expected.iter().any(|resource| !durable_lease_targets.contains(&resource))
-            || durable_lease_targets.iter().any(|resource| !expected.contains(resource))
+            || expected
+                .iter()
+                .any(|resource| !durable_lease_targets.contains(&resource))
+            || durable_lease_targets
+                .iter()
+                .any(|resource| !expected.contains(resource))
         {
             return Err(CloseLeaseFailure::Persistence(
                 "live Close lease differs from sealed unresolved inventory".into(),
@@ -6170,7 +6279,8 @@ fn prepare_generic_worktree_removal(
         return Err("prepared worktree no longer matches captured custody".to_string());
     }
     check_directory_deletion_deadline(Some(deadline))?;
-    let administrative_dir = exact_worktree_administrative_dir(&exact_path, &prepared.common_git_dir)?;
+    let administrative_dir =
+        exact_worktree_administrative_dir(&exact_path, &prepared.common_git_dir)?;
     validate_cleanup_plan_registration_incarnation(identity, &administrative_dir)?;
     let incarnation = observe_administrative_dir_incarnation(&administrative_dir)?;
     Ok((prepared, administrative_dir, incarnation))
@@ -8162,9 +8272,11 @@ impl ExternalWriterEvidence {
     }
 
     fn remember_gap(&mut self, evidence: Self) {
-        if matches!(evidence, Self::Observed(CloseWriterObservation::InspectionGap { .. }))
-            && (matches!(self, Self::NoPositiveEvidence)
-                || (!self.blocks_initial_removal() && evidence.blocks_initial_removal()))
+        if matches!(
+            evidence,
+            Self::Observed(CloseWriterObservation::InspectionGap { .. })
+        ) && (matches!(self, Self::NoPositiveEvidence)
+            || (!self.blocks_initial_removal() && evidence.blocks_initial_removal()))
         {
             *self = evidence;
         }
@@ -8214,7 +8326,9 @@ fn scan_writer_entries<T, M>(
             Ok(Some(authority)) => return Ok(Some(authority)),
             Ok(None) => {}
             Err(WriterScanError::Gap(reason)) => {
-                if gap.is_none_or(|prior| is_residual_process_gap(prior) && !is_residual_process_gap(reason)) {
+                if gap.is_none_or(|prior| {
+                    is_residual_process_gap(prior) && !is_residual_process_gap(reason)
+                }) {
                     gap = Some(reason);
                 }
             }
@@ -8290,7 +8404,9 @@ impl CloseWriterProbe {
         F: FnOnce(&Path, std::time::Instant) -> Result<ExternalWriterEvidence, String>,
     {
         match policy {
-            GenericRemovalPolicy::Initial => self.observe_and_retain_until(path, deadline, production),
+            GenericRemovalPolicy::Initial => {
+                self.observe_and_retain_until(path, deadline, production)
+            }
             GenericRemovalPolicy::RetainedOnly => self.observe_until(path, deadline, production),
         }
     }
@@ -10378,10 +10494,15 @@ impl CloseWorktreeEffects {
             WorktreeRemovalEntry::AdmittedNativeRetry,
             WorktreeRemovalWriterChecks::Quarantine {
                 descriptors: Box::new(move |path, deadline| {
-                    descriptor_probe.observe_until(path, deadline, quarantine_has_open_descriptors_until)
+                    descriptor_probe.observe_until(
+                        path,
+                        deadline,
+                        quarantine_has_open_descriptors_until,
+                    )
                 }),
                 external: Box::new(move |path, deadline| {
-                    Ok(probe.observe_until(path, deadline, quarantine_has_external_writer_until)?
+                    Ok(probe
+                        .observe_until(path, deadline, quarantine_has_external_writer_until)?
                         .blocks_retirement())
                 }),
             },
@@ -10401,7 +10522,9 @@ impl CloseWorktreeEffects {
                 || request.snapshot != probe.snapshot
                 || request.resource != probe.resource
             {
-                return Err("first dispatch does not match the worktree writer evidence target".to_string());
+                return Err(
+                    "first dispatch does not match the worktree writer evidence target".to_string(),
+                );
             }
         }
         Ok(Self::with_writer_checks(
@@ -10425,8 +10548,14 @@ impl CloseWorktreeEffects {
     }
 
     #[cfg(test)]
-    fn writer_checks_for_test(&mut self) -> (&mut OpenDescriptorsEffect, &mut ExternalWriterEffect) {
-        let WorktreeRemovalWriterChecks::Quarantine { descriptors, external } = &mut self.writers else {
+    fn writer_checks_for_test(
+        &mut self,
+    ) -> (&mut OpenDescriptorsEffect, &mut ExternalWriterEffect) {
+        let WorktreeRemovalWriterChecks::Quarantine {
+            descriptors,
+            external,
+        } = &mut self.writers
+        else {
             panic!("expected quarantine writer fixture");
         };
         (descriptors, external)
@@ -15174,7 +15303,8 @@ mod tests {
         let mut effects = injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning));
         // Keep persistence and fsmonitor fixture-local; use the actual host
         // descriptor, cwd, and mapping probes at the normal removal boundary.
-        *effects.writer_checks_for_test().0 = Box::new(super::quarantine_has_open_descriptors_until);
+        *effects.writer_checks_for_test().0 =
+            Box::new(super::quarantine_has_open_descriptors_until);
         *effects.writer_checks_for_test().1 = Box::new(|path, deadline| {
             Ok(super::quarantine_has_external_writer_until(path, deadline)?.blocks_retirement())
         });
@@ -18303,10 +18433,17 @@ mod tests {
         assert_eq!(unknown, gap().unwrap());
         assert!(!unknown.is_positive());
         assert!(unknown.blocks_retirement(), "strict paths still block");
-        assert!(!unknown.blocks_initial_removal(), "per-process opacity is residual");
-        let global_gap = || Ok(super::writer_gap(
-            CloseWriterDetector::MacDescriptor, None, CloseWriterGap::Unavailable,
-        ));
+        assert!(
+            !unknown.blocks_initial_removal(),
+            "per-process opacity is residual"
+        );
+        let global_gap = || {
+            Ok(super::writer_gap(
+                CloseWriterDetector::MacDescriptor,
+                None,
+                CloseWriterGap::Unavailable,
+            ))
+        };
         let blocked = super::scan_writer_detectors(deadline, gap, global_gap, no_evidence).unwrap();
         assert_eq!(blocked, global_gap().unwrap());
         assert!(blocked.blocks_initial_removal());
@@ -18376,9 +18513,7 @@ mod tests {
             stop_fsmonitor: Box::new(move |path, _deadline, _admission| stop_fsmonitor(path)),
             first_submodule_spawn_admission: None,
             writers: super::WorktreeRemovalWriterChecks::Quarantine {
-                descriptors: Box::new(|_, _| {
-                    Ok(super::ExternalWriterEvidence::NoPositiveEvidence)
-                }),
+                descriptors: Box::new(|_, _| Ok(super::ExternalWriterEvidence::NoPositiveEvidence)),
                 external: Box::new(|_, _| Ok(false)),
             },
         }

@@ -267,16 +267,22 @@ impl NativeCloseInitialContinuation {
         };
         let resources = progress.current_resources(&scope, step);
         progress.retry_backoff = false;
-        if !resources.is_empty() && progress.resource_index == 0
-            && progress.pending_dispatches.is_empty() && progress.entry.is_none()
-            && progress.pending.is_none() && progress.observer.is_none()
+        if !resources.is_empty()
+            && progress.resource_index == 0
+            && progress.pending_dispatches.is_empty()
+            && progress.entry.is_none()
+            && progress.pending.is_none()
+            && progress.observer.is_none()
         {
-            let requests = resources.iter().map(|resource| RecordCloseRetirementDispatchRequest {
-                attempt_id: resource.attempt_id.clone(),
-                scope: resource.scope.clone(),
-                snapshot: resource.snapshot.clone(),
-                resource: resource.resource.clone(),
-            }).collect::<Vec<_>>();
+            let requests = resources
+                .iter()
+                .map(|resource| RecordCloseRetirementDispatchRequest {
+                    attempt_id: resource.attempt_id.clone(),
+                    scope: resource.scope.clone(),
+                    snapshot: resource.snapshot.clone(),
+                    resource: resource.resource.clone(),
+                })
+                .collect::<Vec<_>>();
             match self
                 .db
                 .record_native_close_initial_process_dispatches(

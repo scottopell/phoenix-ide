@@ -41,33 +41,41 @@ impl NativeCloseSettlementStopOffer {
         live_source: phoenix_core::domain::sm_state::ConvState,
         target: phoenix_db::CloseDirectTurnSettlementTarget,
     ) -> Self {
-        Self { db, command, receipt, source_entry, live_source, target }
+        Self {
+            db,
+            command,
+            receipt,
+            source_entry,
+            live_source,
+            target,
+        }
     }
 
     pub(crate) async fn claim(
         self,
         fatal: std::sync::Arc<super::FatalLocalAuthorityFence>,
     ) -> bool {
-        use phoenix_db::workflow::LocalAuthorityResult;
         use super::executor::WorkerEntryResult;
+        use phoenix_db::workflow::LocalAuthorityResult;
 
         let runtime = tokio::runtime::Handle::current();
         let worker_fatal = fatal.clone();
         let work = tokio::task::spawn_blocking(move || {
-            let (result, lease) = runtime.block_on(self.db.claim_native_close_initial_settlement_stop(
-                &self.command,
-                &self.receipt,
-                &self.live_source,
-                &self.target,
-                || match self.source_entry.try_acquire_first_effect(&self.command) {
-                    WorkerEntryResult::Ran(lease) => Ok(lease),
-                    WorkerEntryResult::Busy | WorkerEntryResult::Refused => {
-                        Err(phoenix_db::DbError::CloseFoundationPrecondition(
-                            "Close settlement source entry is unavailable".into(),
-                        ))
-                    }
-                },
-            ));
+            let (result, lease) =
+                runtime.block_on(self.db.claim_native_close_initial_settlement_stop(
+                    &self.command,
+                    &self.receipt,
+                    &self.live_source,
+                    &self.target,
+                    || match self.source_entry.try_acquire_first_effect(&self.command) {
+                        WorkerEntryResult::Ran(lease) => Ok(lease),
+                        WorkerEntryResult::Busy | WorkerEntryResult::Refused => {
+                            Err(phoenix_db::DbError::CloseFoundationPrecondition(
+                                "Close settlement source entry is unavailable".into(),
+                            ))
+                        }
+                    },
+                ));
             match result {
                 LocalAuthorityResult::DurableFactEstablished(result) => {
                     drop(lease);
@@ -110,8 +118,13 @@ impl CloseSettlementStopOffer {
         }
     }
 
-    pub(crate) async fn claim(self, fatal: std::sync::Arc<super::FatalLocalAuthorityFence>) -> bool {
-        use phoenix_db::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+    pub(crate) async fn claim(
+        self,
+        fatal: std::sync::Arc<super::FatalLocalAuthorityFence>,
+    ) -> bool {
+        use phoenix_db::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
         if fatal.is_closed() {
             return false;
         }
@@ -206,15 +219,17 @@ impl DirectTurnCancellationReservation {
             turn_id: phoenix_workflow::TurnAuthorityId(offer.target().turn_id),
             generation: offer.target().expected_generation,
         };
-        self.0.send(CancellationInput::DirectTurn(ScopedDirectTurnCancellation {
-            scope,
-            offer,
-            cancellation: UserCancellation {
-                reason: Some("active Close settlement".into()),
-                cause: CancelCause::UserRequested,
+        self.0.send(CancellationInput::DirectTurn(
+            ScopedDirectTurnCancellation {
+                scope,
+                offer,
+                cancellation: UserCancellation {
+                    reason: Some("active Close settlement".into()),
+                    cause: CancelCause::UserRequested,
+                },
+                applied,
             },
-            applied,
-        }));
+        ));
         receipt
     }
 }

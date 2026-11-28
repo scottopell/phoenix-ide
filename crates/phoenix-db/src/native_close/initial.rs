@@ -24,11 +24,10 @@ use crate::{
     BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     CaptureCloseRetirementInventoryRequest, CloseCleanupFailureAuthority,
     CloseCleanupFailureResource, CloseCleanupResourceDisposition, CloseRetirementBatchDispatch,
-    CloseRetirementDispatch, Database, DbError, DbResult,
-    RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
-    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
-    TerminalizeInitialCloseCleanupFailureRequest, WorkScopeRetirementBlocker,
-    WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
+    CloseRetirementDispatch, Database, DbError, DbResult, RecordCloseRetirementDispatchRequest,
+    RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
+    ReplaceCloseInspectionRequest, TerminalizeInitialCloseCleanupFailureRequest,
+    WorkScopeRetirementBlocker, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -363,7 +362,8 @@ async fn require_initial_original_dispatch_tx(
     snapshot: &phoenix_core::domain::close::CloseRetirementSnapshot,
     resource: &RetiredResourceIdentity,
 ) -> DbResult<Vec<CloseExpectedRetirementResource>> {
-    let expected = require_initial_original_resource_tx(tx, admitted, scope, snapshot, resource).await?;
+    let expected =
+        require_initial_original_resource_tx(tx, admitted, scope, snapshot, resource).await?;
     let identity = resource.identity();
     let dispatched: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches
@@ -1414,20 +1414,25 @@ impl Database {
             )
             .await?;
             let kind = first.resource.kind();
-            let inventory = expected.iter().filter(|item| {
-                item.scope == first.scope && item.resource.kind() == kind
-            });
-            if matches!(kind, RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope)
-                || inventory.clone().count() != requests.len()
-                || !inventory.clone().all(|item| requests.iter().any(|request| {
-                    request.attempt_id == item.attempt_id
-                        && request.scope == item.scope
-                        && request.snapshot == item.snapshot
-                        && request.resource == item.resource
-                }))
+            let inventory = expected
+                .iter()
+                .filter(|item| item.scope == first.scope && item.resource.kind() == kind);
+            if matches!(
+                kind,
+                RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope
+            ) || inventory.clone().count() != requests.len()
+                || !inventory.clone().all(|item| {
+                    requests.iter().any(|request| {
+                        request.attempt_id == item.attempt_id
+                            && request.scope == item.scope
+                            && request.snapshot == item.snapshot
+                            && request.resource == item.resource
+                    })
+                })
             {
                 return Err(DbError::CloseFoundationPrecondition(
-                    "initial process dispatch batch must match the exact process-kind inventory".into(),
+                    "initial process dispatch batch must match the exact process-kind inventory"
+                        .into(),
                 ));
             }
             Self::insert_close_process_dispatch_batch_tx(&mut tx, requests).await
@@ -2287,10 +2292,9 @@ impl Database {
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
         };
         let result = async {
-            let admitted = require_initial_settlement_dispatch_tx(
-                &mut tx.tx, command, receipt, live_source,
-            )
-            .await?;
+            let admitted =
+                require_initial_settlement_dispatch_tx(&mut tx.tx, command, receipt, live_source)
+                    .await?;
             let Some(live_target) =
                 require_exact_live_settlement_target_tx(&mut tx, &admitted.attempt_id, target)
                     .await?
@@ -2339,15 +2343,17 @@ impl Database {
         let mut tx = match workflow.begin_immediate_tx().await {
             Ok(tx) => tx,
             Err(error) => {
-                return (LocalAuthorityResult::DurableFactEstablished(Err(error)), None);
+                return (
+                    LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                    None,
+                );
             }
         };
         let mut lease = None;
         let result = async {
-            let admitted = require_initial_settlement_dispatch_tx(
-                &mut tx.tx, command, receipt, live_source,
-            )
-            .await?;
+            let admitted =
+                require_initial_settlement_dispatch_tx(&mut tx.tx, command, receipt, live_source)
+                    .await?;
             let Some(live_target) =
                 require_exact_live_settlement_target_tx(&mut tx, &admitted.attempt_id, target)
                     .await?
@@ -2624,7 +2630,8 @@ async fn ensure_native_initial_cancel_unencumbered_tx(
     ).bind(attempt_id).fetch_one(&mut **tx).await?;
     if encumbered {
         return Err(DbError::CloseFoundationPrecondition(
-            "native Initial cancellation is unsafe after settlement or retirement custody exists".into(),
+            "native Initial cancellation is unsafe after settlement or retirement custody exists"
+                .into(),
         ));
     }
     ensure_close_retirement_loss_free_tx(tx, attempt_id).await?;
@@ -2638,11 +2645,18 @@ async fn require_initial_settlement_dispatch_tx(
     live_source: &phoenix_core::domain::sm_state::ConvState,
 ) -> DbResult<NativeCloseRunRef> {
     let (admitted, _) = require_initial_execution_tx(
-        tx, command, receipt, live_source, ClosePhase::SettlingActiveWork,
-    ).await?;
+        tx,
+        command,
+        receipt,
+        live_source,
+        ClosePhase::SettlingActiveWork,
+    )
+    .await?;
     let latest = crate::close_foundation::read_topology_tx(tx, &admitted.target)
         .await?
-        .ok_or_else(|| DbError::CloseFoundationPrecondition("Close target topology is missing".into()))?;
+        .ok_or_else(|| {
+            DbError::CloseFoundationPrecondition("Close target topology is missing".into())
+        })?;
     let current: Option<(String, String)> = sqlx::query_as(
         "SELECT obligation.attempt_id, member.conversation_id
          FROM close_obligations obligation

@@ -3594,8 +3594,10 @@ where
                 deferred_native_close_exit.is_none() && self.has_pending_cancellation();
             let acknowledged_control_ready =
                 queued_acknowledged_request.as_ref().is_some_and(|request| {
-                    matches!(request, AcknowledgedRuntimeRequest::ControlNativeCloseInitial(_))
-                        || matches!(request, AcknowledgedRuntimeRequest::Event(request)
+                    matches!(
+                        request,
+                        AcknowledgedRuntimeRequest::ControlNativeCloseInitial(_)
+                    ) || matches!(request, AcknowledgedRuntimeRequest::Event(request)
                             if matches!(&request.event, Event::UserCancel { .. } | Event::Shutdown))
                 });
             let event_control_ready = deferred_native_close_exit.is_none()

@@ -1,7 +1,7 @@
 use super::{
-    AcknowledgedEventOutcome, CANCELLATION_DEADLINE, ConvState, ConversationRuntime,
-    CreationSettlementDisposition, Effect, LlmClient, LocalTerminalAuthority,
-    RuntimeExitDisposition, StepResult, Storage, ToolExecutor,
+    AcknowledgedEventOutcome, ConvState, ConversationRuntime, CreationSettlementDisposition,
+    Effect, LlmClient, LocalTerminalAuthority, RuntimeExitDisposition, StepResult, Storage,
+    ToolExecutor, CANCELLATION_DEADLINE,
 };
 use crate::runtime::cancellation_inbox::{
     CancellationInput, CancellationReceipt, DirectTurnCancellation, ScopedStopHandling,
@@ -148,7 +148,11 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             let origin = self.foreground_dispatch.open_batch_origin()?;
             let at = tokio::time::Instant::now() + CANCELLATION_DEADLINE;
             self.cancel_ordinary_batch();
-            Some(CancellationCutoff { origin, at, phase: CutoffPhase::Pending })
+            Some(CancellationCutoff {
+                origin,
+                at,
+                phase: CutoffPhase::Pending,
+            })
         })
     }
 
@@ -216,10 +220,7 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         }
     }
 
-    async fn await_scoped_stop_claim(
-        &mut self,
-        claim: impl Future<Output = bool> + Send,
-    ) -> bool {
+    async fn await_scoped_stop_claim(&mut self, claim: impl Future<Output = bool> + Send) -> bool {
         tokio::pin!(claim);
         if let Some(cutoff) = self.cancellation_custody.pending_cutoff() {
             tokio::select! {
@@ -244,11 +245,17 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                     cutoff.map_or(CancellationCustody::Idle, CancellationCustody::Closing);
                 let fatal = self.fatal_local_authority_fence.clone();
                 if !self.direct_turn_cancellation_is_current(&scoped.scope)
-                    || !self.await_scoped_stop_claim(scoped.offer.claim(fatal)).await
-                    || self.fatal_local_authority_fence.fatal_authority_loss_is_latched()
+                    || !self
+                        .await_scoped_stop_claim(scoped.offer.claim(fatal))
+                        .await
+                    || self
+                        .fatal_local_authority_fence
+                        .fatal_authority_loss_is_latched()
                 {
                     let _ = scoped.applied.send(ScopedStopHandling::Refused);
-                    return self.fatal_local_authority_fence.fatal_authority_loss_is_latched()
+                    return self
+                        .fatal_local_authority_fence
+                        .fatal_authority_loss_is_latched()
                         .then(|| self.fatal_local_authority_exit());
                 }
                 let retained = self.cancellation_custody.take_closing();

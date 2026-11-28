@@ -43,7 +43,9 @@ pub(crate) fn project_completed_close(
     use phoenix_core::domain::close::CloseCompletionOutcome;
 
     let (message, error_type) = match outcome {
-        Some(CloseCompletionOutcome::Archived | CloseCompletionOutcome::ArchivedCleanupAttention) => {
+        Some(
+            CloseCompletionOutcome::Archived | CloseCompletionOutcome::ArchivedCleanupAttention,
+        ) => {
             return Ok(());
         }
         Some(CloseCompletionOutcome::CloseIncomplete) => (
@@ -182,10 +184,9 @@ pub(crate) async fn run_observed_close(
     aggregate: &crate::db::ProductConversationAggregate,
 ) -> Result<(), AppError> {
     let product = aggregate.product_conversation.id();
-    let expected_latest_transcript = TranscriptConversationId::parse(
-        aggregate.latest_transcript_row_id.clone(),
-    )
-    .map_err(|error| AppError::Internal(error.to_string()))?;
+    let expected_latest_transcript =
+        TranscriptConversationId::parse(aggregate.latest_transcript_row_id.clone())
+            .map_err(|error| AppError::Internal(error.to_string()))?;
     let mut obligation = match state
         .db
         .get_active_close_obligation_for_product(product)
@@ -262,11 +263,17 @@ pub(crate) async fn run_observed_close(
                 ))));
             }
             ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement => {
-                state.runtime.wait_for_close_owner(obligation.attempt_id()).await;
+                state
+                    .runtime
+                    .wait_for_close_owner(obligation.attempt_id())
+                    .await;
                 observe_close_settlement(state, obligation.attempt_id()).await?
             }
             ClosePhase::AwaitingRetirementInspection | ClosePhase::RetirementRequested => {
-                state.runtime.wait_for_close_owner(obligation.attempt_id()).await;
+                state
+                    .runtime
+                    .wait_for_close_owner(obligation.attempt_id())
+                    .await;
                 let current = state
                     .db
                     .get_close_obligation(obligation.attempt_id().as_str())
@@ -453,13 +460,25 @@ mod tests {
 
         let state = crate::api::handlers::api_test_support::make_test_state().await;
         let id = "concurrent-initial-close";
-        state.db.create_conversation(id, id, "/tmp", true, None, None)
-            .await.unwrap();
-        let product = state.db.get_conversation(id).await.unwrap().product_conversation_id;
+        state
+            .db
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let product = state
+            .db
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .product_conversation_id;
         let latest = TranscriptConversationId::parse(id).unwrap();
         let losing_attempt = CloseAttemptId::parse("losing-initial-close").unwrap();
 
-        let open = state.db.get_ordinary_product_conversation(&product).await.unwrap();
+        let open = state
+            .db
+            .get_ordinary_product_conversation(&product)
+            .await
+            .unwrap();
         assert_eq!(
             open.product_conversation.ordinary_lifecycle(),
             Some(OrdinaryProductConversationLifecycle::Open)
@@ -467,15 +486,26 @@ mod tests {
         crate::api::product_conversations::close_product_conversation(
             axum::extract::State(state.clone()),
             axum::extract::Path(id.to_string()),
-        ).await.unwrap();
+        )
+        .await
+        .unwrap();
 
-        let worker = state.runtime.start_generic_close_ingress(
-            losing_attempt.clone(), product.clone(), latest, GenericCloseIngress::Initial,
-        ).unwrap();
+        let worker = state
+            .runtime
+            .start_generic_close_ingress(
+                losing_attempt.clone(),
+                product.clone(),
+                latest,
+                GenericCloseIngress::Initial,
+            )
+            .unwrap();
         let Ok(GenericCloseIngressOutcome::Observed(retained)) = worker.await.unwrap() else {
             panic!("competing Initial must observe the committed winner");
         };
-        assert_eq!(retained.close_outcome(), Some(CloseCompletionOutcome::Archived));
+        assert_eq!(
+            retained.close_outcome(),
+            Some(CloseCompletionOutcome::Archived)
+        );
         assert_ne!(retained.attempt_id(), &losing_attempt);
         run_observed_close(&state, &open).await.unwrap();
         let rows: i64 = sqlx::query_scalar(
@@ -498,25 +528,56 @@ mod tests {
         .unwrap();
         assert_eq!(attempts, 1);
 
-        let stale = state.db.begin_generic_close_settlement_classified(
-            &product, &TranscriptConversationId::parse("stale-old-transcript").unwrap(), &losing_attempt,
-        ).await.established().expect("classified fixture transaction");
-        assert!(matches!(stale, Err(crate::db::DbError::CloseFoundationStaleLatest { .. })));
-        let other = "different-close-target";
-        let other_product = state.db.create_conversation(other, other, "/tmp", true, None, None)
-            .await.unwrap().product_conversation_id;
-        state.db.begin_generic_close_settlement_classified(
-            &other_product, &TranscriptConversationId::parse(other).unwrap(), &losing_attempt,
-        ).await.established().expect("classified fixture transaction").unwrap();
+        let stale = state
+            .db
+            .begin_generic_close_settlement_classified(
+                &product,
+                &TranscriptConversationId::parse("stale-old-transcript").unwrap(),
+                &losing_attempt,
+            )
+            .await
+            .established()
+            .expect("classified fixture transaction");
         assert!(matches!(
-            state.db.begin_generic_close_settlement_classified(
-                &product, &TranscriptConversationId::parse(id).unwrap(), &losing_attempt,
-            ).await.established().expect("classified fixture transaction"),
+            stale,
+            Err(crate::db::DbError::CloseFoundationStaleLatest { .. })
+        ));
+        let other = "different-close-target";
+        let other_product = state
+            .db
+            .create_conversation(other, other, "/tmp", true, None, None)
+            .await
+            .unwrap()
+            .product_conversation_id;
+        state
+            .db
+            .begin_generic_close_settlement_classified(
+                &other_product,
+                &TranscriptConversationId::parse(other).unwrap(),
+                &losing_attempt,
+            )
+            .await
+            .established()
+            .expect("classified fixture transaction")
+            .unwrap();
+        assert!(matches!(
+            state
+                .db
+                .begin_generic_close_settlement_classified(
+                    &product,
+                    &TranscriptConversationId::parse(id).unwrap(),
+                    &losing_attempt,
+                )
+                .await
+                .established()
+                .expect("classified fixture transaction"),
             Err(crate::db::DbError::CloseFoundationConflict(_))
         ));
-        assert!(matches!(crate::api::product_conversations::close_product_conversation(
+        assert!(
+            matches!(crate::api::product_conversations::close_product_conversation(
             axum::extract::State(state), axum::extract::Path(id.to_string()),
-        ).await, Err(AppError::Conflict(conflict)) if conflict.error_type == "close_already_history"));
+        ).await, Err(AppError::Conflict(conflict)) if conflict.error_type == "close_already_history")
+        );
     }
 
     #[tokio::test]

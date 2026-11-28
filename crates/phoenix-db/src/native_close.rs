@@ -353,9 +353,9 @@ mod initial_exit;
 pub use initial::{
     NativeCloseInitialEntryRelease, NativeCloseInitialExecution,
     NativeCloseInitialFirstEffectError, NativeCloseInitialProcessAuthorization,
-    NativeCloseInitialTurnDispatch, NativeCloseInitialTurnDispatchResult,
     NativeCloseInitialResourceEntryDecision, NativeCloseInitialResourceEntryResult,
-    NativeCloseInitialResult, NativeCloseInitialSettlement, NativeCloseReceipt, NativeCloseRunRef,
+    NativeCloseInitialResult, NativeCloseInitialSettlement, NativeCloseInitialTurnDispatch,
+    NativeCloseInitialTurnDispatchResult, NativeCloseReceipt, NativeCloseRunRef,
 };
 mod observe;
 mod receipts;

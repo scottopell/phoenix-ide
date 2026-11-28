@@ -151,12 +151,20 @@ impl super::RuntimeManager {
         let (response, reply) = tokio::sync::oneshot::channel();
         handle
             .acknowledged_event_tx
-            .send(super::AcknowledgedRuntimeRequest::ControlNativeCloseInitial(Box::new(
-                NativeCloseInitialControlRequest { route, action, response },
-            )))
+            .send(
+                super::AcknowledgedRuntimeRequest::ControlNativeCloseInitial(Box::new(
+                    NativeCloseInitialControlRequest {
+                        route,
+                        action,
+                        response,
+                    },
+                )),
+            )
             .await
             .map_err(|_| NativeCloseApplicationError::Unavailable)?;
-        reply.await.map_err(|_| NativeCloseApplicationError::Unavailable)?
+        reply
+            .await
+            .map_err(|_| NativeCloseApplicationError::Unavailable)?
     }
 }
 
