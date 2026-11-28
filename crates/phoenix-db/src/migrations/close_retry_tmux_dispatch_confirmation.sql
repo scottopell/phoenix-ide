@@ -1,3 +1,9 @@
+CREATE UNIQUE INDEX close_retirement_dispatches_exact_identity
+    ON close_retirement_resource_dispatches (
+        attempt_id, scope, inspection_generation, inspection_fingerprint,
+        resource_kind, identity_kind, identity_codec, identity_value
+    );
+
 CREATE TABLE close_retry_tmux_dispatch_confirmations (
     attempt_id TEXT NOT NULL,
     scope TEXT NOT NULL,

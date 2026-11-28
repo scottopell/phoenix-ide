@@ -73,6 +73,41 @@ async fn real188_to189_preserves_worktree_authority_and_adds_exact_original_tmux
 }
 
 #[tokio::test]
+async fn migration_198_preserves_dispatch_dml_and_adds_no_confirmation() {
+    let pool = predecessor().await;
+    run_through_for_test(&pool, 197).await.unwrap();
+    let before = ledger(&pool).await;
+    assert_eq!(before.last().unwrap().0, 197);
+
+    assert_eq!(run_through_for_test(&pool, 198).await.unwrap(), 1);
+    let after = ledger(&pool).await;
+    assert_eq!(&after[..before.len()], before.as_slice());
+    assert_eq!(run_through_for_test(&pool, 198).await.unwrap(), 0);
+    assert_eq!(ledger(&pool).await, after);
+
+    let confirmations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM close_retry_tmux_dispatch_confirmations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(confirmations, 0);
+    let violations: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(violations, 0);
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(foreign_keys, 1);
+    sqlx::query("DELETE FROM close_retirement_resource_dispatches WHERE attempt_id = 'missing'")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
 async fn missing_or_changed_dispatch_trigger_rolls_back189() {
     for changed in [false, true] {
         let pool = predecessor().await;

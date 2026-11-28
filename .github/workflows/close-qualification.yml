@@ -129,6 +129,7 @@ jobs:
             dispatched_absence_retry_resumes_retirement_with_retained_snapshot \
             generic_close_process_batch_replay_rolls_back_unclaimed_resources \
             migration_197_preserves_existing_evidence_and_round_trips_tmux_replacement \
+            migration_198_preserves_dispatch_dml_and_adds_no_confirmation \
             migration_199_installs_immutable_legacy_retry_claims_with_exact_plan_fk \
             generic_legacy_close_retry_serializes_with_native_adoption \
             generic_legacy_close_retry_refuses_owning_native_receipt \
