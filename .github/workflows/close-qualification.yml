@@ -83,6 +83,8 @@ jobs:
       - name: Verify public Close on the ordinary Linux runner
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         timeout-minutes: 8
+        env:
+          E2E_RUST_LOG: warn,phoenix_ide::runtime::close_retirement=debug
         shell: bash
         run: |
           set -euo pipefail
