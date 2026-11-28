@@ -195,7 +195,8 @@ impl ReadFileTool {
         let mut output = String::new();
         for (i, line) in lines[window.range()].iter().enumerate() {
             let line_num = start_idx + i + 1; // 1-based line number
-            let _ = writeln!(output, "{line_num:>6}\t{line}");
+                                              // unpadded: padding costs ~2 tokens per line and carries no information
+            let _ = writeln!(output, "{line_num}\t{line}");
         }
 
         let remaining = total_lines.saturating_sub(end_idx);
@@ -343,6 +344,32 @@ mod tests {
         assert!(result.output().contains('b'));
         assert!(result.output().contains('c'));
         assert!(!result.output().contains("\ta\n"));
+    }
+
+    /// Each line keeps its exact 1-based number, unpadded, then a tab and the
+    /// line with its own indentation intact.
+    #[tokio::test]
+    async fn lines_are_numbered_without_padding() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = (1..=12)
+            .map(|i| format!("    line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.path().join("n.txt"), text).unwrap();
+        let result = ReadFileTool
+            .run(
+                json!({"path": "n.txt", "offset": 9, "limit": 3}),
+                test_context(dir.path().to_path_buf()),
+            )
+            .await;
+        assert!(result.is_success());
+        assert!(
+            result
+                .output()
+                .starts_with("9\t    line 9\n10\t    line 10\n11\t    line 11\n"),
+            "{}",
+            result.output()
+        );
     }
 
     #[tokio::test]

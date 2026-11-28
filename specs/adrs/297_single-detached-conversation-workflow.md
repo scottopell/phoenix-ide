@@ -1,4 +1,4 @@
-# ADR-295: Keep the conversation lifecycle detached and local
+# ADR-297: Keep the conversation lifecycle detached and local
 
 - **Status:** Accepted
 - **Date:** 2026-11-26

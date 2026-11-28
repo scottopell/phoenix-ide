@@ -1,0 +1,310 @@
+{
+  "recorded_input": 61086976624,
+  "tokenizer": "o200k_base",
+  "sample_seed": 921,
+  "sampled_results": 7663,
+  "excluded": {
+    "errors": 1035,
+    "without_recognized_numbered_lines": 199,
+    "clipped_or_discontinuous": 86,
+    "excluded_numbered_line_carries": 2712679,
+    "excluded_padding_run_carries": 2712679,
+    "excluded_padding_bytes_carried": 6807317
+  },
+  "line_reference_proxies": {
+    "numbered_reads_with_full_carries": 112822,
+    "reads_with_same_turn_followup": 111295,
+    "reads_with_any_matching_number": 33506,
+    "reads_with_explicit_matching_line_syntax": 15127,
+    "reads_with_matching_prose_line_syntax": 362,
+    "reads_with_matching_tool_line_syntax": 14773,
+    "reads_with_matching_explicit_same_file_reread_offset": 4489,
+    "numbered_reads_without_full_carries": 231
+  },
+  "strata": {
+    "4k_to_16k": {
+      "population": 57250,
+      "rows_with_full_result_carry": 57133,
+      "numbered_lines": 9470600,
+      "numbered_line_carries": 216142071,
+      "upper_numbered_line_carries": 685337224,
+      "padding_run_carries": 216142071,
+      "padding_bytes_carried": 613550998,
+      "sample_size": 1500,
+      "options": {
+        "unpad": {
+          "per_result_tokens_saved": {
+            "p50": 280,
+            "p90": 520,
+            "p99": 726,
+            "max": 860
+          },
+          "per_result_mean_tokens_saved": 323.55066666666664,
+          "rows_with_savings": 1500,
+          "rows_with_growth": 0,
+          "sample_numbered_line_carries": 5641730,
+          "projected_token_turns": 421735773.8869136,
+          "projected_variance": 4735949368245.794,
+          "token_turns_sample_count_expansion": 420143513.8333333,
+          "upper_carry_token_turns": 1330192512.752083
+        },
+        "range": {
+          "per_result_tokens_saved": {
+            "p50": 524,
+            "p90": 919,
+            "p99": 1291,
+            "max": 1753
+          },
+          "per_result_mean_tokens_saved": 574.0186666666667,
+          "rows_with_savings": 1498,
+          "rows_with_growth": 2,
+          "sample_numbered_line_carries": 5641730,
+          "projected_token_turns": 750850621.0363412,
+          "projected_variance": 15387194011621.678,
+          "token_turns_sample_count_expansion": 748015790.5,
+          "upper_carry_token_turns": 2393777877.984625
+        }
+      }
+    },
+    "1k_to_4k": {
+      "population": 40533,
+      "rows_with_full_result_carry": 40445,
+      "numbered_lines": 2175383,
+      "numbered_line_carries": 58836628,
+      "upper_numbered_line_carries": 256303559,
+      "padding_run_carries": 58834245,
+      "padding_bytes_carried": 164911607,
+      "sample_size": 1500,
+      "options": {
+        "unpad": {
+          "per_result_tokens_saved": {
+            "p50": 100,
+            "p90": 160,
+            "p99": 214,
+            "max": 270
+          },
+          "per_result_mean_tokens_saved": 105.12266666666666,
+          "rows_with_savings": 1500,
+          "rows_with_growth": 0,
+          "sample_numbered_line_carries": 2238575,
+          "projected_token_turns": 115808734.86922708,
+          "projected_variance": 124260012511.97878,
+          "token_turns_sample_count_expansion": 119064606.62,
+          "upper_carry_token_turns": 501802705.271701
+        },
+        "range": {
+          "per_result_tokens_saved": {
+            "p50": 176,
+            "p90": 296,
+            "p99": 383,
+            "max": 587
+          },
+          "per_result_mean_tokens_saved": 185.38533333333334,
+          "rows_with_savings": 1499,
+          "rows_with_growth": 1,
+          "sample_numbered_line_carries": 2238575,
+          "projected_token_turns": 203037125.78288418,
+          "projected_variance": 1316996448702.7432,
+          "token_turns_sample_count_expansion": 208745355.33,
+          "upper_carry_token_turns": 884364064.3035431
+        }
+      }
+    },
+    "under_1k": {
+      "population": 4732,
+      "rows_with_full_result_carry": 4726,
+      "numbered_lines": 78317,
+      "numbered_line_carries": 2152790,
+      "upper_numbered_line_carries": 10654387,
+      "padding_run_carries": 2152790,
+      "padding_bytes_carried": 7018782,
+      "sample_size": 1500,
+      "options": {
+        "unpad": {
+          "per_result_tokens_saved": {
+            "p50": 36,
+            "p90": 50,
+            "p99": 64,
+            "max": 80
+          },
+          "per_result_mean_tokens_saved": 32.164,
+          "rows_with_savings": 1500,
+          "rows_with_growth": 0,
+          "sample_numbered_line_carries": 672490,
+          "projected_token_turns": 4251015.16550432,
+          "projected_variance": 167572149.0525268,
+          "token_turns_sample_count_expansion": 4189192.28,
+          "upper_carry_token_turns": 21041699.34250286
+        },
+        "range": {
+          "per_result_tokens_saved": {
+            "p50": 53,
+            "p90": 83,
+            "p99": 115,
+            "max": 167
+          },
+          "per_result_mean_tokens_saved": 50.89333333333333,
+          "rows_with_savings": 1428,
+          "rows_with_growth": 72,
+          "sample_numbered_line_carries": 672490,
+          "projected_token_turns": 6719330.442549332,
+          "projected_variance": 1189395855.3856044,
+          "token_turns_sample_count_expansion": 6621610.632,
+          "upper_carry_token_turns": 33345336.37962291
+        }
+      }
+    },
+    "16k_to_32k": {
+      "population": 8654,
+      "rows_with_full_result_carry": 8638,
+      "numbered_lines": 3536003,
+      "numbered_line_carries": 69325942,
+      "upper_numbered_line_carries": 163701592,
+      "padding_run_carries": 69325942,
+      "padding_bytes_carried": 189500980,
+      "sample_size": 1500,
+      "options": {
+        "unpad": {
+          "per_result_tokens_saved": {
+            "p50": 800,
+            "p90": 1080,
+            "p99": 1426,
+            "max": 1600
+          },
+          "per_result_mean_tokens_saved": 792.37,
+          "rows_with_savings": 1500,
+          "rows_with_growth": 0,
+          "sample_numbered_line_carries": 11630869,
+          "projected_token_turns": 137150526.22744423,
+          "projected_variance": 85751430882.72426,
+          "token_turns_sample_count_expansion": 132751517.67733334,
+          "upper_carry_token_turns": 323873891.8339236
+        },
+        "range": {
+          "per_result_tokens_saved": {
+            "p50": 1370,
+            "p90": 2011,
+            "p99": 2543,
+            "max": 3098
+          },
+          "per_result_mean_tokens_saved": 1408.9813333333334,
+          "rows_with_savings": 1491,
+          "rows_with_growth": 9,
+          "sample_numbered_line_carries": 11630869,
+          "projected_token_turns": 243103198.67140606,
+          "projected_variance": 1124742388113.7798,
+          "token_turns_sample_count_expansion": 235305831.21733335,
+          "upper_carry_token_turns": 577949020.6683664
+        }
+      }
+    },
+    "32k_to_64k": {
+      "population": 1635,
+      "rows_with_full_result_carry": 1632,
+      "numbered_lines": 1216391,
+      "numbered_line_carries": 24228894,
+      "upper_numbered_line_carries": 51002164,
+      "padding_run_carries": 24228894,
+      "padding_bytes_carried": 63048374,
+      "sample_size": 1500,
+      "options": {
+        "unpad": {
+          "per_result_tokens_saved": {
+            "p50": 1520,
+            "p90": 2180,
+            "p99": 2738,
+            "max": 3000
+          },
+          "per_result_mean_tokens_saved": 1458.1313333333333,
+          "rows_with_savings": 1500,
+          "rows_with_growth": 0,
+          "sample_numbered_line_carries": 22206390,
+          "projected_token_turns": 47636927.79340784,
+          "projected_variance": 2111185879.3990743,
+          "token_turns_sample_count_expansion": 47589880.69,
+          "upper_carry_token_turns": 99919033.78304864
+        },
+        "range": {
+          "per_result_tokens_saved": {
+            "p50": 2788,
+            "p90": 3992,
+            "p99": 5052,
+            "max": 6269
+          },
+          "per_result_mean_tokens_saved": 2684.3886666666667,
+          "rows_with_savings": 1482,
+          "rows_with_growth": 18,
+          "sample_numbered_line_carries": 22206390,
+          "projected_token_turns": 86995138.6942056,
+          "projected_variance": 13069744564.101784,
+          "token_turns_sample_count_expansion": 86909220.7,
+          "upper_carry_token_turns": 183972330.40134075
+        }
+      }
+    },
+    "64k_or_more": {
+      "population": 163,
+      "rows_with_full_result_carry": 163,
+      "numbered_lines": 207211,
+      "numbered_line_carries": 3933218,
+      "upper_numbered_line_carries": 4661819,
+      "padding_run_carries": 3933218,
+      "padding_bytes_carried": 9558194,
+      "sample_size": 163,
+      "options": {
+        "unpad": {
+          "per_result_tokens_saved": {
+            "p50": 2800,
+            "p90": 4000,
+            "p99": 4572,
+            "max": 5200
+          },
+          "per_result_mean_tokens_saved": 2514.674846625767,
+          "rows_with_savings": 163,
+          "rows_with_growth": 0,
+          "sample_numbered_line_carries": 3933218,
+          "projected_token_turns": 7815436.0,
+          "projected_variance": 0.0,
+          "token_turns_sample_count_expansion": 7815436.0,
+          "upper_carry_token_turns": 9247438.0
+        },
+        "range": {
+          "per_result_tokens_saved": {
+            "p50": 5396,
+            "p90": 7465,
+            "p99": 8319,
+            "max": 10035
+          },
+          "per_result_mean_tokens_saved": 4781.472392638037,
+          "rows_with_savings": 155,
+          "rows_with_growth": 8,
+          "sample_numbered_line_carries": 3933218,
+          "projected_token_turns": 14853983.0,
+          "projected_variance": 0.0,
+          "token_turns_sample_count_expansion": 14853983.0,
+          "upper_carry_token_turns": 17614060.0
+        }
+      }
+    }
+  },
+  "projected": {
+    "unpad": {
+      "projected_token_turns": 734398413.942497,
+      "token_turns_sample_count_expansion": 731554147.1006666,
+      "upper_carry_token_turns": 2286077280.983259,
+      "sampling_interval_95": [
+        730038464.7305405,
+        738758363.1544535
+      ]
+    },
+    "range": {
+      "projected_token_turns": 1305559397.6273863,
+      "token_turns_sample_count_expansion": 1300451791.3793333,
+      "upper_carry_token_turns": 4091022689.7374983,
+      "sampling_interval_95": [
+        1297280121.91363,
+        1313838673.3411427
+      ]
+    }
+  }
+}
