@@ -9288,6 +9288,14 @@ fn quarantine_has_open_descriptors_with_info_reader_until(
 }
 
 #[cfg(target_os = "linux")]
+fn initial_linux_descriptor_link_gap(error: &std::io::Error) -> CloseWriterGap {
+    match error.kind() {
+        std::io::ErrorKind::PermissionDenied => CloseWriterGap::Unavailable,
+        _ => CloseWriterGap::DescriptorChanged,
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_has_open_descriptors_with_info_reader_until_scoped(
     path: &Path,
     proc_root: &Path,
@@ -9321,7 +9329,7 @@ fn quarantine_has_open_descriptors_with_info_reader_until_scoped(
                 writer_scan_check(deadline)?;
                 let candidate = candidate_result.map_err(|error| {
                     linux_writer_io_diagnostic("fd_read_link", &descriptor.path(), &error);
-                    CloseWriterGap::DescriptorChanged
+                    initial_linux_descriptor_link_gap(&error)
                 })?;
                 if !path_is_within(&candidate, canonical) {
                     return Ok(None);
@@ -20968,6 +20976,25 @@ mod tests {
             "pos:\t0\nflags:\t0100000\n",
         )
         .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_first_descriptor_link_distinguishes_denial_from_identity_loss() {
+        for errno in [libc::EACCES, libc::EPERM] {
+            let reason = super::initial_linux_descriptor_link_gap(
+                &std::io::Error::from_raw_os_error(errno),
+            );
+            assert_eq!(reason, super::CloseWriterGap::Unavailable);
+            assert!(super::is_residual_process_gap(reason));
+        }
+        for errno in [libc::ENOENT, libc::EIO] {
+            let reason = super::initial_linux_descriptor_link_gap(
+                &std::io::Error::from_raw_os_error(errno),
+            );
+            assert_eq!(reason, super::CloseWriterGap::DescriptorChanged);
+            assert!(!super::is_residual_process_gap(reason));
+        }
     }
 
     #[cfg(target_os = "linux")]
