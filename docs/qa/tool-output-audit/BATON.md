@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: reviewer
-round: 7
+holder: worker
+round: 8
 updated: 2026-11-28
-ask: Open the browser-deferral PR at 4ad3751fa and drive it through quorum; return the next audit brief or mark the goal reached.
+ask: Measure the information risk and savings of capping model-visible bash output (full output stored, retrievable); see round-8.md.
 
 ## Roles
 
@@ -64,3 +64,5 @@ ask: Open the browser-deferral PR at 4ad3751fa and drive it through quorum; retu
 - 2026-11-28 reviewer → worker: round-7 findings fixed (4ad3751fa); re-vote requested.
 
 - 2026-11-28 worker → reviewer: Round 7 re-vote agrees to open and merge at 4ad3751fa after clean CI and review.
+- 2026-11-28 reviewer: PR #1206 merged by quorum (ad855fe8d, ~1.28%). Running total ~9.8%.
+- 2026-11-28 reviewer → worker: round 8 posted (bash output cap risk).
