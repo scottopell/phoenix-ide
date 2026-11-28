@@ -10421,9 +10421,11 @@ fn both_worktree_paths_absent(path: &Path, quarantine: &Path) -> Result<bool, St
 }
 
 fn planned_administrative_dir_is_absent(path: &Path) -> Result<bool, String> {
-    path_entry_exists(path).map(|exists| !exists).map_err(|error| {
-        format!("cannot observe planned worktree administrative directory: {error}")
-    })
+    path_entry_exists(path)
+        .map(|exists| !exists)
+        .map_err(|error| {
+            format!("cannot observe planned worktree administrative directory: {error}")
+        })
 }
 
 fn complete_retained_absence_cleanup(
@@ -15736,8 +15738,9 @@ mod tests {
             let admin_quarantine =
                 super::administrative_dir_quarantine_path(&planned_admin, incarnation).unwrap();
             std::os::unix::fs::symlink(temp.path().join("missing"), &admin_quarantine).unwrap();
-            let error = super::remove_exact_worktree_administrative_dir(&planned_admin, incarnation)
-                .unwrap_err();
+            let error =
+                super::remove_exact_worktree_administrative_dir(&planned_admin, incarnation)
+                    .unwrap_err();
             assert!(error.contains("administrative registration is not a directory"));
             assert!(super::path_entry_exists(&admin_quarantine).unwrap());
         }

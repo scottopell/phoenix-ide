@@ -22212,7 +22212,10 @@ mod tests {
             claim(&replacement, &exact_plan),
             claim(&replacement, &exact_plan),
         );
-        let first = match (left.established().unwrap().unwrap(), right.established().unwrap().unwrap()) {
+        let first = match (
+            left.established().unwrap().unwrap(),
+            right.established().unwrap().unwrap(),
+        ) {
             (
                 LegacyRetryWorktreeClaimRelease::First(first),
                 LegacyRetryWorktreeClaimRelease::Replay,
@@ -22227,11 +22230,13 @@ mod tests {
         assert_eq!(first.scope(), &scope);
         assert_eq!(first.snapshot(), &replacement);
         assert_eq!(first.resource(), &worktree.resource);
-        assert!(sqlx::query("PRAGMA foreign_key_check(close_legacy_retry_worktree_claims)")
-            .fetch_optional(db.pool())
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check(close_legacy_retry_worktree_claims)")
+                .fetch_optional(db.pool())
+                .await
+                .unwrap()
+                .is_none()
+        );
         // The later generation may succeed without rewriting the G1 residual.
         // Original-bound reads must not substitute this conflicting G2 receipt.
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
