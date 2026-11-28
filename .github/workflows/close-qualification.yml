@@ -180,6 +180,7 @@ jobs:
             shared_close_inspection_distinguishes_absence_from_quarantine_probe_failure \
             external_writer_detector_gap_does_not_mask_independent_evidence_or_target_failure \
             stranded_generic_dispatch_cannot_reenter_original_worktree \
+            recorded_final_tombstone_root_only_refuses_original_checkout \
             generic_close_worker_survives_waiter_drop_and_serializes_reinspection \
             public_close_observes_unprepared_attempt_without_advancing_it \
             concurrent_initial_observes_winner_but_later_http_close_sees_history \

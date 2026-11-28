@@ -7800,73 +7800,35 @@ where
                     ));
                 }
             };
-            match (captured_exists, quarantine_exists) {
-                    (true, false) => {
-                        if observe_worktree_fingerprint(&captured_path).as_deref()
-                            != Some(expected_identity)
-                        {
-                            return FinalTombstoneRecovery::Residual(
-                                "captured worktree does not match recorded final tombstone identity; preserved for manual repair".to_string(),
-                            );
-                        }
-                        let tombstone_object = tombstone.root.join("object");
-                        if let Err(error) = std::fs::rename(&captured_path, &tombstone_object) {
-                            return FinalTombstoneRecovery::Residual(format!(
-                                "cannot resume recorded final tombstone pre-rename state: {error}"
-                            ));
-                        }
-                        let metadata = match std::fs::symlink_metadata(&tombstone_object) {
-                            Ok(metadata) => metadata,
-                            Err(error) => {
-                                return FinalTombstoneRecovery::Residual(format!(
-                                    "cannot identify resumed final tombstone object: {error}"
-                                ))
-                            }
-                        };
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::fs::MetadataExt as _;
-                            (metadata.dev(), metadata.ino())
-                        }
-                        #[cfg(not(unix))]
-                        unreachable!()
-                    }
-                    (false, false) => {
-                        let mut object_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-                        // SAFETY: root_fd is a verified owned directory descriptor, name is a valid C string,
-                        // and object_stat points to writable storage.
-                        let status = unsafe {
-                            libc::fstatat(
-                                root_fd.as_raw_fd(),
-                                name.as_ptr(),
-                                object_stat.as_mut_ptr(),
-                                libc::AT_SYMLINK_NOFOLLOW,
-                            )
-                        };
-                        if status == 0 {
-                            return FinalTombstoneRecovery::Residual(
-                                "unbound object remains inside the exact final tombstone root; preserved for manual repair".to_string(),
-                            );
-                        }
-                        let error = std::io::Error::last_os_error();
-                        if error.raw_os_error() == Some(libc::ENOENT) {
-                            return FinalTombstoneRecovery::Completed;
-                        }
-                        return FinalTombstoneRecovery::Residual(format!(
-                            "cannot inspect unbound final tombstone object: {error}"
-                        ));
-                    }
-                    (true, true) => {
-                        return FinalTombstoneRecovery::Residual(
-                            "captured and quarantined worktree paths are both present during final tombstone recovery; preserved for manual repair".to_string(),
-                        )
-                    }
-                    (false, true) => {
-                        return FinalTombstoneRecovery::Residual(
-                            "recorded final tombstone object identity is absent and only quarantine remains; preserved for manual repair".to_string(),
-                        )
-                    }
-                }
+            if captured_exists || quarantine_exists {
+                return FinalTombstoneRecovery::Residual(
+                    "a worktree path is present during retained tombstone recovery; preserved for manual repair"
+                        .to_string(),
+                );
+            }
+            let mut object_stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: root_fd is the verified directory, name is a valid C string,
+            // and object_stat points to writable storage.
+            let status = unsafe {
+                libc::fstatat(
+                    root_fd.as_raw_fd(),
+                    name.as_ptr(),
+                    object_stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if status == 0 {
+                return FinalTombstoneRecovery::Residual(
+                    "unbound object remains inside the exact final tombstone root; preserved for manual repair".to_string(),
+                );
+            }
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ENOENT) {
+                return FinalTombstoneRecovery::Completed;
+            }
+            return FinalTombstoneRecovery::Residual(format!(
+                "cannot inspect unbound final tombstone object: {error}"
+            ));
         }
         _ => return FinalTombstoneRecovery::Residual(
             "recorded final tombstone object identity is incomplete; preserved for manual repair"
@@ -19254,7 +19216,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn recorded_final_tombstone_root_only_resumes_pre_rename() {
+    fn recorded_final_tombstone_root_only_refuses_original_checkout() {
         use std::os::unix::fs::MetadataExt as _;
 
         let temp = tempfile::tempdir().unwrap();
@@ -19273,13 +19235,19 @@ mod tests {
             object_inode: None,
         };
 
-        let recovery = resume_tombstone_with_no_external_writer(&recorded, &identity, &confirmed);
-        assert!(
-            matches!(recovery, FinalTombstoneRecovery::Completed),
-            "{recovery:?}"
+        let recovery = super::resume_final_worktree_tombstone_with_writer_probe(
+            &recorded,
+            &identity,
+            &confirmed,
+            |_| panic!("a retained-only retry cannot move the original into the tombstone"),
         );
-        assert!(!target.exists());
-        assert!(!recorded.root.exists());
+        assert!(matches!(
+            recovery,
+            FinalTombstoneRecovery::Residual(detail) if detail.contains("a worktree path is present")
+        ));
+        assert!(target.join(".git").exists());
+        assert!(recorded.root.is_dir());
+        assert!(!recorded.root.join("object").exists());
     }
 
     #[cfg(unix)]
