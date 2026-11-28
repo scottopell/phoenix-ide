@@ -1947,6 +1947,23 @@ async fn validate_topology_tx(
     Ok(())
 }
 
+pub(crate) async fn require_control_target_latest_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    target: &ProductConversationId,
+    latest: &TranscriptConversationId,
+) -> DbResult<()> {
+    let current = read_topology_tx(tx, target)
+        .await?
+        .ok_or_else(|| close_precondition("Close target topology is missing"))?;
+    if current.latest.id != latest.as_str() {
+        return Err(DbError::CloseFoundationStaleLatest {
+            expected: latest.as_str().to_owned(),
+            actual: current.latest.id,
+        });
+    }
+    Ok(())
+}
+
 fn validate_begin_preconditions(
     topology: &CloseFoundationTopology,
     addressed_id: &str,
@@ -2726,6 +2743,41 @@ impl Database {
         let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
         tx.commit().await?;
         Ok(obligation)
+    }
+
+    /// Confirms stop-work for the exact generic target and hands the committed
+    /// settlement to the same worker used by Initial and background settlement.
+    pub async fn confirm_generic_close_stop_work(
+        &self,
+        target: &ProductConversationId,
+        target_latest: &TranscriptConversationId,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<GenericCloseSettlement> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current =
+            Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+        if current.product_conversation_id() != target {
+            return Err(close_precondition(
+                "Close stop-work target does not own the attempt",
+            ));
+        }
+        require_control_target_latest_tx(&mut tx, target, target_latest).await?;
+        let captured_latest: String = sqlx::query_scalar(
+            "SELECT conversation_id FROM close_attempt_members
+             WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if captured_latest != target_latest.as_str() {
+            return Err(close_precondition(
+                "Close stop-work transcript does not match the captured latest member",
+            ));
+        }
+        Self::begin_close_active_work_settlement_tx(&mut tx, attempt_id.as_str(), &current).await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        tx.commit().await?;
+        Ok(GenericCloseSettlement { obligation })
     }
 
     pub async fn begin_close_active_work_settlement(
@@ -9953,6 +10005,58 @@ mod tests {
                 .unwrap()
                 .phase(),
             ClosePhase::SettlingActiveWork
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_stop_confirmation_hands_off_only_the_exact_target() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_root(&db, "other").await;
+        let target = product_id("root");
+        let latest = transcript_id("root");
+        let attempt_id = CloseAttemptId::parse("attempt-generic-confirm").unwrap();
+        db.begin_close_foundation(&target, &latest, attempt_id.as_str())
+            .await
+            .unwrap();
+        db.confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            db.confirm_generic_close_stop_work(
+                &product_id("other"),
+                &transcript_id("other"),
+                &attempt_id,
+            )
+            .await,
+            Err(DbError::CloseFoundationPrecondition(_))
+        ));
+        assert!(matches!(
+            db.confirm_generic_close_stop_work(&target, &transcript_id("other"), &attempt_id)
+                .await,
+            Err(DbError::CloseFoundationStaleLatest { .. })
+        ));
+        assert!(db
+            .list_pending_generic_close_settlements(Some(&attempt_id))
+            .await
+            .unwrap()
+            .is_empty());
+
+        let settlement = db
+            .confirm_generic_close_stop_work(&target, &latest, &attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(settlement.obligation().attempt_id(), &attempt_id);
+        assert_eq!(
+            settlement.obligation().phase(),
+            ClosePhase::SettlingActiveWork
+        );
+        assert_eq!(
+            db.list_pending_generic_close_settlements(Some(&attempt_id))
+                .await
+                .unwrap(),
+            vec![settlement]
         );
     }
 

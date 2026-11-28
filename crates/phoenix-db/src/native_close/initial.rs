@@ -15,7 +15,7 @@ use super::{
     CloseTargetControlResolution, NativeCloseCommand, NativeCloseInitialControl,
     NativeCloseInitialControlRoute, NativeCloseIntent,
 };
-use crate::close_foundation::ensure_close_retirement_loss_free_tx;
+use crate::close_foundation::{ensure_close_retirement_loss_free_tx, require_control_target_latest_tx};
 use crate::workflow::LocalAuthorityResult;
 use crate::{
     BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
@@ -2673,23 +2673,6 @@ pub(super) async fn require_initial_identity_tx(
         ));
     }
     Ok(admitted)
-}
-
-async fn require_control_target_latest_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    target: &ProductConversationId,
-    latest: &TranscriptConversationId,
-) -> DbResult<()> {
-    let current = crate::close_foundation::read_topology_tx(tx, target)
-        .await?
-        .ok_or_else(|| DbError::CloseFoundationPrecondition("Close target topology is missing".into()))?;
-    if current.latest.id != latest.as_str() {
-        return Err(DbError::CloseFoundationStaleLatest {
-            expected: latest.as_str().to_owned(),
-            actual: current.latest.id,
-        });
-    }
-    Ok(())
 }
 
 async fn ensure_native_initial_cancel_unencumbered_tx(

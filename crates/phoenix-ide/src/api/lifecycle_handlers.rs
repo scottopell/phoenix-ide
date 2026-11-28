@@ -402,28 +402,32 @@ pub(crate) async fn confirm_close_stop_work(
         .await
         .map_err(super::handlers::map_admission_db_error)?;
     let guard = admission.lock().await;
-    require_close_target_latest(&state, &transcript.product_conversation_id, &id).await?;
-    state
+    let settlement = state
         .db
-        .begin_close_active_work_settlement(obligation.attempt_id().as_str())
+        .confirm_generic_close_stop_work(
+            &transcript.product_conversation_id,
+            &target_latest,
+            obligation.attempt_id(),
+        )
         .await
         .map_err(|error| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                error.to_string(),
-                "close_stop_work_confirmation_failed",
-            )))
+            let error_type = if matches!(error, crate::db::DbError::CloseFoundationStaleLatest { .. }) {
+                "inactive_close_transcript"
+            } else {
+                "close_stop_work_confirmation_failed"
+            };
+            close_target_control_conflict(error.to_string(), error_type)
         })?;
     drop(guard);
-    state
+    let worker = state
         .runtime
-        .resume_close_settlements(Some(obligation.attempt_id()))
+        .start_generic_close_settlement(settlement)
         .await
-        .map_err(|error| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                error,
-                "close_settlement_in_progress",
-            )))
-        })?;
+        .map_err(|error| close_target_control_conflict(error, "close_settlement_in_progress"))?;
+    worker
+        .await
+        .unwrap_or_else(|error| Err(format!("Close settlement worker failed: {error}")))
+        .map_err(|error| close_target_control_conflict(error, "close_settlement_in_progress"))?;
     let refreshed = state
         .db
         .get_close_obligation(obligation.attempt_id().as_str())

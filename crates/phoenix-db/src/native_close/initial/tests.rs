@@ -2229,6 +2229,25 @@ async fn prepared_native_initial_is_not_generic_settlement_work() {
             if message.contains("owned by native Close execution")
     ));
     let attempt = receipt.admitted.attempt_id.as_str();
+    let latest: String = sqlx::query_scalar(
+        "SELECT conversation_id FROM close_attempt_members
+         WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+    )
+    .bind(attempt)
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    let latest = TranscriptConversationId::parse(latest).unwrap();
+    assert!(matches!(
+        f.db.confirm_generic_close_stop_work(
+            &f.target,
+            &latest,
+            &receipt.admitted.attempt_id,
+        )
+        .await,
+        Err(DbError::CloseFoundationPrecondition(message))
+            if message.contains("owned by native Close execution")
+    ));
     for result in [
         f.db.begin_close_idle_settlement(attempt).await,
         f.db.begin_close_active_work_settlement(attempt).await,
@@ -2238,7 +2257,7 @@ async fn prepared_native_initial_is_not_generic_settlement_work() {
         assert!(matches!(
             result,
             Err(DbError::CloseFoundationPrecondition(message))
-                if message.contains("owned by native initial Close settlement")
+                if message.contains("owned by native Close execution")
         ));
     }
     assert!(f
@@ -2783,7 +2802,7 @@ async fn initial_execution_preserves_captured_busy_decision_without_confirming_w
         assert!(matches!(
             result,
             Err(DbError::CloseFoundationPrecondition(message))
-                if message.contains("owned by native initial Close settlement")
+                if message.contains("owned by native Close execution")
         ));
     }
     let phase: String =
