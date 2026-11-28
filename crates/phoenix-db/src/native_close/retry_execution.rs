@@ -131,6 +131,7 @@ struct NativeCloseRetryAuthority {
     pending: Vec<CloseSafeRetryEffect>,
 }
 
+#[derive(Clone, Copy)]
 enum NativeCloseRetryDispatchKind {
     Worktree,
     Tmux,

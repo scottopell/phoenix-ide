@@ -3223,31 +3223,12 @@ impl RuntimeManager {
                                 )
                                 .await?;
                             let recovery = tokio::task::spawn_blocking(move || {
-                                require_retained_worktree_claim(claim, &writer_probe, &identity)?;
-                                if !both_worktree_paths_absent(
-                                    &worktree_path(&identity),
-                                    &worktree_quarantine_path(&identity)?,
-                                )? {
-                                    return Err(
-                                        "worktree paths changed before retained cleanup".into()
-                                    );
-                                }
-                                match resume_final_worktree_tombstone(
-                                    cleanup_plan
-                                        .final_tombstone
-                                        .as_ref()
-                                        .expect("filtered above"),
+                                complete_retained_absence_cleanup(
+                                    claim,
                                     &identity,
                                     &confirmed_snapshot,
+                                    &cleanup_plan,
                                     writer_probe,
-                                ) {
-                                    FinalTombstoneRecovery::Completed => {}
-                                    FinalTombstoneRecovery::Residual(detail) => return Err(detail),
-                                }
-                                complete_persisted_worktree_administrative_cleanup(
-                                    &identity,
-                                    &cleanup_plan.administrative_dir,
-                                    &cleanup_plan.administrative_dir_incarnation,
                                 )
                             })
                             .await;
@@ -3387,32 +3368,12 @@ impl RuntimeManager {
                                 )
                                 .await?;
                             let recovery = tokio::task::spawn_blocking(move || {
-                                require_retained_worktree_claim(claim, &writer_probe, &identity)?;
-                                if !both_worktree_paths_absent(
-                                    &worktree_path(&identity),
-                                    &worktree_quarantine_path(&identity)?,
-                                )? {
-                                    return Err(
-                                        "worktree paths changed before retained cleanup".into()
-                                    );
-                                }
-                                if let Some(tombstone) = &cleanup_plan.final_tombstone {
-                                    match resume_final_worktree_tombstone(
-                                        tombstone,
-                                        &identity,
-                                        &confirmed_snapshot,
-                                        writer_probe,
-                                    ) {
-                                        FinalTombstoneRecovery::Completed => {}
-                                        FinalTombstoneRecovery::Residual(detail) => {
-                                            return Err(detail);
-                                        }
-                                    }
-                                }
-                                complete_persisted_worktree_administrative_cleanup(
+                                complete_retained_absence_cleanup(
+                                    claim,
                                     &identity,
-                                    &cleanup_plan.administrative_dir,
-                                    &cleanup_plan.administrative_dir_incarnation,
+                                    &confirmed_snapshot,
+                                    &cleanup_plan,
+                                    writer_probe,
                                 )
                             })
                             .await;
@@ -7755,7 +7716,7 @@ where
             std::io::Error::last_os_error().kind(),
             std::io::ErrorKind::NotFound
         );
-        let captured_missing = match captured_path.try_exists() {
+        let captured_missing = match path_entry_exists(&captured_path) {
             Ok(exists) => !exists,
             Err(error) => {
                 return FinalTombstoneRecovery::Residual(format!(
@@ -7763,7 +7724,7 @@ where
                 ));
             }
         };
-        let quarantine_missing = match quarantine_path.try_exists() {
+        let quarantine_missing = match path_entry_exists(&quarantine_path) {
             Ok(exists) => !exists,
             Err(error) => {
                 return FinalTombstoneRecovery::Residual(format!(
@@ -7819,7 +7780,7 @@ where
     ) {
         (Some(device), Some(inode)) => (device, inode),
         (None, None) => {
-            let captured_exists = match captured_path.try_exists() {
+            let captured_exists = match path_entry_exists(&captured_path) {
                 Ok(exists) => exists,
                 Err(error) => {
                     return FinalTombstoneRecovery::Residual(format!(
@@ -7827,7 +7788,7 @@ where
                     ));
                 }
             };
-            let quarantine_exists = match quarantine_path.try_exists() {
+            let quarantine_exists = match path_entry_exists(&quarantine_path) {
                 Ok(exists) => exists,
                 Err(error) => {
                     return FinalTombstoneRecovery::Residual(format!(
@@ -8175,10 +8136,8 @@ where
     check_directory_deletion_deadline(deadline)?;
     let quarantine = administrative_dir_quarantine_path(administrative_dir, expected_incarnation)?;
     reject_administrative_final_tombstone_residuals(&quarantine, deadline)?;
-    let source_exists = administrative_dir
-        .try_exists()
-        .map_err(|error| error.to_string())?;
-    let quarantine_exists = quarantine.try_exists().map_err(|error| error.to_string())?;
+    let source_exists = path_entry_exists(administrative_dir).map_err(|error| error.to_string())?;
+    let quarantine_exists = path_entry_exists(&quarantine).map_err(|error| error.to_string())?;
     check_directory_deletion_deadline(deadline)?;
     let deletion_target = match (source_exists, quarantine_exists) {
         (false, false) => return Ok(()),
@@ -10443,20 +10402,74 @@ fn quarantine_has_writable_mappings_until(
     result
 }
 
+fn path_entry_exists(path: &Path) -> std::io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn both_worktree_paths_absent(path: &Path, quarantine: &Path) -> Result<bool, String> {
-    let path_exists = path.try_exists().map_err(|error| {
+    let path_exists = path_entry_exists(path).map_err(|error| {
         format!("cannot observe captured worktree path before retirement: {error}")
     })?;
-    let quarantine_exists = quarantine.try_exists().map_err(|error| {
+    let quarantine_exists = path_entry_exists(quarantine).map_err(|error| {
         format!("cannot observe quarantined worktree path before retirement: {error}")
     })?;
     Ok(!path_exists && !quarantine_exists)
 }
 
 fn planned_administrative_dir_is_absent(path: &Path) -> Result<bool, String> {
-    path.try_exists().map(|exists| !exists).map_err(|error| {
+    path_entry_exists(path).map(|exists| !exists).map_err(|error| {
         format!("cannot observe planned worktree administrative directory: {error}")
     })
+}
+
+fn complete_retained_absence_cleanup(
+    claim: crate::db::FirstLegacyRetryWorktreeClaim,
+    identity: &WorktreeIdentity,
+    confirmed_snapshot: &CloseRetirementSnapshot,
+    plan: &crate::db::CloseWorktreeCleanupPlan,
+    writer_probe: CloseWriterProbe,
+) -> Result<(), String> {
+    require_retained_worktree_claim(claim, &writer_probe, identity)?;
+    validate_cleanup_plan_registration_incarnation(identity, &plan.administrative_dir)?;
+    let common = plan
+        .administrative_dir
+        .parent()
+        .filter(|parent| parent.file_name().is_some_and(|name| name == "worktrees"))
+        .and_then(Path::parent)
+        .ok_or_else(|| "retained registration has no Git common directory".to_string())?;
+    let incarnation = observe_administrative_dir_incarnation(common)?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let _repository_lock = RepositoryMutationLock::acquire_common_directory_until(common, deadline)
+        .map_err(|(message, _)| message)?;
+    if observe_administrative_dir_incarnation(common)? != incarnation {
+        return Err("retained worktree repository changed while acquiring its lock".into());
+    }
+    let path = worktree_path(identity);
+    let quarantine = worktree_quarantine_path(identity)?;
+    let require_absence = || {
+        if !both_worktree_paths_absent(&path, &quarantine)? {
+            return Err("worktree paths changed before retained cleanup".to_string());
+        }
+        Ok(())
+    };
+    require_absence()?;
+    if let Some(tombstone) = &plan.final_tombstone {
+        match resume_final_worktree_tombstone(tombstone, identity, confirmed_snapshot, writer_probe)
+        {
+            FinalTombstoneRecovery::Completed => {}
+            FinalTombstoneRecovery::Residual(detail) => return Err(detail),
+        }
+        require_absence()?;
+    }
+    complete_persisted_worktree_administrative_cleanup(
+        identity,
+        &plan.administrative_dir,
+        &plan.administrative_dir_incarnation,
+    )
 }
 
 fn complete_persisted_worktree_administrative_cleanup(
@@ -10821,11 +10834,9 @@ where
     let confirmed_fingerprint = confirmed_snapshot.fingerprint().to_string();
     tokio::task::spawn_blocking(move || {
         let _repository_lock = repository_lock;
-        let original_exists = path
-            .try_exists()
+        let original_exists = path_entry_exists(&path)
             .map_err(|error| format!("cannot observe captured worktree: {error}"))?;
-        let quarantine_exists = quarantine
-            .try_exists()
+        let quarantine_exists = path_entry_exists(&quarantine)
             .map_err(|error| format!("cannot observe quarantined worktree: {error}"))?;
         let resuming_quarantine = !original_exists && quarantine_exists;
         if !original_exists && !resuming_quarantine {
@@ -15709,6 +15720,27 @@ mod tests {
         std::fs::create_dir(&quarantine).unwrap();
         assert!(!both_worktree_paths_absent(&captured, &quarantine).unwrap());
         std::fs::remove_dir(&quarantine).unwrap();
+        #[cfg(unix)]
+        for replacement in [&captured, &quarantine, &planned_admin] {
+            std::os::unix::fs::symlink(temp.path().join("missing"), replacement).unwrap();
+            if replacement == &planned_admin {
+                assert!(!planned_administrative_dir_is_absent(&planned_admin).unwrap());
+            } else {
+                assert!(!both_worktree_paths_absent(&captured, &quarantine).unwrap());
+            }
+            std::fs::remove_file(replacement).unwrap();
+        }
+        #[cfg(unix)]
+        {
+            let incarnation = "git_admin_dir_v1:1:2";
+            let admin_quarantine =
+                super::administrative_dir_quarantine_path(&planned_admin, incarnation).unwrap();
+            std::os::unix::fs::symlink(temp.path().join("missing"), &admin_quarantine).unwrap();
+            let error = super::remove_exact_worktree_administrative_dir(&planned_admin, incarnation)
+                .unwrap_err();
+            assert!(error.contains("administrative registration is not a directory"));
+            assert!(super::path_entry_exists(&admin_quarantine).unwrap());
+        }
         std::fs::create_dir(&planned_admin).unwrap();
         assert!(!planned_administrative_dir_is_absent(&planned_admin).unwrap());
     }

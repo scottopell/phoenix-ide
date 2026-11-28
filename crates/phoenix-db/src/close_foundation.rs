@@ -9724,6 +9724,10 @@ impl Database {
             }
             Self::require_no_retained_legacy_creation_for_attempt_tx(&mut tx, attempt_id).await?;
             ensure_close_retirement_loss_free_tx(&mut tx, attempt_id.as_str()).await?;
+            Self::require_original_worktree_unsettled_tx(
+                &mut tx, attempt_id, scope, snapshot, resource,
+            )
+            .await?;
             if Self::read_close_worktree_cleanup_plan(&mut *tx, attempt_id, scope, snapshot, resource)
                 .await?
                 .as_ref() != Some(expected_plan)
@@ -20723,37 +20727,19 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut other_plan = exact_plan.clone();
-        other_plan.administrative_dir.push("different-registration");
-        let claim = |plan| {
+        assert!(matches!(
             db.claim_generic_legacy_retry_worktree(
                 &admission,
                 &request.scope,
                 &request.snapshot,
                 &request.resource,
-                plan,
+                &exact_plan,
             )
-        };
-        assert!(claim(&other_plan).await.established().unwrap().is_err());
-        let (left, right) = tokio::join!(claim(&exact_plan), claim(&exact_plan));
-        let first = match (
-            left.established().unwrap().unwrap(),
-            right.established().unwrap().unwrap(),
-        ) {
-            (
-                LegacyRetryWorktreeClaimRelease::First(first),
-                LegacyRetryWorktreeClaimRelease::Replay,
-            )
-            | (
-                LegacyRetryWorktreeClaimRelease::Replay,
-                LegacyRetryWorktreeClaimRelease::First(first),
-            ) => first,
-            pair => panic!("expected exactly one retained cleanup claim, got {pair:?}"),
-        };
-        assert_eq!(first.attempt_id(), &request.attempt_id);
-        assert_eq!(first.scope(), &request.scope);
-        assert_eq!(first.snapshot(), &request.snapshot);
-        assert_eq!(first.resource(), &request.resource);
+            .await
+            .established(),
+            Some(Err(DbError::CloseFoundationPrecondition(detail)))
+                if detail.contains("native-managed attempt")
+        ));
         let before: i64 = sqlx::query_scalar(
             "SELECT dispatched_at_us FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
         )
@@ -22117,7 +22103,12 @@ mod tests {
         })
         .await
         .unwrap();
-        db.retry_close_retirement(&attempt).await.unwrap();
+        let admission = db
+            .admit_generic_legacy_close_retry(&attempt)
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
         let original_anchor: (String, String) = sqlx::query_as(
             "SELECT inspection_generation, inspection_fingerprint
              FROM close_original_retirement_anchors WHERE attempt_id = ?1",
@@ -22191,6 +22182,56 @@ mod tests {
             .list_close_retirement_inspections_for_snapshot(attempt.as_str(), &snapshot)
             .await
             .is_err());
+        let exact_plan = db
+            .close_worktree_cleanup_plan(&attempt, &scope, &replacement, &worktree.resource)
+            .await
+            .unwrap()
+            .unwrap();
+        let claim = |snapshot, plan| {
+            db.claim_generic_legacy_retry_worktree(
+                &admission,
+                &scope,
+                snapshot,
+                &worktree.resource,
+                plan,
+            )
+        };
+        let mut other_plan = exact_plan.clone();
+        other_plan.administrative_dir.push("different-registration");
+        assert!(matches!(
+            claim(&replacement, &other_plan).await.established(),
+            Some(Err(DbError::CloseFoundationPrecondition(detail)))
+                if detail.contains("cleanup plan changed")
+        ));
+        assert!(claim(&snapshot, &exact_plan)
+            .await
+            .established()
+            .unwrap()
+            .is_err());
+        let (left, right) = tokio::join!(
+            claim(&replacement, &exact_plan),
+            claim(&replacement, &exact_plan),
+        );
+        let first = match (left.established().unwrap().unwrap(), right.established().unwrap().unwrap()) {
+            (
+                LegacyRetryWorktreeClaimRelease::First(first),
+                LegacyRetryWorktreeClaimRelease::Replay,
+            )
+            | (
+                LegacyRetryWorktreeClaimRelease::Replay,
+                LegacyRetryWorktreeClaimRelease::First(first),
+            ) => first,
+            pair => panic!("expected one retained cleanup claim, got {pair:?}"),
+        };
+        assert_eq!(first.attempt_id(), &attempt);
+        assert_eq!(first.scope(), &scope);
+        assert_eq!(first.snapshot(), &replacement);
+        assert_eq!(first.resource(), &worktree.resource);
+        assert!(sqlx::query("PRAGMA foreign_key_check(close_legacy_retry_worktree_claims)")
+            .fetch_optional(db.pool())
+            .await
+            .unwrap()
+            .is_none());
         // The later generation may succeed without rewriting the G1 residual.
         // Original-bound reads must not substitute this conflicting G2 receipt.
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
@@ -22203,6 +22244,11 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(matches!(
+            claim(&replacement, &exact_plan).await.established(),
+            Some(Err(DbError::CloseFoundationPrecondition(detail)))
+                if detail.contains("positive retirement evidence")
+        ));
         let initial_run = CloseRunRef::initial(attempt.clone());
         assert!(db
             .read_stopped_close_original_retirement_proof(&initial_run)
