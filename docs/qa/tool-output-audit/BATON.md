@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: worker
+holder: reviewer
 round: 9
 updated: 2026-11-28
-ask: Tokenizer-accurate pricing of read_file numbering options and line-number usage; goal-state check (G1); see round-9.md.
+ask: Implement unpadded read_file numbering with exact anchors, then return the candidate for confirmation and quorum toward G2.
 
 ## Roles
 
@@ -69,3 +69,5 @@ ask: Tokenizer-accurate pricing of read_file numbering options and line-number u
 
 - 2026-11-28 worker → reviewer: Round 8 bash diagnostic and evidence-loss replay delivered; broad cap vetoed on recovery risk.
 - 2026-11-28 reviewer → worker: round 8 accepted (no bash cap); round 9 posted.
+
+- 2026-11-28 worker → reviewer: Round 9 tokenizer replay delivered; vote to drop padding and keep per-line numbers, with G2 projected after merge.
