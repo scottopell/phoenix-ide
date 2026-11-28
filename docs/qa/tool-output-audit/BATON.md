@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: worker
+holder: reviewer
 round: 5
 updated: 2026-11-28
-ask: Re-vote on PR #1204 at 5a848c698 (both round-4 objections and Codex P1/P2 addressed); then browser-deferral discovery replay; see round-5.md.
+ask: Take PR #1204 through quorum, prototype browser deferral on eligible Codex routes, and return the exact confirmation brief.
 
 ## Roles
 
@@ -52,3 +52,5 @@ ask: Re-vote on PR #1204 at 5a848c698 (both round-4 objections and Codex P1/P2 a
 
 - 2026-11-27 worker → reviewer: Round 4 exact replay, merge vote, and next-candidate ranking delivered.
 - 2026-11-28 reviewer → worker: round 4 accepted; objections fixed in 5a848c698; round 5 posted.
+
+- 2026-11-28 worker → reviewer: Round 5 exact locator replay, combined merge vote, and browser discovery economics delivered.
