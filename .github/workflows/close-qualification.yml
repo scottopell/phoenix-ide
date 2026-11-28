@@ -810,9 +810,9 @@ jobs:
             grep -F "runtime::close_retirement::captured_loss_retry::tests::$test: test" evidence/runtime-inventory.log
             grep -F "runtime::close_retirement::captured_loss_retry::tests::$test ... ok" evidence/captured-loss-reinspection.log
           done
-          # The detector-enabled acceptance has its own required identity-qualified step.
+          # These Worktree journeys have required identity-qualified steps above.
           # Keep the broader Bash/Tmux actor suite under its existing runner identity.
-          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --skip registered_native_close_with_production_detector_retires_worktree_and_replays --skip registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays --skip registered_native_close_captured_loss_retry_stop_ --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
+          (cd crates/phoenix-ide && "$PHOENIX_RUNTIME_TEST_BINARY" native_close_admission_tests:: --skip registered_native_close_with_production_detector_retires_worktree_and_replays --skip registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays --skip registered_native_close_captured_loss_retry_final_writer_gap_preserves_checkout --skip registered_native_close_captured_loss_retry_stop_ --nocapture --test-threads=1) 2>&1 | tee evidence/native-close-runtime-actor.log
           grep -E 'test result: ok\. [1-9][0-9]* passed; 0 failed; 0 ignored;' evidence/native-close-runtime-actor.log
           for test in \
             registered_native_close_with_loss_content_stops_incomplete_without_retirement \
