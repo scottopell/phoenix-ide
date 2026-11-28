@@ -133,6 +133,8 @@ jobs:
           set -euo pipefail
           evidence="$RUNNER_TEMP/close-http-evidence"
           for selector in \
+            generic_cancel_rejects_native_initial_before_reopening_resource_fences \
+            cancel_close_settles_only_the_requested_attempt_without_reclaiming_custody \
             shared_close_inspection_distinguishes_absence_from_quarantine_probe_failure \
             stranded_generic_dispatch_cannot_reenter_original_worktree \
             generic_close_worker_survives_waiter_drop_and_serializes_reinspection \

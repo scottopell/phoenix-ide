@@ -1425,7 +1425,7 @@ impl RuntimeManager {
             .discard_completed(attempt_id.as_str());
     }
 
-    pub(crate) async fn cancel_close_resource_leases(
+    async fn cancel_close_resource_leases(
         &self,
         attempt_id: &CloseAttemptId,
     ) -> Result<(), String> {
@@ -1444,12 +1444,26 @@ impl RuntimeManager {
             .close_retirement_execution
             .lock(attempt_id.as_str())
             .await;
-        self.cancel_close_resource_leases(attempt_id).await?;
+        let cancellation = self
+            .db()
+            .authorize_generic_close_cancellation(attempt_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.reopen_generic_close_cancellation_leases(&cancellation)
+            .await?;
         self.db()
-            .cancel_close_before_retirement(attempt_id.as_str())
+            .cancel_close_before_retirement(cancellation.attempt_id().as_str())
             .await
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    async fn reopen_generic_close_cancellation_leases(
+        &self,
+        cancellation: &crate::db::GenericCloseCancellation,
+    ) -> Result<(), String> {
+        self.cancel_close_resource_leases(cancellation.attempt_id())
+            .await
     }
 
     /// Builds the exact durable request from captured scopes and their original leases.

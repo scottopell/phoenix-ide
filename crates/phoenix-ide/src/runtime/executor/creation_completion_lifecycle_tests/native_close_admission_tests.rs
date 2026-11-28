@@ -2839,6 +2839,51 @@ async fn revoked_source_aborts_owned_collector_without_persisting_result() {
 }
 
 #[tokio::test]
+async fn generic_cancel_rejects_native_initial_before_reopening_resource_fences() {
+    use phoenix_core::domain::close::CloseRetirementSnapshot;
+
+    let fixture = CloseFixture::new().await;
+    let receipt = fixture.admitted().await;
+    let attempt = &receipt.admitted.attempt_id;
+    let scopes = fixture
+        .db
+        .list_close_attempt_scopes(attempt.as_str())
+        .await
+        .unwrap();
+    assert_eq!(scopes.len(), 1);
+    let scope = &scopes[0].scope;
+    let backend = CloseFixture::backend(fixture.db.clone());
+    let before = fixture
+        .db
+        .get_close_obligation(attempt.as_str())
+        .await
+        .unwrap();
+    // Acquire real registry fences without advancing the durable phase.
+    let snapshot =
+        CloseRetirementSnapshot::parse("cancel-fence-generation", "cancel-fence").unwrap();
+    backend
+        .prepare_close_retirement_inventory(attempt.clone(), snapshot)
+        .await
+        .unwrap();
+    assert_native_resource_admission_fenced(&backend, scope).await;
+
+    let error = backend
+        .cancel_close_before_retirement(attempt)
+        .await
+        .unwrap_err();
+    assert!(error.contains("owned by native initial Close settlement"));
+    assert_native_resource_admission_fenced(&backend, scope).await;
+    assert_eq!(
+        fixture
+            .db
+            .get_close_obligation(attempt.as_str())
+            .await
+            .unwrap(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn invalid_captured_worktree_collector_does_not_route_generic_repair() {
     use phoenix_core::domain::close::{ClosePhase, RetirementFailureReason};
     let fixture = CloseFixture::new().await;

@@ -40,6 +40,52 @@ impl GenericCloseSettlement {
     }
 }
 
+/// Exact generic attempt accepted for pre-retirement cancellation.
+#[derive(Debug)]
+pub struct GenericCloseCancellation {
+    attempt_id: CloseAttemptId,
+}
+
+impl GenericCloseCancellation {
+    #[must_use]
+    pub fn attempt_id(&self) -> &CloseAttemptId {
+        &self.attempt_id
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GenericCloseCancellationKind {
+    RequestDuringSettlement,
+    AlreadyRequestedDuringSettlement,
+    CompleteBeforeRetirement,
+}
+
+fn generic_close_cancellation_kind(
+    obligation: &CloseObligation,
+) -> DbResult<GenericCloseCancellationKind> {
+    match obligation.phase() {
+        ClosePhase::SettlingActiveWork => Ok(GenericCloseCancellationKind::RequestDuringSettlement),
+        ClosePhase::CancelRequestedDuringSettlement => {
+            Ok(GenericCloseCancellationKind::AlreadyRequestedDuringSettlement)
+        }
+        ClosePhase::AwaitingBlockerResolution
+        | ClosePhase::AwaitingStopWorkConfirmation
+        | ClosePhase::AwaitingRetirementInspection
+        | ClosePhase::AwaitingLossConfirmation => {
+            Ok(GenericCloseCancellationKind::CompleteBeforeRetirement)
+        }
+        phase @ (ClosePhase::RetirementRequested
+        | ClosePhase::NeedsRepair
+        | ClosePhase::Completed) => {
+            Err(close_precondition(format!(
+                "attempt {} phase {} does not admit pre-retirement cancellation",
+                obligation.attempt_id(),
+                phase.as_str()
+            )))
+        }
+    }
+}
+
 /// Identifies whether the writer transaction inserted this Close attempt.
 /// This is provenance, not permission to dispatch a retirement effect.
 #[derive(Debug)]
@@ -2671,14 +2717,30 @@ impl Database {
         Ok(obligation)
     }
 
+    /// Checks the exact owner and phase before the attempt's execution owner reopens leases.
+    /// The terminal write still rechecks both after reopening.
+    pub async fn authorize_generic_close_cancellation(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<GenericCloseCancellation> {
+        let mut tx = self.pool.begin().await?;
+        let obligation =
+            Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+        generic_close_cancellation_kind(&obligation)?;
+        tx.commit().await?;
+        Ok(GenericCloseCancellation {
+            attempt_id: obligation.attempt_id().clone(),
+        })
+    }
+
     pub async fn cancel_close_before_retirement(
         &self,
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
-        match obligation.phase() {
-            ClosePhase::SettlingActiveWork => {
+        match generic_close_cancellation_kind(&obligation)? {
+            GenericCloseCancellationKind::RequestDuringSettlement => {
                 set_close_phase_tx(
                     &mut tx,
                     attempt_id,
@@ -2686,11 +2748,8 @@ impl Database {
                 )
                 .await?;
             }
-            ClosePhase::CancelRequestedDuringSettlement => {}
-            ClosePhase::AwaitingBlockerResolution
-            | ClosePhase::AwaitingStopWorkConfirmation
-            | ClosePhase::AwaitingRetirementInspection
-            | ClosePhase::AwaitingLossConfirmation => {
+            GenericCloseCancellationKind::AlreadyRequestedDuringSettlement => {}
+            GenericCloseCancellationKind::CompleteBeforeRetirement => {
                 let now = Utc::now().to_rfc3339();
                 sqlx::query(
                     "UPDATE close_obligations
@@ -2704,14 +2763,6 @@ impl Database {
                 .bind(obligation.phase().as_str())
                 .execute(&mut *tx)
                 .await?;
-            }
-            phase @ (ClosePhase::RetirementRequested
-            | ClosePhase::NeedsRepair
-            | ClosePhase::Completed) => {
-                return Err(close_precondition(format!(
-                    "attempt {attempt_id} phase {} does not admit pre-retirement cancellation",
-                    phase.as_str()
-                )));
             }
         }
         let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
