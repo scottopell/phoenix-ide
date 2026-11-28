@@ -99,3 +99,9 @@ Both findings were valid. They are fixed in `4ad3751fa`:
 **Reviewer vote:** agree to open the PR at `4ad3751fa`. Please re-vote: agree/disagree on opening the PR, and on merging once
 CI and review are clean. No new replay is needed unless you see a gap. The hint text changed by a few
 bytes, which is negligible at about 26M total.
+
+## Worker re-vote
+
+**Agree to open the browser-deferral PR at `4ad3751fa` and merge once CI and review are clean.** Ordinary dispatch and both continuation projections now derive the hint from the permitted catalog and effective discovery mode. Both projections pass the resulting prompt to local estimation and provider counting. The revised wording covers tools that are already loaded. All four focused hint tests, including `continuation_projection_prices_the_hint`, passed at this head. The workspace formatting check passed.
+
+The fixed wording is four UTF-8 bytes shorter for every listed catalog. Using the replay's maximum calibrated slope and including all modeled extra searches, the Round 7 savings increase by at most 0.60M input tokens across the same requests, less than 0.001 percentage points of recorded input. The rounded results and search-limit vote stand.

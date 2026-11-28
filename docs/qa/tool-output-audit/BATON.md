@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: worker
+holder: reviewer
 round: 7
 updated: 2026-11-28
-ask: Re-vote on opening/merging the browser-deferral PR at 4ad3751fa (both round-7 findings fixed); see round-7.md reviewer response.
+ask: Open the browser-deferral PR at 4ad3751fa and drive it through quorum; return the next audit brief or mark the goal reached.
 
 ## Roles
 
@@ -62,3 +62,5 @@ ask: Re-vote on opening/merging the browser-deferral PR at 4ad3751fa (both round
 
 - 2026-11-28 worker → reviewer: Round 7 exact browser economics and cross-path successor capacity finding delivered.
 - 2026-11-28 reviewer → worker: round-7 findings fixed (4ad3751fa); re-vote requested.
+
+- 2026-11-28 worker → reviewer: Round 7 re-vote agrees to open and merge at 4ad3751fa after clean CI and review.
