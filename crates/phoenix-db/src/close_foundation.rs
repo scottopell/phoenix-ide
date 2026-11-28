@@ -1594,6 +1594,10 @@ pub struct RecordCloseRetirementDispatchRequest {
 pub struct FirstCloseRetirementDispatch(RecordCloseRetirementDispatchRequest);
 
 impl FirstCloseRetirementDispatch {
+    pub fn request(&self) -> &RecordCloseRetirementDispatchRequest {
+        &self.0
+    }
+
     pub fn into_request(self) -> RecordCloseRetirementDispatchRequest {
         self.0
     }
@@ -4716,6 +4720,11 @@ type WorktreeCleanupPlanColumns = (
     Option<String>,
 );
 
+enum GenericCloseDispatchKind {
+    Legacy,
+    OriginalWorktree,
+}
+
 impl Database {
     /// Durably records intent to remove one exact sealed resource before external
     /// teardown begins. A restart can adopt absence only from this same-attempt
@@ -4729,6 +4738,30 @@ impl Database {
         &self,
         request: RecordCloseRetirementDispatchRequest,
     ) -> DbResult<()> {
+        self.record_generic_close_dispatch(request, GenericCloseDispatchKind::Legacy)
+            .await?;
+        Ok(())
+    }
+
+    /// Claims the first generic dispatch of an exact original worktree. A replay
+    /// grants no ownership. Neither result authorizes relaxed writer inspection.
+    ///
+    /// # Errors
+    /// Returns an error unless the request matches a sealed worktree in the
+    /// exact snapshot of a requested generic retirement.
+    pub async fn claim_generic_original_worktree_dispatch(
+        &self,
+        request: RecordCloseRetirementDispatchRequest,
+    ) -> DbResult<CloseRetirementDispatch> {
+        self.record_generic_close_dispatch(request, GenericCloseDispatchKind::OriginalWorktree)
+            .await
+    }
+
+    async fn record_generic_close_dispatch(
+        &self,
+        request: RecordCloseRetirementDispatchRequest,
+        kind: GenericCloseDispatchKind,
+    ) -> DbResult<CloseRetirementDispatch> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let native_initial: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM native_close_initial_receipts
@@ -4756,6 +4789,28 @@ impl Database {
                 return Err(close_precondition(
                     "generic retry dispatch is unavailable for native-managed Close operations",
                 ));
+            }
+        }
+        if matches!(kind, GenericCloseDispatchKind::OriginalWorktree)
+            && (current.phase() != ClosePhase::RetirementRequested
+                || request.resource.kind() != RetiredResourceKind::Worktree)
+        {
+            return Err(close_precondition(
+                "original worktree claim requires requested worktree retirement",
+            ));
+        }
+        if matches!(kind, GenericCloseDispatchKind::OriginalWorktree) {
+            let initial_run_active: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                     SELECT 1 FROM close_runs
+                     WHERE attempt_id = ?1 AND run_ordinal = 1 AND status = 'running'
+                 )",
+            )
+            .bind(request.attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !initial_run_active {
+                return Err(close_precondition("original worktree claim requires a running initial Close run"));
             }
         }
         let identity = request.resource.identity();
@@ -4798,9 +4853,34 @@ impl Database {
             )));
         }
         ensure_close_retirement_loss_free_tx(&mut tx, request.attempt_id.as_str()).await?;
-        Self::insert_close_retirement_dispatch_tx(&mut tx, &request).await?;
+        let dispatch = Self::insert_close_retirement_dispatch_tx(&mut tx, &request).await?;
+        if matches!(kind, GenericCloseDispatchKind::OriginalWorktree)
+            && matches!(&dispatch, CloseRetirementDispatch::First(_))
+        {
+            let prior_dispatch: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM close_retirement_resource_dispatches
+                     WHERE attempt_id = ?1 AND scope = ?2 AND resource_kind = 'worktree'
+                       AND identity_kind = ?3 AND identity_codec = ?4 AND identity_value = ?5
+                       AND (inspection_generation <> ?6 OR inspection_fingerprint <> ?7)
+                 )",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .bind(request.snapshot.generation())
+            .bind(request.snapshot.fingerprint())
+            .fetch_one(&mut *tx)
+            .await?;
+            if prior_dispatch {
+                tx.rollback().await?;
+                return Ok(CloseRetirementDispatch::Replay);
+            }
+        }
         tx.commit().await?;
-        Ok(())
+        Ok(dispatch)
     }
 
     pub(crate) async fn insert_close_retirement_dispatch_tx(
@@ -18449,9 +18529,19 @@ mod tests {
             snapshot,
             resource,
         };
-        db.record_close_retirement_dispatch(request.clone())
-            .await
-            .unwrap();
+        let (left, right) = tokio::join!(
+            db.claim_generic_original_worktree_dispatch(request.clone()),
+            db.claim_generic_original_worktree_dispatch(request.clone()),
+        );
+        let first = match (left.unwrap(), right.unwrap()) {
+            (CloseRetirementDispatch::First(first), CloseRetirementDispatch::Replay)
+            | (CloseRetirementDispatch::Replay, CloseRetirementDispatch::First(first)) => first,
+            other => panic!("expected one first dispatch and one replay, got {other:?}"),
+        };
+        assert_eq!(first.request().resource, request.resource);
+        assert_eq!(first.request().scope, request.scope);
+        assert_eq!(first.request().snapshot, request.snapshot);
+        assert_eq!(first.request().attempt_id, request.attempt_id);
         let before: i64 = sqlx::query_scalar(
             "SELECT dispatched_at_us FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
         )

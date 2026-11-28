@@ -95,6 +95,16 @@ jobs:
           printf 'PHOENIX_BASH_LAUNCH_TEST_EXE=%s\n' "$GITHUB_WORKSPACE/target/debug/phoenix_ide" >> "$GITHUB_ENV"
           printf 'PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1\n' >> "$GITHUB_ENV"
           (cd crates/phoenix-ide && "$runtime_test_binary" --list) | tee "$evidence/runtime-inventory.log"
+      - name: Verify concurrent generic dispatch after native Observe adoption
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          selector=generic_dispatch_and_failure_preserve_observe_adopted_legacy_initial
+          cargo test --locked -p phoenix-db --lib "$selector" -- --nocapture 2>&1 | tee "$evidence/$selector.log"
+          grep -E "^test .*::$selector \.\.\. ok$" "$evidence/$selector.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$evidence/$selector.log"
       - name: Required production writer detection on the ordinary Linux runner
         if: ${{ !cancelled() && steps.controls.outcome == 'success' }}
         shell: bash
@@ -124,6 +134,9 @@ jobs:
           evidence="$RUNNER_TEMP/close-http-evidence"
           for selector in \
             shared_close_inspection_distinguishes_absence_from_quarantine_probe_failure \
+            stranded_generic_dispatch_cannot_reenter_original_worktree \
+            generic_close_worker_survives_waiter_drop_and_serializes_reinspection \
+            failed_pre_runtime_worktree_reinspection_persists_typed_residual \
             anchored_native_retry_assessment_preserves_writer_inspection_gap \
             registered_native_close_origin_only_fetched_pin_public_retry_preserves_owner_ref \
             detached_unreachable_commits_until_rejects_expired_deadline_before_repository_access \

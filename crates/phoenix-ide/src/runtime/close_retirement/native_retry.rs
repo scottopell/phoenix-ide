@@ -863,7 +863,7 @@ impl super::RuntimeManager {
                 plan.final_tombstone.as_ref(),
                 bind,
                 |_| {},
-                super::CloseWorktreeEffects::production(writer_probe),
+                super::CloseWorktreeEffects::for_admitted_native_retry(writer_probe),
             )
         });
         if unknown.load(Ordering::SeqCst) {

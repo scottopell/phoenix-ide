@@ -13,6 +13,7 @@ use crate::close_service::{
 };
 #[cfg(test)]
 use crate::db::Conversation;
+use crate::runtime::close_retirement::GenericCloseRetryError;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
 
@@ -505,65 +506,22 @@ pub(crate) async fn retry_close_retirement(
             "stale_close_attempt",
         ))));
     }
-    let retried = state
-        .db
-        .retry_close_retirement(attempt.attempt_id())
+    state
+        .runtime
+        .retry_generic_close_retirement(attempt.attempt_id().clone())
         .await
-        .map_err(|error| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                error.to_string(),
-                "close_retry_unavailable",
-            )))
+        .map_err(|error| match error {
+            GenericCloseRetryError::Admission(error) => AppError::Conflict(Box::new(
+                ConflictErrorResponse::new(error, "close_retry_unavailable"),
+            )),
+            GenericCloseRetryError::Continuation(error) => AppError::Conflict(Box::new(
+                ConflictErrorResponse::new(error, "close_retirement_needs_repair"),
+            )),
+            GenericCloseRetryError::Internal(error) => AppError::Internal(error),
         })?;
-    let retry_result = if retried.phase()
-        == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-    {
-        state
-            .runtime
-            .inspect_close_retirement(retried.attempt_id().clone())
-            .await
-            .map(|_| ())
-    } else {
-        state
-            .runtime
-            .retire_close_runtime_resources(retried.attempt_id().clone())
-            .await
-    };
-    if let Err(error) = retry_result {
-        let authoritative = state
-            .db
-            .get_close_obligation(retried.attempt_id().as_str())
-            .await
-            .map_err(|reload_error| AppError::Internal(reload_error.to_string()))?;
-        if authoritative.phase() == phoenix_core::domain::close::ClosePhase::RetirementRequested {
-            let scope = state
-                .db
-                .list_close_attempt_scopes(retried.attempt_id().as_str())
-                .await
-                .map_err(|route_error| AppError::Internal(route_error.to_string()))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| AppError::Internal("Close retry has no captured scope".to_string()))?
-                .scope;
-            state
-                .runtime
-                .route_close_attempt_to_repair::<()>(
-                    retried.attempt_id(),
-                    &scope,
-                    phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
-                    error.clone(),
-                )
-                .await
-                .expect_err("repair routing returns the persisted repair detail");
-        }
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            error,
-            "close_retirement_needs_repair",
-        ))));
-    }
     let authoritative = state
         .db
-        .get_close_obligation(retried.attempt_id().as_str())
+        .get_close_obligation(attempt.attempt_id().as_str())
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
     if authoritative.phase() == phoenix_core::domain::close::ClosePhase::AwaitingLossConfirmation {
