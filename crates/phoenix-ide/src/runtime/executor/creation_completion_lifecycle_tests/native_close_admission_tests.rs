@@ -512,10 +512,26 @@ impl ParkedNativeInitial {
     }
 
     async fn finish(self) {
+        assert!(matches!(
+            self.finish_and_observe().await.unwrap(),
+            NativeCloseInitialResult::NewlyAdmitted(_)
+        ));
+    }
+
+    async fn finish_and_observe(
+        self,
+    ) -> Result<NativeCloseInitialResult, NativeCloseApplicationError> {
         wait_for_target_mutation_gate_release(&self.backend).await;
-        assert!(matches!(self.observer.await.unwrap().unwrap(), NativeCloseInitialResult::NewlyAdmitted(_)));
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), self.observer)
+            .await
+            .expect("source observer must resolve after the target gate is released")
+            .unwrap();
         self.source_events.send(Event::Shutdown).await.unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(10), self.actor).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), self.actor)
+            .await
+            .unwrap()
+            .unwrap();
+        result
     }
 }
 
@@ -683,7 +699,10 @@ async fn queued_native_close_settlement_stop_refuses_after_source_revocation() {
     .await
     .unwrap();
     assert_eq!(claims, 0);
-    parked.finish().await;
+    assert!(matches!(
+        parked.finish_and_observe().await,
+        Err(NativeCloseApplicationError::SourceRefused)
+    ));
 }
 
 #[tokio::test]
