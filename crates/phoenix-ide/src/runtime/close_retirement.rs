@@ -5549,7 +5549,6 @@ where
     )
 }
 
-#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn inspect_and_remove_exact_worktree_with_hook_and_plan<F, B>(
     runtime: &tokio::runtime::Handle,
@@ -5659,7 +5658,6 @@ fn prepare_generic_worktree_removal(
     Ok((prepared, administrative_dir, incarnation))
 }
 
-#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn inspect_and_remove_exact_worktree_with_hook_and_plan_until<F, B>(
     runtime: &tokio::runtime::Handle,
@@ -10072,10 +10070,10 @@ where
         }
         check_directory_deletion_deadline(Some(deadline))?;
         if observe_worktree_fingerprint(&quarantine).as_deref() != Some(expected.as_str()) {
-            if check_directory_deletion_deadline(Some(deadline)).is_ok() {
-                let _ = std::fs::rename(&quarantine, &path);
-            }
-            return Err("quarantined worktree administrative incarnation changed".to_string());
+            return Err(format!(
+                "quarantined worktree administrative incarnation changed; retained at {}",
+                quarantine.display(),
+            ));
         }
 
         check_directory_deletion_deadline(Some(deadline))?;
