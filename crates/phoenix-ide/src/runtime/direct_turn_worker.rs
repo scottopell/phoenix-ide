@@ -1376,7 +1376,7 @@ mod tests {
         let MessageContent::Tool(result) = &messages[0].content else {
             panic!("expected real tool result")
         };
-        assert_eq!(result.content, "real side effect completed");
+        assert_eq!(result.content(), "real side effect completed");
         assert!(!result.is_error);
         assert_eq!(
             db.get_conversation(parent_id).await.unwrap().state,

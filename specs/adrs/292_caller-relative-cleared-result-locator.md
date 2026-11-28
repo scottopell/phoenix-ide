@@ -24,7 +24,7 @@ to that transcript's rows.
 
 ## Decision
 
-Option 3. Live requests render `[tool result cleared; read_conversation @self#seq-<n>]`, about 50 bytes.
+Option 3. Live requests render `[tool result cleared; source @self#seq-<n>]`, about 50 bytes.
 `read_conversation`, both local and the local route of the federated tool, resolves `@self#seq-<n>`
 through the caller's tool context to `@transcript:<id>#message-<id>`. Remote reads reject it. Continuation
 input renders `@transcript:<conversation>#message-<message>`, because a summarizer may copy a locator

@@ -751,28 +751,20 @@ fn cleared_tool_result_text(
     locator: ClearedLocator,
 ) -> String {
     let marker = cleared_tool_result_marker(message, locator);
-    let Some(preview) = tool.valid_clearable_preview() else {
+    if tool.is_error {
         return marker;
-    };
-    let summary = preview.cleared_summary(&tool.content).unwrap_or_default();
-    let replacement = if summary.is_empty() {
-        marker
-    } else {
-        format!("{summary}\n{marker}")
-    };
-    preview
-        .replace_in(&tool.content, &replacement)
-        .unwrap_or_else(|| cleared_tool_result_marker(message, locator))
+    }
+    tool.cleared_text(&marker).unwrap_or(marker)
 }
 
 fn cleared_tool_result_marker(message: &crate::db::Message, locator: ClearedLocator) -> String {
     match locator {
         ClearedLocator::SelfRelative => format!(
-            "{CLEARED_TOOL_RESULT_PLACEHOLDER}; read_conversation @self#seq-{}]",
+            "{CLEARED_TOOL_RESULT_PLACEHOLDER}; source @self#seq-{}]",
             message.sequence_id
         ),
         ClearedLocator::Canonical => format!(
-            "{CLEARED_TOOL_RESULT_PLACEHOLDER}; read_conversation @transcript:{}#message-{}]",
+            "{CLEARED_TOOL_RESULT_PLACEHOLDER}; source @transcript:{}#message-{}]",
             message.conversation_id, message.message_id
         ),
     }
@@ -1465,9 +1457,24 @@ fn estimate_tool_result_tokens(content: &str, image_count: usize) -> usize {
 /// recently opened round (the first is numbered 0). A `tool_use` always precedes
 /// its result in `sequence_id` order, so the producing-tool lookup is filled
 /// inline in this single pass.
+#[cfg(test)]
 fn collect_tool_result_facts(
     db_messages: &[crate::db::Message],
     clearable_tool_names: &std::collections::HashSet<String>,
+) -> (Vec<ToolResultFacts>, usize) {
+    collect_tool_result_facts_with_locator(
+        db_messages,
+        clearable_tool_names,
+        ClearedLocator::SelfRelative,
+    )
+}
+
+/// Facts priced with the marker `locator` renders, so the sweep's gain and a
+/// preview's shrink check match the text actually sent.
+fn collect_tool_result_facts_with_locator(
+    db_messages: &[crate::db::Message],
+    clearable_tool_names: &std::collections::HashSet<String>,
+    locator: ClearedLocator,
 ) -> (Vec<ToolResultFacts>, usize) {
     use crate::db::MessageContent;
     use phoenix_llm::ContentBlock as LlmContentBlock;
@@ -1499,14 +1506,12 @@ fn collect_tool_result_facts(
                     .get(tc.tool_use_id.as_str())
                     .copied()
                     .unwrap_or("");
-                let token_estimate = estimate_tool_result_tokens(&tc.content, tc.images.len());
-                let marker_token_estimate = estimate_text_tokens(&cleared_tool_result_text(
-                    m,
-                    tc,
-                    ClearedLocator::SelfRelative,
-                ));
+                let token_estimate = estimate_tool_result_tokens(tc.content(), tc.images.len());
+                let marker_token_estimate =
+                    estimate_text_tokens(&cleared_tool_result_text(m, tc, locator));
                 // a preview is cleared only when that shrinks the result
-                let preview_shrinks = tc.valid_clearable_preview().is_some()
+                let preview_shrinks = !tc.is_error
+                    && tc.clearable_preview().is_some()
                     && marker_token_estimate < token_estimate;
                 results.push(ToolResultFacts {
                     sequence_id: m.sequence_id,
@@ -1537,7 +1542,26 @@ fn plan_tool_result_clearing(
     reported_prompt_tokens: Option<i64>,
     context_window: usize,
 ) -> ClearPlan {
-    let (results, max_round) = collect_tool_result_facts(db_messages, clearable_tool_names);
+    plan_tool_result_clearing_with_locator(
+        db_messages,
+        clearable_tool_names,
+        prior_watermark,
+        reported_prompt_tokens,
+        context_window,
+        ClearedLocator::SelfRelative,
+    )
+}
+
+fn plan_tool_result_clearing_with_locator(
+    db_messages: &[crate::db::Message],
+    clearable_tool_names: &std::collections::HashSet<String>,
+    prior_watermark: i64,
+    reported_prompt_tokens: Option<i64>,
+    context_window: usize,
+    locator: ClearedLocator,
+) -> ClearPlan {
+    let (results, max_round) =
+        collect_tool_result_facts_with_locator(db_messages, clearable_tool_names, locator);
 
     // Recency floor: rounds at or above `floor_first_round` are never cleared.
     let floor_first_round = (max_round + 1).saturating_sub(KEEP_RECENT_ROUNDS);
@@ -1607,8 +1631,9 @@ fn clearable_sequence_ids_through_watermark(
     db_messages: &[crate::db::Message],
     clearable_tool_names: &std::collections::HashSet<String>,
     watermark: i64,
+    locator: ClearedLocator,
 ) -> std::collections::HashSet<i64> {
-    collect_tool_result_facts(db_messages, clearable_tool_names)
+    collect_tool_result_facts_with_locator(db_messages, clearable_tool_names, locator)
         .0
         .into_iter()
         .filter(|f| f.clearable && f.sequence_id <= watermark)
@@ -1676,7 +1701,8 @@ async fn render_existing_cleared_messages<S: StateStore>(
             watermark_cache.lock().unwrap().unwrap_or(0)
         }
     };
-    let cleared = clearable_sequence_ids_through_watermark(db_messages, clearable_names, watermark);
+    let cleared =
+        clearable_sequence_ids_through_watermark(db_messages, clearable_names, watermark, locator);
     render_messages_with_locator(
         db_messages
             .iter()
@@ -1715,8 +1741,12 @@ async fn assemble_cleared_messages_with_pressure<S: StateStore>(
                     conv_id = %conv_id, error = %e, watermark = w,
                     "failed to read clear watermark; rendering last known cleared set",
                 );
-                let cleared =
-                    clearable_sequence_ids_through_watermark(db_messages, clearable_names, w);
+                let cleared = clearable_sequence_ids_through_watermark(
+                    db_messages,
+                    clearable_names,
+                    w,
+                    locator,
+                );
                 render_messages_with_locator(included_messages(), &cleared, locator)
             } else {
                 tracing::warn!(
@@ -1740,12 +1770,13 @@ async fn assemble_cleared_messages_with_pressure<S: StateStore>(
     };
 
     let reported_prompt_tokens = pressure_override.or(reported_prompt_tokens);
-    let plan = plan_tool_result_clearing(
+    let plan = plan_tool_result_clearing_with_locator(
         db_messages,
         clearable_names,
         prior_watermark,
         reported_prompt_tokens,
         context_window,
+        locator,
     );
 
     let cleared = if plan.new_watermark == prior_watermark {
@@ -1775,6 +1806,7 @@ async fn assemble_cleared_messages_with_pressure<S: StateStore>(
                     db_messages,
                     clearable_names,
                     prior_watermark,
+                    locator,
                 )
             }
         }
@@ -1925,15 +1957,14 @@ fn render_messages_with_locator<'a>(
                 });
             }
 
-            MessageContent::Tool(
-                tool @ ToolContent {
+            MessageContent::Tool(tool) => {
+                let ToolContent {
                     tool_use_id,
-                    content,
                     is_error,
                     images,
-                    clearable_preview: _,
-                },
-            ) => {
+                    ..
+                } = tool;
+                let content = tool.content();
                 // Cleared results render as a placeholder with no images; kept
                 // results carry their body and any images verbatim (REQ-STR-004,
                 // REQ-STR-011).
@@ -1948,7 +1979,7 @@ fn render_messages_with_locator<'a>(
                                 data: img.data.clone(),
                             })
                             .collect();
-                        (content.clone(), sources)
+                        (content.to_owned(), sources)
                     };
 
                 // Tool results go in user message
@@ -27571,7 +27602,7 @@ mod steer_drain_detector_tests {
         assert_eq!(tool_results.len(), 1);
         assert!(tool_results[0].is_error);
         assert_eq!(
-            tool_results[0].content,
+            tool_results[0].content(),
             "bash wait exceeded its bounded settlement deadline"
         );
         assert!(dropped.await.is_err(), "the wait task was aborted");
@@ -27898,7 +27929,7 @@ mod steer_drain_detector_tests {
                 .collect();
             assert_eq!(results.len(), 1);
             assert!(!results[0].is_error);
-            assert!(results[0].content.contains("still_running"));
+            assert!(results[0].content().contains("still_running"));
         }
         assert!(storage
             .get_all_messages("runtime-real-bash-wait")
@@ -29208,7 +29239,7 @@ mod steer_drain_detector_tests {
             })
             .unwrap();
         assert!(
-            matches!(&old.content, crate::db::MessageContent::Tool(content) if content.content == "first-assistant")
+            matches!(&old.content, crate::db::MessageContent::Tool(content) if content.content() == "first-assistant")
         );
         let latest = messages
             .iter()
@@ -29217,7 +29248,7 @@ mod steer_drain_detector_tests {
             })
             .unwrap();
         assert!(
-            matches!(&latest.content, crate::db::MessageContent::Tool(content) if content.content.contains("Sub-agent results"))
+            matches!(&latest.content, crate::db::MessageContent::Tool(content) if content.content().contains("Sub-agent results"))
         );
         assert!(rt.latest_spawn_result_message_id("missing").await.is_err());
     }
@@ -29705,7 +29736,7 @@ mod steer_drain_detector_tests {
             .find(|message| matches!(&message.content, MessageContent::Tool(content) if content.tool_use_id == "spawn-1"))
             .expect("spawn result persists");
         assert!(matches!(&message.content, MessageContent::Tool(content)
-            if content.content.starts_with("Sub-agent results")));
+            if content.content().starts_with("Sub-agent results")));
         assert_eq!(
             message
                 .display_data
@@ -31389,11 +31420,11 @@ mod steer_drain_detector_tests {
             panic!("trusted instructions must persist as a tool result receipt");
         };
         assert_eq!(
-            persisted.content,
+            persisted.content(),
             "Authenticated built-in skill instructions were delivered for this live request."
         );
         assert!(!persisted
-            .content
+            .content()
             .contains("POST /api/product-conversations/new"));
 
         let trusted_results = trusted_tool_results("trusted-round", &[result]);
@@ -31402,7 +31433,7 @@ mod steer_drain_detector_tests {
             role: phoenix_llm::MessageRole::User,
             content: vec![ContentBlock::ToolResult {
                 tool_use_id: "phoenix-api-call".to_string(),
-                content: persisted.content,
+                content: persisted.content().to_owned(),
                 is_error: false,
                 images: vec![],
             }],
@@ -31459,7 +31490,7 @@ mod steer_drain_detector_tests {
         assert!(matches!(
             msgs.iter().find_map(|message| match &message.content {
                 MessageContent::Tool(content) if content.tool_use_id == "trusted-skill-1" => {
-                    Some((content.content.as_str(), content.is_error))
+                    Some((content.content(), content.is_error))
                 }
                 _ => None,
             }),
@@ -31471,7 +31502,7 @@ mod steer_drain_detector_tests {
         let persisted = msgs
             .iter()
             .filter_map(|message| match &message.content {
-                MessageContent::Tool(content) => Some(content.content.as_str()),
+                MessageContent::Tool(content) => Some(content.content()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -32096,7 +32127,7 @@ mod goal_report_cancellation_checkpoint_tests {
                 &row.content,
                 MessageContent::Tool(tool_content)
                     if tool_content.tool_use_id == result.tool_use_id
-                        && tool_content.content == result.output()
+                        && tool_content.content() == result.output()
                         && !tool_content.is_error
             ));
             let result = FinalizedToolResult::new(
@@ -35452,7 +35483,7 @@ mod stale_tool_result_clearing_tests {
         );
         assert_eq!(
             cleared_body,
-            format!("[tool result cleared; read_conversation @self#seq-{cleared_seq}]")
+            format!("[tool result cleared; source @self#seq-{cleared_seq}]")
         );
         // Text that may be carried into another transcript names the exact row.
         let canonical = render_messages_with_locator(&db, &cleared, ClearedLocator::Canonical);
@@ -35462,7 +35493,7 @@ mod stale_tool_result_clearing_tests {
             .any(|b| matches!(b,
                 ContentBlock::ToolResult { tool_use_id, content, .. } if tool_use_id == "old-tool"
                     && *content == format!(
-                        "[tool result cleared; read_conversation @transcript:{conv}#message-{}]",
+                        "[tool result cleared; source @transcript:{conv}#message-{}]",
                         source.message_id
                     )
             )));
@@ -35499,7 +35530,7 @@ mod stale_tool_result_clearing_tests {
         let storage = Arc::new(InMemoryStorage::new());
         let conv = "marker-net-gain";
         add_round(&storage, conv, "large", "read_file", 6).await;
-        for i in 0..100 {
+        for i in 0..400 {
             add_round(&storage, conv, &format!("tiny-{i}"), "read_file", 0).await;
         }
         for i in 0..KEEP_RECENT_ROUNDS {
@@ -35536,14 +35567,24 @@ mod stale_tool_result_clearing_tests {
         "</diff>"
     );
 
+    fn previewed(receipt: &str, diff: &str) -> phoenix_core::domain::db_schema::PreviewedText {
+        phoenix_core::domain::db_schema::PreviewedText::from_parts(
+            &format!("{receipt}\n"),
+            diff,
+            "",
+            phoenix_core::domain::db_schema::ClearablePreviewKind::UnifiedDiff,
+        )
+        .unwrap()
+    }
+
     fn patch_content(tool_use_id: &str, is_error: bool) -> crate::db::ToolContent {
-        let content = format!("{PATCH_RECEIPT}\n{PATCH_DIFF}");
-        let mut tc = crate::db::ToolContent::new(tool_use_id, content, is_error);
-        tc.clearable_preview = Some(phoenix_core::domain::db_schema::ClearablePreview {
-            start: PATCH_RECEIPT.len() + 1,
-            end: PATCH_RECEIPT.len() + 1 + PATCH_DIFF.len(),
-            kind: phoenix_core::domain::db_schema::ClearablePreviewKind::UnifiedDiff,
-        });
+        let mut tc = crate::db::ToolContent::with_preview(
+            tool_use_id,
+            previewed(PATCH_RECEIPT, PATCH_DIFF),
+            Vec::new(),
+        );
+        // is_error is a public field; the clearing path must still refuse it
+        tc.is_error = is_error;
         tc
     }
 
@@ -35622,8 +35663,11 @@ mod stale_tool_result_clearing_tests {
             crate::db::ToolContent::new("b-tool", "<patches_applied>all</patches_applied>", false),
         )
         .await;
-        let mut bad = patch_content("c-tool", false);
-        bad.clearable_preview.as_mut().unwrap().end = bad.content.len() + 1;
+        // a stored span that does not fit its text is dropped on load
+        let mut stored = serde_json::to_value(patch_content("c-tool", false)).unwrap();
+        stored["clearable_preview"]["end"] = serde_json::json!(10_000);
+        let bad: crate::db::ToolContent = serde_json::from_value(stored).unwrap();
+        assert!(bad.clearable_preview().is_none());
         let invalid = add_patch_round(&storage, conv, "c", bad).await;
         let errored = add_patch_round(&storage, conv, "d", patch_content("d-tool", true)).await;
 
@@ -35656,12 +35700,8 @@ mod stale_tool_result_clearing_tests {
         let conv = "conv-patch-tiny";
         let receipt = "<patches_applied>all</patches_applied>";
         let diff = "<diff>\n@@ -1 +1 @@\n-a\n+b\n</diff>";
-        let mut tc = crate::db::ToolContent::new("t-tool", format!("{receipt}\n{diff}"), false);
-        tc.clearable_preview = Some(phoenix_core::domain::db_schema::ClearablePreview {
-            start: receipt.len() + 1,
-            end: receipt.len() + 1 + diff.len(),
-            kind: phoenix_core::domain::db_schema::ClearablePreviewKind::UnifiedDiff,
-        });
+        let tc =
+            crate::db::ToolContent::with_preview("t-tool", previewed(receipt, diff), Vec::new());
         let seq = add_patch_round(&storage, conv, "t", tc).await;
         let db = storage.get_messages(conv).await.unwrap();
         let (facts, _) = collect_tool_result_facts(&db, &clearable(&["bash"]));
@@ -35674,32 +35714,57 @@ mod stale_tool_result_clearing_tests {
         );
     }
 
+    /// Eligibility is priced with the marker that will render: a preview that
+    /// shrinks under the short live marker can grow under the exact pair used
+    /// in continuation input, and must then stay.
+    #[tokio::test]
+    async fn preview_shrink_check_uses_the_rendered_locator() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-patch-locator";
+        let diff = "<diff>\n@@ -1 +1 @@\n-aaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n+bbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n</diff>";
+        let tc = crate::db::ToolContent::with_preview("l-tool", previewed("r", diff), Vec::new());
+        let seq = add_patch_round(&storage, conv, "l", tc).await;
+        let db = storage.get_messages(conv).await.unwrap();
+        let clearable_with = |locator| {
+            collect_tool_result_facts_with_locator(&db, &clearable(&["bash"]), locator)
+                .0
+                .into_iter()
+                .find(|f| f.sequence_id == seq)
+                .unwrap()
+                .clearable
+        };
+        assert!(clearable_with(ClearedLocator::SelfRelative));
+        assert!(!clearable_with(ClearedLocator::Canonical));
+    }
+
     /// Capping rewrites the text, so a preview span must not survive it.
     #[test]
     fn capped_output_drops_clearable_preview() {
         let big = "x".repeat(MAX_TOOL_OUTPUT_BYTES + 10);
-        let preview = phoenix_core::domain::db_schema::ClearablePreview {
-            start: 0,
-            end: 5,
-            kind: phoenix_core::domain::db_schema::ClearablePreviewKind::UnifiedDiff,
-        };
-        let out = crate::tools::ToolOutput::success(big).with_clearable_preview(preview);
+        let text = phoenix_core::domain::db_schema::PreviewedText::from_parts(
+            "r\n",
+            &big,
+            "",
+            phoenix_core::domain::db_schema::ClearablePreviewKind::UnifiedDiff,
+        )
+        .unwrap();
         let ToolOutcome::Success {
             clearable_preview, ..
-        } = tool_output_to_outcome(out)
+        } = tool_output_to_outcome(crate::tools::ToolOutput::success_with_preview(text))
         else {
             panic!("expected success");
         };
         assert_eq!(clearable_preview, None);
 
-        let out = crate::tools::ToolOutput::success("small diff").with_clearable_preview(preview);
+        let text = previewed("r", "<diff>\n@@ -1 +1 @@\n</diff>");
+        let expected = *text.preview();
         let ToolOutcome::Success {
             clearable_preview, ..
-        } = tool_output_to_outcome(out)
+        } = tool_output_to_outcome(crate::tools::ToolOutput::success_with_preview(text))
         else {
             panic!("expected success");
         };
-        assert_eq!(clearable_preview, Some(preview));
+        assert_eq!(clearable_preview.as_deref(), Some(&expected));
     }
 }
 

@@ -1902,7 +1902,7 @@ fn render_bounded_message_text(message: &BoundedReadMessage) -> String {
                 .map(ContentBlock::render_text)
                 .collect::<Vec<_>>()
                 .join("\n"),
-            MessageContent::Tool(content) => content.content.clone(),
+            MessageContent::Tool(content) => content.content().to_owned(),
             MessageContent::System(content) => content.text.clone(),
             MessageContent::Error(content) => content.message.clone(),
             MessageContent::Continuation(content) => content.summary.clone(),
@@ -2159,7 +2159,7 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
             .join("\n"),
         MessageContent::Tool(c) => {
             if c.images.is_empty() {
-                c.content.clone()
+                c.content().to_owned()
             } else {
                 tracing::debug!(
                     tool_use_id = %c.tool_use_id,
@@ -2168,7 +2168,7 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
                 );
                 format!(
                     "{}\n[{} image(s) in this tool result are not shown — read_conversation returns text only]",
-                    c.content,
+                    c.content(),
                     c.images.len()
                 )
             }

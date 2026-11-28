@@ -155,7 +155,7 @@ pub enum ToolOutput {
         llm_usage: Option<Box<ToolLlmUsage>>,
         /// Span of `output` that stale-result clearing may remove
         /// (specs/stale-tool-results REQ-STR-013).
-        clearable_preview: Option<phoenix_core::domain::db_schema::ClearablePreview>,
+        clearable_preview: Option<Box<phoenix_core::domain::db_schema::ClearablePreview>>,
     },
     /// Instructions from an authenticated audience-bound built-in skill.
     TrustedInstructions(skill::TrustedInstructions),
@@ -216,31 +216,18 @@ impl ToolOutput {
         self
     }
 
-    /// Mark `output[start..end]` as a preview that stale-result clearing may
-    /// remove. Ignored (and logged) unless this is a success whose output the
-    /// span fits.
+    /// A success whose text carries a clearable preview (REQ-STR-013). The
+    /// span comes from the same parts as the text, so it always fits.
     #[must_use]
-    pub fn with_clearable_preview(
-        mut self,
-        preview: phoenix_core::domain::db_schema::ClearablePreview,
-    ) -> Self {
-        if let Self::Success {
+    pub fn success_with_preview(text: phoenix_core::domain::db_schema::PreviewedText) -> Self {
+        let (output, preview) = text.into_parts();
+        Self::Success {
             output,
-            clearable_preview,
-            ..
-        } = &mut self
-        {
-            if preview.is_valid_for(output) {
-                *clearable_preview = Some(preview);
-            } else {
-                tracing::warn!(
-                    ?preview,
-                    len = output.len(),
-                    "invalid clearable preview span ignored"
-                );
-            }
+            images: vec![],
+            display_data: None,
+            llm_usage: None,
+            clearable_preview: Some(Box::new(preview)),
         }
-        self
     }
 
     /// Attach tool-spent LLM usage for runtime accounting.

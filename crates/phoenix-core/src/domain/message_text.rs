@@ -68,9 +68,11 @@ pub fn index_text(message: &Message) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
-        MessageContent::Tool(c) => {
-            tool_excerpt(&c.content, TOOL_EXCERPT_HEAD_CHARS, TOOL_EXCERPT_TAIL_CHARS)
-        }
+        MessageContent::Tool(c) => tool_excerpt(
+            c.content(),
+            TOOL_EXCERPT_HEAD_CHARS,
+            TOOL_EXCERPT_TAIL_CHARS,
+        ),
         MessageContent::System(c) => c.text.clone(),
         MessageContent::Error(c) => c.message.clone(),
         MessageContent::Continuation(c) => c.summary.clone(),
@@ -223,13 +225,11 @@ mod tests {
 
     #[test]
     fn short_tool_result_passes_through_whole() {
-        let m = msg(MessageContent::Tool(ToolContent {
-            tool_use_id: "t".into(),
-            content: "error: missing semicolon at foo.rs:42".into(),
-            is_error: true,
-            images: vec![],
-            clearable_preview: None,
-        }));
+        let m = msg(MessageContent::Tool(ToolContent::new(
+            "t",
+            "error: missing semicolon at foo.rs:42",
+            true,
+        )));
         assert_eq!(index_text(&m), "error: missing semicolon at foo.rs:42");
     }
 
@@ -238,13 +238,7 @@ mod tests {
         // head marker ... (filler) ... tail marker
         let filler = "x".repeat(5000);
         let body = format!("HEAD_START compiling crate\n{filler}\nFAILED at zzz.rs:7 TAIL_END");
-        let m = msg(MessageContent::Tool(ToolContent {
-            tool_use_id: "t".into(),
-            content: body,
-            is_error: true,
-            images: vec![],
-            clearable_preview: None,
-        }));
+        let m = msg(MessageContent::Tool(ToolContent::new("t", body, true)));
         let out = index_text(&m);
         assert!(out.contains("HEAD_START"), "head signal must survive");
         assert!(out.contains("TAIL_END"), "tail signal must survive");

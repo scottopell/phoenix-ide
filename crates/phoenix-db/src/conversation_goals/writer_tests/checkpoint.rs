@@ -248,9 +248,9 @@ fn assert_result(result: &Message, is_error: bool) {
         tool_result_message_id("checkpoint-assistant", "checkpoint-call")
     );
     if is_error {
-        assert!(content.content.starts_with("Goal report rejected:"));
+        assert!(content.content().starts_with("Goal report rejected:"));
     } else {
-        assert!(content.content.contains("recorded complete"));
+        assert!(content.content().contains("recorded complete"));
     }
 }
 

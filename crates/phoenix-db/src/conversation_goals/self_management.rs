@@ -295,7 +295,7 @@ pub(super) fn retained_result(
     let MessageContent::Tool(content) = &actual.content else {
         return Err(GoalDbError::Integrity("retained self-goal result content"));
     };
-    let value: serde_json::Value = serde_json::from_str(&content.content)
+    let value: serde_json::Value = serde_json::from_str(content.content())
         .map_err(|_| GoalDbError::Integrity("retained self-goal result JSON"))?;
     let output = match value.get("status").and_then(serde_json::Value::as_str) {
         Some("goal_created") if matches!(&pending.operation, SelfGoalOperation::Create { .. }) => {
