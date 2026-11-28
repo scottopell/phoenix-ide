@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use super::*;
-use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
+use crate::api::handlers::{api_test_support::make_test_state, create_router};
 
 const PASSWORD: &str = "disposable-goal-owner";
 

@@ -42,6 +42,7 @@ impl Database {
         tx: &mut Transaction<'_, Sqlite>,
         attempt: &CloseAttemptId,
     ) -> DbResult<()> {
+        Self::require_no_retained_legacy_creation_for_attempt_tx(tx, attempt).await?;
         let active =
             Self::count_close_settlement_active_participants_tx(tx, attempt.as_str()).await?;
         if active != 0 {

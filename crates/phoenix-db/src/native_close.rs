@@ -103,6 +103,37 @@ enum NativeCloseSourceShape {
     LegacyFlat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeCloseInitialControl {
+    ConfirmStopWork,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseTargetControlResolution {
+    Generic,
+    ParkedNativeInitial(NativeCloseInitialControlRoute),
+    NativeInitialSettlementInProgress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCloseInitialControlRoute {
+    target: ProductConversationId,
+    target_latest: phoenix_core::domain::close::TranscriptConversationId,
+    attempt_id: CloseAttemptId,
+    run_ordinal: CloseRunOrdinal,
+    source_transcript_id: phoenix_core::domain::close::TranscriptConversationId,
+    source_message_id: String,
+    source_tool_use_id: String,
+}
+
+impl NativeCloseInitialControlRoute {
+    #[must_use]
+    pub fn source_transcript_id(&self) -> &phoenix_core::domain::close::TranscriptConversationId {
+        &self.source_transcript_id
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeCloseCommand {
     source_transcript_id: String,
@@ -323,7 +354,8 @@ pub use initial::{
     NativeCloseInitialEntryRelease, NativeCloseInitialExecution,
     NativeCloseInitialFirstEffectError, NativeCloseInitialProcessAuthorization,
     NativeCloseInitialResourceEntryDecision, NativeCloseInitialResourceEntryResult,
-    NativeCloseInitialResult, NativeCloseInitialSettlement, NativeCloseReceipt, NativeCloseRunRef,
+    NativeCloseInitialResult, NativeCloseInitialSettlement, NativeCloseInitialTurnDispatch,
+    NativeCloseInitialTurnDispatchResult, NativeCloseReceipt, NativeCloseRunRef,
 };
 mod observe;
 mod receipts;
@@ -332,7 +364,9 @@ mod retry_execution;
 mod source_fence;
 pub use observe::{NativeCloseObservation, NativeCloseObserveReceipt, NativeCloseObserveResult};
 pub use retry::{NativeCloseRetryResult, NativeCloseRetrySourceAssessment};
-pub use retry_execution::{NativeCloseRetryExecutionContext, NativeCloseRetryPreAdmissionContext};
+pub use retry_execution::{
+    NativeCloseRetryExecutionContext, NativeCloseRetryPreAdmissionContext, NativeRetryTmuxProof,
+};
 pub(crate) use source_fence::{
     acknowledge_initial_result_tx, fence_native_retry_sources_tx, interrupt_native_retry_tx,
     recover_native_retry_sources_tx, NativeInitialSourceFence, NativeRetrySourceFence,

@@ -327,13 +327,13 @@ def _is_addr_in_use(log_text: str) -> bool:
     return "kind: AddrInUse" in log_text or "Address already in use" in log_text
 
 
-def _start_server_attempt(env: dict[str, str], tmpdir: Path, attempt: int):
+def _start_server_attempt(env: dict[str, str], tmpdir: Path, attempt: int, *, binary: Path = BINARY):
     port = _free_port()
     attempt_env = env | {"PHOENIX_PORT": str(port)}
     log_path = tmpdir / f"phoenix-startup-{attempt}.log"
     log_file = log_path.open("w")
     proc = subprocess.Popen(
-        [str(BINARY)],
+        [str(binary)],
         cwd=tmpdir,
         env=attempt_env,
         stdout=log_file,
@@ -433,7 +433,7 @@ def _server_env(tmpdir: Path, parent_env: dict[str, str] | None = None) -> dict[
 
 
 @contextmanager
-def _server():
+def _server(binary: Path = BINARY):
     tmpdir = Path(tempfile.mkdtemp(prefix="phoenix-e2e-"))
     env = _server_env(tmpdir)
     profile_dir = _profile_dir_from_env()
@@ -442,7 +442,10 @@ def _server():
     startup_started_cpu = _harness_cpu_times() if profile_dir is not None else None
 
     try:
-        proc, base_url, log_path, log_file = _start_server_with_retries(env, tmpdir)
+        proc, base_url, log_path, log_file = _start_server_with_retries(
+            env, tmpdir,
+            lambda env, tmpdir, attempt: _start_server_attempt(env, tmpdir, attempt, binary=binary),
+        )
     except Exception:
         startup_finished_monotonic_ns = time.monotonic_ns()
         _write_cpu_window(
@@ -624,6 +627,71 @@ def _get_product_conversation_route(base_url: str, reference: str) -> dict:
     r = httpx.get(f"{base_url}/api/product-conversations/{reference}/route", timeout=10.0)
     r.raise_for_status()
     return r.json()
+
+
+def _git(cwd: Path, *args: str) -> str:
+    result = subprocess.run(
+        ["git", "--no-optional-locks", *args], cwd=cwd, check=True, capture_output=True, text=True,
+    )
+    return result.stdout.strip()
+
+
+def _git_lifecycle_snapshot(cwd: Path) -> tuple:
+    index = Path(_git(cwd, "rev-parse", "--git-path", "index"))
+    if not index.is_absolute():
+        index = cwd / index
+    common = Path(_git(cwd, "rev-parse", "--git-common-dir"))
+    if not common.is_absolute():
+        common = cwd / common
+    excludes = common / "info" / "exclude"
+    ignores = tuple(sorted(
+        (str(path.relative_to(cwd)), path.read_bytes())
+        for path in cwd.rglob(".gitignore") if ".git" not in path.parts
+    ))
+    return (
+        _git(cwd, "rev-parse", "HEAD"),
+        _git(cwd, "for-each-ref", "--format=%(refname) %(objectname)"),
+        _git(cwd, "status", "--porcelain=v1", "--untracked-files=all"),
+        _git(cwd, "fsck", "--no-reflogs", "--unreachable"),
+        index.read_bytes() if index.exists() else None,
+        excludes.read_bytes() if excludes.exists() else None,
+        ignores,
+    )
+
+
+def _git_worktree_paths(repo: Path) -> list[Path]:
+    output = _git(repo, "worktree", "list", "--porcelain")
+    return [Path(line.removeprefix("worktree ")) for line in output.splitlines()
+            if line.startswith("worktree ")]
+
+
+def _wait_for_task_proposal(base_url: str, conv_id: str, ordinal: int) -> dict:
+    deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        snapshot = _get_conv(base_url, conv_id)
+        state = _state_str(snapshot["conversation"].get("state"))
+        if state == "error":
+            raise AssertionError(f"proposal turn failed: {snapshot!r}")
+        if state == "awaiting_task_approval":
+            assert _count_tool_use(snapshot["messages"], "propose_task") == ordinal, (
+                "approval state did not contain the model-emitted propose_task"
+            )
+            return snapshot
+        time.sleep(0.05)
+    raise TimeoutError(f"conversation did not reach task approval: {_get_conv(base_url, conv_id)!r}")
+
+
+def _wait_for_idle(base_url: str, conv_id: str) -> dict:
+    deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        snapshot = _get_conv(base_url, conv_id)
+        state = _state_str(snapshot["conversation"].get("state"))
+        if state == "error":
+            raise AssertionError(f"approved turn failed: {snapshot!r}")
+        if state == "idle" and not snapshot.get("agent_working"):
+            return snapshot
+        time.sleep(0.05)
+    raise TimeoutError(f"conversation did not return to idle: {_get_conv(base_url, conv_id)!r}")
 
 
 def _list_product_conversations(base_url: str) -> dict:
@@ -1320,8 +1388,14 @@ def scenario_coordinator_home(_base_url: str) -> None:
                 time.sleep(0.05)
             assert binding() == (scope, cwd)
             assert sentinel.read_text() == 'separate-worker-bytes'
-            deleted = httpx.post(f"{base_url}/api/conversations/{worker['id']}/delete", timeout=10)
-            deleted.raise_for_status()
+            closed_worker = _get_conv(base_url, worker['id'])
+            retired_delete = httpx.post(f"{base_url}/api/conversations/{worker['id']}/delete", timeout=10)
+            absent_route = httpx.post(f"{base_url}/api/conversations/{worker['id']}/unknown-route", timeout=10)
+            assert retired_delete.status_code == absent_route.status_code != 200, retired_delete.text
+            assert retired_delete.json() == absent_route.json()
+            retained_worker = _get_conv(base_url, worker['id'])
+            assert retained_worker['conversation']['archived']
+            assert retained_worker['messages'] == closed_worker['messages']
             assert binding() == (scope, cwd)
             assert Path(cwd, 'e2e-home-evidence.txt').read_text() == 'coordinator-home-proof'
             outside = root / 'data' / 'outside.txt'
@@ -1577,6 +1651,142 @@ def scenario_continuation(base_url: str) -> None:
         "third-turn idle completion",
         timeout=SCENARIO_TIMEOUT_SECONDS,
     )
+
+
+def scenario_git_lifecycle_public_http(base_url: str) -> None:
+    with tempfile.TemporaryDirectory(prefix="phoenix-e2e-git-lifecycle-") as temp_dir:
+        repo = Path(temp_dir) / "source"
+        repo.mkdir()
+        _git(repo, "init", "-q", "-b", "main")
+        (repo / ".gitignore").write_text("*.ignored\n")
+        reviewed_tasks = (
+            ("e2e-task.md", b"# Disposable Git lifecycle task\n\nPrepared by the E2E fixture for approval.\n"),
+            ("e2e-follow-up.md", b"# Disposable follow-up\n\nReview the second plan.\n\n"),
+        )
+        for task_path, reviewed_bytes in reviewed_tasks:
+            (repo / task_path).write_bytes(reviewed_bytes)
+        _git(repo, "add", ".gitignore", "e2e-task.md", "e2e-follow-up.md")
+        subprocess.run(
+            ["git", "-c", "user.name=Phoenix E2E", "-c", "user.email=e2e@example.invalid",
+             "commit", "-qm", "fixture"], cwd=repo, check=True,
+        )
+        (repo / "staged.txt").write_text("staged source bytes\n")
+        _git(repo, "add", "staged.txt")
+        (repo / "staged.txt").write_text("unstaged source bytes\n")
+        ignored = repo / "source.ignored"
+        ignored.write_text("ignored source bytes\n")
+        original = _git_lifecycle_snapshot(repo)
+
+        request_id = str(uuid.uuid4())
+        created = httpx.post(
+            f"{base_url}/api/product-conversations/new",
+            json={
+                "cwd": str(repo),
+                "model": _default_model(base_url),
+                "objective": "[[scenario:git_lifecycle_proposal]] review the prepared task",
+                "images": [],
+                "request_id": request_id,
+            }, timeout=10.0,
+        )
+        created.raise_for_status()
+        assert created.status_code == 202, f"unexpected creation acceptance: {created.status_code}"
+        product_id = created.json()["product_conversation_id"]
+
+        deadline = time.monotonic() + SCENARIO_TIMEOUT_SECONDS
+        while True:
+            status = httpx.get(
+                f"{base_url}/api/product-conversations/creation/{request_id}", timeout=10.0,
+            )
+            status.raise_for_status()
+            creation = status.json()
+            if creation["kind"] == "published":
+                break
+            if creation["kind"] in {"failed", "cancelled"}:
+                raise AssertionError(f"Git product creation failed: {creation!r}")
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Git product creation timed out: {creation!r}")
+            time.sleep(0.05)
+
+        conv_id = creation["transcript_row_id"]
+        first = _wait_for_task_proposal(base_url, conv_id, 1)
+        checkout = Path(first["conversation"]["cwd"])
+        assert checkout != repo and checkout.exists(), f"Git route did not publish a disposable checkout: {checkout}"
+        assert checkout in _git_worktree_paths(repo), "created checkout is not registered as a Git worktree"
+        root_before_approval = _git_lifecycle_snapshot(repo)
+        checkout_before_approval = _git_lifecycle_snapshot(checkout)
+        approval_prefix = f"Task approved in the current environment at {checkout}.\n\n"
+
+        for approval_number, (task_path, reviewed_bytes) in enumerate(reviewed_tasks, start=1):
+            assert (checkout / task_path).read_bytes() == reviewed_bytes
+            approval = httpx.post(
+                f"{base_url}/api/conversations/{conv_id}/approve-task", json={}, timeout=10.0,
+            )
+            approval.raise_for_status()
+            assert approval.json().get("success") is True
+            idle = _wait_for_idle(base_url, conv_id)
+            assert Path(idle["conversation"]["cwd"]) == checkout, "approval changed the checkout path"
+            approval_messages = [
+                message["content"]["text"].removeprefix(approval_prefix)
+                for message in _user_messages(idle["messages"])
+                if message["content"]["text"].startswith(approval_prefix)
+            ]
+            assert len(approval_messages) == approval_number, "expected one published message per approval"
+            accepted_bodies = []
+            for message in approval_messages:
+                heading, priority, body = message.split("\n\n", maxsplit=2)
+                assert heading.startswith("## Approved plan: ") and priority.startswith("Priority: ")
+                accepted_bodies.append(body.encode("utf-8"))
+            assert accepted_bodies == [body for _, body in reviewed_tasks[:approval_number]], (
+                "published approval did not carry the exact reviewed bytes"
+            )
+            assert _git_lifecycle_snapshot(repo) == root_before_approval, (
+                f"approval {approval_number} mutated the source repository/index/refs/ignores"
+            )
+            assert _git_lifecycle_snapshot(checkout) == checkout_before_approval, (
+                f"approval {approval_number} changed checkout status, index, refs, ignores, or commits"
+            )
+            if approval_number == 1:
+                followup = httpx.post(
+                    f"{base_url}/api/conversations/{conv_id}/chat",
+                    json={
+                        "text": "[[scenario:git_lifecycle_followup]] review this ordinary Git follow-up",
+                        "images": [],
+                        "message_id": str(uuid.uuid4()),
+                    }, timeout=10.0,
+                )
+                followup.raise_for_status()
+                _wait_for_task_proposal(base_url, conv_id, 2)
+        assert _git_lifecycle_snapshot(checkout) == checkout_before_approval, (
+            "test left checkout changes before physical Close"
+        )
+        try:
+            closed = httpx.post(
+                f"{base_url}/api/product-conversations/{product_id}/close", timeout=10.0,
+            )
+        except httpx.RequestError as error:
+            raise AssertionError(f"physical Close request failed: {error}") from error
+        assert closed.is_success, f"physical Close returned HTTP {closed.status_code}: {closed.text}"
+        assert closed.json().get("success") is True, (
+            f"physical Close did not return success for {product_id}: {closed.text}"
+        )
+        assert not checkout.exists(), (
+            f"physical Close retained the checkout {checkout} for {product_id}: {closed.text}"
+        )
+        assert checkout not in _git_worktree_paths(repo), (
+            f"physical Close retained the Git registration for {product_id}: {closed.text}"
+        )
+        assert _git_lifecycle_snapshot(repo) == original, "Close or approval changed the original repository"
+        assert (repo / "staged.txt").read_text() == "unstaged source bytes\n"
+        assert ignored.read_text() == "ignored source bytes\n"
+
+        archived = httpx.get(f"{base_url}/api/conversations/archived", timeout=10.0)
+        archived.raise_for_status()
+        history = archived.json().get("conversations", [])
+        assert any(item.get("id") == conv_id for item in history), (
+            "closed conversation is not readable from History"
+        )
+        retained = _get_conv(base_url, conv_id)
+        assert retained["messages"], "closed transcript history is empty"
 
 
 def scenario_product_conversation_context_continuation(base_url: str) -> None:
@@ -2067,6 +2277,7 @@ SCENARIOS = [
     ("patch", scenario_patch),
     ("present_svg", scenario_present_svg),
     ("continuation", scenario_continuation),
+    ("git_lifecycle_public_http", scenario_git_lifecycle_public_http),
     (
         "product_conversation_context_continuation",
         scenario_product_conversation_context_continuation,
@@ -2083,6 +2294,9 @@ SCENARIO_MAP = dict(SCENARIOS)
 def _parse_args(argv: list[str]):
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
+    qualification = parser.add_mutually_exclusive_group()
+    qualification.add_argument("--isolated-git-lifecycle", action="store_true")
+    qualification.add_argument("--ordinary-git-lifecycle", type=Path, metavar="SOURCE_SHA_FILE")
     parser.add_argument(
         "--scenario",
         action="append",
@@ -2093,6 +2307,8 @@ def _parse_args(argv: list[str]):
     args = parser.parse_args(argv)
     if args.positional:
         parser.error(f"unrecognized arguments: {' '.join(args.positional)}")
+    if (args.isolated_git_lifecycle or args.ordinary_git_lifecycle) and (args.self_test or args.scenario):
+        parser.error("Git lifecycle qualification is a fixed standalone selector")
     return args
 
 
@@ -2611,6 +2827,20 @@ class ScenarioSelectorTests(unittest.TestCase):
         self.assertEqual(["patch", "list_models"], args.scenario)
         self.assertFalse(args.self_test)
 
+    def test_isolated_git_lifecycle_cannot_select_other_work(self):
+        flag = "--isolated-git-lifecycle"
+        self.assertTrue(_parse_args([flag]).isolated_git_lifecycle)
+        for other in (["--scenario", "patch"], ["--scenario", "git_lifecycle_public_http"], ["--self-test"]):
+            with self.subTest(other=other), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                _parse_args([flag, *other])
+
+    def test_ordinary_git_lifecycle_uses_a_prepared_sha_and_cannot_select_other_work(self):
+        flag = ["--ordinary-git-lifecycle", "source.sha"]
+        self.assertEqual(_parse_args(flag).ordinary_git_lifecycle, Path("source.sha"))
+        for other in (["--scenario", "git_lifecycle_public_http"], ["--self-test"], ["--isolated-git-lifecycle"]):
+            with self.subTest(other=other), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                _parse_args([*flag, *other])
+
     def test_parse_args_rejects_positional_arguments(self):
         with self.assertRaises(SystemExit):
             _parse_args(["product_conversation_context_continuation"])
@@ -2747,6 +2977,65 @@ class ParallelDispatchTests(unittest.TestCase):
         self.assertIn("synthetic e2e failure", failures[0][1])
 
 
+def _report_disposable_close_state(db_path: Path) -> None:
+    import sqlite3
+
+    # Only read the hermetic server's disposable database, before it is removed.
+    queries = (
+        ("attempts", "SELECT product_conversation_id, attempt_id, phase, close_outcome "
+                     "FROM close_obligations ORDER BY chronology_ordinal DESC LIMIT 4"),
+        ("failures", "SELECT attempt_id, cleanup_run_ordinal, resource_kind, reason, substr(detail, 1, 1200) "
+                     "FROM close_cleanup_failures ORDER BY occurred_at_us DESC LIMIT 4"),
+        ("writers", "SELECT attempt_id, run_ordinal, detector, pid, authority, gap "
+                    "FROM close_writer_observations ORDER BY attempt_id, run_ordinal, detector LIMIT 12"),
+    )
+    try:
+        with contextlib.closing(sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True, timeout=1)) as db:
+            for label, query in queries:
+                print(f"[e2e] Close durable {label}: {db.execute(query).fetchall()!r}", flush=True)
+    except sqlite3.Error as error:
+        print(f"[e2e] Close durable diagnostics unavailable: {error}", flush=True)
+
+
+def _close_descriptor_diagnostic_tail(log_text: str) -> list[str]:
+    tail = []
+    for line in reversed(log_text.splitlines()):
+        if "phoenix_ide::runtime::close_retirement" not in line:
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(record, dict) or record.get("target") != "phoenix_ide::runtime::close_retirement":
+            continue
+        fields = record.get("fields")
+        if isinstance(fields, dict) and (
+            fields.get("detector") == "linux_descriptor"
+            or fields.get("message") == "Linux Close writer scan I/O failed"
+        ):
+            tail.append(line)
+            if len(tail) == 12:
+                break
+    return list(reversed(tail))
+
+
+class CloseDescriptorDiagnosticsTests(unittest.TestCase):
+    def test_keeps_bounded_json_tail_including_non_io_gaps(self):
+        target = "phoenix_ide::runtime::close_retirement"
+        entries = [
+            json.dumps({"target": target, "fields": {
+                "operation": operation, "detector": "linux_descriptor", "pid": pid,
+            }})
+            for pid, operation in enumerate(["identity_before", "process_revalidation"] * 7)
+        ]
+        io_error = json.dumps({"target": target, "fields": {
+            "message": "Linux Close writer scan I/O failed", "raw_os_error": "Some(13)",
+        }})
+        noise = [f"{target} is not JSON", json.dumps({"target": "other", "fields": {"detector": "linux_descriptor"}})]
+        log = "\n".join([*entries, *noise, io_error])
+        self.assertEqual(_close_descriptor_diagnostic_tail(log), [*entries[-11:], io_error])
+
+
 def _run_self_tests() -> int:
     suite = unittest.TestSuite(
         unittest.defaultTestLoader.loadTestsFromTestCase(case)
@@ -2759,25 +3048,68 @@ def _run_self_tests() -> int:
             PublicLiteralChatPreflightTests,
             ScenarioSelectorTests,
             ParallelDispatchTests,
+            CloseDescriptorDiagnosticsTests,
         )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     return 0 if result.wasSuccessful() else 1
 
 
+def _verify_qualified_linux_server(
+    base_url: str, pid: int, binary: Path, expected_sha: str, *, isolated: bool
+) -> None:
+    version = httpx.get(f"{base_url}/api/version", timeout=10.0)
+    version.raise_for_status()
+    assert version.json()["git_sha"] == expected_sha, version.text
+    server_proc = Path(f"/proc/{pid}")
+    for namespace in ("pid", "mnt"):
+        harness_ns = Path(f"/proc/self/ns/{namespace}").readlink()
+        assert (server_proc / "ns" / namespace).readlink() == harness_ns
+        print(f"[e2e] harness and server share {harness_ns}", flush=True)
+    assert (server_proc / "exe").samefile(binary), "server executable differs from staged binary"
+    credentials = dict(line.split(":", 1) for line in (server_proc / "status").read_text().splitlines())
+    uid = os.getuid()
+    assert uid != 0 and credentials["Uid"].split() == [str(uid)] * 4
+    assert all(int(credentials[f"Cap{kind}"], 16) == 0 for kind in ("Inh", "Prm", "Eff", "Amb"))
+    if isolated:
+        assert not credentials["Groups"].split()
+        assert credentials["NoNewPrivs"].strip() == "1"
+        assert int(credentials["CapBnd"], 16) == 0
+    context = "isolated" if isolated else "ordinary Linux"
+    print(f"[e2e] {context} server source={expected_sha} uid={uid} pid={pid}", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     if args.self_test:
         return _run_self_tests()
-    if _run_self_tests() != 0:
-        return 1
-    selected_scenarios = _select_scenarios(args.scenario)
-    _build_binary()
+    binary = BINARY
+    expected_sha = None
+    if args.isolated_git_lifecycle:
+        selected_scenarios = _select_scenarios(["git_lifecycle_public_http"])
+        binary = Path.cwd() / "runtime-test"
+        expected_sha = (Path(__file__).parent / "source.sha").read_text().strip()
+    elif args.ordinary_git_lifecycle:
+        selected_scenarios = _select_scenarios(["git_lifecycle_public_http"])
+        expected_sha = args.ordinary_git_lifecycle.read_text().strip()
+    else:
+        if _run_self_tests() != 0:
+            return 1
+        selected_scenarios = _select_scenarios(args.scenario)
+        _build_binary()
     failures: list[tuple[str, str]] = []
     log_text = ""
     workers = _e2e_worker_budget()
-    with _server() as (base_url, log_path, server_pid, profile_dir):
+    with _server(binary) as (base_url, log_path, server_pid, profile_dir):
         print(f"[e2e] server up at {base_url}", flush=True)
+        if expected_sha is not None:
+            try:
+                _verify_qualified_linux_server(
+                    base_url, server_pid, binary, expected_sha, isolated=args.isolated_git_lifecycle
+                )
+            except Exception:
+                print("\n".join(log_path.read_text().splitlines()[-80:]), file=sys.stderr)
+                raise
         if profile_dir is None and workers > 1 and len(selected_scenarios) > 1:
             failures = _run_scenarios_parallel(
                 selected_scenarios, base_url, min(workers, len(selected_scenarios))
@@ -2834,9 +3166,33 @@ def main(argv: list[str] | None = None) -> int:
                         extra={"kind": "e2e_scenario", "process_role": "server", "scenario": name, "status": scenario_status},
                     )
 
+        lifecycle_close_failed = any(
+            name == "git_lifecycle_public_http" and "physical Close " in detail
+            for name, detail in failures
+        )
+        if lifecycle_close_failed:
+            _report_disposable_close_state(log_path.parent / "phoenix.db")
+        if lifecycle_close_failed and sys.platform == "linux":
+            for role, pid in (("harness", os.getpid()), ("server", server_pid)):
+                proc = Path("/proc") / str(pid)
+                try:
+                    namespace = (proc / "ns/pid").readlink()
+                    status = (proc / "status").read_text()
+                    pids = next(
+                        (line for line in status.splitlines() if line.startswith("NSpid:")),
+                        "NSpid: unavailable",
+                    )
+                    print(f"[e2e] Close {role} pid={pid} namespace={namespace} {pids}")
+                except OSError as error:
+                    print(f"[e2e] Close {role} pid={pid} namespace unavailable (errno={error.errno})")
+
         # Read log inside the context — the tempdir may be cleaned up after.
         if log_path.exists():
             log_text = log_path.read_text()
+
+    if lifecycle_close_failed:
+        for line in _close_descriptor_diagnostic_tail(log_text):
+            print(f"  | {line}")
 
     external_mcp_lines = [
         line

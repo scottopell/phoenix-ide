@@ -193,6 +193,12 @@ final class AppModelProductConversationTests: XCTestCase {
 
     func testAPIRebuildRestartsAggregateReconciliationAfterPermanentFailure() {
         let model = AppModel()
+        let key = "phoenix.serverURL"
+        let originalURL = UserDefaults.standard.string(forKey: key)
+        defer { UserDefaults.standard.set(originalURL, forKey: key) }
+        model.connectivity.setOnlineForTesting(true)
+        model.serverURLString = "http://127.0.0.1:2"
+        XCTAssertNotNil(model.aggregateReconciliationId)
         model.cancelAggregateReconciliationForTesting()
         XCTAssertNil(model.aggregateReconciliationId)
 
@@ -234,18 +240,6 @@ final class AppModelProductConversationTests: XCTestCase {
 
         XCTAssertTrue(model.aggregateEventStreamOwnedForTesting)
         XCTAssertNil(model.aggregateReconciliationId)
-    }
-
-    func testProductConversationDeleteOutcomeCarriesEveryAuthoritativeMember() throws {
-        let response = try JSONDecoder().decode(
-            PhoenixAPI.ProductConversationDeleteResponse.self,
-            from: Data("""
-            {"success":true,"outcome":{"type":"deleted","deleted_conversation_ids":["root","agent"]}}
-            """.utf8))
-
-        XCTAssertEqual(
-            response.outcome,
-            .deleted(conversationIds: ["root", "agent"]))
     }
 
     func testForegroundRestoreDefersReconciliationUntilStreamIsReady() {
@@ -506,133 +500,6 @@ final class AppModelProductConversationTests: XCTestCase {
             page: historySnapshot(aggregateId: "different", segments: []))) {
             XCTAssertEqual($0 as? ProductHistoryLoadError, .aggregateIdentityChanged)
         }
-    }
-
-    func testAuthoritativeProductHistoryRemovalCleansAggregateState() async throws {
-        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("phoenix-product-history-tests-\(UUID().uuidString)")
-        let aggregateId = "pc-deleted"
-        let row = conversation(id: "row-deleted", aggregateId: aggregateId)
-        persistReadableSnapshot(conversation: row)
-        DiskStore.save(["queued"], name: "outbox-row-deleted")
-        let history = historySnapshot(aggregateId: aggregateId, segments: [])
-        let writer = ProductHistorySnapshotStore.writer(productConversationId: aggregateId)
-        let revision = writer.reserveRevision()
-        let historySaved = await writer.save(
-            CachedProductHistory(snapshot: history, fetchedAt: Date()),
-            revision: revision)
-        XCTAssertTrue(historySaved)
-
-        let model = AppModel()
-        model.serverURLString = "http://localhost"
-        model.listStore.upsert(row)
-        XCTAssertNotNil(model.session(for: row.id))
-
-        let removed = await model.removeProductHistoryLocallyForTesting(
-            productConversationId: aggregateId,
-            transcriptIds: [row.id])
-        XCTAssertTrue(removed)
-
-        XCTAssertTrue(model.listStore.conversations.isEmpty)
-        XCTAssertTrue(model.deletedProductHistoryIds.contains(aggregateId))
-        XCTAssertNil(model.cachedProductHistory(productConversationId: aggregateId))
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: row.id))
-        XCTAssertFalse(DiskStore.listNames(prefix: "outbox-row-deleted").contains("outbox-row-deleted"))
-    }
-
-    func testAggregateDeletionEventCleansAllExactTranscriptOwnersAndConfirmation() async {
-        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("phoenix-aggregate-event-tests-\(UUID().uuidString)")
-        let model = AppModel()
-        model.serverURLString = "http://localhost"
-        let aggregateId = "pc-deleted"
-        let root = conversation(id: "root", aggregateId: aggregateId)
-        let leaf = conversation(id: "leaf", aggregateId: aggregateId)
-        model.listStore.upsert(root)
-        model.listStore.upsert(leaf)
-        persistReadableSnapshot(conversation: root)
-        persistReadableSnapshot(conversation: leaf)
-        DiskStore.save(["queued"], name: "outbox-root")
-        DiskStore.save(["queued"], name: "outbox-leaf")
-        XCTAssertNotNil(model.session(for: root.id))
-        XCTAssertNotNil(model.session(for: leaf.id))
-        model.installPendingProductCloseConfirmationForTesting(PendingProductCloseConfirmation(
-            productConversationId: aggregateId,
-            transcriptRowId: leaf.id,
-            close: closeSnapshot(phase: .awaiting_stop_work_confirmation)))
-
-        await model.handleAggregateHardDeletedForTesting(
-            productConversationId: aggregateId,
-            transcriptIds: [root.id, leaf.id])
-
-        XCTAssertTrue(model.listStore.conversations.isEmpty)
-        XCTAssertTrue(model.deletedProductHistoryIds.contains(aggregateId))
-        XCTAssertNil(model.pendingProductCloseConfirmation)
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: root.id))
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: leaf.id))
-        XCTAssertFalse(DiskStore.listNames(prefix: "outbox-").contains("outbox-root"))
-        XCTAssertFalse(DiskStore.listNames(prefix: "outbox-").contains("outbox-leaf"))
-    }
-
-    func testAggregateDeletionTerminalizesRetainedOwnersMissingFromAliases() async throws {
-        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("phoenix-retained-delete-tests-\(UUID().uuidString)")
-        let aggregateId = "pc-deleted"
-        let openRow = conversation(id: "open-row", aggregateId: aggregateId)
-        let drainRow = conversation(id: "drain-row", aggregateId: aggregateId)
-        persistReadableSnapshot(conversation: openRow)
-        persistReadableSnapshot(conversation: drainRow)
-        let model = AppModel()
-        model.installAPIForTesting()
-        let openOwner = try XCTUnwrap(model.session(for: openRow.id))
-        let drainOwner = try XCTUnwrap(model.installDrainSessionForTesting(conversationId: drainRow.id))
-
-        let removed = await model.removeProductHistoryLocallyForTesting(
-            productConversationId: aggregateId,
-            transcriptIds: [])
-
-        XCTAssertTrue(removed)
-        XCTAssertTrue(openOwner.isHardDeleted)
-        XCTAssertTrue(drainOwner.isHardDeleted)
-        XCTAssertFalse(openOwner.acceptsConversationActions)
-        XCTAssertFalse(drainOwner.acceptsConversationActions)
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: openRow.id))
-        XCTAssertFalse(ConversationSession.hasCachedSnapshot(conversationId: drainRow.id))
-    }
-
-    func testAggregateDeletionTombstonesEveryIdentityBeforeCleanupCanSuspend() async throws {
-        DiskStore.baseDirectory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("phoenix-delete-tombstone-race-tests-\(UUID().uuidString)")
-        let aggregateId = "pc-deleted"
-        let listed = conversation(id: "listed-row", aggregateId: aggregateId)
-        let cached = conversation(id: "cached-row", aggregateId: aggregateId)
-        let retained = conversation(id: "retained-row", aggregateId: aggregateId)
-        persistReadableSnapshot(conversation: cached)
-        persistReadableSnapshot(conversation: retained)
-        let model = AppModel()
-        model.installAPIForTesting()
-        model.listStore.upsert(listed)
-        XCTAssertNotNil(model.session(for: retained.id))
-        var checkedBeforeFirstAwait = false
-
-        let removed = await model.removeProductHistoryLocallyForTesting(
-            productConversationId: aggregateId,
-            transcriptIds: [listed.id, cached.id],
-            tombstonesInstalled: {
-                checkedBeforeFirstAwait = true
-                XCTAssertTrue(model.deletedProductHistoryIds.isSuperset(
-                    of: [aggregateId, listed.id, cached.id, retained.id]))
-                XCTAssertNil(model.session(for: aggregateId))
-                XCTAssertNil(model.session(for: listed.id))
-                XCTAssertNil(model.session(for: cached.id))
-                XCTAssertNil(model.session(for: retained.id))
-            })
-
-        XCTAssertTrue(removed)
-        XCTAssertTrue(checkedBeforeFirstAwait)
-        XCTAssertNil(model.session(for: listed.id))
-        XCTAssertNil(model.session(for: cached.id))
-        XCTAssertNil(model.session(for: retained.id))
     }
 
     func testRetainedProductHistoryCacheShowsAgeUntilOnlineRefreshSucceeds() {
@@ -1064,38 +931,6 @@ final class AppModelProductConversationTests: XCTestCase {
 
         XCTAssertFalse(tracker.isCurrent(productA, productConversationId: "product-a"))
         XCTAssertTrue(tracker.isCurrent(productB, productConversationId: "product-b"))
-    }
-
-    func testLegacyCachedHistoryResolvesCanonicalRootBeforeDelete() async throws {
-        let legacy = conversation(id: "latest", aggregateId: "product", archived: true)
-        var fetchedReferences: [String] = []
-
-        let root = try await AppModel.resolveProductHistoryRoot(
-            conversation: legacy,
-            fetch: { reference in
-                fetchedReferences.append(reference)
-                return self.historySnapshot(aggregateId: "product", segments: [])
-            })
-
-        XCTAssertEqual(root, "root")
-        XCTAssertEqual(fetchedReferences, ["latest"])
-    }
-
-    func testPersistedHistoryRootSkipsCanonicalLookupBeforeDelete() async throws {
-        let migrated = conversation(
-            id: "latest",
-            aggregateId: "product",
-            archived: true,
-            chainRootId: "persisted-root")
-
-        let root = try await AppModel.resolveProductHistoryRoot(
-            conversation: migrated,
-            fetch: { _ in
-                XCTFail("A persisted canonical root must not be looked up again")
-                throw APIError.invalidURL
-            })
-
-        XCTAssertEqual(root, "persisted-root")
     }
 
     func testProductHistoryHandoffDisplaySummaryCoversBothKinds() {

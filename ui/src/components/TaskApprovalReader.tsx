@@ -61,17 +61,6 @@ const formatTaskApprovalContextPercent = (used: number, max: number): string => 
   return `${Math.round(percent)}%`;
 };
 
-type TaskApprovalContextRecommendation = 'continue-here' | 'new-conversation' | 'either';
-
-function getTaskApprovalContextRecommendation(percent: number): {
-  kind: TaskApprovalContextRecommendation;
-  label: string;
-} {
-  if (percent < 60) return { kind: 'continue-here', label: 'Continue here recommended' };
-  if (percent < 82) return { kind: 'either', label: 'Either path is fine' };
-  if (percent < 94) return { kind: 'new-conversation', label: 'Start in new conversation recommended' };
-  return { kind: 'new-conversation', label: 'Start in new conversation strongly recommended' };
-}
 
 export interface TaskApprovalReaderProps {
   title: string;
@@ -342,9 +331,6 @@ export function TaskApprovalReader({
       : null;
   const contextUsagePercent = contextUsage !== null
     ? formatTaskApprovalContextPercent(contextWindowUsed ?? 0, modelContextWindow ?? 0)
-    : null;
-  const contextRecommendation = contextUsage !== null
-    ? getTaskApprovalContextRecommendation(contextUsage)
     : null;
 
   const markdownDisplayBlocks = useMemo(() => buildMarkdownDisplayBlocks(plan, 'standard'), [plan]);
@@ -784,16 +770,10 @@ export function TaskApprovalReader({
         </div>
       )}
 
-      {contextUsagePercent && contextRecommendation && (
-        <div className={`task-approval-context-cue task-approval-context-cue--${contextRecommendation.kind}`}>
+      {contextUsagePercent && (
+        <div className="task-approval-context-cue">
           <span className="task-approval-context-cue__label">Context</span>
           <span className="task-approval-context-cue__value">{contextUsagePercent} used</span>
-          <span className="task-approval-context-cue__recommendation">
-            {contextRecommendation.label}
-          </span>
-          <span className="task-approval-context-cue__hint">
-            Continue here keeps this discussion; Start in new conversation starts a summarized continuation.
-          </span>
         </div>
       )}
 
@@ -831,7 +811,6 @@ export function TaskApprovalReader({
             'task-approval-btn',
             'task-approval-btn--approve',
             hasUnsentNotes && 'task-approval-btn--subdued',
-            !hasUnsentNotes && contextRecommendation?.kind === 'continue-here' && 'task-approval-btn--recommended-decision',
           ]
             .filter(Boolean)
             .join(' ')}
@@ -849,32 +828,6 @@ export function TaskApprovalReader({
               <Check size={18} />
               <span className="task-approval-btn-label-full">Continue here</span>
               <span className="task-approval-btn-label-compact">Continue here</span>
-            </>
-          )}
-        </button>
-        <button
-          className={[
-            'task-approval-btn',
-            'task-approval-btn--approve',
-            hasUnsentNotes && 'task-approval-btn--subdued',
-            !hasUnsentNotes && contextRecommendation?.kind === 'new-conversation' && 'task-approval-btn--recommended-decision',
-          ]
-            .filter(Boolean)
-            .join(' ')}
-          disabled={!mutationEnabled || approvingHandoff !== null}
-          onClick={() => handleApprove('start_fresh_work_conversation')}
-          aria-label="Start in new conversation"
-        >
-          {approvingHandoff === 'start_fresh_work_conversation' ? (
-            <>
-              <Loader2 size={18} className="spinning" />
-              Approving...
-            </>
-          ) : (
-            <>
-              <Check size={18} />
-              <span className="task-approval-btn-label-full">Start in new conversation</span>
-              <span className="task-approval-btn-label-compact">Start in new conversation</span>
             </>
           )}
         </button>

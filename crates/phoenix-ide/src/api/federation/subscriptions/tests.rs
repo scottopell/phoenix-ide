@@ -456,7 +456,7 @@ async fn dropping_sync_owner_aborts_in_flight_work_instead_of_detaching_it() {
 
 #[tokio::test]
 async fn closed_runtime_authority_aborts_retained_work_and_does_not_launch_a_new_task() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let (mut sync, held) = held_sync_task().await;
     state.runtime.begin_process_shutdown();
     sync.sync_pass(&state.runtime).await;

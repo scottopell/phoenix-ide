@@ -4,23 +4,29 @@
 use super::handlers::AppError;
 use super::types::{
     CancelCloseBeforeRetirementRequest, ConfirmCloseLossRetirementRequest,
-    ConfirmCloseStopWorkRequest, ConflictErrorResponse, ForkDismissResponse, ForkPromoteResponse,
-    ForkProposalListResponse, ForkProposalSummary, ForkSpawnResponse, RequestChangesRequest,
-    RetryCloseRetirementRequest, SuccessResponse, TaskApprovalRequest, TaskApprovalResponse,
-    TaskFeedbackRequest,
+    ConfirmCloseStopWorkRequest, ConflictErrorResponse, RetryCloseRetirementRequest,
+    SuccessResponse, TaskApprovalRequest, TaskApprovalResponse, TaskFeedbackRequest,
 };
 use super::AppState;
-use crate::close_service::run_legacy_close_compat;
+use crate::close_service::{
+    require_close_settlement_without_retained_custody, run_legacy_close_compat,
+};
 #[cfg(test)]
 use crate::db::Conversation;
-use crate::runtime::fork_resolve::ForkResolveError;
+use crate::runtime::close_retirement::GenericCloseRetryError;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
 
+use crate::runtime::close_retirement::{
+    GenericCloseIngress, GenericCloseIngressError, GenericCloseIngressOutcome,
+};
 use axum::{
     extract::{Path, State},
     Json,
 };
+use phoenix_core::domain::close::ClosePhase;
+use phoenix_core::domain::product_conversation::ProductConversationId;
+use phoenix_db::native_close::{CloseTargetControlResolution, NativeCloseInitialControl};
 
 // ============================================================
 // Terminal-action gate (REQ-BED-031)
@@ -158,6 +164,12 @@ pub(crate) async fn approve_task(
     require_task_lifecycle_admission(&state, &conv).await?;
 
     let handoff = body.map(|Json(req)| req.handoff).unwrap_or_default();
+    if handoff != phoenix_core::domain::sm_state::TaskApprovalHandoff::ContinueInCurrentConversation
+    {
+        return Err(AppError::BadRequest(
+            "Starting a new conversation through task approval is no longer supported".to_string(),
+        ));
+    }
     // 3. Dispatch approval event to state machine
     state
         .runtime
@@ -260,125 +272,6 @@ pub(crate) async fn task_feedback(
 }
 
 // ============================================================
-// Fork proposal resolution (REQ-PROJ-034 / 037)
-// ============================================================
-
-/// Map a typed fork-resolve failure to the matching HTTP status. A non-pending
-/// proposal / terminal origin / branch collision is a 409; an unknown proposal
-/// is a 404; everything else is a 500-class internal error.
-fn fork_resolve_app_error(e: ForkResolveError) -> AppError {
-    match e {
-        ForkResolveError::NotFound(m) => AppError::NotFound(m),
-        ForkResolveError::Conflict(m) => AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            m,
-            "fork_proposal_conflict",
-        ))),
-        ForkResolveError::Internal(m) => AppError::Internal(m),
-    }
-}
-
-/// Validate that `proposal_id` belongs to `conv_id`, returning 404 when the
-/// proposal is unknown and 400 when it belongs to a different conversation.
-async fn require_proposal_for_conversation(
-    state: &AppState,
-    conv_id: &str,
-    proposal_id: &str,
-) -> Result<(), AppError> {
-    let proposal = state
-        .db
-        .get_fork_proposal(proposal_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-        .ok_or_else(|| AppError::NotFound(format!("fork proposal {proposal_id}")))?;
-    if proposal.origin_conversation_id != conv_id {
-        return Err(AppError::BadRequest(format!(
-            "fork proposal {proposal_id} does not belong to conversation {conv_id}"
-        )));
-    }
-    Ok(())
-}
-
-/// `POST /api/conversations/:id/proposals/:proposal_id/approve` — spawn a Work
-/// fork (REQ-PROJ-034).
-pub(crate) async fn approve_fork_proposal(
-    State(state): State<AppState>,
-    Path((id, proposal_id)): Path<(String, String)>,
-) -> Result<Json<ForkSpawnResponse>, AppError> {
-    require_proposal_for_conversation(&state, &id, &proposal_id).await?;
-    let fork_conversation_id = state
-        .runtime
-        .approve_fork_proposal(&proposal_id)
-        .await
-        .map_err(fork_resolve_app_error)?;
-    Ok(Json(ForkSpawnResponse {
-        fork_conversation_id,
-    }))
-}
-
-/// `POST /api/conversations/:id/proposals/:proposal_id/dismiss` — record the
-/// proposal as dismissed (REQ-PROJ-034). Idempotent.
-pub(crate) async fn dismiss_fork_proposal(
-    State(state): State<AppState>,
-    Path((id, proposal_id)): Path<(String, String)>,
-) -> Result<Json<ForkDismissResponse>, AppError> {
-    require_proposal_for_conversation(&state, &id, &proposal_id).await?;
-    let transitioned = state
-        .runtime
-        .dismiss_fork_proposal(&proposal_id)
-        .await
-        .map_err(fork_resolve_app_error)?;
-    Ok(Json(ForkDismissResponse {
-        success: true,
-        no_op: !transitioned,
-    }))
-}
-
-/// `POST /api/conversations/:id/proposals/:proposal_id/request-changes` —
-/// promote the proposal to an Explore refinement (REQ-PROJ-037).
-pub(crate) async fn request_changes_on_fork_proposal(
-    State(state): State<AppState>,
-    Path((id, proposal_id)): Path<(String, String)>,
-    Json(req): Json<RequestChangesRequest>,
-) -> Result<Json<ForkPromoteResponse>, AppError> {
-    require_proposal_for_conversation(&state, &id, &proposal_id).await?;
-    let refinement_conversation_id = state
-        .runtime
-        .request_changes_on_fork_proposal(&proposal_id, req.note)
-        .await
-        .map_err(fork_resolve_app_error)?;
-    Ok(Json(ForkPromoteResponse {
-        refinement_conversation_id,
-    }))
-}
-
-/// `GET /api/conversations/:id/proposals` — list this conversation's fork
-/// proposals so the UI can render / withdraw the Review affordance.
-pub(crate) async fn list_fork_proposals(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<ForkProposalListResponse>, AppError> {
-    let rows = state
-        .db
-        .list_fork_proposals_for_origin(&id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    let proposals = rows
-        .into_iter()
-        .map(|p| ForkProposalSummary {
-            id: p.id,
-            status: p.status.as_str().to_string(),
-            title: p.title,
-            priority: p.priority,
-            task_file: p.task_file,
-            body: p.body,
-            fork_conversation_id: p.fork_conversation_id,
-            refinement_conversation_id: p.refinement_conversation_id,
-        })
-        .collect();
-    Ok(Json(ForkProposalListResponse { proposals }))
-}
-
-// ============================================================
 // Task Abandon (REQ-PROJ-010)
 // ============================================================
 
@@ -398,17 +291,46 @@ pub(crate) async fn confirm_close_loss_retirement(
     ))))
 }
 
+fn close_target_control_conflict(detail: String, code: &str) -> AppError {
+    AppError::Conflict(Box::new(ConflictErrorResponse::new(detail, code)))
+}
+
+fn close_settlement_in_progress() -> AppError {
+    close_target_control_conflict(
+        "Close settlement remains in progress".into(),
+        "close_settlement_in_progress",
+    )
+}
+
+async fn require_close_target_latest(
+    state: &AppState,
+    product_id: &ProductConversationId,
+    transcript_id: &str,
+) -> Result<(), AppError> {
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(product_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if aggregate
+        .segments
+        .last()
+        .map(|segment| segment.transcript_row.conversation.id.as_str())
+        != Some(transcript_id)
+    {
+        return Err(close_target_control_conflict(
+            "Close control is accepted only from the active aggregate transcript".into(),
+            "inactive_close_transcript",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn confirm_close_stop_work(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(request): Json<ConfirmCloseStopWorkRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state
-        .runtime
-        .mutation_admission(&id)
-        .await
-        .map_err(super::handlers::map_admission_db_error)?;
-    let _guard = admission.lock().await;
     let transcript = state
         .db
         .get_conversation(&id)
@@ -447,46 +369,113 @@ pub(crate) async fn confirm_close_stop_work(
             "stale_close_attempt",
         ))));
     }
-    state
+    let target_latest = phoenix_core::domain::close::TranscriptConversationId::parse(id.clone())
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let route = state
         .db
-        .begin_close_active_work_settlement(obligation.attempt_id().as_str())
+        .resolve_close_target_control(
+            obligation.product_conversation_id(),
+            &target_latest,
+            obligation.attempt_id(),
+        )
         .await
         .map_err(|error| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                error.to_string(),
-                "close_stop_work_confirmation_failed",
-            )))
+            close_target_control_conflict(error.to_string(), "close_stop_work_confirmation_failed")
         })?;
-    state
+    match route {
+        CloseTargetControlResolution::ParkedNativeInitial(route) => {
+            state
+                .runtime
+                .control_native_close_initial(route, NativeCloseInitialControl::ConfirmStopWork)
+                .await
+                .map_err(|error| {
+                    close_target_control_conflict(
+                        error.to_string(),
+                        "close_stop_work_confirmation_failed",
+                    )
+                })?;
+            return Err(close_settlement_in_progress());
+        }
+        CloseTargetControlResolution::NativeInitialSettlementInProgress => {
+            return Err(close_settlement_in_progress());
+        }
+        CloseTargetControlResolution::Generic => {}
+    }
+    let admission = state
         .runtime
-        .resume_pending_close_settlements()
+        .mutation_admission(&id)
         .await
-        .map_err(|error| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
+        .map_err(super::handlers::map_admission_db_error)?;
+    let worker = state
+        .runtime
+        .start_generic_close_ingress(
+            obligation.attempt_id().clone(),
+            transcript.product_conversation_id.clone(),
+            target_latest,
+            GenericCloseIngress::ConfirmStop(admission),
+        )
+        .map_err(|error| close_target_control_conflict(error, "close_settlement_in_progress"))?;
+    match worker.await {
+        Ok(Ok(GenericCloseIngressOutcome::Continued)) => {}
+        Ok(Ok(GenericCloseIngressOutcome::Observed(_))) => {
+            return Err(AppError::Internal(
+                "expected committed Close stop-work".into(),
+            ));
+        }
+        Ok(Err(GenericCloseIngressError::Admission(error))) => {
+            let error_type =
+                if matches!(error, crate::db::DbError::CloseFoundationStaleLatest { .. }) {
+                    "inactive_close_transcript"
+                } else {
+                    "close_stop_work_confirmation_failed"
+                };
+            return Err(close_target_control_conflict(error.to_string(), error_type));
+        }
+        Ok(Err(GenericCloseIngressError::Worker(error))) => {
+            crate::close_service::project_close_worker_failure(
+                &state,
+                obligation.attempt_id(),
                 error,
-                "close_settlement_in_progress",
-            )))
-        })?;
+            )
+            .await?;
+            return Ok(Json(SuccessResponse { success: true }));
+        }
+        Err(error) => {
+            crate::close_service::project_close_worker_failure(
+                &state,
+                obligation.attempt_id(),
+                format!("Close settlement worker failed: {error}"),
+            )
+            .await?;
+            return Ok(Json(SuccessResponse { success: true }));
+        }
+    }
     let refreshed = state
         .db
         .get_close_obligation(obligation.attempt_id().as_str())
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
     match refreshed.phase() {
-        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-        | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement => {
-            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Close settlement remains in progress",
-                "close_settlement_in_progress",
-            ))))
+        ClosePhase::Completed => {
+            crate::close_service::project_completed_close(refreshed.close_outcome(), None)?;
+            Ok(Json(SuccessResponse { success: true }))
         }
-        phoenix_core::domain::close::ClosePhase::AwaitingLossConfirmation => {
+        ClosePhase::SettlingActiveWork => {
+            require_close_settlement_without_retained_custody(&state, refreshed.attempt_id())
+                .await?;
+            Err(close_settlement_in_progress())
+        }
+        ClosePhase::AwaitingLossConfirmation => {
             Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 "Close requires confirmation of the freshly inspected loss inventory",
                 "close_loss_confirmation_required",
             ))))
         }
-        _ => Ok(Json(SuccessResponse { success: true })),
+        ClosePhase::NeedsRepair => Err(close_target_control_conflict(
+            "Close retirement requires repair".to_string(),
+            "close_retirement_needs_repair",
+        )),
+        _ => Err(close_settlement_in_progress()),
     }
 }
 
@@ -496,12 +485,6 @@ pub(crate) async fn cancel_close_before_retirement(
     Path(id): Path<String>,
     Json(request): Json<CancelCloseBeforeRetirementRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state
-        .runtime
-        .mutation_admission(&id)
-        .await
-        .map_err(super::handlers::map_admission_db_error)?;
-    let _guard = admission.lock().await;
     let transcript = state
         .db
         .get_conversation(&id)
@@ -540,6 +523,43 @@ pub(crate) async fn cancel_close_before_retirement(
             "stale_close_attempt",
         ))));
     }
+    let target_latest = phoenix_core::domain::close::TranscriptConversationId::parse(id.clone())
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let route = state
+        .db
+        .resolve_close_target_control(
+            obligation.product_conversation_id(),
+            &target_latest,
+            obligation.attempt_id(),
+        )
+        .await
+        .map_err(|error| close_target_control_conflict(error.to_string(), "close_cancel_failed"))?;
+    match route {
+        CloseTargetControlResolution::ParkedNativeInitial(route) => {
+            state
+                .runtime
+                .control_native_close_initial(route, NativeCloseInitialControl::Cancel)
+                .await
+                .map_err(|error| {
+                    close_target_control_conflict(error.to_string(), "close_cancel_failed")
+                })?;
+            return Ok(Json(SuccessResponse { success: true }));
+        }
+        CloseTargetControlResolution::NativeInitialSettlementInProgress => {
+            return Err(close_target_control_conflict(
+                "Native Initial Close is already settling active work".into(),
+                "close_cancel_failed",
+            ));
+        }
+        CloseTargetControlResolution::Generic => {}
+    }
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
+    let guard = admission.lock().await;
+    require_close_target_latest(&state, &transcript.product_conversation_id, &id).await?;
     state
         .runtime
         .cancel_close_before_retirement(obligation.attempt_id())
@@ -550,6 +570,14 @@ pub(crate) async fn cancel_close_before_retirement(
                 "close_cancel_failed",
             )))
         })?;
+    drop(guard);
+    if let Err(error) = state
+        .runtime
+        .resume_close_settlements(Some(obligation.attempt_id()))
+        .await
+    {
+        tracing::warn!(%error, attempt_id = %obligation.attempt_id(), "accepted Close cancellation settlement remains pending");
+    }
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -601,65 +629,22 @@ pub(crate) async fn retry_close_retirement(
             "stale_close_attempt",
         ))));
     }
-    let retried = state
-        .db
-        .retry_close_retirement(attempt.attempt_id())
+    state
+        .runtime
+        .retry_generic_close_retirement(attempt.attempt_id().clone())
         .await
-        .map_err(|error| {
-            AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                error.to_string(),
-                "close_retry_unavailable",
-            )))
+        .map_err(|error| match error {
+            GenericCloseRetryError::Admission(error) => AppError::Conflict(Box::new(
+                ConflictErrorResponse::new(error, "close_retry_unavailable"),
+            )),
+            GenericCloseRetryError::Continuation(error) => AppError::Conflict(Box::new(
+                ConflictErrorResponse::new(error, "close_retirement_needs_repair"),
+            )),
+            GenericCloseRetryError::Internal(error) => AppError::Internal(error),
         })?;
-    let retry_result = if retried.phase()
-        == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-    {
-        state
-            .runtime
-            .inspect_close_retirement(retried.attempt_id().clone())
-            .await
-            .map(|_| ())
-    } else {
-        state
-            .runtime
-            .retire_close_runtime_resources(retried.attempt_id().clone())
-            .await
-    };
-    if let Err(error) = retry_result {
-        let authoritative = state
-            .db
-            .get_close_obligation(retried.attempt_id().as_str())
-            .await
-            .map_err(|reload_error| AppError::Internal(reload_error.to_string()))?;
-        if authoritative.phase() == phoenix_core::domain::close::ClosePhase::RetirementRequested {
-            let scope = state
-                .db
-                .list_close_attempt_scopes(retried.attempt_id().as_str())
-                .await
-                .map_err(|route_error| AppError::Internal(route_error.to_string()))?
-                .into_iter()
-                .next()
-                .ok_or_else(|| AppError::Internal("Close retry has no captured scope".to_string()))?
-                .scope;
-            state
-                .runtime
-                .route_close_attempt_to_repair::<()>(
-                    retried.attempt_id(),
-                    &scope,
-                    phoenix_core::domain::close::RetirementFailureReason::ManualRepairRequired,
-                    error.clone(),
-                )
-                .await
-                .expect_err("repair routing returns the persisted repair detail");
-        }
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            error,
-            "close_retirement_needs_repair",
-        ))));
-    }
     let authoritative = state
         .db
-        .get_close_obligation(retried.attempt_id().as_str())
+        .get_close_obligation(attempt.attempt_id().as_str())
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
     if authoritative.phase() == phoenix_core::domain::close::ClosePhase::AwaitingLossConfirmation {
@@ -676,14 +661,7 @@ pub(crate) async fn close_legacy_compat(
     id: &str,
     action: &str,
 ) -> Result<(), AppError> {
-    run_legacy_close_compat(state, id, action, false).await
-}
-
-pub(crate) async fn close_product_conversation_with_active_work(
-    state: &AppState,
-    id: &str,
-) -> Result<(), AppError> {
-    run_legacy_close_compat(state, id, "archive", false).await
+    run_legacy_close_compat(state, id, action).await
 }
 
 pub(crate) async fn abandon_task(
@@ -696,7 +674,7 @@ pub(crate) async fn abandon_task(
         .await
         .map_err(super::handlers::map_admission_db_error)?;
     let _admission = admission.lock().await;
-    run_legacy_close_compat(&state, &id, "abandon", false).await?;
+    run_legacy_close_compat(&state, &id, "abandon").await?;
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -717,7 +695,7 @@ pub(crate) async fn mark_merged(
         .await
         .map_err(super::handlers::map_admission_db_error)?;
     let _admission = admission.lock().await;
-    run_legacy_close_compat(&state, &id, "mark as merged", false).await?;
+    run_legacy_close_compat(&state, &id, "mark as merged").await?;
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -790,7 +768,7 @@ mod tests {
 
     #[tokio::test]
     async fn product_conversation_without_project_approves_from_allocated_work_scope() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let id = "product-work-scope-approval";
         state
             .db
@@ -822,7 +800,7 @@ mod tests {
 
     #[tokio::test]
     async fn attached_work_child_cannot_own_task_lifecycle_decisions() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let id = "work-child-lifecycle-parent";
         state
             .db
@@ -888,14 +866,12 @@ mod tests {
             require_task_lifecycle_admission(&state, &child).await,
             Err(AppError::BadRequest(message)) if message == "Sub-agents cannot own task lifecycle decisions"
         ));
-        assert!(run_legacy_close_compat(&state, &child.id, "abandon", false)
+        assert!(run_legacy_close_compat(&state, &child.id, "abandon")
             .await
             .is_err());
-        assert!(
-            run_legacy_close_compat(&state, &child.id, "mark as merged", false)
-                .await
-                .is_err()
-        );
+        assert!(run_legacy_close_compat(&state, &child.id, "mark as merged")
+            .await
+            .is_err());
         let retained_parent = state.db.get_conversation(id).await.unwrap();
         assert_eq!(
             retained_parent.attached_work_scope_id,
@@ -906,7 +882,7 @@ mod tests {
 
     #[tokio::test]
     async fn approve_task_rejects_direct_unowned_cwd() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let id = "direct-unowned-approval";
         state
             .db

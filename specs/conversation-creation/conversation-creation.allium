@@ -8,7 +8,8 @@
 --
 -- Creation has no unresolved success outcome, no visible shell before publication,
 -- no stale/local canonical fallback, and no creation-time file or skill expansion.
--- Excludes: Git command details, database representation, HTTP and UI layout.
+-- Excludes: legacy transcript Stop (REQ-CCR-007), Git command details,
+-- database representation, HTTP and UI layout.
 --
 -- Requirement traceability: REQ-CCR-001 through REQ-CCR-015.
 
@@ -69,7 +70,7 @@ entity CreationJob {
     delivery_attempt: Integer
     delivery_retry_at: Timestamp? when status = delivery_pending
     next_attempt_at: Timestamp when status = retry_scheduled
-    error_message: String when status in { failed, delivery_failed }
+    error_message: String when status in { failed, delivery_failed, cleanup_ambiguous }
 
     transitions status {
         accepted -> claimed
@@ -81,6 +82,7 @@ entity CreationJob {
         claimed -> failed
         claimed -> cancelling
         claimed -> deletion_pending
+        claimed -> cleanup_ambiguous
         retry_scheduled -> claimed
         retry_scheduled -> failed
         retry_scheduled -> cancelling
@@ -143,6 +145,7 @@ entity StartingPin {
     commit_id: String
     branch_name: String
     source: StartingPinSource
+    common_directory_incarnation: String?
 }
 
 ------------------------------------------------------------
@@ -250,34 +253,74 @@ rule CurrentClaimAdvancesStage {
 }
 
 rule OriginDefaultStartingPinSelected {
-    when: StartingPinResolvedFromAuthoritativeOrigin(job, branch_name, commit_id)
+    when: StartingPinResolvedFromAuthoritativeOrigin(job, branch_name, commit_id, common_directory_incarnation)
 
     requires: job.status = claimed
     requires: job.stage = resolve_starting_pin
     requires: not StartingPin.exists(job: job)
+    requires: common_directory_incarnation != null
 
     ensures: StartingPin.created(
         job: job,
         commit_id: commit_id,
         branch_name: branch_name,
-        source: authoritative_origin_default
+        source: authoritative_origin_default,
+        common_directory_incarnation: common_directory_incarnation
     )
 }
 
 rule LocalMainStartingPinSelectedWithoutOrigin {
-    when: StartingPinResolvedFromLocalMain(job, commit_id)
+    when: StartingPinResolvedFromLocalMain(job, commit_id, common_directory_incarnation)
 
     requires: job.status = claimed
     requires: job.stage = resolve_starting_pin
     requires: not repository_has_remote_named_origin(job)
     requires: not StartingPin.exists(job: job)
+    requires: common_directory_incarnation != null
 
     ensures: StartingPin.created(
         job: job,
         commit_id: commit_id,
         branch_name: "main",
-        source: local_main_without_origin
+        source: local_main_without_origin,
+        common_directory_incarnation: common_directory_incarnation
     )
+}
+
+rule GitAggregateStagingRequiresMatchingPinIncarnation {
+    when: GitAggregateStagingRequested(job, current_common_directory_incarnation)
+
+    requires: job.status = claimed
+    requires: job.stage in { materialize_worktree, commit_metadata }
+    requires: StartingPin.exists(job: job)
+    requires: current_common_directory_incarnation != null
+    requires: StartingPin{job: job}.common_directory_incarnation != null
+    requires: StartingPin{job: job}.common_directory_incarnation = current_common_directory_incarnation
+
+    ensures: GitAggregateStagingAdmitted(job.conversation_id)
+}
+
+rule GitAggregateStagingRejectedForUnboundOrDifferentIncarnation {
+    when: GitAggregateStagingRequested(job, current_common_directory_incarnation)
+
+    requires: job.status = claimed
+    requires: job.stage in { resolve_starting_pin, materialize_worktree, finalize_attachments, commit_metadata }
+    requires: StartingPin.exists(job: job)
+    requires: current_common_directory_incarnation = null
+        or StartingPin{job: job}.common_directory_incarnation = null
+        or StartingPin{job: job}.common_directory_incarnation != current_common_directory_incarnation
+
+    ensures: GitAggregateStagingRejectedWithoutPinMutation(job.request_id)
+    ensures: NoReplacementPinSelected(job.request_id)
+    ensures: NoDirectFallbackSelected(job.request_id)
+    ensures: StartingPinImmutable(job)
+    ensures: StagingCheckoutAndRegistrationRetained(job) when staging_custody_uncertain(job)
+
+    @guidance
+        -- Apply ordinary claim-fenced failure settlement. Uncertain custody
+        -- settles as cleanup_ambiguous before retry can be considered. When
+        -- custody is not uncertain, an unbound historical pin fails permanently;
+        -- an unavailable or different observation for a bound pin uses bounded retry.
 }
 
 rule StartingPinResolutionFailureIsRetryableAndNeverFallsBack {
@@ -309,6 +352,7 @@ rule CurrentClaimStagesWholeAggregate {
     requires: job.stage = commit_metadata
     requires: job.stage_updated_at <= now()
     requires: WholePublicationFactsAvailable(job)
+    requires: not StartingPin.exists(job: job) or matching_git_incarnation_at_publication(job)
     requires: not StagedAggregate.exists(job: job)
 
     ensures: StagedAggregate.created(job: job)
@@ -633,10 +677,15 @@ rule AmbiguousCleanupPreservesRecord {
     when: CleanupAmbiguityObserved(job, generation)
 
     requires: job.generation = generation
-    requires: job.status in { cancelling, deletion_pending }
+    requires: job.status in { claimed, cancelling, deletion_pending }
 
     ensures: job.status = cleanup_ambiguous
     ensures: CleanupLeftForManualResolution(job.request_id)
+
+    @guidance
+        -- Settle under the current claim. Do not remove or repair the checkout
+        -- or its registration or schedule automatic recreation. Cancellation
+        -- can still retire the independently proven hidden product aggregate.
 }
 
 ------------------------------------------------------------
@@ -685,7 +734,7 @@ surface CreationControls {
     exposes:
         job.status
         job.creation_intent when job.status in { accepted, claimed, retry_scheduled, delivery_pending, delivery_failed, cancelling, cancelled, failed, cleanup_ambiguous }
-        job.error_message when job.status in { failed, delivery_failed }
+        job.error_message when job.status in { failed, delivery_failed, cleanup_ambiguous }
 
     provides:
         StructurallyValidCreationRequested(request_id, conversation_id, creation_intent, accepted_handle)
@@ -714,6 +763,16 @@ surface ReadyConversationNavigation {
 -- config.retry_delay_4 for attempts two, three, and four respectively.
 -- WholePublicationFactsAvailable(job) is true iff the accepted job has every
 -- user-visible fact required for one atomic publication outcome.
+-- Git aggregate staging, staging adoption and publication require a current
+-- common-directory incarnation matching the immutable pin. This filesystem
+-- evidence is not the opaque Phoenix-local GitRepository identity in REQ-GITREP-001.
+-- Missing evidence (including historical pins without it) is not a match; never
+-- infer continuity from a locator, OID, staging resource, or GitRepository identity.
+-- matching_git_incarnation_at_publication(job) requires a current matching
+-- observation and the same incarnation in the present checkout reservation.
+-- staging_custody_uncertain(job) is true if recorded staging may have been
+-- materialized or the recorded path cannot be established as absent.
+-- The guard applies to Git aggregate staging only, not Direct creation or delivery.
 -- StartingPinImmutable(job) asserts that an already-created StartingPin row is
 -- never rewritten by retries, replacement claims, or stale results.
 -- current_claim_matches(job, worker, token, generation) requires non-null

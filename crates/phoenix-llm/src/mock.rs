@@ -100,6 +100,8 @@ enum Scenario {
     /// setup has run, so E2E can drive the shipped continuation journey
     /// without a fault endpoint or direct state fabrication.
     ContextWindowExceeded,
+    GitLifecycleProposal,
+    GitLifecycleFollowUpProposal,
 }
 
 impl Scenario {
@@ -120,6 +122,16 @@ impl Scenario {
             // spawn_agents tool call in this conversation, wrap up with text
             // instead of spawning a fresh batch every turn.
             if matches!(s, Self::SpawnAgents) && already_spawned_agents(request) {
+                return Self::PlainText;
+            }
+            let proposal_ordinal = match s {
+                Self::GitLifecycleProposal => Some(0),
+                Self::GitLifecycleFollowUpProposal => Some(1),
+                _ => None,
+            };
+            if proposal_ordinal
+                .is_some_and(|ordinal| prior_tool_call_count(request, "propose_task") != ordinal)
+            {
                 return Self::PlainText;
             }
             if matches!(s, Self::AskUserQuestion { .. }) {
@@ -172,8 +184,8 @@ impl Scenario {
 /// roulette. Symmetric with `[[perf:N]]` — both make the mock authorable for
 /// E2E tests. Recognized NAMEs: `plain_text`, `markdown`, `mermaid`, `bash`,
 /// `read_file`, `think`, `multi_tool`, `ask_user_question`, `long`, `patch`, `present_svg`,
-/// `spawn_agents`, `reminder`, `context_window_exceeded`. Dev-only: mock is opt-in
-/// (`PHOENIX_ENABLE_MOCK_MODEL=1`).
+/// `spawn_agents`, `reminder`, `context_window_exceeded`, `git_lifecycle_proposal`,
+/// `git_lifecycle_followup`. Dev-only: mock is opt-in (`PHOENIX_ENABLE_MOCK_MODEL=1`).
 fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
     let text = request.messages.iter().rev().find_map(|m| {
         (m.role == super::types::MessageRole::User).then(|| {
@@ -209,6 +221,9 @@ fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
         return Some(Scenario::CoordinatorHomeBash {
             scope: scope.to_string(),
         });
+    }
+    if text.starts_with("Task approved in the current environment at ") {
+        return Some(Scenario::PlainText);
     }
     parse_scenario_text(&text).or_else(|| {
         request
@@ -262,6 +277,8 @@ fn parse_scenario_text(text: &str) -> Option<Scenario> {
                 .unwrap_or(3600),
         }),
         "context_window_exceeded" => Some(Scenario::ContextWindowExceeded),
+        "git_lifecycle_proposal" => Some(Scenario::GitLifecycleProposal),
+        "git_lifecycle_followup" => Some(Scenario::GitLifecycleFollowUpProposal),
         _ => None,
     }
 }
@@ -627,6 +644,17 @@ fn rand_u64() -> u64 {
 #[allow(clippy::too_many_lines)] // flat match over scenarios; splitting would add no value
 fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
     match scenario {
+        Scenario::GitLifecycleProposal | Scenario::GitLifecycleFollowUpProposal => (
+            vec![ContentBlock::ToolUse {
+                id: tool_use_id(),
+                name: "propose_task".into(),
+                input: serde_json::json!({"task_file": match scenario {
+                    Scenario::GitLifecycleProposal => "e2e-task.md",
+                    _ => "e2e-follow-up.md",
+                }}),
+            }],
+            "Review the prepared task file.".into(),
+        ),
         Scenario::Reminder { seconds } => (
             vec![ContentBlock::ToolUse {
                 id: "mock-reminder-create".into(),
@@ -1183,6 +1211,14 @@ mod tests {
             (
                 "[[scenario:context_window_exceeded]]",
                 Scenario::ContextWindowExceeded,
+            ),
+            (
+                "[[scenario:git_lifecycle_proposal]]",
+                Scenario::GitLifecycleProposal,
+            ),
+            (
+                "[[scenario:git_lifecycle_followup]]",
+                Scenario::GitLifecycleFollowUpProposal,
             ),
         ];
         for (text, expected) in cases {

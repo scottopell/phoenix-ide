@@ -16,7 +16,8 @@ use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeId, WorkScopeRetiremen
 use phoenix_db::native_close::{NativeCloseCommand, NativeCloseReceipt};
 use phoenix_db::workflow::LocalAuthorityResult;
 use phoenix_db::{
-    CloseCleanupFailureAuthority, CloseCleanupResourceDisposition, Database, DbError, DbResult,
+    CloseCleanupFailureAuthority, CloseCleanupResourceDisposition, CloseRetirementDispatch,
+    Database, DbError, DbResult, FirstCloseRetirementDispatch,
     RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
     TerminalizeInitialCloseCleanupFailureRequest,
 };
@@ -56,6 +57,7 @@ where
 pub(super) enum PostRetirementStep {
     Retiring,
     Completed(CloseObligation),
+    ObserveExistingDispatch,
     Blocked,
     Unclassified,
     FatalAuthority,
@@ -64,14 +66,14 @@ pub(super) enum PostRetirementStep {
 #[derive(Debug)]
 enum Stage {
     WorktreeDispatch,
-    WorktreePreparing,
+    WorktreePreparing(FirstCloseRetirementDispatch),
     WorktreePhysical,
     WorktreeEvidence,
     WorktreeFailure,
-    Dispatch,
-    Retiring,
+    RetiringScope,
     Finalizing,
     Completed(CloseObligation),
+    ObserveExistingDispatch,
     Blocked,
     FatalAuthority,
 }
@@ -236,7 +238,7 @@ impl PostRetirement {
         }
         let worktree_targets = select_original_worktrees(&original_inventory, &scope_order)?;
         let stage = if worktree_targets.is_empty() {
-            Stage::Dispatch
+            Stage::RetiringScope
         } else {
             Stage::WorktreeDispatch
         };
@@ -278,6 +280,9 @@ impl PostRetirement {
         source_entry: Option<&SourceEntryWorker>,
         original_deadline: Option<std::time::Instant>,
     ) -> DbResult<PostRetirementStep> {
+        if matches!(&self.stage, Stage::ObserveExistingDispatch) {
+            return Ok(PostRetirementStep::ObserveExistingDispatch);
+        }
         if matches!(&self.stage, Stage::Blocked) {
             return Ok(PostRetirementStep::Blocked);
         }
@@ -329,31 +334,6 @@ impl PostRetirement {
                 .await;
         }
 
-        if matches!(&self.stage, Stage::Dispatch) {
-            return match run_authoritative_command(&mut self.stage, || {
-                db.record_native_close_initial_retirement_dispatch(
-                    command,
-                    receipt,
-                    live_source,
-                    RecordCloseRetirementDispatchRequest {
-                        attempt_id: resource.attempt_id.clone(),
-                        scope: resource.scope.clone(),
-                        snapshot: self.snapshot.clone(),
-                        resource: resource.resource.clone(),
-                    },
-                )
-            })
-            .await
-            {
-                AuthoritativeCommand::Established(Ok(())) => {
-                    self.stage = Stage::Retiring;
-                    Ok(PostRetirementStep::Retiring)
-                }
-                AuthoritativeCommand::Established(Err(error)) => Err(error),
-                AuthoritativeCommand::FatalAuthority => Ok(PostRetirementStep::FatalAuthority),
-            };
-        }
-
         // Reconcile the exact original proof before checking live preconditions:
         // a lost successful reply must not turn retirement into a new failure.
         let evidence = match db
@@ -381,7 +361,7 @@ impl PostRetirement {
             self.stage = if self.scope_index == self.scope_order.len() {
                 Stage::Finalizing
             } else {
-                Stage::Dispatch
+                Stage::RetiringScope
             };
             return Ok(PostRetirementStep::Retiring);
         }
@@ -422,7 +402,7 @@ impl PostRetirement {
                 self.stage = if self.scope_index == self.scope_order.len() {
                     Stage::Finalizing
                 } else {
-                    Stage::Dispatch
+                    Stage::RetiringScope
                 };
                 Ok(PostRetirementStep::Retiring)
             }
@@ -467,7 +447,7 @@ impl PostRetirement {
             self.worktree_preparation = None;
         }
         self.stage = if self.worktree_index == self.worktree_targets.len() {
-            Stage::Dispatch
+            Stage::RetiringScope
         } else {
             Stage::WorktreeDispatch
         };
@@ -502,9 +482,15 @@ impl PostRetirement {
             })
             .await
             {
-                AuthoritativeCommand::Established(Ok(())) => {
-                    self.stage = Stage::WorktreePreparing;
+                AuthoritativeCommand::Established(Ok(CloseRetirementDispatch::First(dispatch))) => {
+                    self.stage = Stage::WorktreePreparing(dispatch);
                     Ok(PostRetirementStep::Retiring)
+                }
+                AuthoritativeCommand::Established(Ok(CloseRetirementDispatch::Replay)) => {
+                    tracing::warn!(attempt_id = %resource.attempt_id, scope = %resource.scope,
+                        "original Worktree dispatch already recorded; refusing to recreate physical custody");
+                    self.stage = Stage::ObserveExistingDispatch;
+                    Ok(PostRetirementStep::ObserveExistingDispatch)
                 }
                 AuthoritativeCommand::Established(Err(error)) => Err(error),
                 AuthoritativeCommand::FatalAuthority => Ok(PostRetirementStep::FatalAuthority),
@@ -547,7 +533,7 @@ impl PostRetirement {
 
         #[cfg(unix)]
         {
-            if matches!(self.stage, Stage::WorktreePreparing) {
+            if matches!(self.stage, Stage::WorktreePreparing(_)) {
                 let (Some(source_entry), Some(deadline)) = (source_entry, original_deadline) else {
                     self.stage = Stage::FatalAuthority;
                     return Ok(PostRetirementStep::FatalAuthority);
@@ -589,18 +575,21 @@ impl PostRetirement {
                         return Ok(PostRetirementStep::FatalAuthority);
                     }
                 };
-                let original_effect = OriginalWorktreeEffectContext::new(
+                let Stage::WorktreePreparing(dispatch) =
+                    std::mem::replace(&mut self.stage, Stage::FatalAuthority)
+                else {
+                    unreachable!("prepared Worktree retains its first dispatch");
+                };
+                let original_effect = OriginalWorktreeEffectContext::new_initial(
                     db.clone(),
                     command.clone(),
                     receipt.clone(),
                     live_source.clone(),
-                    resource.scope.clone(),
-                    resource.snapshot.clone(),
-                    resource.resource.clone(),
+                    dispatch,
                     source_entry.clone(),
                     deadline,
                     std::sync::Arc::clone(&backend.fatal_local_authority_fence),
-                );
+                )?;
                 let continuation = match prepared.into_continuation(original_effect) {
                     Ok(continuation) => continuation,
                     Err(detail) => {
@@ -644,6 +633,11 @@ impl PostRetirement {
         #[cfg(not(unix))]
         {
             let _ = (backend, source_entry, original_deadline);
+            if let Stage::WorktreePreparing(dispatch) =
+                std::mem::replace(&mut self.stage, Stage::FatalAuthority)
+            {
+                let _ = dispatch.into_request();
+            }
             self.fail_worktree(
                 RetirementFailureReason::ManualRepairRequired,
                 "native physical Worktree retirement is unavailable on this platform".into(),
@@ -760,7 +754,7 @@ mod tests {
         use phoenix_db::workflow::LocalAuthorityResult;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let mut stage = Stage::Dispatch;
+        let mut stage = Stage::RetiringScope;
         let calls = AtomicUsize::new(0);
         let first = run_authoritative_command(&mut stage, || {
             calls.fetch_add(1, Ordering::SeqCst);
@@ -894,7 +888,7 @@ mod tests {
         );
         cursor.accept_physical_outcome(WorktreePhysicalOutcome::Retired);
         cursor.advance_worktree();
-        assert!(matches!(cursor.stage, Stage::Dispatch));
+        assert!(matches!(cursor.stage, Stage::RetiringScope));
         assert_eq!(cursor.current(), Some(&inventory[1]));
         assert_eq!(cursor.original_inventory, inventory);
     }

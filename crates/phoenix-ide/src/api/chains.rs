@@ -32,19 +32,12 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use ts_rs::TS;
 
-use super::handlers::{
-    broadcast_aggregate_hard_deleted, finalize_hard_deleted_conversation_resources,
-    prepare_hard_delete_cascade, reopen_prepared_hard_delete, require_hard_delete_admission,
-    AppError, PreparedHardDelete,
-};
-use super::types::{
-    ChainDeleteOutcome, ChainDeleteResponse, ConflictErrorResponse, SuccessResponse,
-};
+use super::handlers::AppError;
+use super::types::SuccessResponse;
 use super::wire::ChainSseWireEvent;
 use super::AppState;
 use crate::chain_qa::ChainQaError;
 use crate::db::{ChainQaRow, Conversation, DbError};
-use crate::state_machine::ConvState;
 
 // ---------------------------------------------------------------------------
 // Response/request shapes
@@ -196,10 +189,6 @@ pub async fn submit_chain_question(
     Ok(Json(SubmitChainQaResponse { chain_qa_id }))
 }
 
-fn chain_member_blocks_cascade(state: &ConvState) -> bool {
-    state.is_busy() || matches!(state, ConvState::AwaitingContinuation { .. })
-}
-
 /// Compatibility route for closing a legacy chain URL.
 /// Single-member roots use the per-conversation compatibility route. A chain
 /// resolves to its latest aggregate transcript and enters the same durable Close
@@ -235,15 +224,6 @@ async fn archive_chain_boxed_body(
     Ok(Json(SuccessResponse { success: true }))
 }
 
-async fn aggregate_is_absent_after_delete_serialization(
-    state: &AppState,
-    root_id: &str,
-) -> Result<bool, AppError> {
-    Ok(validate_aggregate_delete_root(state, root_id)
-        .await?
-        .is_none())
-}
-
 async fn lock_aggregate_admissions(
     state: &AppState,
     product_conversation_id: &str,
@@ -273,142 +253,6 @@ async fn lock_chain_admissions(
         .await
         .map_err(db_to_app)?;
     Ok(lock_aggregate_admissions(state, root.product_conversation_id.as_str(), member_ids).await)
-}
-
-async fn refuse_busy_chain_members(
-    state: &AppState,
-    member_ids: &[String],
-) -> Result<(), AppError> {
-    for id in member_ids {
-        let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
-        if chain_member_blocks_cascade(&conv.state) {
-            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                format!(
-                    "Cannot delete chain: member {id} is busy. Cancel the in-flight \
-                     operation first, then retry.",
-                ),
-                "cancel_first",
-            ))));
-        }
-    }
-    Ok(())
-}
-
-/// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
-///
-/// Acquires every member's admission guard, then admits the aggregate exactly
-/// once through its root. Only History chains proceed to preflight and cleanup.
-/// Pre-checks every member's busy state up front and refuses the whole
-/// operation if any member is busy (atomic refuse — no partial wipe).
-/// External cleanup runs for every member before any conversation row is
-/// removed. The rows are then deleted root-first in one immediate transaction
-/// so any member failure rolls the whole aggregate back.
-fn chain_delete_response(outcome: ChainDeleteOutcome) -> Json<ChainDeleteResponse> {
-    Json(ChainDeleteResponse {
-        success: true,
-        outcome,
-    })
-}
-
-pub async fn delete_chain_handler(
-    State(state): State<AppState>,
-    Path(root_id): Path<String>,
-) -> Result<Json<ChainDeleteResponse>, AppError> {
-    Box::pin(delete_chain_boxed_body(State(state), Path(root_id))).await
-}
-
-async fn delete_chain_boxed_body(
-    State(state): State<AppState>,
-    Path(root_id): Path<String>,
-) -> Result<Json<ChainDeleteResponse>, AppError> {
-    let Some(root) = validate_aggregate_delete_root(&state, &root_id).await? else {
-        return Ok(chain_delete_response(ChainDeleteOutcome::AlreadyAbsent));
-    };
-    let product_conversation_id = root.product_conversation_id.to_string();
-    let member_ids = state
-        .db
-        .product_conversation_member_ids(&root_id)
-        .await
-        .map_err(db_to_app)?;
-    let _admission_guards =
-        lock_aggregate_admissions(&state, root.product_conversation_id.as_str(), &member_ids).await;
-    if aggregate_is_absent_after_delete_serialization(&state, &root_id).await? {
-        return Ok(chain_delete_response(ChainDeleteOutcome::AlreadyAbsent));
-    }
-    require_hard_delete_admission(&state, &root_id).await?;
-    for id in &member_ids {
-        super::handlers::refuse_if_coordinator(&state, id, "delete").await?;
-    }
-
-    refuse_busy_chain_members(&state, &member_ids).await?;
-    let deleting_conversation_ids = member_ids.iter().cloned().collect();
-    let mut prepared = Vec::with_capacity(member_ids.len());
-    for id in &member_ids {
-        match prepare_hard_delete_cascade(&state, id, &deleting_conversation_ids).await {
-            Ok(member) => prepared.push(member),
-            Err(error) => {
-                for member in &prepared {
-                    reopen_prepared_hard_delete(&state, member).await;
-                }
-                return Err(error);
-            }
-        }
-    }
-
-    if prepared
-        .iter()
-        .any(|member| matches!(member, PreparedHardDelete::AlreadyDeleted))
-    {
-        for member in &prepared {
-            reopen_prepared_hard_delete(&state, member).await;
-        }
-        return Err(AppError::Internal(
-            "chain member entered creation cleanup during aggregate deletion".to_string(),
-        ));
-    }
-
-    match state
-        .db
-        .delete_conversations_atomically_with_authority(&member_ids)
-        .await
-    {
-        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
-        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
-            for member in &prepared {
-                reopen_prepared_hard_delete(&state, member).await;
-            }
-            return Err(AppError::Internal(format!(
-                "Failed to delete chain conversation rows: {error}"
-            )));
-        }
-        phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
-            state
-                .runtime
-                .signal_fatal_local_authority("aggregate_hard_delete_commit");
-            return Err(AppError::Internal(
-                "aggregate deletion lost local commit authority".to_string(),
-            ));
-        }
-    }
-
-    let conversations = prepared
-        .into_iter()
-        .filter_map(PreparedHardDelete::release_authority)
-        .collect::<Vec<_>>();
-    for conversation in &conversations {
-        finalize_hard_deleted_conversation_resources(&state, conversation).await;
-    }
-    broadcast_aggregate_hard_deleted(
-        &state,
-        &root_id,
-        &product_conversation_id,
-        member_ids.clone(),
-    )
-    .await;
-
-    Ok(chain_delete_response(ChainDeleteOutcome::Deleted {
-        deleted_conversation_ids: member_ids,
-    }))
 }
 
 /// `GET /api/chains/:rootId/stream`
@@ -479,28 +323,6 @@ pub async fn stream_chain(
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
-
-/// Validate that `root_id` names a chain root with at least 2 members.
-///
-/// Mirrors the check in `ChainQa::prepare_invocation` so failures are
-/// surfaced as 404 here instead of bubbling up as 500 from the Q&A backend.
-async fn validate_aggregate_delete_root(
-    state: &AppState,
-    root_id: &str,
-) -> Result<Option<Conversation>, AppError> {
-    let root = match state.db.get_conversation(root_id).await {
-        Ok(root) => root,
-        Err(DbError::ConversationNotFound(_)) => return Ok(None),
-        Err(error) => return Err(db_to_app(error)),
-    };
-    let canonical_root = state.db.chain_root_of(root_id).await.map_err(db_to_app)?;
-    if canonical_root.as_deref() != Some(root_id) || !root.user_initiated {
-        return Err(AppError::NotFound(format!(
-            "no ProductConversation rooted at {root_id}"
-        )));
-    }
-    Ok(Some(root))
-}
 
 async fn validate_chain_root(state: &AppState, root_id: &str) -> Result<(), AppError> {
     if let Some(coordinator_id) = state
@@ -1188,19 +1010,6 @@ mod tests {
         assert!(!by_id["hw-b"].has_worktree, "Direct has no worktree");
         assert!(by_id["hw-c"].has_worktree, "Work has a worktree");
         assert!(by_id["hw-d"].has_worktree, "Branch has a worktree");
-    }
-
-    #[test]
-    fn pending_continuation_blocks_chain_cascade() {
-        let state = ConvState::AwaitingContinuation {
-            request: phoenix_core::domain::sm_state::ContinuationSummaryRequest {
-                operation_id: "chain-pending-continuation".to_string(),
-                rejected_tool_calls: Vec::new(),
-                attempt: 1,
-            },
-        };
-        assert!(chain_member_blocks_cascade(&state));
-        assert!(!chain_member_blocks_cascade(&ConvState::Idle));
     }
 
     // ----- POST validation -----------------------------------------------

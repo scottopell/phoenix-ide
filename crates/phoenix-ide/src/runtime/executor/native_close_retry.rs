@@ -255,6 +255,16 @@ where
             LocalAuthorityResult::DurableFactEstablished(Ok(
                 NativeCloseRetryResult::NewlyAdmitted(receipt),
             )) => {
+                if attempt_gate
+                    .require_exact(&receipt.admitted.attempt_id)
+                    .is_err()
+                {
+                    backend.signal_fatal_local_authority(
+                        "native_close_retry_admission_owner_mismatch",
+                    );
+                    let _ = response.send(Err(NativeCloseApplicationError::FatalAuthority));
+                    return (true, None);
+                }
                 let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
                 let mut controller = super::native_close::source_entry::SourceEntryController::new(
                     command.clone(),
@@ -348,7 +358,7 @@ where
         backend: Arc<crate::runtime::RuntimeManager>,
         admitted: crate::runtime::AdmittedOperation,
         _target_gate: tokio::sync::OwnedMutexGuard<()>,
-        _attempt_gate: tokio::sync::OwnedMutexGuard<()>,
+        _attempt_gate: crate::runtime::close_authority::CloseAttemptOwner,
         prepared: Option<(NativeCloseCommand, NativeCloseRetryOriginAssessment)>,
     ) -> Result<NativeCloseRetryResult, NativeCloseApplicationError> {
         if !self.context.is_coordinator

@@ -7,7 +7,7 @@ import {
 import { act, render, fireEvent, waitFor } from '@testing-library/react';
 import { Link, MemoryRouter, useLocation } from 'react-router-dom';
 import { refreshProductConversationList } from '../conversation/productConversationList';
-import { ApiResponseError, ConflictError } from '../api';
+import { ConflictError } from '../api';
 import type { Conversation, ProductConversationListRow } from '../api';
 
 const { apiMock } = vi.hoisted(() => ({
@@ -21,8 +21,6 @@ const { apiMock } = vi.hoisted(() => ({
     archiveChain: vi.fn(),
     closeProductConversation: vi.fn(),
     getChain: vi.fn(),
-    deleteChain: vi.fn(),
-    deleteConversation: vi.fn(),
     regenerateProductConversationName: vi.fn(),
     renameProductConversation: vi.fn(),
     getProductConversationSnapshot: vi.fn(),
@@ -439,153 +437,6 @@ describe('Sidebar — ProductConversation navigation', () => {
     fireEvent.click(getByRole('button', { name: /^Actions for conversation/ }));
     expect(queryByRole('button', { name: /Rename conversation/ })).toBeNull();
     expect(queryByRole('button', { name: /Close conversation/ })).toBeNull();
-  });
-
-  it('uses aggregate deletion for History with one parent transcript', async () => {
-    apiMock.deleteChain.mockResolvedValueOnce({
-      success: true,
-      outcome: { type: 'deleted', deleted_conversation_ids: ['root-1'] },
-    });
-    apiMock.listProductConversations.mockResolvedValue({
-      product_conversations: [makeProductConversation('pc-history', {
-        lifecycle: { state: 'history' },
-        canonical_root: { transcript_row_id: 'history-root', slug: 'history-root', title: 'History Product' },
-        latest_transcript_row_id: 'history-root',
-      })],
-    });
-
-    const { getByRole, container } = render(
-      <MemoryRouter initialEntries={['/product-conversations/pc-history']}>
-        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-history" onConversationCreated={vi.fn()} />
-      </MemoryRouter>,
-    );
-
-    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
-    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation History Product' })));
-    fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
-    fireEvent.click(getByRole('button', { name: 'Delete' }));
-
-    await waitFor(() => expect(apiMock.deleteChain).toHaveBeenCalledWith('history-root'));
-    expect(apiMock.deleteConversation).not.toHaveBeenCalled();
-  });
-
-  it('removes a deleted product row before a failed list refresh can retain it', async () => {
-    const row = makeProductConversation('pc-history', {
-      lifecycle: { state: 'history' },
-      canonical_root: { transcript_row_id: 'history-root', slug: 'history-root', title: 'History Product' },
-      latest_transcript_row_id: 'history-latest',
-    });
-    apiMock.deleteChain.mockResolvedValueOnce({
-      success: true,
-      outcome: { type: 'deleted', deleted_conversation_ids: ['root-1'] },
-    });
-    apiMock.listProductConversations
-      .mockResolvedValueOnce({ product_conversations: [row] })
-      .mockRejectedValueOnce(new Error('refresh failed'));
-
-    const { getByRole, container } = render(
-      <MemoryRouter initialEntries={['/product-conversations/pc-history']}>
-        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-history" onConversationCreated={vi.fn()} />
-      </MemoryRouter>,
-    );
-
-    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
-    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation History Product' })));
-    fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
-    fireEvent.click(getByRole('button', { name: 'Delete' }));
-
-    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).toBeNull());
-    await waitFor(() => expect(apiMock.listProductConversations).toHaveBeenCalledTimes(2));
-    expect(container.querySelector('[data-product-conversation-id="pc-history"]')).toBeNull();
-  });
-
-  it('keeps History Delete open with an error and gates duplicate submissions', async () => {
-    let rejectDelete!: (error: Error) => void;
-    apiMock.deleteChain.mockReturnValueOnce(new Promise((_, reject) => { rejectDelete = reject; }));
-    apiMock.listProductConversations.mockResolvedValue({
-      product_conversations: [makeProductConversation('pc-history', {
-        lifecycle: { state: 'history' },
-        canonical_root: { transcript_row_id: 'history-root', slug: 'history-root', title: 'History Product' },
-        latest_transcript_row_id: 'history-latest',
-      })],
-    });
-
-    const { getByRole, findByText, container } = render(
-      <MemoryRouter initialEntries={['/product-conversations/pc-history']}>
-        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-history" onConversationCreated={vi.fn()} />
-      </MemoryRouter>,
-    );
-
-    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
-    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation History Product' })));
-    fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
-    const confirm = getByRole('button', { name: 'Delete' });
-    fireEvent.click(confirm);
-    fireEvent.click(confirm);
-
-    expect(apiMock.deleteChain).toHaveBeenCalledTimes(1);
-    expect(confirm).toBeDisabled();
-    rejectDelete(new Error('server refused deletion'));
-
-    expect(await findByText('server refused deletion')).toBeInTheDocument();
-    expect(container.querySelector('.confirm-dialog[title="Delete Conversation"]')).not.toBeNull();
-    expect(getByRole('button', { name: 'Delete' })).not.toBeDisabled();
-  });
-
-  it('treats an authoritative History Delete 404 as idempotent success', async () => {
-    apiMock.deleteChain.mockRejectedValueOnce(new ApiResponseError('not found', 404));
-    apiMock.listProductConversations.mockResolvedValue({
-      product_conversations: [makeProductConversation('pc-history', {
-        lifecycle: { state: 'history' },
-        canonical_root: { transcript_row_id: 'history-root', slug: 'history-root', title: 'History Product' },
-        latest_transcript_row_id: 'history-latest',
-      })],
-    });
-
-    const { getByRole, queryByText, container } = render(
-      <MemoryRouter initialEntries={['/product-conversations/pc-history']}>
-        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="pc-history" onConversationCreated={vi.fn()} />
-      </MemoryRouter>,
-    );
-    await waitFor(() => expect(container.querySelector('[data-product-conversation-id="pc-history"]')).not.toBeNull());
-    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation History Product' })));
-    fireEvent.click(getByRole('button', { name: /Delete conversation History Product/ }));
-    fireEvent.click(getByRole('button', { name: 'Delete' }));
-
-    await waitFor(() => expect(container.querySelector('.confirm-dialog[title="Delete Conversation"]')).toBeNull());
-    expect(queryByText('not found')).toBeNull();
-  });
-
-  it('leaves an intermediate aggregate member route after History Delete', async () => {
-    const row = makeProductConversation('pc-history', {
-      lifecycle: { state: 'history' },
-      canonical_root: { transcript_row_id: 'history-root', slug: 'history-root', title: 'History Product' },
-      latest_transcript_row_id: 'history-latest',
-    });
-    apiMock.listProductConversations.mockResolvedValue({ product_conversations: [row] });
-    apiMock.deleteChain.mockResolvedValueOnce({
-      success: true,
-      outcome: {
-        type: 'deleted',
-        deleted_conversation_ids: ['history-root', 'middle-id', 'history-latest'],
-      },
-    });
-    apiMock.getProductConversationSnapshot.mockResolvedValue({
-      product_conversation_id: 'pc-history',
-      segments: [{ transcript_row_id: 'history-root', slug: 'history-root' }, { transcript_row_id: 'middle-id', slug: 'middle-slug' }, { transcript_row_id: 'history-latest', slug: 'latest-slug' }],
-    });
-
-    const { getByRole, container } = render(
-      <MemoryRouter initialEntries={['/product-conversations/middle-slug']}>
-        <Sidebar collapsed={false} onToggle={vi.fn()} conversations={[]} archivedConversations={[]} activeSlug="middle-slug" onConversationCreated={vi.fn()} />
-      </MemoryRouter>,
-    );
-    await waitFor(() => expect(apiMock.getProductConversationSnapshot).toHaveBeenCalledWith('middle-slug', { message_limit: 1 }));
-    fireEvent.click(await waitFor(() => getByRole('button', { name: 'Actions for conversation History Product' })));
-    fireEvent.click(await waitFor(() => getByRole('button', { name: /Delete conversation History Product/ })));
-    fireEvent.click(getByRole('button', { name: 'Delete' }));
-
-    await waitFor(() => expect(container.querySelector('.confirm-dialog[title="Delete Conversation"]')).toBeNull());
   });
 
   it('does not navigate back when a rename completes after leaving its route', async () => {

@@ -20,10 +20,8 @@ export interface PendingOperation {
   type:
     | 'send_message'
     | 'archive'
-    | 'delete'
     | 'rename'
-    | 'archive_chain'
-    | 'delete_chain';
+    | 'archive_chain';
   /** Per-conv ops use the conversation id; chain ops use the chain root id. */
   conversationId: string;
   payload: PendingOperationPayload;

@@ -673,6 +673,18 @@ async fn captured_initial_retirement(
     ConvState,
     Vec<CloseExpectedRetirementResource>,
 ) {
+    captured_initial_retirement_with_pty_sessions(f, BTreeSet::new()).await
+}
+
+async fn captured_initial_retirement_with_pty_sessions(
+    f: &Fixture,
+    pty_sessions: BTreeSet<phoenix_core::domain::close::OpaqueIdentity>,
+) -> (
+    NativeCloseCommand,
+    NativeCloseReceipt,
+    ConvState,
+    Vec<CloseExpectedRetirementResource>,
+) {
     let scope = crate::close_foundation::allocate_scope_worktree(&f.db, "first-target").await;
     let (command, receipt, live_source) = prepared_initial(f).await;
     f.db.settle_native_close_initial(&command, &receipt, &live_source)
@@ -709,7 +721,8 @@ async fn captured_initial_retirement(
         LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
     ));
     assert_eq!(initial_completion_writes(f, &receipt).await, before);
-    let inventory = initial_inventory_request(f, &receipt).await;
+    let mut inventory = initial_inventory_request(f, &receipt).await;
+    inventory.scopes[0].inventory.pty_sessions = pty_sessions;
     // A valid inspected resource is not dispatch authority until the complete
     // original inventory and anchor have been captured atomically.
     let before_dispatch = initial_dispatch_writes(f, &receipt).await;
@@ -1267,7 +1280,7 @@ async fn initial_dispatch_records_exact_resources_and_replays_without_effects_or
                     request.clone(),
                 )
                 .await,
-                LocalAuthorityResult::DurableFactEstablished(Ok(()))
+                LocalAuthorityResult::DurableFactEstablished(Ok(_))
             ));
             let after = initial_dispatch_writes(&f, &receipt).await;
             assert_eq!(after.0, i64::try_from(index + 1).unwrap());
@@ -1289,6 +1302,87 @@ async fn initial_dispatch_records_exact_resources_and_replays_without_effects_or
         initial_completion_writes(&f, &receipt).await,
         completion_before
     );
+}
+
+#[tokio::test]
+async fn process_batch_replay_does_not_commit_other_first_dispatches() {
+    use phoenix_core::domain::close::OpaqueIdentity;
+    let f = Fixture::new().await;
+    let (command, receipt, live_source, expected) = captured_initial_retirement_with_pty_sessions(
+        &f,
+        ["test-pty-a", "test-pty-b"]
+            .into_iter()
+            .map(|id| OpaqueIdentity::parse(id).unwrap())
+            .collect(),
+    )
+    .await;
+    let requests: Vec<_> = expected
+        .iter()
+        .filter(|item| item.resource.kind() == RetiredResourceKind::PtySession)
+        .map(|item| initial_dispatch_request(&receipt, item))
+        .collect();
+    assert_eq!(requests.len(), 2);
+    assert!(matches!(
+        f.db.record_native_close_initial_retirement_dispatch(
+            &command,
+            &receipt,
+            &live_source,
+            requests[1].clone(),
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(CloseRetirementDispatch::First(_)))
+    ));
+    let before = initial_dispatch_writes(&f, &receipt).await;
+    assert_eq!(before.0, 1);
+    assert!(matches!(
+        f.db.record_native_close_initial_process_dispatches(
+            &command,
+            &receipt,
+            &live_source,
+            &requests,
+        )
+        .await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(CloseRetirementBatchDispatch::Replay))
+    ));
+    assert_eq!(initial_dispatch_writes(&f, &receipt).await, before);
+}
+
+#[tokio::test]
+async fn concurrent_original_worktree_dispatches_yield_one_first_owner() {
+    let f = Fixture::new_file_backed().await;
+    let (command, receipt, live_source, expected) = captured_initial_retirement(&f).await;
+    let worktree = expected
+        .iter()
+        .find(|resource| resource.resource.kind() == RetiredResourceKind::Worktree)
+        .unwrap();
+    let request = initial_dispatch_request(&receipt, worktree);
+    let dispatch = || {
+        f.db.record_native_close_initial_retirement_dispatch(
+            &command,
+            &receipt,
+            &live_source,
+            request.clone(),
+        )
+    };
+    let (left, right) = tokio::join!(dispatch(), dispatch());
+    let left = left.established().unwrap().unwrap();
+    let right = right.established().unwrap().unwrap();
+    let owner = match (left, right) {
+        (CloseRetirementDispatch::First(owner), CloseRetirementDispatch::Replay)
+        | (CloseRetirementDispatch::Replay, CloseRetirementDispatch::First(owner)) => owner,
+        other => panic!("expected exactly one first dispatch, got {other:?}"),
+    };
+    let claimed = owner.into_request();
+    assert_eq!(claimed.attempt_id, request.attempt_id);
+    assert_eq!(claimed.scope, request.scope);
+    assert_eq!(claimed.snapshot, request.snapshot);
+    assert_eq!(claimed.resource, request.resource);
+    assert!(matches!(
+        dispatch().await.established().unwrap().unwrap(),
+        CloseRetirementDispatch::Replay
+    ));
+    let (dispatches, _, receipts) = initial_dispatch_writes(&f, &receipt).await;
+    assert_eq!((dispatches, receipts), (1, 0));
 }
 
 #[tokio::test]
@@ -2125,10 +2219,47 @@ async fn prepared_native_initial_is_not_generic_settlement_work() {
     let (command, receipt, live_source) = prepared_initial(&f).await;
     assert!(f
         .db
-        .list_pending_generic_close_settlements()
+        .list_pending_generic_close_settlements(None)
         .await
         .unwrap()
         .is_empty());
+    assert!(matches!(
+        f.db.read_generic_close_continuation(&receipt.admitted.attempt_id).await,
+        Err(DbError::CloseFoundationPrecondition(message))
+            if message.contains("owned by native Close execution")
+    ));
+    let attempt = receipt.admitted.attempt_id.as_str();
+    let latest: String = sqlx::query_scalar(
+        "SELECT conversation_id FROM close_attempt_members
+         WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+    )
+    .bind(attempt)
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    let latest = TranscriptConversationId::parse(latest).unwrap();
+    assert!(matches!(
+        f.db.confirm_generic_close_stop_work(
+            &f.target,
+            &latest,
+            &receipt.admitted.attempt_id,
+        )
+        .await,
+        Err(DbError::CloseFoundationPrecondition(message))
+            if message.contains("owned by native Close execution")
+    ));
+    for result in [
+        f.db.begin_close_idle_settlement(attempt).await,
+        f.db.begin_close_active_work_settlement(attempt).await,
+        f.db.cancel_close_before_retirement(attempt).await,
+        f.db.request_close_settlement_cancellation(attempt).await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("owned by native Close execution")
+        ));
+    }
     assert!(f
         .db
         .advance_close_settlement_when_quiescent(receipt.admitted.attempt_id.as_str())
@@ -2663,6 +2794,17 @@ async fn initial_execution_preserves_captured_busy_decision_without_confirming_w
         prepared.phase,
         phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation
     );
+    let attempt = receipt.admitted.attempt_id.as_str();
+    for result in [
+        f.db.begin_close_active_work_settlement(attempt).await,
+        f.db.cancel_close_before_retirement(attempt).await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("owned by native Close execution")
+        ));
+    }
     let phase: String =
         sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
             .bind(receipt.admitted.attempt_id.as_str())
@@ -2936,9 +3078,15 @@ async fn exact_receipt_replay_keeps_run_one_after_operation_progress() {
         panic!("expected a new operation")
     };
 
-    f.db.begin_close_idle_settlement(receipt.admitted.attempt_id.as_str())
+    let live_source = f.db.get_conversation(&f.coordinator).await.unwrap().state;
+    let prepared = f
+        .db
+        .prepare_native_close_initial_execution(&command, &receipt, &live_source)
         .await
+        .established()
+        .unwrap()
         .unwrap();
+    assert_eq!(prepared.phase, ClosePhase::SettlingActiveWork);
 
     assert_eq!(
         f.apply(&command).await.unwrap(),
@@ -3665,6 +3813,7 @@ async fn initial_worktree_metadata_requires_exact_original_dispatched_authority_
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits_proof_atomically()
 {
     let f = Fixture::new().await;
@@ -3699,16 +3848,17 @@ async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits
     .established()
     .unwrap()
     .unwrap();
-    f.db.record_native_close_initial_retirement_dispatch(
-        &command,
-        &receipt,
-        &live_source,
-        initial_dispatch_request(&receipt, work_scope),
-    )
-    .await
-    .established()
-    .unwrap()
-    .unwrap();
+    let scope_dispatches = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM close_retirement_resource_dispatches
+             WHERE attempt_id = ?1 AND scope = ?2 AND resource_kind = 'work_scope'",
+        )
+        .bind(receipt.admitted.attempt_id.as_str())
+        .bind(work_scope.scope.as_str())
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap()
+    };
     assert_eq!(lifecycle().await, "active");
     let unresolved =
         f.db.retire_work_scope_for_native_close_initial(
@@ -3737,6 +3887,7 @@ async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits
     .await
     .unwrap();
     assert_eq!(scope_proofs, 0);
+    assert_eq!(scope_dispatches().await, 0);
 
     record_initial_retirement(&f, &command, &receipt, &live_source, worktree).await;
     let retired =
@@ -3758,6 +3909,7 @@ async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits
         ))
     ));
     assert_eq!(lifecycle().await, "retired");
+    assert_eq!(scope_dispatches().await, 1);
     let proof: (String, Option<String>) = sqlx::query_as(
         "SELECT proof_kind, detail FROM close_retirement_resources
          WHERE attempt_id = ?1 AND scope = ?2 AND resource_kind = 'work_scope'",
@@ -3769,4 +3921,413 @@ async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits
     .unwrap();
     assert_eq!(proof.0, "retired");
     assert_eq!(proof.1.as_deref(), Some("original resources resolved"));
+}
+
+#[tokio::test]
+async fn native_initial_control_route_confirms_stop_and_captures_settlement_targets() {
+    let f = Fixture::new().await;
+    let source_state = f.db.get_conversation(&f.coordinator).await.unwrap().state;
+    let latest: String = sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE product_conversation_id = ?1 AND parent_conversation_id IS NULL",
+    ).bind(f.target.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    let turn = source_turn(&f.db, f.target.as_str(), "native-control-turn").await;
+    f.db.update_conversation_state(&latest, &source_state).await.unwrap();
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+    let latest = TranscriptConversationId::parse(latest).unwrap();
+    let CloseTargetControlResolution::ParkedNativeInitial(route) = f
+        .db
+        .resolve_close_target_control(&f.target, &latest, &receipt.admitted.attempt_id)
+        .await
+        .unwrap()
+    else {
+        panic!("expected parked Initial source route");
+    };
+    assert_eq!(route.run_ordinal, CloseRunOrdinal::INITIAL);
+    let result = f.db.apply_native_initial_close_control(
+        &command, &receipt, &live_source, &route, super::super::NativeCloseInitialControl::ConfirmStopWork,
+    ).await;
+    let LocalAuthorityResult::DurableFactEstablished(Ok(obligation)) = result else {
+        panic!("expected confirmed stop settlement: {result:?}");
+    };
+    assert_eq!(obligation.phase(), phoenix_core::domain::close::ClosePhase::SettlingActiveWork);
+    assert_eq!(
+        f.db.resolve_close_target_control(&f.target, &latest, &receipt.admitted.attempt_id)
+            .await
+            .unwrap(),
+        CloseTargetControlResolution::NativeInitialSettlementInProgress,
+    );
+    let wrong_transcript = TranscriptConversationId::parse(f.coordinator.clone()).unwrap();
+    assert!(f
+        .db
+        .resolve_close_target_control(&f.target, &wrong_transcript, &receipt.admitted.attempt_id)
+        .await
+        .is_err());
+    let capture_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_attempt_direct_turn_settlement_captures WHERE attempt_id = ?1",
+    )
+    .bind(receipt.admitted.attempt_id.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(capture_count, 1);
+    let captured = f.db.list_unsettled_close_direct_turn_settlement_targets(receipt.admitted.attempt_id.as_str())
+        .await.unwrap();
+    assert_eq!(captured.len(), 1);
+    assert_eq!(captured[0].turn_id, turn);
+    assert_eq!(captured[0].conversation_id, latest.as_str());
+}
+
+#[tokio::test]
+async fn native_initial_control_cancel_terminalizes_only_unencumbered_stop_confirmation() {
+    let f = Fixture::new().await;
+    let source_state = f.db.get_conversation(&f.coordinator).await.unwrap().state;
+    let latest: String = sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE product_conversation_id = ?1 AND parent_conversation_id IS NULL",
+    ).bind(f.target.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    f.db.update_conversation_state(&latest, &source_state).await.unwrap();
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+    let latest = TranscriptConversationId::parse(latest).unwrap();
+    let CloseTargetControlResolution::ParkedNativeInitial(route) = f
+        .db
+        .resolve_close_target_control(&f.target, &latest, &receipt.admitted.attempt_id)
+        .await
+        .unwrap()
+    else {
+        panic!("expected parked Initial source route");
+    };
+    let result = f.db.apply_native_initial_close_control(
+        &command, &receipt, &live_source, &route, super::super::NativeCloseInitialControl::Cancel,
+    ).await;
+    let LocalAuthorityResult::DurableFactEstablished(Ok(obligation)) = result else {
+        panic!("expected cancellation: {result:?}");
+    };
+    assert_eq!(obligation.phase(), phoenix_core::domain::close::ClosePhase::Completed);
+    assert_eq!(obligation.close_outcome(), Some(phoenix_core::domain::close::CloseCompletionOutcome::Cancelled));
+    let (status, created_at_us, ended_at_us): (String, i64, Option<i64>) = sqlx::query_as(
+        "SELECT status, created_at_us, ended_at_us FROM close_runs
+         WHERE attempt_id = ?1 AND run_ordinal = 1",
+    )
+    .bind(receipt.admitted.attempt_id.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(status, "completed");
+    assert!(ended_at_us.is_some_and(|ended_at| ended_at >= created_at_us));
+    assert_no_settlement_effects(&f.db, &receipt).await;
+    assert!(f.db.resolve_close_target_control(
+        &f.target, &latest, &receipt.admitted.attempt_id,
+    ).await.is_err());
+}
+
+#[tokio::test]
+async fn native_initial_control_refuses_cancel_after_stop_settlement_begins() {
+    let f = Fixture::new().await;
+    let source_state = f.db.get_conversation(&f.coordinator).await.unwrap().state;
+    let latest: String = sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE product_conversation_id = ?1 AND parent_conversation_id IS NULL",
+    ).bind(f.target.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    f.db.update_conversation_state(&latest, &source_state).await.unwrap();
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+    let latest = TranscriptConversationId::parse(latest).unwrap();
+    let CloseTargetControlResolution::ParkedNativeInitial(route) = f
+        .db
+        .resolve_close_target_control(&f.target, &latest, &receipt.admitted.attempt_id)
+        .await
+        .unwrap()
+    else {
+        panic!("expected parked Initial source route");
+    };
+    let confirmed = f.db.apply_native_initial_close_control(
+        &command, &receipt, &live_source, &route, super::super::NativeCloseInitialControl::ConfirmStopWork,
+    ).await;
+    assert!(matches!(confirmed, LocalAuthorityResult::DurableFactEstablished(Ok(_))));
+    let cancelled = f.db.apply_native_initial_close_control(
+        &command, &receipt, &live_source, &route, super::super::NativeCloseInitialControl::Cancel,
+    ).await;
+    assert!(matches!(cancelled, LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))));
+}
+
+#[tokio::test]
+async fn settlement_dispatch_no_actor_terminalizes_only_the_captured_target() {
+    let f = Fixture::new().await;
+    let turn_id = source_turn(&f.db, f.target.as_str(), "settlement-no-actor-turn").await;
+    let source_state = f.db.get_conversation(&f.coordinator).await.unwrap().state;
+    let latest: String = sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE product_conversation_id = ?1 AND parent_conversation_id IS NULL",
+    ).bind(f.target.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    f.db.update_conversation_state(&latest, &source_state).await.unwrap();
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+    let latest = TranscriptConversationId::parse(latest).unwrap();
+    let CloseTargetControlResolution::ParkedNativeInitial(route) = f
+        .db
+        .resolve_close_target_control(&f.target, &latest, &receipt.admitted.attempt_id)
+        .await
+        .unwrap()
+    else {
+        panic!("expected parked Initial source route");
+    };
+    f.db.apply_native_initial_close_control(
+        &command, &receipt, &live_source, &route, super::super::NativeCloseInitialControl::ConfirmStopWork,
+    ).await.established().unwrap().unwrap();
+    let targets = f
+        .db
+        .prepare_native_close_initial_settlement_dispatch(&command, &receipt, &live_source)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].turn_id, turn_id);
+
+    let mut stale = targets[0].clone();
+    stale.expected_generation += 1;
+    let rejected = f.db.dispatch_native_close_initial_settlement_turn::<()>(
+        &command, &receipt, &live_source, &stale,
+        || panic!("stale generation must be refused before enqueue"),
+    ).await.established().unwrap();
+    assert!(matches!(rejected, Err(DbError::CloseFoundationPrecondition(_))));
+    assert_turn_unsettled(&f.db, turn_id).await;
+
+    let mut callback_called = false;
+    assert_eq!(
+        f.db.dispatch_native_close_initial_settlement_turn::<()>(
+            &command,
+            &receipt,
+            &live_source,
+            &targets[0],
+            || {
+                callback_called = true;
+                NativeCloseInitialTurnDispatch::NoLiveActor
+            },
+        )
+        .await
+        .established()
+        .unwrap()
+        .unwrap(),
+        NativeCloseInitialTurnDispatchResult::Released
+    );
+    assert!(callback_called);
+    let (generation, terminal, owns_conversation): (i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT generation, terminal_kind, owns_conversation FROM durable_turns WHERE turn_id = ?1",
+    )
+    .bind(i64::try_from(turn_id).unwrap())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(generation, 1);
+    assert_eq!(terminal.as_deref(), Some("Cancelled"));
+    assert_eq!(owns_conversation, 0);
+    assert!(f.db.list_unsettled_close_direct_turn_settlement_targets(receipt.admitted.attempt_id.as_str())
+        .await.unwrap().is_empty());
+}
+
+async fn generic_close_with_captured_turn() -> (
+    Fixture,
+    crate::GenericCloseSettlement,
+    crate::CloseDirectTurnSettlementTarget,
+) {
+    use crate::GenericCloseAdmission;
+
+    let f = Fixture::new().await;
+    let turn_id = source_turn(&f.db, f.target.as_str(), "generic-no-actor-turn").await;
+    let latest: String = sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE product_conversation_id = ?1 AND parent_conversation_id IS NULL",
+    )
+    .bind(f.target.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    let promised_state = f.db.get_conversation(&f.coordinator).await.unwrap().state;
+    f.db.update_conversation_state(&latest, &promised_state).await.unwrap();
+    let latest = TranscriptConversationId::parse(latest).unwrap();
+    let attempt = CloseAttemptId::parse("generic-no-actor-attempt").unwrap();
+    let GenericCloseAdmission::InsertedAwaitingStopWork(_) = f
+        .db
+        .begin_generic_close_settlement(&f.target, &latest, &attempt)
+        .await
+        .unwrap()
+    else {
+        panic!("expected the captured live turn to require Stop confirmation");
+    };
+    let settlement = f
+        .db
+        .confirm_generic_close_stop_work(&f.target, &latest, &attempt)
+        .await
+        .unwrap();
+    let targets = f
+        .db
+        .list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
+        .await
+        .unwrap();
+    let [target] = targets.as_slice() else {
+        panic!("expected exactly one captured turn");
+    };
+    assert_eq!(target.turn_id, turn_id);
+    (f, settlement, target.clone())
+}
+
+#[tokio::test]
+async fn generic_close_stopped_run_cannot_cancel_captured_turn() {
+    use crate::{GenericCloseSettlementFailure, GenericCloseTurnRelease};
+
+    let (f, settlement, target) = generic_close_with_captured_turn().await;
+    let attempt = settlement.obligation().attempt_id();
+    let unclaimed_offer = settlement.offer_turn(target.clone()).unwrap();
+    assert_eq!(
+        f.db.fail_generic_close_settlement(&settlement, "test stops settlement")
+            .await.unwrap(),
+        GenericCloseSettlementFailure::Classified,
+    );
+    assert!(matches!(
+        f.db.claim_generic_close_turn_offer(unclaimed_offer).await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(false)),
+    ));
+    assert!(matches!(
+        f.db.cancel_generic_close_turn_without_actor(&settlement, &target).await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(GenericCloseTurnRelease::NoTransition)),
+    ));
+    let turn: (i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT generation, terminal_kind, owns_conversation FROM durable_turns WHERE turn_id = ?1",
+    )
+    .bind(i64::try_from(target.turn_id).unwrap())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(turn, (0, None, 1));
+    assert_eq!(
+        f.db.list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
+            .await.unwrap(),
+        vec![target],
+    );
+    assert!(matches!(
+        f.db.finish_generic_close_settlement(&settlement).await.unwrap(),
+        crate::GenericCloseSettlementAdvance::NoTransition,
+    ));
+}
+
+#[tokio::test]
+async fn generic_close_no_actor_cancels_and_releases_exact_target_atomically() {
+    use crate::GenericCloseTurnRelease;
+
+    let (f, settlement, target) = generic_close_with_captured_turn().await;
+    let attempt = settlement.obligation().attempt_id();
+    let turn_id = target.turn_id;
+    let target = &target;
+    let wrong = crate::CloseDirectTurnSettlementTarget {
+        conversation_id: f.coordinator.clone(),
+        ..target.clone()
+    };
+    let stale = crate::CloseDirectTurnSettlementTarget {
+        expected_generation: target.expected_generation + 1,
+        ..target.clone()
+    };
+    for rejected in [&wrong, &stale] {
+        assert!(matches!(
+            f.db.cancel_generic_close_turn_without_actor(&settlement, rejected).await,
+            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+        ));
+    }
+
+    sqlx::query(
+        "CREATE TRIGGER test_reject_generic_settlement_release
+         BEFORE UPDATE OF settled_at ON close_attempt_direct_turn_settlements
+         WHEN NEW.settled_at IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'test refuses exact receipt update'); END",
+    )
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        f.db.cancel_generic_close_turn_without_actor(&settlement, target).await,
+        LocalAuthorityResult::DurableFactEstablished(Err(error))
+            if error.to_string().contains("test refuses exact receipt update")
+    ));
+    let turn = || async {
+        sqlx::query_as::<_, (i64, Option<String>, i64)>(
+            "SELECT generation, terminal_kind, owns_conversation FROM durable_turns WHERE turn_id = ?1",
+        )
+        .bind(i64::try_from(turn_id).unwrap())
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap()
+    };
+    assert_eq!(turn().await, (0, None, 1));
+    assert_eq!(
+        f.db.list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
+            .await
+            .unwrap(),
+        vec![target.clone()],
+    );
+    sqlx::query("DROP TRIGGER test_reject_generic_settlement_release")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        assert!(matches!(
+            f.db.cancel_generic_close_turn_without_actor(&settlement, target).await,
+            LocalAuthorityResult::DurableFactEstablished(Ok(GenericCloseTurnRelease::Released))
+        ));
+        assert_eq!(turn().await, (1, Some("Cancelled".to_string()), 0));
+        assert!(f.db.list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn settlement_stop_claim_rejects_revoked_source_and_competing_delivery() {
+    let f = Fixture::new().await;
+    let turn_id = source_turn(&f.db, f.target.as_str(), "settlement-no-actor-turn").await;
+    let source_state = f.db.get_conversation(&f.coordinator).await.unwrap().state;
+    let latest: String = sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE product_conversation_id = ?1 AND parent_conversation_id IS NULL",
+    ).bind(f.target.as_str()).fetch_one(f.db.pool()).await.unwrap();
+    f.db.update_conversation_state(&latest, &source_state).await.unwrap();
+    let (command, receipt, live_source) = prepared_initial(&f).await;
+    let latest = TranscriptConversationId::parse(latest).unwrap();
+    let CloseTargetControlResolution::ParkedNativeInitial(route) = f
+        .db
+        .resolve_close_target_control(&f.target, &latest, &receipt.admitted.attempt_id)
+        .await
+        .unwrap()
+    else {
+        panic!("expected parked Initial source route");
+    };
+    f.db.apply_native_initial_close_control(
+        &command, &receipt, &live_source, &route, super::super::NativeCloseInitialControl::ConfirmStopWork,
+    ).await.established().unwrap().unwrap();
+    let targets = f
+        .db
+        .prepare_native_close_initial_settlement_dispatch(&command, &receipt, &live_source)
+        .await
+        .established()
+        .unwrap()
+        .unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].turn_id, turn_id);
+
+    let target = &targets[0];
+    let (revoked, lease) = f.db.claim_native_close_initial_settlement_stop(
+        &command, &receipt, &live_source, target,
+        || Err::<(), _>(DbError::CloseFoundationPrecondition("source revoked while queued".into())),
+    ).await;
+    assert!(lease.is_none());
+    assert!(matches!(revoked, LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))));
+    let claim = || f.db.claim_native_close_initial_settlement_stop(
+        &command, &receipt, &live_source, target, || Ok(()),
+    );
+    let ((a, _), (b, _)) = tokio::join!(claim(), claim());
+    assert_ne!(a.established().unwrap().unwrap(), b.established().unwrap().unwrap());
+    let (duplicate, lease) = f.db.claim_native_close_initial_settlement_stop::<()>(
+        &command, &receipt, &live_source, target, || panic!("duplicate must not enter the source"),
+    ).await;
+    assert!(!duplicate.established().unwrap().unwrap());
+    assert!(lease.is_none());
+    let fallback = f.db.dispatch_native_close_initial_settlement_turn::<()>(
+        &command, &receipt, &live_source, target, || NativeCloseInitialTurnDispatch::NoLiveActor,
+    ).await.established().unwrap();
+    assert!(matches!(fallback, Err(DbError::CloseFoundationPrecondition(_))));
+    assert_turn_unsettled(&f.db, turn_id).await;
 }

@@ -308,7 +308,7 @@ fn replayed_rename_receipt_rejects_negative_commit_timestamp() {
 
 #[tokio::test]
 async fn native_rename_error_is_not_published_after_authority_closes() {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let owner = state.runtime.acquire_local_authority_pass().unwrap();
     owner.close("test_native_rename_response_authority_closure");
     let response = Err(NativeActionFailure::from(StatusCode::INTERNAL_SERVER_ERROR));
@@ -1263,7 +1263,7 @@ struct NativeCreateTestFixture {
 }
 
 async fn native_create_test_fixture() -> NativeCreateTestFixture {
-    let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+    let state = crate::api::handlers::api_test_support::make_test_state().await;
     let caller = state.db.instance_id().await.unwrap();
     let coordinator = state
         .db

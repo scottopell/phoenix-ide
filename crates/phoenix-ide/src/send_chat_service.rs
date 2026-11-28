@@ -1319,7 +1319,6 @@ fn map_conversation_load_error(error: crate::db::DbError) -> SendChatServiceErro
         | crate::db::DbError::CloseFoundationStaleLatest { .. }
         | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
-        | crate::db::DbError::ForkProposalConflict(_)
         | crate::db::DbError::DirectTurnConflict(_)
         | crate::db::DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | crate::db::DbError::FederationSendAuthorityInactive
@@ -1385,7 +1384,6 @@ fn map_direct_turn_accept_error(error: crate::db::DbError) -> SendChatServiceErr
         | crate::db::DbError::CloseFoundationStaleLatest { .. }
         | crate::db::DbError::CloseFoundationRepairRequired(_)
         | crate::db::DbError::CloseFoundationNotFound(_)
-        | crate::db::DbError::ForkProposalConflict(_)
         | crate::db::DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | crate::db::DbError::FederationSendAuthorityInactive
         | crate::db::DbError::FederationPeerNotFound
@@ -2204,7 +2202,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // Three historical fixtures share one migration pass.
     async fn historical_manual_opening_repair_unfences_service_chat_only_with_matching_evidence() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let db = &state.db;
         let matching =
             historical_manual_opening(db, "matching-history", Some("historical manual handoff"))

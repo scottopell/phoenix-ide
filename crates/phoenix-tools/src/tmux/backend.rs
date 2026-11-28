@@ -83,6 +83,7 @@ impl GlobalEnvRead {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenBoundKill {
     Killed,
+    QueueCompletedWithoutExecutionWitness,
     TokenMismatch,
     DeadlineExceeded,
     Failed { reason: String },
@@ -721,7 +722,7 @@ async fn kill_server_if_condition(
             if String::from_utf8_lossy(&output.stdout).contains("PHOENIX_TOKEN_MISMATCH") {
                 TokenBoundKill::TokenMismatch
             } else {
-                TokenBoundKill::Killed
+                TokenBoundKill::QueueCompletedWithoutExecutionWitness
             }
         }
         Ok(Some(output)) => TokenBoundKill::Failed {

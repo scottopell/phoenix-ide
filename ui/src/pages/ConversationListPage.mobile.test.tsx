@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ProductConversationListRow } from '../api';
-import { ApiResponseError, api } from '../api';
+import { api } from '../api';
 import { __testing } from '../conversation/productConversationList';
 import { ConversationListPage } from './ConversationListPage';
 
@@ -31,8 +31,6 @@ vi.mock('../api', async () => {
       codexLoginPreflight: vi.fn(),
       listProductConversations: vi.fn(),
       renameProductConversation: vi.fn(),
-      deleteChain: vi.fn(),
-      deleteConversation: vi.fn(),
     },
   };
 });
@@ -221,14 +219,12 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     expect(screen.queryByRole('button', { name: 'Close conversation Mobile Product' })).toBeNull();
   });
 
-  it.each(['open', 'history'] as const)('restores Actions focus after %s confirmation cancellation', async (state) => {
-    if (state === 'history') vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [{ ...productConversation(), lifecycle: { state: 'history' } }], coordinator: null });
+  it('restores Actions focus after Close confirmation cancellation', async () => {
     render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
-    if (state === 'history') fireEvent.click(await screen.findByRole('button', { name: 'History 1' }));
     const trigger = await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' });
     trigger.focus();
     fireEvent.click(trigger);
-    const action = screen.getByRole('button', { name: `${state === 'history' ? 'Delete' : 'Close'} conversation Mobile Product` });
+    const action = screen.getByRole('button', { name: 'Close conversation Mobile Product' });
     action.focus();
     fireEvent.click(action);
     const cancel = screen.getByRole('button', { name: 'Cancel' });
@@ -237,87 +233,6 @@ describe('ConversationListPage mobile ProductConversation actions', () => {
     expect(trigger).toHaveFocus();
     expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull();
     expect(api.closeProductConversation).not.toHaveBeenCalled();
-    expect(api.deleteChain).not.toHaveBeenCalled();
-  });
-
-  it('uses aggregate deletion for History with one parent transcript', async () => {
-    const history = {
-      ...productConversation(),
-      lifecycle: { state: 'history' as const },
-      latest_transcript_row_id: 'root-mobile',
-    };
-    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history], coordinator: null });
-    vi.mocked(api.deleteChain).mockResolvedValue({
-      success: true,
-      outcome: {
-        type: 'deleted',
-        deleted_conversation_ids: ['root-mobile', 'agent-mobile'],
-      },
-    });
-    render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
-
-    touchActivate(await screen.findByRole('button', { name: 'History 1' }));
-    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
-    touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
-    touchActivate(screen.getByRole('button', { name: 'Delete' }));
-
-    await waitFor(() => expect(api.deleteChain).toHaveBeenCalledWith('root-mobile'));
-    expect(api.deleteConversation).not.toHaveBeenCalled();
-  });
-
-  it('treats an authoritative 404 while deleting History as completed', async () => {
-    const history = {
-      ...productConversation(),
-      lifecycle: { state: 'history' as const },
-      latest_transcript_row_id: 'successor-mobile',
-    };
-    vi.mocked(api.listProductConversations).mockResolvedValue({ product_conversations: [history], coordinator: null });
-    vi.mocked(api.deleteChain).mockRejectedValue(new ApiResponseError('gone', 404));
-    render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
-
-    touchActivate(await screen.findByRole('button', { name: 'History 1' }));
-    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
-    touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
-    touchActivate(screen.getByRole('button', { name: 'Delete' }));
-
-    await waitFor(() => expect(api.deleteChain).toHaveBeenCalledWith('root-mobile'));
-    await waitFor(() => expect(screen.queryByText(/gone/)).toBeNull());
-    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
-  });
-
-  it('removes deleted History locally when the invalidation refresh fails', async () => {
-    const history = {
-      ...productConversation(),
-      lifecycle: { state: 'history' as const },
-      latest_transcript_row_id: 'successor-mobile',
-    };
-    vi.mocked(api.listProductConversations)
-      .mockResolvedValueOnce({ product_conversations: [history], coordinator: null })
-      .mockRejectedValueOnce(new Error('refresh failed'));
-    vi.mocked(api.deleteChain).mockResolvedValue({
-      success: true,
-      outcome: {
-        type: 'deleted',
-        deleted_conversation_ids: ['root-mobile', 'agent-mobile'],
-      },
-    });
-    const hardDeleted = vi.fn();
-    window.addEventListener('phoenix:conversation-hard-deleted', hardDeleted, { once: true });
-    render(<MemoryRouter><ConversationListPage /></MemoryRouter>);
-
-    touchActivate(await screen.findByRole('button', { name: 'History 1' }));
-    touchActivate(await screen.findByRole('button', { name: 'Actions for conversation Mobile Product' }));
-    touchActivate(await screen.findByRole('button', { name: 'Delete conversation Mobile Product' }));
-    touchActivate(screen.getByRole('button', { name: 'Delete' }));
-
-    await waitFor(() => expect(api.deleteChain).toHaveBeenCalledWith('root-mobile'));
-    await waitFor(() => expect(screen.queryByText('Mobile Product')).toBeNull());
-    expect(hardDeleted).toHaveBeenCalledWith(expect.objectContaining({
-      detail: {
-        conversationId: 'pc-mobile',
-        deletedConversationIds: ['root-mobile', 'agent-mobile'],
-      },
-    }));
   });
 
   it('closes through the production mobile list touch target and aggregate confirmation', async () => {

@@ -158,6 +158,9 @@ which = { workspace = true }
 # via `git diff --exit-code ui/src/generated/` in `./dev.py check`.
 ts-rs = { workspace = true, features = ["serde-compat", "chrono-impl"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
+
 [dev-dependencies]
 # Re-declared with test-support so phoenix-core's #[cfg(test)] domain
 # constructors (ContentBlock::tool_use, …) are visible to this crate's tests.

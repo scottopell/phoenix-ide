@@ -109,8 +109,8 @@ parsing commands, installing Git hooks, or exposing raw WorkScope construction t
 active PR is explicit because PR-specific surfaces need a target whose provenance is visible:
 user-pinned intent must outrank inference, and compatibility singular projections must not remain
 an invisible authority once multiple deliverable PRs exist. Continuations therefore keep the same
-WorkScope-owned PR history, while Start in new conversation and follow-up forks create separate Open
-conversations with their own WorkScopes rather than inheriting PR ownership.
+WorkScope-owned PR history, while an independent follow-up from History creates a separate Open
+conversation without inheriting the previous WorkScope’s PR ownership.
 
 ---
 

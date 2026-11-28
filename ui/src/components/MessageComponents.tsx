@@ -49,7 +49,6 @@ import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './Browse
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 import { buildAgentTextFragments, buildKeywordSearchOutputProjection, buildMarkdownDisplayBlocks, buildPatchOutputProjection, buildReadFileOutputProjection, buildSearchOutputProjection, buildSubAgentCardFragments, buildTerminalToolResultProjection, type ConversationTextFragment, type ConversationFragmentRevealTarget, type TerminalToolResultFamily } from './viewer-find/searchProjections';
 import { bashInputCopyText, cleanToolThoughts as cleanThoughts, formatToolInput, isBashToolInput, skillCommandFromInput, skillResultVisibleText, truncateToolInputValue as truncateValue } from './toolInputDisplay';
-import { ForkProposalAffordance } from './ForkProposalAffordance';
 import { ConversationMarkdownAnchor, ConversationMarkdownImage } from './conversationMarkdown';
 import { ConversationMarkdownTable } from './conversationMarkdownTable';
 import { inlineCodeTokenKind } from './conversationMarkdownTableSemantics';
@@ -2939,17 +2938,6 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
   const isShortOutput = resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD;
   const isSubAgentResult = !!(result?.display_data && isSubAgentSummaryData(result.display_data));
 
-  // Decoupled task fork proposal (REQ-PROJ-034): a writing-mode `propose_task`
-  // records its proposal id on the synthetic success tool-result's
-  // `display_data.fork_proposal_id`. That id anchors the inline Review
-  // affordance (which cross-references the proposal's status from the
-  // ForkProposals store and withdraws once resolved).
-  const forkProposalId: string | undefined = (() => {
-    const dd = result?.display_data as Record<string, unknown> | undefined;
-    const v = dd?.['fork_proposal_id'];
-    return typeof v === 'string' && v.length > 0 ? v : undefined;
-  })();
-
   // Get the raw input for copying (not the formatted display)
   if (name === 'skill') {
     return (
@@ -3178,8 +3166,6 @@ function ToolUseBlockImpl({ block, result, onOpenFile, knownResultIds, toolStart
         />
       )}
 
-      {/* Fork proposal Review affordance (REQ-PROJ-034 / 037) */}
-      {forkProposalId && <ForkProposalAffordance proposalId={forkProposalId} />}
     </div>
     </>
   );

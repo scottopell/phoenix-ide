@@ -21,8 +21,8 @@ D-state-hang case). The same bounded ring-buffer facts are also projected as a
 conversation-scoped, typed ephemeral live-output feed keyed by `tool_use_id`, so
 inline conversation cards can show running bash identity, status, duration, and
 a bounded tail before the terminal tool result lands. On process exit, the live
-ring is demoted to a compact in-memory tombstone retained until the
-conversation is hard-deleted or the Phoenix process exits.
+ring is demoted to a compact in-memory tombstone retained until resource
+retirement, legacy archive cleanup, or Phoenix process exit.
 
 A per-resource-scope cap of 8 live handles is enforced with an explicit
 `handle_cap_reached` error listing existing handles — no silent eviction.
@@ -139,7 +139,7 @@ entirely.
 | **REQ-BASH-003:** Handle Operations | ❌ New | `peek` / `wait` / `kill` with handle ids; no auto-escalation; `kill_pending_kernel` for D-state |
 | **REQ-BASH-004:** Ring Buffer + Read Semantics | 🔄 Rewrite | Bytes-bounded ring, per-line offsets, caller-controlled read window, plus typed ephemeral live-output projection for conversation cards with terminal handoff back to the normal tool result |
 | **REQ-BASH-005:** Live Handle Cap | ❌ New | Hard refusal with structured live-handles list |
-| **REQ-BASH-006:** Tombstones and Process Exit | ❌ New | Demote-on-exit, in-memory only, retained until conv hard-delete or Phoenix exit |
+| **REQ-BASH-006:** Tombstones and Process Exit | ❌ New | Demote-on-exit, in-memory only, retained until resource retirement, legacy archive cleanup, or Phoenix exit |
 | **REQ-BASH-007:** Child Process Reaper | ❌ New | Subreaper where supported; bounded, incarnation-bound shutdown signal attempts (no complete-tree-reaping guarantee) |
 | **REQ-BASH-008:** Error Reporting | 🔄 Rewrite | Stable error ids, structured envelopes; non-zero exit is not an error |
 | **REQ-BASH-009:** No TTY Attached | 🔄 Carry-forward | Existing behavior; tool description points at `tmux` |
@@ -152,7 +152,7 @@ entirely.
 | **REQ-BASH-013:** Fail-Closed Explore Bash | ✅ Complete | Startup uses `nono::Sandbox::support_info()`; unsupported hosts omit Bash from top-level Explore registries without suppressing the Coordinator's separately authorized path |
 | **REQ-BASH-014:** Stateless Tool with Per-WorkScope Handle Registry | ✅ Complete | Tool stays stateless; `ctx.bash_handles()` resolves the caller's structural resource scope |
 | **REQ-BASH-WS-001:** Handle Registry Keyed by WorkScope | ✅ Complete | All handles are stored under durable WorkScope identity; globally unique IDs and controller metadata preserve Coordinator continuation control |
-| **REQ-BASH-WS-002:** Hard-Delete Cascade Respects Inheritor Scope | ❌ New | `cascade_bash_on_delete` consults inheritor `WorkScope` and skips teardown on scope match, like `cascade_terminal/browser_on_delete` |
+| **REQ-BASH-WS-002:** Resource Retirement Respects WorkScope Ownership | ❌ New | Exact Close retires the sealed WorkScope; legacy archive preserves handles still owned by another live row |
 | **REQ-BASH-015:** Display Command Simplification | 🔄 Carry-forward + extension | Was REQ-BASH-011; new display labels for peek/wait/kill, and compact conversation summaries retain identity/status/duration/output-tail rather than a generic done badge |
 | **REQ-BASH-016:** Coordinator Live-Handle Surface | ✅ Complete | Process-local discovery exposes only live Coordinator-controlled handles with immutable spawn cwd; output uses the authorized inspector, and exact stop is incarnation-bound and offered only on supported hosts |
 | **REQ-BASH-017:** Post-launch Identity and Registration Settlement | Implemented; reconciled-head hosted qualification pending | The preventive gated launcher validates birth identity and commits registration before releasing user payload; the pre-release native denial path proves no command marker is created. Caller-independent owned-child custody, 250ms natural-exit settlement, bounded capture (including empty records), and focused fault regressions cover failures after a child exists. Failed release returns a typed `launch_release_unknown` error with the retained handle and explicit no-retry/may-have-executed guidance; it is not reported as `spawn_failed`. Scope uncertainty remains conservative and sticky, blocks successful Close retirement, and never fabricates a PGID or authorizes reset/recovery. Generated TypeScript wire contracts are checked in and guarded by CI's codegen-stale check. Required CI runs the focused regressions on Linux with the native executable required; `.github/workflows/bash-launch.yml` runs them on macOS, blocking pull requests that touch macOS launch or identity code (ADR-213). Ordinary test runs explicitly skip native-executable cases when the fixture is absent; hosted qualification fails if it is absent. Exact-successor hosted CI and fault qualification remain required after integration. |
@@ -193,17 +193,11 @@ WorkScope-scoped local Git state into durable observed-branch and PR-association
 re-derives explicit active-PR selection with terminal-generation fencing. Other rows in this table
 continue to record their own implementation state independently.
 
-## Bedrock Dependency
+## Resource Scope Retirement
 
-REQ-BASH-006's hard-delete cascade is wired through
-`cascade_bash_on_delete`, called directly from the bedrock hard-delete
-handler per REQ-BED-032. The cascade receives the deleted conversation's
-`WorkScope` and the inheritor's `WorkScope` (REQ-BASH-WS-002) and skips
-teardown on scope match — the same signature the terminal and browser
-cascades take. The orchestrator runs as a sequence of direct function calls;
-there is no event-bus / subscriber-registration pattern. Implementing this
-requires REQ-BED-032 to be in place — which it is, as part of the same spec
-set under review.
+Resource retirement is governed by the owning lifecycle operation and its
+WorkScope ownership checks (REQ-BASH-WS-002). Bash tombstones are process-local
+and last until resource retirement, legacy archive cleanup, or process exit.
 
 ## Behavioural Specification
 

@@ -193,7 +193,7 @@ mod tests {
     async fn cancellation_reports_lifecycle_conflict_without_failing_local_authority() {
         use phoenix_core::domain::close::TranscriptConversationId;
         for history in [false, true] {
-            let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+            let state = crate::api::handlers::api_test_support::make_test_state().await;
             let owner = state
                 .db
                 .create_conversation("fenced-reminder", "fenced", "/tmp", true, None, None)
@@ -256,7 +256,7 @@ mod tests {
 
     #[tokio::test]
     async fn management_is_owner_scoped_and_reports_conflicts_without_erasing_due_facts() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         for id in ["rem-owner", "other-owner"] {
             state
                 .db
@@ -330,7 +330,7 @@ mod tests {
 
     #[tokio::test]
     async fn reschedule_uses_shared_time_validation_and_observed_revision() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         state
             .db
             .create_conversation("resched-owner", "resched-owner", "/tmp", true, None, None)

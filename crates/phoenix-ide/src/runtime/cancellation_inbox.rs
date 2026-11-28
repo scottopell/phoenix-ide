@@ -10,7 +10,7 @@ pub(crate) struct UserCancellation {
 }
 
 impl UserCancellation {
-    fn into_event(self) -> Event {
+    pub(crate) fn into_event(self) -> Event {
         Event::UserCancel {
             reason: self.reason,
             cause: self.cause,
@@ -18,8 +18,143 @@ impl UserCancellation {
     }
 }
 
+pub(crate) struct DirectTurnCancellation {
+    pub(crate) turn_id: phoenix_workflow::TurnAuthorityId,
+    pub(crate) generation: u64,
+}
+
+pub(crate) struct NativeCloseSettlementStopOffer {
+    db: phoenix_db::Database,
+    command: phoenix_db::native_close::NativeCloseCommand,
+    receipt: phoenix_db::native_close::NativeCloseReceipt,
+    source_entry: super::executor::SourceEntryWorker,
+    live_source: phoenix_core::domain::sm_state::ConvState,
+    target: phoenix_db::CloseDirectTurnSettlementTarget,
+}
+
+impl NativeCloseSettlementStopOffer {
+    pub(crate) fn new(
+        db: phoenix_db::Database,
+        command: phoenix_db::native_close::NativeCloseCommand,
+        receipt: phoenix_db::native_close::NativeCloseReceipt,
+        source_entry: super::executor::SourceEntryWorker,
+        live_source: phoenix_core::domain::sm_state::ConvState,
+        target: phoenix_db::CloseDirectTurnSettlementTarget,
+    ) -> Self {
+        Self {
+            db,
+            command,
+            receipt,
+            source_entry,
+            live_source,
+            target,
+        }
+    }
+
+    pub(crate) async fn claim(
+        self,
+        fatal: std::sync::Arc<super::FatalLocalAuthorityFence>,
+    ) -> bool {
+        use super::executor::WorkerEntryResult;
+        use phoenix_db::workflow::LocalAuthorityResult;
+
+        let runtime = tokio::runtime::Handle::current();
+        let worker_fatal = fatal.clone();
+        let work = tokio::task::spawn_blocking(move || {
+            let (result, lease) =
+                runtime.block_on(self.db.claim_native_close_initial_settlement_stop(
+                    &self.command,
+                    &self.receipt,
+                    &self.live_source,
+                    &self.target,
+                    || match self.source_entry.try_acquire_first_effect(&self.command) {
+                        WorkerEntryResult::Ran(lease) => Ok(lease),
+                        WorkerEntryResult::Busy | WorkerEntryResult::Refused => {
+                            Err(phoenix_db::DbError::CloseFoundationPrecondition(
+                                "Close settlement source entry is unavailable".into(),
+                            ))
+                        }
+                    },
+                ));
+            match result {
+                LocalAuthorityResult::DurableFactEstablished(result) => {
+                    drop(lease);
+                    result.unwrap_or_else(|error| {
+                        tracing::debug!(%error, "native Close settlement Stop claim refused");
+                        false
+                    })
+                }
+                LocalAuthorityResult::DurableFactUnclassified => {
+                    worker_fatal.close("native_close_settlement_stop_unknown_writer_release");
+                    if let Some(lease) = lease {
+                        std::mem::forget(self.source_entry.clone());
+                        std::mem::forget(lease);
+                    }
+                    false
+                }
+            }
+        });
+        match work.await {
+            Ok(claimed) => claimed,
+            Err(error) => {
+                tracing::error!(%error, "native Close settlement Stop claim worker failed");
+                fatal.close("native_close_settlement_stop_worker_failure");
+                false
+            }
+        }
+    }
+}
+
+pub(crate) enum CloseSettlementStopOffer {
+    Native(Box<NativeCloseSettlementStopOffer>),
+    Generic(phoenix_db::Database, phoenix_db::GenericCloseTurnOffer),
+}
+
+impl CloseSettlementStopOffer {
+    fn target(&self) -> &phoenix_db::CloseDirectTurnSettlementTarget {
+        match self {
+            Self::Native(offer) => &offer.target,
+            Self::Generic(_, offer) => offer.target(),
+        }
+    }
+
+    pub(crate) async fn claim(
+        self,
+        fatal: std::sync::Arc<super::FatalLocalAuthorityFence>,
+    ) -> bool {
+        use phoenix_db::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+        if fatal.is_closed() {
+            return false;
+        }
+        match self {
+            Self::Native(offer) => offer.claim(fatal).await,
+            Self::Generic(db, offer) => match db.claim_generic_close_turn_offer(offer).await {
+                DurableFactEstablished(Ok(accepted)) => accepted,
+                DurableFactEstablished(Err(error)) => {
+                    tracing::debug!(%error, "generic Close settlement Stop refused");
+                    false
+                }
+                DurableFactUnclassified => {
+                    fatal.close("generic_close_settlement_stop_unknown_writer_release");
+                    false
+                }
+            },
+        }
+    }
+}
+
+pub(crate) struct ScopedDirectTurnCancellation {
+    pub(crate) scope: DirectTurnCancellation,
+    pub(crate) offer: CloseSettlementStopOffer,
+    pub(crate) cancellation: UserCancellation,
+    pub(crate) applied: oneshot::Sender<ScopedStopHandling>,
+}
+
 pub(crate) enum CancellationInput {
     Addressed(UserCancellation),
+    DirectTurn(ScopedDirectTurnCancellation),
     Acknowledged {
         cancellation: UserCancellation,
         acknowledgement: oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
@@ -27,8 +162,16 @@ pub(crate) enum CancellationInput {
     },
 }
 
+/// A mailbox response describes handling, not release of durable turn ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScopedStopHandling {
+    Handled,
+    Refused,
+}
+
 pub(crate) enum CancellationReceipt {
     Addressed,
+    DirectTurn(oneshot::Sender<ScopedStopHandling>),
     Acknowledged {
         acknowledgement: oneshot::Sender<Result<AcknowledgedEventOutcome, String>>,
         retirement: oneshot::Receiver<()>,
@@ -36,11 +179,18 @@ pub(crate) enum CancellationReceipt {
 }
 
 impl CancellationInput {
-    pub(crate) fn into_parts(self) -> (Event, CancellationReceipt) {
+    pub(crate) fn into_parts(self) -> (Event, CancellationReceipt, Option<DirectTurnCancellation>) {
         match self {
-            Self::Addressed(cancellation) => {
-                (cancellation.into_event(), CancellationReceipt::Addressed)
-            }
+            Self::Addressed(cancellation) => (
+                cancellation.into_event(),
+                CancellationReceipt::Addressed,
+                None,
+            ),
+            Self::DirectTurn(scoped) => (
+                scoped.cancellation.into_event(),
+                CancellationReceipt::DirectTurn(scoped.applied),
+                Some(scoped.scope),
+            ),
             Self::Acknowledged {
                 cancellation,
                 acknowledgement,
@@ -51,8 +201,36 @@ impl CancellationInput {
                     acknowledgement,
                     retirement,
                 },
+                None,
             ),
         }
+    }
+}
+
+pub(crate) struct DirectTurnCancellationReservation(mpsc::OwnedPermit<CancellationInput>);
+
+impl DirectTurnCancellationReservation {
+    pub(crate) fn send(
+        self,
+        offer: CloseSettlementStopOffer,
+    ) -> oneshot::Receiver<ScopedStopHandling> {
+        let (applied, receipt) = oneshot::channel();
+        let scope = DirectTurnCancellation {
+            turn_id: phoenix_workflow::TurnAuthorityId(offer.target().turn_id),
+            generation: offer.target().expected_generation,
+        };
+        self.0.send(CancellationInput::DirectTurn(
+            ScopedDirectTurnCancellation {
+                scope,
+                offer,
+                cancellation: UserCancellation {
+                    reason: Some("active Close settlement".into()),
+                    cause: CancelCause::UserRequested,
+                },
+                applied,
+            },
+        ));
+        receipt
     }
 }
 
@@ -158,11 +336,36 @@ impl ConversationEventSender {
         }
     }
 
-    #[cfg(test)]
+    pub(crate) fn try_reserve_direct_turn_cancellation(
+        &self,
+    ) -> Result<DirectTurnCancellationReservation, mpsc::error::TrySendError<()>> {
+        match &self.0 {
+            EventDestination::Runtime { cancellation, .. } => cancellation
+                .clone()
+                .try_reserve_owned()
+                .map(DirectTurnCancellationReservation)
+                .map_err(|error| match error {
+                    mpsc::error::TrySendError::Full(_) => mpsc::error::TrySendError::Full(()),
+                    mpsc::error::TrySendError::Closed(_) => mpsc::error::TrySendError::Closed(()),
+                }),
+            #[cfg(test)]
+            EventDestination::TestReceiver(_) => Err(mpsc::error::TrySendError::Closed(())),
+        }
+    }
+
+    pub(crate) fn is_cancellation_closed(&self) -> bool {
+        match &self.0 {
+            EventDestination::Runtime { cancellation, .. } => cancellation.is_closed(),
+            #[cfg(test)]
+            EventDestination::TestReceiver(sender) => sender.is_closed(),
+        }
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         match &self.0 {
-            EventDestination::Runtime { ordinary, .. }
-            | EventDestination::TestReceiver(ordinary) => ordinary.is_closed(),
+            EventDestination::Runtime { ordinary, .. } => ordinary.is_closed(),
+            #[cfg(test)]
+            EventDestination::TestReceiver(ordinary) => ordinary.is_closed(),
         }
     }
 
@@ -305,6 +508,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_direct_turn_cancellation_reservation_does_not_enqueue() {
+        let (events, _events_rx) = mpsc::channel(1);
+        let (ordinary, _ordinary_rx) = mpsc::channel(1);
+        let (sender, _, mut cancellation_rx) = channel(events, ordinary);
+        let reservation = sender.try_reserve_direct_turn_cancellation().unwrap();
+        assert!(matches!(
+            cancellation_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(reservation);
+        let _reservation = sender.try_reserve_direct_turn_cancellation().unwrap();
+        assert!(matches!(
+            cancellation_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
     async fn acknowledged_stop_routes_to_cancellation_with_original_receipt() {
         let (events, _events_rx) = mpsc::channel(1);
         let (ordinary, mut ordinary_rx) = mpsc::channel(1);
@@ -323,7 +544,8 @@ mod tests {
             ordinary_rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
-        let (event, receipt) = cancellation_rx.try_recv().unwrap().into_parts();
+        let (event, receipt, scope) = cancellation_rx.try_recv().unwrap().into_parts();
+        assert!(scope.is_none());
         assert!(matches!(
             event,
             Event::UserCancel { reason: Some(reason), cause: CancelCause::UserRequested }
@@ -369,8 +591,10 @@ mod tests {
     async fn closed_cancellation_inbox_returns_stop_envelope_with_original_receipt() {
         let (events, _events_rx) = mpsc::channel(1);
         let (ordinary, mut ordinary_rx) = mpsc::channel(1);
-        let (_events, sender, mut cancellation_rx) = channel(events, ordinary);
+        let (events, sender, mut cancellation_rx) = channel(events, ordinary);
         cancellation_rx.close();
+        assert!(!events.is_closed());
+        assert!(events.is_cancellation_closed());
         let (request, peer) = EventReceiptPeer::request(Event::UserCancel {
             reason: Some("close race".into()),
             cause: CancelCause::Timeout,
@@ -493,6 +717,9 @@ mod tests {
         ));
 
         let (response, mut retry_reply) = oneshot::channel();
+        let attempt_gate = backend
+            .acquire_close_attempt(referenced.attempt_id.clone())
+            .await;
         let retry = Box::new(NativeCloseRetryRequest {
             source,
             target: referenced.target,
@@ -501,7 +728,7 @@ mod tests {
             backend: Arc::clone(&backend),
             admitted: backend.acquire_local_authority_pass().unwrap(),
             target_gate: Arc::new(Mutex::new(())).try_lock_owned().unwrap(),
-            attempt_gate: Arc::new(Mutex::new(())).try_lock_owned().unwrap(),
+            attempt_gate,
             response,
         });
         let original = std::ptr::from_ref(retry.as_ref());

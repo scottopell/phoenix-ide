@@ -8,7 +8,8 @@ use crate::runtime::native_close_application::{
 };
 use phoenix_core::domain::sm_state::ConvState;
 use phoenix_db::native_close::{NativeCloseCommand, NativeCloseIntent};
-use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
+use std::sync::Arc;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::Instant;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -16,10 +17,11 @@ enum Eligibility {
     Unavailable,
     Eligible,
     Revoked,
+    Poisoned,
 }
 
 struct Shared {
-    eligibility: Mutex<Eligibility>,
+    eligibility: Arc<Mutex<Eligibility>>,
     revoked: std::sync::atomic::AtomicBool,
     original: NativeCloseCommand,
     deadline: Instant,
@@ -39,7 +41,7 @@ pub(crate) struct SourceEntryController {
 struct RevalidationCheckpoint {
     entered: std::sync::mpsc::Sender<()>,
     // Keep the controller's production Send + Sync properties in test builds.
-    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
 }
 
 /// Worker capability scoped to one exact original command and deadline.
@@ -48,11 +50,22 @@ pub(crate) struct SourceEntryWorker {
     shared: Arc<Shared>,
 }
 
-/// Borrowed, non-cloneable source custody for one admitted first effect.
+/// Owned, non-cloneable source custody for one admitted first effect.
 /// The private guard cannot be unlocked, modified, or reminted by its holder.
 #[must_use = "retain source custody through the effect and confirmed transaction release"]
-pub(crate) struct SourceEntryLease<'a> {
-    _guard: MutexGuard<'a, Eligibility>,
+pub(crate) struct SourceEntryLease {
+    _guard: EligibilityGuard,
+}
+
+struct EligibilityGuard(OwnedMutexGuard<Eligibility>);
+
+impl Drop for EligibilityGuard {
+    fn drop(&mut self) {
+        // Tokio's mutex does not poison on unwind.
+        if std::thread::panicking() {
+            *self.0 = Eligibility::Poisoned;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,7 +87,7 @@ impl SourceEntryController {
     pub(crate) fn new(original: NativeCloseCommand, deadline: Instant) -> Self {
         Self {
             shared: Arc::new(Shared {
-                eligibility: Mutex::new(Eligibility::Unavailable),
+                eligibility: Arc::new(Mutex::new(Eligibility::Unavailable)),
                 revoked: std::sync::atomic::AtomicBool::new(false),
                 original,
                 deadline,
@@ -104,7 +117,7 @@ impl SourceEntryController {
     ) {
         self.revalidation_checkpoint = Some(RevalidationCheckpoint {
             entered,
-            release: Mutex::new(release),
+            release: std::sync::Mutex::new(release),
         });
     }
 
@@ -133,7 +146,7 @@ impl SourceEntryController {
             LockAttempt::Busy => return ActorEntryResult::Busy,
             LockAttempt::Poisoned => return ActorEntryResult::Refused,
         };
-        if *eligibility == Eligibility::Revoked {
+        if *eligibility.0 == Eligibility::Revoked {
             return ActorEntryResult::Refused;
         }
         if Instant::now() >= self.shared.deadline
@@ -143,7 +156,7 @@ impl SourceEntryController {
             self.shared
                 .revoked
                 .store(true, std::sync::atomic::Ordering::Release);
-            *eligibility = Eligibility::Revoked;
+            *eligibility.0 = Eligibility::Revoked;
             return ActorEntryResult::Refused;
         }
         #[cfg(test)]
@@ -159,7 +172,7 @@ impl SourceEntryController {
                 .recv_timeout(std::time::Duration::from_secs(60))
                 .expect("release revalidation checkpoint");
         }
-        *eligibility = Eligibility::Eligible;
+        *eligibility.0 = Eligibility::Eligible;
         ActorEntryResult::Updated
     }
 
@@ -182,7 +195,7 @@ impl SourceEntryController {
             .store(true, std::sync::atomic::Ordering::Release);
         match try_lock(&self.shared) {
             LockAttempt::Acquired(mut eligibility) => {
-                *eligibility = Eligibility::Revoked;
+                *eligibility.0 = Eligibility::Revoked;
                 ActorEntryResult::Updated
             }
             LockAttempt::Busy => ActorEntryResult::Busy,
@@ -260,13 +273,13 @@ impl SourceEntryWorker {
     }
 
     /// Acquire source custody only at the actual effect sink, after any writer
-    /// wait and exact DB validation. The borrowed guard must span the mutation
+    /// wait and exact DB validation. The owned guard must span the mutation
     /// and transaction release; an unknown release must retain it indefinitely.
     /// This never waits, and workers cannot establish eligibility themselves.
     pub(crate) fn try_acquire_first_effect(
         &self,
         exact_original: &NativeCloseCommand,
-    ) -> WorkerEntryResult<SourceEntryLease<'_>> {
+    ) -> WorkerEntryResult<SourceEntryLease> {
         let guard = match try_lock(&self.shared) {
             LockAttempt::Acquired(guard) => guard,
             LockAttempt::Busy => return WorkerEntryResult::Busy,
@@ -276,7 +289,7 @@ impl SourceEntryWorker {
             .shared
             .revoked
             .load(std::sync::atomic::Ordering::Acquire)
-            || *guard != Eligibility::Eligible
+            || *guard.0 != Eligibility::Eligible
         {
             return WorkerEntryResult::Refused;
         }
@@ -290,24 +303,23 @@ impl SourceEntryWorker {
     }
 }
 
-enum LockAttempt<'a> {
-    Acquired(MutexGuard<'a, Eligibility>),
+enum LockAttempt {
+    Acquired(EligibilityGuard),
     Busy,
     Poisoned,
 }
 
-fn try_lock(shared: &Shared) -> LockAttempt<'_> {
-    match shared.eligibility.try_lock() {
-        Ok(guard) => LockAttempt::Acquired(guard),
-        Err(TryLockError::WouldBlock) => LockAttempt::Busy,
-        Err(TryLockError::Poisoned(guard)) => {
-            shared
-                .revoked
-                .store(true, std::sync::atomic::Ordering::Release);
-            drop(guard);
-            LockAttempt::Poisoned
-        }
+fn try_lock(shared: &Shared) -> LockAttempt {
+    let Ok(guard) = Arc::clone(&shared.eligibility).try_lock_owned() else {
+        return LockAttempt::Busy;
+    };
+    if *guard == Eligibility::Poisoned {
+        shared
+            .revoked
+            .store(true, std::sync::atomic::Ordering::Release);
+        return LockAttempt::Poisoned;
     }
+    LockAttempt::Acquired(EligibilityGuard(guard))
 }
 
 pub(crate) fn source_matches(live_state: &ConvState, command: &NativeCloseCommand) -> bool {
@@ -597,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_metadata_lease_defers_actor_revoke_until_explicit_release() {
+    fn transferred_metadata_lease_defers_actor_revoke_until_explicit_release() {
         let (state, command, _) = fixture();
         let mut controller = SourceEntryController::new(
             command.clone(),
@@ -614,9 +626,11 @@ mod tests {
         // Deterministic interleaving: the actor cannot apply its source event
         // while metadata owns the lease, including an unclassified DB release.
         assert_eq!(controller.revoke(), ActorEntryResult::Busy);
-        let retained_unknown_release = Some(lease);
-        assert_eq!(controller.revoke(), ActorEntryResult::Busy);
-        drop(retained_unknown_release);
+        assert!(matches!(
+            worker.try_acquire_first_effect(&command),
+            WorkerEntryResult::Busy
+        ));
+        std::thread::spawn(move || drop(lease)).join().unwrap();
         assert_eq!(controller.revoke(), ActorEntryResult::Updated);
         assert!(matches!(
             worker.try_acquire_first_effect(&command),

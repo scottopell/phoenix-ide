@@ -53,8 +53,7 @@ async fn fixture() -> (
     String,
     crate::db::Conversation,
 ) {
-    fixture_from_state(crate::api::handlers::hard_delete_cascade_tests::make_test_state().await)
-        .await
+    fixture_from_state(crate::api::handlers::api_test_support::make_test_state().await).await
 }
 
 async fn fixture_from_state(
@@ -550,7 +549,7 @@ async fn state_from_database_path(path: &std::path::Path) -> AppState {
     let db = crate::db::Database::open_migrated_for_test(path.to_str().unwrap())
         .await
         .unwrap();
-    crate::api::handlers::hard_delete_cascade_tests::make_test_state_with_db(db)
+    crate::api::handlers::api_test_support::make_test_state_with_db(db)
 }
 
 async fn close_state(state: AppState, app: Router) {

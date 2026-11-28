@@ -570,7 +570,7 @@ async fn delete_api_clears_dispatches_before_expected_resource_teardown() {
         .await
         .unwrap()
     {
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+        db.seed_pre_197_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: CloseAttemptId::parse(&attempt).unwrap(),
             snapshot: CloseRetirementSnapshot::parse(&generation, &fingerprint).unwrap(),
             scope: expected.scope,
@@ -578,8 +578,7 @@ async fn delete_api_clears_dispatches_before_expected_resource_teardown() {
             outcome: RetirementOutcome::Retired,
             detail: None,
         })
-        .await
-        .unwrap();
+        .await;
     }
     let completed = db
         .complete_close_retirement(&CloseAttemptId::parse(&attempt).unwrap())

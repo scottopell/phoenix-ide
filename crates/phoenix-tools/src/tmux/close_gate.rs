@@ -633,7 +633,7 @@ pub async fn retire_exact_on_server_with_entry(
             ),
         };
     }
-    TokenBoundKill::Killed
+    TokenBoundKill::QueueCompletedWithoutExecutionWitness
 }
 
 fn valid_embed_path(path: &Path) -> bool {

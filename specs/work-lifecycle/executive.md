@@ -39,7 +39,7 @@ These are requirements, not additional tests reported as passing here:
 | Repeated/concurrent/lost-response native Close | Same exact retained request/attempt/run/result; no new topology and no implicit retry |
 | Staged, unstaged, untracked, ignored/build, submodule, or detached content | Exact blocker evidence; no discard based on metadata or incomplete observation |
 | Active writer, target permission/layout/error/deadline failure | One blocker decision and projection naming exact target and operational cause; retain data |
-| Ambient process inspection gap (REQ-WL-002e) | Admitted native physical retirement records uncertainty without blocking for that gap alone after confirmed owned shutdown. Current writer authority and all target safety checks still block. Installed shared-host acceptance remains required. |
+| Ambient process inspection gap (REQ-WL-002e) | After confirmed owned shutdown, admitted native Initial retirement records uncertainty without blocking on an external process gap alone. Public Initial allows only candidate-specific unavailability; explicit Retry blocks on gaps, including at the final moved-object scan. Current writer authority and all target safety checks still block. Installed shared-host acceptance remains required. |
 | Mutation after inspection | Recheck at the mutation boundary; newly observed failure is a concrete blocker, not a claimed snapshot guarantee |
 | Registered owned resources | Only exact WorkScope registrations and existing shutdown authorities are targeted |
 | First failure | Stop remaining effects; retain completed steps, exact failure and residual state |

@@ -19,9 +19,9 @@ use crate::close_foundation::{
     close_obligation_for_update, parse_cleanup_resource_identity, retained_close_retry_progress_tx,
     BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
-    CloseSafeRetryEffect, CloseSafeRetryProgress, RecordCloseRetirementDispatchRequest,
-    RecordCloseWorktreeCleanupPlanRequest, StoppedCloseOriginalRetirementProof,
-    TerminalizeInitialCloseCleanupFailureRequest,
+    CloseRetrySuccessWrite, CloseSafeRetryEffect, CloseSafeRetryProgress,
+    RecordCloseRetirementDispatchRequest, RecordCloseWorktreeCleanupPlanRequest,
+    StoppedCloseOriginalRetirementProof, TerminalizeInitialCloseCleanupFailureRequest,
 };
 use crate::workflow::LocalAuthorityResult;
 use crate::{Database, DbError, DbResult};
@@ -131,6 +131,7 @@ struct NativeCloseRetryAuthority {
     pending: Vec<CloseSafeRetryEffect>,
 }
 
+#[derive(Clone, Copy)]
 enum NativeCloseRetryDispatchKind {
     Worktree,
     Tmux,
@@ -188,6 +189,16 @@ impl NativeCloseRetryWorktreeMetadata {
             ),
         }
     }
+}
+
+/// Evidence for the exact original tmux identity in a native Retry plan.
+#[derive(Debug)]
+pub enum NativeRetryTmuxProof {
+    Dispatched,
+    Replacement {
+        sealed_identity: String,
+        token: uuid::Uuid,
+    },
 }
 
 impl Database {
@@ -374,6 +385,7 @@ impl Database {
             snapshot,
             resource,
             NativeCloseRetryDispatchKind::Worktree,
+            true,
             first_effect,
         )
         .await
@@ -408,7 +420,42 @@ impl Database {
             snapshot,
             resource,
             NativeCloseRetryDispatchKind::Tmux,
+            true,
             first_effect,
+        )
+        .await
+    }
+
+    /// Authorizes the process-bound approval sink for the exact durable plan.
+    /// Entering approval does not establish that the original command ran.
+    ///
+    /// # Errors
+    /// Refuses stale source authority or a mismatched or settled effect, and reports
+    /// database errors with the transaction release classification when available.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn with_native_close_retry_tmux_approval<F, T>(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        scope: WorkScopeId,
+        snapshot: CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+        sink: F,
+    ) -> Result<(T, NativeCloseInitialEntryRelease), NativeCloseInitialFirstEffectError>
+    where
+        F: FnOnce() -> T,
+    {
+        self.with_native_close_retry_resource_first_effect(
+            command,
+            admitted,
+            live_source,
+            scope,
+            snapshot,
+            resource,
+            NativeCloseRetryDispatchKind::Tmux,
+            false,
+            sink,
         )
         .await
     }
@@ -424,6 +471,7 @@ impl Database {
         snapshot: CloseRetirementSnapshot,
         resource: &RetiredResourceIdentity,
         kind: NativeCloseRetryDispatchKind,
+        require_retained_dispatch: bool,
         first_effect: F,
     ) -> Result<(T, NativeCloseInitialEntryRelease), NativeCloseInitialFirstEffectError>
     where
@@ -450,6 +498,17 @@ impl Database {
                 return Err(refused(
                     "native retry entry requires its exact original snapshot",
                 ));
+            }
+            if matches!(kind, NativeCloseRetryDispatchKind::Tmux) {
+                let confirmed = Self::native_retry_tmux_dispatch_confirmed_tx(
+                    &mut tx, admitted, &snapshot, &effect,
+                )
+                .await?;
+                return match (require_retained_dispatch, confirmed) {
+                    (true, true) | (false, false) => Ok(()),
+                    (true, false) => Err(refused("tmux finalization requires confirmed dispatch")),
+                    (false, true) => Err(refused("tmux dispatch is already confirmed")),
+                };
             }
             let identity = resource.identity();
             let dispatched: bool = sqlx::query_scalar(
@@ -734,6 +793,37 @@ impl Database {
     where
         F: FnOnce() -> DbResult<L>,
     {
+        self.record_native_retry_dispatch_with_entry(admitted, command, effect, entry, false)
+            .await
+    }
+
+    /// Records the process-bound tmux backend's positive command confirmation.
+    /// Neither permission to enter nor a prior dispatch preclaim may call this boundary.
+    pub async fn confirm_native_retry_tmux_dispatch_with_entry<F, L>(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        entry: F,
+    ) -> (LocalAuthorityResult<DbResult<()>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
+        self.record_native_retry_dispatch_with_entry(admitted, command, effect, entry, true)
+            .await
+    }
+
+    async fn record_native_retry_dispatch_with_entry<F, L>(
+        &self,
+        admitted: &NativeCloseRunRef,
+        command: &NativeCloseCommand,
+        effect: &CloseSafeRetryEffect,
+        entry: F,
+        confirm_tmux: bool,
+    ) -> (LocalAuthorityResult<DbResult<()>>, Option<L>)
+    where
+        F: FnOnce() -> DbResult<L>,
+    {
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
             Err(error) => {
@@ -745,7 +835,13 @@ impl Database {
         };
         let mut lease = None;
         let result = Self::record_native_close_retry_retirement_dispatch_tx(
-            &mut tx, command, admitted, effect, entry, &mut lease,
+            &mut tx,
+            command,
+            admitted,
+            effect,
+            entry,
+            &mut lease,
+            confirm_tmux,
         )
         .await;
         let classification = match result {
@@ -847,6 +943,7 @@ impl Database {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn record_native_close_retry_retirement_dispatch_tx<F, L>(
         tx: &mut Transaction<'_, Sqlite>,
         command: &NativeCloseCommand,
@@ -854,11 +951,15 @@ impl Database {
         effect: &CloseSafeRetryEffect,
         entry: F,
         lease: &mut Option<L>,
+        confirm_tmux: bool,
     ) -> DbResult<()>
     where
         F: FnOnce() -> DbResult<L>,
     {
         let kind = NativeCloseRetryDispatchKind::for_resource(&effect.resource)?;
+        if confirm_tmux && !matches!(kind, NativeCloseRetryDispatchKind::Tmux) {
+            return Err(refused("tmux confirmation requires a tmux plan effect"));
+        }
         let snapshot = Self::require_native_close_retry_pending_dispatch_tx(
             tx, command, admitted, effect, kind,
         )
@@ -869,11 +970,33 @@ impl Database {
             &RecordCloseRetirementDispatchRequest {
                 attempt_id: admitted.attempt_id.clone(),
                 scope: effect.scope.clone(),
-                snapshot,
+                snapshot: snapshot.clone(),
                 resource: effect.resource.clone(),
             },
         )
-        .await
+        .await?;
+        if confirm_tmux {
+            let identity = effect.resource.identity();
+            let result = sqlx::query(
+                "INSERT INTO close_retry_tmux_dispatch_confirmations (
+                    attempt_id, scope, inspection_generation, inspection_fingerprint,
+                    resource_kind, identity_kind, identity_codec, identity_value, run_ordinal
+                 ) VALUES (?1, ?2, ?3, ?4, 'tmux_server', 'opaque', 'opaque_string_v1', ?5, ?6)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .bind(effect.scope.as_str())
+            .bind(snapshot.generation())
+            .bind(snapshot.fingerprint())
+            .bind(identity.value())
+            .bind(admitted.run_ordinal.get())
+            .execute(&mut **tx)
+            .await?;
+            if result.rows_affected() != 1 {
+                return Err(refused("exact tmux dispatch was already confirmed"));
+            }
+        }
+        Ok(())
     }
 
     /// Retires one pending original `WorkScope` under the live native retry authority.
@@ -1068,13 +1191,54 @@ impl Database {
         effect: &CloseSafeRetryEffect,
         detail: &str,
     ) -> LocalAuthorityResult<DbResult<()>> {
+        self.write_native_close_retry_success(command, admitted, effect, detail, None, || async {
+            Ok(())
+        })
+        .await
+    }
+
+    /// Checks the physical witness again after the exact durable proof has been staged,
+    /// under the same writer transaction that commits the Retry success.
+    pub async fn record_native_close_retry_tmux_success(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        proof: NativeRetryTmuxProof,
+        recheck: impl AsyncFnOnce() -> DbResult<()>,
+    ) -> LocalAuthorityResult<DbResult<()>> {
+        self.write_native_close_retry_success(
+            command,
+            admitted,
+            effect,
+            "exact native retry tmux retirement",
+            Some(proof),
+            recheck,
+        )
+        .await
+    }
+
+    async fn write_native_close_retry_success(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        detail: &str,
+        tmux_proof: Option<NativeRetryTmuxProof>,
+        recheck: impl AsyncFnOnce() -> DbResult<()>,
+    ) -> LocalAuthorityResult<DbResult<()>> {
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
-        let result =
-            Self::record_native_close_retry_success_tx(&mut tx, command, admitted, effect, detail)
-                .await;
+        let result = match Self::record_native_close_retry_success_tx(
+            &mut tx, command, admitted, effect, detail, tmux_proof,
+        )
+        .await
+        {
+            Ok(()) => recheck().await,
+            Err(error) => Err(error),
+        };
         match result {
             Ok(()) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
@@ -1252,7 +1416,7 @@ impl Database {
         ) {
             Self::require_native_close_retry_members_quiescent_tx(tx, &run.attempt_id).await?;
         }
-        Self::insert_and_finish_close_resource_failure_tx(tx, &run, request, obligation).await
+        Self::persist_validated_close_failure_tx(tx, &run, request, obligation).await
     }
 
     async fn require_native_close_original_process_proof_tx(
@@ -1320,14 +1484,162 @@ impl Database {
         admitted: &NativeCloseRunRef,
         effect: &CloseSafeRetryEffect,
         detail: &str,
+        tmux_proof: Option<NativeRetryTmuxProof>,
     ) -> DbResult<()> {
-        let effect_count = Self::require_native_close_retry_plan_tx(tx, command, admitted).await?;
+        let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
+        if !plan.running {
+            return Err(refused(
+                "native retry success requires its exact latest running plan",
+            ));
+        }
+        Self::require_native_close_retry_members_quiescent_tx(tx, &admitted.attempt_id).await?;
         let run = CloseRunRef {
             attempt_id: admitted.attempt_id.clone(),
             ordinal: admitted.run_ordinal,
         };
-        Self::record_native_close_retry_success_effect_tx(tx, &run, effect, detail, effect_count)
-            .await
+        let detail = match (effect.resource.kind(), &tmux_proof) {
+            (RetiredResourceKind::TmuxServer, Some(NativeRetryTmuxProof::Dispatched)) => {
+                "exact native retry tmux absence with confirmed dispatch"
+            }
+            (RetiredResourceKind::TmuxServer, Some(NativeRetryTmuxProof::Replacement { .. })) => {
+                "exact native retry tmux absence with verified replacement"
+            }
+            (RetiredResourceKind::TmuxServer, None) | (_, Some(_)) => {
+                return Err(refused("native Retry requires the correct resource proof"));
+            }
+            (_, None) => detail,
+        };
+        let write = Self::record_native_close_retry_success_effect_tx(
+            tx,
+            &run,
+            effect,
+            detail,
+            plan.effect_count,
+        )
+        .await?;
+        if let Some(proof) = tmux_proof {
+            Self::record_native_retry_tmux_proof_tx(
+                tx,
+                admitted,
+                &plan.snapshot,
+                effect,
+                write,
+                proof,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn native_retry_tmux_dispatch_confirmed_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        admitted: &NativeCloseRunRef,
+        snapshot: &CloseRetirementSnapshot,
+        effect: &CloseSafeRetryEffect,
+    ) -> DbResult<bool> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_retry_tmux_dispatch_confirmations
+             WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+               AND inspection_fingerprint = ?4 AND identity_value = ?5 AND run_ordinal <= ?6)",
+        )
+        .bind(admitted.attempt_id.as_str())
+        .bind(effect.scope.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .bind(effect.resource.identity().value())
+        .bind(admitted.run_ordinal.get())
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(Into::into)
+    }
+
+    async fn record_native_retry_tmux_proof_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        admitted: &NativeCloseRunRef,
+        snapshot: &CloseRetirementSnapshot,
+        effect: &CloseSafeRetryEffect,
+        write: CloseRetrySuccessWrite,
+        proof: NativeRetryTmuxProof,
+    ) -> DbResult<()> {
+        let identity = effect.resource.identity();
+        let NativeRetryTmuxProof::Replacement {
+            sealed_identity,
+            token,
+        } = proof
+        else {
+            let dispatched =
+                Self::native_retry_tmux_dispatch_confirmed_tx(tx, admitted, snapshot, effect)
+                    .await?;
+            return if dispatched {
+                Ok(())
+            } else {
+                Err(refused("tmux absence requires exact confirmed dispatch"))
+            };
+        };
+        let original_token = sealed_identity
+            .strip_prefix("tmux-v1:")
+            .and_then(|identity| identity.rsplit_once(':'))
+            .and_then(|(_, token)| uuid::Uuid::parse_str(token).ok());
+        if identity.value() != sealed_identity
+            || original_token.is_none_or(|original| original == token)
+        {
+            return Err(refused(
+                "replacement requires the exact sealed tmux identity and a different token",
+            ));
+        }
+        let retained: Option<String> = sqlx::query_scalar(
+            "SELECT tmux_replacement_token FROM close_retirement_resource_history
+             WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+               AND inspection_fingerprint = ?4 AND resource_kind = 'tmux_server'
+               AND identity_kind = ?5 AND identity_codec = ?6 AND identity_value = ?7
+               AND proof_kind = 'absence_adopted' AND absence_basis = 'verified_tmux_replacement'
+               AND detail IS NULL",
+        )
+        .bind(admitted.attempt_id.as_str())
+        .bind(effect.scope.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_optional(&mut **tx)
+        .await?;
+        let token = token.to_string();
+        match (retained, write) {
+            (Some(retained), _) if retained != token => {
+                return Err(refused(
+                    "replacement conflicts with retained tmux absence proof",
+                ));
+            }
+            (Some(_), _) => {}
+            (None, CloseRetrySuccessWrite::Replay) => {
+                return Err(refused(
+                    "replacement replay lacks its retained tmux absence proof",
+                ));
+            }
+            (None, CloseRetrySuccessWrite::Inserted) => {
+                sqlx::query(
+                    "INSERT INTO close_retirement_resource_history (
+                        attempt_id, scope, inspection_generation, inspection_fingerprint,
+                        resource_kind, identity_kind, identity_codec, identity_value,
+                        proof_kind, absence_basis, recorded_at, tmux_replacement_token
+                     ) VALUES (?1, ?2, ?3, ?4, 'tmux_server', ?5, ?6, ?7,
+                        'absence_adopted', 'verified_tmux_replacement', ?8, ?9)",
+                )
+                .bind(admitted.attempt_id.as_str())
+                .bind(effect.scope.as_str())
+                .bind(snapshot.generation())
+                .bind(snapshot.fingerprint())
+                .bind(identity.identity_kind())
+                .bind(identity.codec())
+                .bind(identity.value())
+                .bind(chrono::Utc::now().to_rfc3339())
+                .bind(token)
+                .execute(&mut **tx)
+                .await?;
+            }
+        }
+        Ok(())
     }
 
     // Shared by success recording and finalization; receipt identity never replaces

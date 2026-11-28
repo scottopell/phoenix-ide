@@ -56,7 +56,7 @@ mod tests {
 
     #[tokio::test]
     async fn shared_svg_artifact_retrieval_is_token_scoped_and_revocable_without_password() {
-        let mut state = super::super::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let mut state = super::super::handlers::api_test_support::make_test_state().await;
         state.password = Some(
             phoenix_core::domain::instance_identity::OwnerPassword::parse(
                 "private-instance".to_owned(),

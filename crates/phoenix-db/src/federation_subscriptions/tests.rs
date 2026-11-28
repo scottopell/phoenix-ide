@@ -3471,6 +3471,7 @@ async fn production_creation_completion_failure_and_cancellation_fanout_are_atom
             TerminalFactOutcome::Cancelled => {
                 f.db.cancel_conversation_creation(&f.source.id, chrono::Utc::now())
                     .await
+                    .map(|_| ())
             }
         };
         assert!(first.is_err());
@@ -3895,7 +3896,7 @@ async fn real_creation_wait_token_and_cancelled_cleanup_paths_never_add_terminal
         1
     );
     let now = chrono::Utc::now() + chrono::Duration::seconds(1);
-    let cleanup = cancelled
+    assert!(cancelled
         .db
         .claim_next_conversation_creation_cleanup(
             "cleanup-worker",
@@ -3905,12 +3906,12 @@ async fn real_creation_wait_token_and_cancelled_cleanup_paths_never_add_terminal
         )
         .await
         .unwrap()
-        .expect("cancelled creation requires cleanup");
-    cancelled
+        .is_none());
+    assert!(!cancelled
         .db
-        .finish_conversation_creation_cleanup(&cleanup, now)
+        .cancel_conversation_creation(&cancelled.source.id, now)
         .await
-        .unwrap();
+        .unwrap());
     assert_eq!(
         facts(cancelled.replay(0, now.timestamp_micros()).await).len(),
         1

@@ -43,7 +43,6 @@ import type {
   SseConversationBecameTerminalData as WireConversationBecameTerminalData,
   SseConversationUpdateData as WireConversationUpdateData,
   SseErrorData as WireErrorData,
-  SseConversationHardDeletedData as WireConversationHardDeletedData,
   SseBrowserSessionStateData as WireBrowserSessionStateData,
   SseSteerMessageQueuedData as WireSteerMessageQueuedData,
   SseSteerMessageCancelledData as WireSteerMessageCancelledData,
@@ -493,18 +492,6 @@ export const SseErrorDataSchema = v.looseObject({
   error: v.unknown(),
 }) satisfies v.GenericSchema<unknown, WireErrorData>;
 
-/** `conversation_hard_deleted`: REQ-BED-032 step 6. Conversation row is gone
- *  from SQLite; all per-conversation resources (bash handles, tmux server,
- *  worktree) have been cleaned up. UI subscribers refresh sidebar /
- *  navigation. The cascade today emits this on the per-conversation
- *  channel only; sidebar listeners that aren't on the deleted conversation
- *  rely on the `DesktopLayout` 5s polling to pick up the deletion. */
-export const SseConversationHardDeletedDataSchema = v.looseObject({
-  sequence_id: v.number(),
-  conversation_id: v.string(),
-  deleted_conversation_ids: v.array(v.string()),
-}) satisfies v.GenericSchema<unknown, WireConversationHardDeletedData>;
-
 /** `browser_session_state`: fired on the server's create / destroy edge for
  *  a browser session in `BrowserSessionManager`. The UI uses this as the
  *  single source of truth for whether to show / auto-mount the live browser
@@ -674,9 +661,6 @@ export type SseConversationBecameTerminalData = v.InferOutput<
   typeof SseConversationBecameTerminalDataSchema
 >;
 export type SseErrorData = v.InferOutput<typeof SseErrorDataSchema>;
-export type SseConversationHardDeletedData = v.InferOutput<
-  typeof SseConversationHardDeletedDataSchema
->;
 export type SseBrowserSessionStateData = v.InferOutput<
   typeof SseBrowserSessionStateDataSchema
 >;

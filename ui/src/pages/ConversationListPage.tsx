@@ -296,7 +296,7 @@ export function ConversationListPage() {
               onProductConversationClick={handleProductConversationClick}
               onProductConversationRename={productActions.openRename}
               {...(isOnline ? { onProductConversationClose: productActions.openClose } : {})}
-              {...(isOnline ? { onProductConversationDelete: productActions.openDelete } : {})}
+
               listDensity={isDesktop ? 'full' : 'mobile'}
               authChip={authChip}
               utilityActions={(

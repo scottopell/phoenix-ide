@@ -1008,6 +1008,41 @@ const MIGRATIONS: &[Migration] = &[
         name: "native_close_captured_retry_writer_observations",
         sql: include_str!("migrations/native_close_captured_retry_writer_observations.sql"),
     },
+    Migration {
+        version: 193,
+        name: "dismiss_pending_fork_proposals",
+        sql: "UPDATE fork_proposals SET status = 'dismissed', resolved_at = COALESCE(resolved_at, CURRENT_TIMESTAMP) WHERE status = 'pending';",
+    },
+    Migration {
+        version: 194,
+        name: "product_creation_repository_identity_pin",
+        sql: MIGRATION_194,
+    },
+    Migration {
+        version: 195,
+        name: "native_close_initial_settlement_stop_claims",
+        sql: include_str!("migrations/native_close_initial_settlement_stop_claims.sql"),
+    },
+    Migration {
+        version: 196,
+        name: "close_settlement_stop_claims",
+        sql: "ALTER TABLE native_close_initial_settlement_stop_claims RENAME TO close_settlement_stop_claims;",
+    },
+    Migration {
+        version: 197,
+        name: "close_verified_tmux_replacement",
+        sql: "",
+    },
+    Migration {
+        version: 198,
+        name: "close_retry_tmux_dispatch_confirmation",
+        sql: include_str!("migrations/close_retry_tmux_dispatch_confirmation.sql"),
+    },
+    Migration {
+        version: 199,
+        name: "close_legacy_retry_worktree_claims",
+        sql: include_str!("migrations/close_legacy_retry_worktree_claims.sql"),
+    },
 ];
 
 const MIGRATION_175: &str = r"
@@ -1149,6 +1184,115 @@ BEGIN
     SELECT RAISE(ABORT, 'native Close management cannot be cleared');
 END;
 ";
+
+#[allow(clippy::too_many_lines)]
+async fn run_migration_197(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = WritableSchemaGuard::enable(pool).await?;
+    let result = async {
+        let mut tx = guard.connection().begin().await?;
+        for (table, basis_list_tail) in [
+            ("close_retirement_resources", "'preexisting_exact_identity_evidence'\n    ))"),
+            ("close_retirement_resource_history", "'preexisting_exact_identity_evidence')"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {table} ADD COLUMN tmux_replacement_token TEXT CHECK (
+                    CASE WHEN absence_basis = 'verified_tmux_replacement' THEN (
+                        proof_kind = 'absence_adopted' AND resource_kind = 'tmux_server'
+                        AND identity_kind = 'opaque' AND identity_codec = 'opaque_string_v1'
+                        AND substr(identity_value, 1, 8) = 'tmux-v1:'
+                        AND length(identity_value) > 45
+                        AND substr(identity_value, -37, 1) = ':'
+                        AND tmux_replacement_token IS NOT NULL
+                        AND length(tmux_replacement_token) = 36
+                        AND substr(tmux_replacement_token, 9, 1) = '-'
+                        AND substr(tmux_replacement_token, 14, 1) = '-'
+                        AND substr(tmux_replacement_token, 19, 1) = '-'
+                        AND substr(tmux_replacement_token, 24, 1) = '-'
+                        AND length(replace(tmux_replacement_token, '-', '')) = 32
+                        AND replace(tmux_replacement_token, '-', '') NOT GLOB '*[^0-9a-f]*'
+                        AND lower(substr(identity_value, -36)) <> tmux_replacement_token
+                    ) ELSE tmux_replacement_token IS NULL END
+                )"
+            )))
+            .execute(&mut *tx)
+            .await?;
+            let schema: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            )
+            .bind(table)
+            .fetch_one(&mut *tx)
+            .await?;
+            if schema.matches(basis_list_tail).count() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "migration 197 found unexpected {table} absence basis CHECK"
+                )));
+            }
+            let extended_tail = basis_list_tail.replacen(
+                "'preexisting_exact_identity_evidence'",
+                "'preexisting_exact_identity_evidence', 'verified_tmux_replacement'",
+                1,
+            );
+            sqlx::query("UPDATE sqlite_schema SET sql = ?1 WHERE type = 'table' AND name = ?2")
+                .bind(schema.replacen(basis_list_tail, &extended_tail, 1))
+                .bind(table)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for trigger in [
+            "close_retirement_resources_require_absence_proof_on_insert",
+            "close_retirement_resources_require_absence_proof_on_update",
+        ] {
+            let schema: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+            )
+            .bind(trigger)
+            .fetch_one(&mut *tx)
+            .await?;
+            let anchor = "WHEN NEW.proof_kind = 'absence_adopted'";
+            if schema.matches(anchor).count() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "migration 197 found unexpected {trigger} definition"
+                )));
+            }
+            sqlx::query("UPDATE sqlite_schema SET sql = ?1 WHERE type = 'trigger' AND name = ?2")
+                .bind(schema.replacen(
+                    anchor,
+                    "WHEN NEW.proof_kind = 'absence_adopted' AND NEW.absence_basis IS NOT 'verified_tmux_replacement'",
+                    1,
+                ))
+                .bind(trigger)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let version: i64 = sqlx::query_scalar("PRAGMA schema_version")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA schema_version = {}", version + 1)))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "CREATE TRIGGER close_retirement_resources_preserve_replacement_token
+             BEFORE UPDATE ON close_retirement_resources
+             FOR EACH ROW
+             WHEN OLD.tmux_replacement_token IS NOT NULL
+              AND NEW.tmux_replacement_token IS NOT OLD.tmux_replacement_token
+             BEGIN SELECT RAISE(ABORT, 'tmux replacement proof is immutable'); END",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+            .bind(migration.version)
+            .bind(migration.name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    let restore = guard.disable().await;
+    result?;
+    restore
+}
 
 async fn run_migration_171(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;
@@ -12732,7 +12876,7 @@ async fn run_migration_156(pool: &SqlitePool, migration: &Migration) -> DbResult
     result
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn run_through_for_test(pool: &SqlitePool, version: u32) -> DbResult<u32> {
     let end = MIGRATIONS.partition_point(|migration| migration.version <= version);
     run_migration_list(pool, &MIGRATIONS[..end]).await
@@ -12919,6 +13063,12 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
 
         if migration.version == 132 {
             run_migration_132(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
+        if migration.version == 197 {
+            run_migration_197(pool, migration).await?;
             applied += 1;
             continue;
         }
@@ -13784,7 +13934,7 @@ mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
 
-    fn registered_after(prefix: u32) -> u32 {
+    pub(super) fn registered_after(prefix: u32) -> u32 {
         u32::try_from(
             super::MIGRATIONS
                 .iter()
@@ -17325,11 +17475,52 @@ mod tests {
             .is_empty());
     }
 
+    #[tokio::test]
+    async fn migration_199_installs_immutable_legacy_retry_claims_with_exact_plan_fk() {
+        let pool = test_pool().await;
+        run_through_for_test(&pool, 198).await.unwrap();
+        assert_eq!(run_through_for_test(&pool, 199).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 199).await.unwrap(), 0);
+        let definition: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'close_legacy_retry_worktree_claims'",
+        ).fetch_one(&pool).await.unwrap();
+        assert!(definition.contains("PRIMARY KEY (attempt_id, run_ordinal, scope, resource_kind, identity_kind, identity_codec, identity_value)"));
+        assert!(definition.contains("continuation_kind TEXT NOT NULL"));
+        for name in [
+            "close_legacy_retry_worktree_claims_exact_cleanup_plan",
+            "close_legacy_retry_worktree_claims_immutable",
+            "close_legacy_retry_worktree_claims_no_delete",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                )
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                1
+            );
+        }
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (199, "close_legacy_retry_worktree_claims"),
+            (198, "close_retry_tmux_dispatch_confirmation"),
+            (197, "close_verified_tmux_replacement"),
+            (196, "close_settlement_stop_claims"),
+            (195, "native_close_initial_settlement_stop_claims"),
+            (194, "product_creation_repository_identity_pin"),
+            (193, "dismiss_pending_fork_proposals"),
             (192, "native_close_captured_retry_writer_observations"),
             (191, "native_close_origin_owner_cleanup"),
             (190, "native_close_retry_origin_gate"),
@@ -24097,6 +24288,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_193_dismisses_pending_forks_without_deleting_history_or_children() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fork-retirement.db");
+        let path = path.to_str().unwrap();
+        let db = crate::Database::open_prefix_for_test(path, 192)
+            .await
+            .unwrap();
+        let origin = db
+            .create_conversation("fork-origin", "fork-origin", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let child = db
+            .create_conversation("fork-child", "fork-child", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(
+            "INSERT INTO fork_proposals (
+                 id, origin_conv_id, task_file, title, priority, body, status,
+                 fork_conv_id, refinement_conv_id, created_at, resolved_at
+             ) VALUES
+                 ('pending-proposal', 'fork-origin', 'tasks/1.md', 'Pending', 'p2',
+                  'snapshot pending', 'pending', 'fork-child', 'fork-child',
+                  '2025-01-01T00:00:00Z', NULL),
+                 ('spawned-proposal', 'fork-origin', 'tasks/2.md', 'Spawned', 'p1',
+                  'snapshot spawned', 'spawned', 'fork-child', NULL,
+                  '2025-01-02T00:00:00Z', '2025-01-03T00:00:00Z')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        db.pool().close().await;
+        drop(db);
+
+        let db = crate::Database::open(path).await.unwrap();
+        assert_eq!(run_through_for_test(db.pool(), 193).await.unwrap(), 1);
+        db.pool().close().await;
+        drop(db);
+
+        let db = crate::Database::open(path).await.unwrap();
+        assert_eq!(run_through_for_test(db.pool(), 193).await.unwrap(), 0);
+        let retained_relationships: Vec<(String, String, Option<String>, Option<String>)> =
+            sqlx::query_as(
+                "SELECT id, origin_conv_id, fork_conv_id, refinement_conv_id
+                 FROM fork_proposals ORDER BY id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            retained_relationships,
+            vec![
+                (
+                    "pending-proposal".to_owned(),
+                    origin.id.clone(),
+                    Some(child.id.clone()),
+                    Some(child.id.clone()),
+                ),
+                (
+                    "spawned-proposal".to_owned(),
+                    origin.id.clone(),
+                    Some(child.id.clone()),
+                    None,
+                ),
+            ]
+        );
+
+        let proposals: Vec<(String, String, String, Option<String>)> =
+            sqlx::query_as("SELECT id, status, body, resolved_at FROM fork_proposals ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(proposals.len(), 2);
+        assert_eq!(proposals[0].0, "pending-proposal");
+        assert_eq!(proposals[0].1, "dismissed");
+        assert_eq!(proposals[0].2, "snapshot pending");
+        assert!(proposals[0].3.is_some());
+        assert_eq!(proposals[1].0, "spawned-proposal");
+        assert_eq!(proposals[1].1, "spawned");
+        assert_eq!(proposals[1].2, "snapshot spawned");
+        assert_eq!(proposals[1].3.as_deref(), Some("2025-01-03T00:00:00Z"));
+        assert_eq!(db.get_conversation(&origin.id).await.unwrap().id, origin.id);
+        assert_eq!(db.get_conversation(&child.id).await.unwrap().id, child.id);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM work_scopes")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn migration_070_rejects_legacy_forks_and_cycles_transactionally() {
         for invalid_topology in [
             "PRAGMA foreign_keys = OFF;
@@ -24624,7 +24909,9 @@ mod close_completion_allowance_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
     use super::{
-        run_pending_migrations, tests::setup_real_pre_176_schema, MIGRATIONS, MIGRATION_174,
+        run_pending_migrations,
+        tests::{registered_after, setup_real_pre_176_schema},
+        MIGRATIONS, MIGRATION_174,
     };
 
     #[tokio::test]
@@ -24976,7 +25263,10 @@ mod close_completion_allowance_tests {
             2
         );
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 17);
+        assert_eq!(
+            run_pending_migrations(&pool).await.unwrap(),
+            registered_after(175)
+        );
         let migrated: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"
@@ -25525,5 +25815,134 @@ mod native_close_initial_receipt_tests {
                 .await
                 .unwrap();
         assert_eq!(remaining, 0);
+    }
+}
+
+const MIGRATION_194: &str = r"
+ALTER TABLE product_creation_jobs
+    ADD COLUMN pin_repository_identity TEXT
+    CHECK (pin_repository_identity IS NULL OR
+           (typeof(pin_repository_identity) = 'text' AND trim(pin_repository_identity) <> ''));
+
+CREATE TRIGGER product_creation_pin_repository_identity_guard_insert
+BEFORE INSERT ON product_creation_jobs
+WHEN NOT (
+    (NEW.pin_exact_checkout_oid IS NULL AND NEW.pin_logical_base IS NULL
+     AND NEW.pin_freshness IS NULL AND NEW.pin_repository_identity IS NULL)
+    OR (NEW.pin_exact_checkout_oid IS NOT NULL AND NEW.pin_logical_base IS NOT NULL
+        AND NEW.pin_freshness IS 'fresh' AND NEW.pin_repository_identity IS NOT NULL)
+)
+BEGIN
+    SELECT RAISE(ABORT, 'product creation checkout pin requires repository identity');
+END;
+
+CREATE TRIGGER product_creation_pin_repository_identity_guard_update
+BEFORE UPDATE OF pin_exact_checkout_oid, pin_logical_base, pin_freshness, pin_repository_identity
+ON product_creation_jobs
+WHEN (
+    OLD.pin_exact_checkout_oid IS NOT NULL OR OLD.pin_logical_base IS NOT NULL
+    OR OLD.pin_freshness IS NOT NULL OR OLD.pin_repository_identity IS NOT NULL
+) AND (
+    NEW.pin_exact_checkout_oid IS NOT OLD.pin_exact_checkout_oid
+    OR NEW.pin_logical_base IS NOT OLD.pin_logical_base
+    OR NEW.pin_freshness IS NOT OLD.pin_freshness
+    OR NEW.pin_repository_identity IS NOT OLD.pin_repository_identity
+) OR (
+    OLD.pin_exact_checkout_oid IS NULL AND OLD.pin_logical_base IS NULL
+    AND OLD.pin_freshness IS NULL AND OLD.pin_repository_identity IS NULL
+    AND NOT (
+        (NEW.pin_exact_checkout_oid IS NULL AND NEW.pin_logical_base IS NULL
+         AND NEW.pin_freshness IS NULL AND NEW.pin_repository_identity IS NULL)
+        OR (NEW.pin_exact_checkout_oid IS NOT NULL AND NEW.pin_logical_base IS NOT NULL
+            AND NEW.pin_freshness IS 'fresh' AND NEW.pin_repository_identity IS NOT NULL)
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'product creation checkout pin repository identity is immutable');
+END;
+";
+
+#[cfg(test)]
+mod product_creation_repository_identity_pin_tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::MIGRATION_194;
+
+    #[tokio::test]
+    async fn migration_preserves_legacy_pins_and_guards_new_identity_bindings() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE product_creation_jobs (
+                request_id TEXT PRIMARY KEY,
+                pin_exact_checkout_oid TEXT,
+                pin_logical_base TEXT,
+                pin_freshness TEXT
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO product_creation_jobs
+                (request_id, pin_exact_checkout_oid, pin_logical_base, pin_freshness)
+             VALUES ('legacy', 'old-oid', 'main', 'fresh')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(MIGRATION_194).execute(&pool).await.unwrap();
+
+        let identity: Option<String> = sqlx::query_scalar(
+            "SELECT pin_repository_identity FROM product_creation_jobs WHERE request_id = 'legacy'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(identity, None);
+        assert!(sqlx::query(
+            "UPDATE product_creation_jobs SET pin_repository_identity = 'bound-later' WHERE request_id = 'legacy'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+        assert!(sqlx::query(
+            "INSERT INTO product_creation_jobs
+                (request_id, pin_exact_checkout_oid, pin_logical_base, pin_freshness)
+             VALUES ('unbound', 'oid', 'main', 'fresh')",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
+
+        sqlx::query("INSERT INTO product_creation_jobs (request_id) VALUES ('direct-flow')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO product_creation_jobs
+                (request_id, pin_exact_checkout_oid, pin_logical_base, pin_freshness, pin_repository_identity)
+             VALUES ('bound', 'oid', 'main', 'fresh', 'repo-incarnation')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        for invalid in [
+            "UPDATE product_creation_jobs SET pin_freshness = NULL WHERE request_id = 'bound'",
+            "UPDATE product_creation_jobs SET pin_exact_checkout_oid = NULL WHERE request_id = 'legacy'",
+            "UPDATE product_creation_jobs SET pin_repository_identity = 'orphan' WHERE request_id = 'direct-flow'",
+        ] {
+            assert!(sqlx::query(invalid).execute(&pool).await.is_err());
+        }
+        assert!(sqlx::query(
+            "UPDATE product_creation_jobs SET pin_repository_identity = 'replacement' WHERE request_id = 'bound'",
+        )
+        .execute(&pool)
+        .await
+        .is_err());
     }
 }

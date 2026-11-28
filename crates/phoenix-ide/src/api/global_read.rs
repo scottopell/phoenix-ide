@@ -3031,7 +3031,6 @@ fn map_db_not_found(e: DbError) -> AppError {
         | DbError::CloseFoundationStaleLatest { .. }
         | DbError::CloseFoundationRepairRequired(_)
         | DbError::CloseFoundationNotFound(_)
-        | DbError::ForkProposalConflict(_)
         | DbError::DirectTurnConflict(_)
         | DbError::GitRepositoryWorkScopeProjectConflict { .. }
         | DbError::FederationSendAuthorityInactive

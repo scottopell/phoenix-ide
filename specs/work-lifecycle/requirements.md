@@ -178,12 +178,17 @@ WHEN an admitted Close run observes positive external writer authority or an ext
 THE SYSTEM SHALL persist a representative immutable child observation bound to the exact attempt, admitted run ordinal, WorkScope, inspection generation and fingerprint, and captured resource identity before deciding whether to continue
 AND SHALL distinguish positive authority from an inspection gap and shall not let a gap mask independent verifiable positive evidence
 
-WHEN an admitted initial Close has confirmed shutdown of the exact Phoenix-owned resources and is authorized to physically retire the worktree
+WHEN an admitted native Initial Close has confirmed shutdown of the exact Phoenix-owned resources and is authorized to physically retire the worktree
 THE SYSTEM SHALL block on current positive target-bound writer authority
 AND SHALL NOT block this admitted physical step solely because an external process or its inventory cannot be fully inspected
 AND SHALL NOT classify such a gap as unrelated, clean, or proof that no external writer exists
 
-The exception is limited to external process inspection. Uncertain shutdown, target inspection, loss checks, identity, permissions, custody, deadline, or evidence persistence still prevent unproven removal. Explicit Retry (including its final moved-object scan) and other strict retirement paths still block on gaps. A concurrent editor save or Git change by an undetected writer can be lost; removal of the checkout and exact Git registration does not prove immediate disk-space recovery when open handles remain.
+WHEN the initial public Close run has proven Phoenix-owned shutdown and exact worktree custody, and its inventory requires no loss confirmation
+THE SYSTEM SHALL block on positive target-bound writer authority, an unbound or malformed writer scan, or a change in candidate identity
+AND MAY continue on a retained, candidate-specific unavailability gap alone
+AND SHALL use the combined writer decision so a descriptor gap cannot mask verifiable evidence from another detector.
+
+These exceptions are limited to external process inspection. Uncertain shutdown, target inspection, loss checks, identity, permissions, custody, deadline, or evidence persistence still prevent unproven removal. Explicit Retry, including its final moved-object scan, and other strict retirement paths still block on gaps. A concurrent editor save or Git change by an undetected writer can be lost; removal of the checkout and exact Git registration does not prove immediate disk-space recovery when open handles remain.
 
 Positive evidence shall retain the detector, PID and process incarnation, executable when observable, matched path and object kind, access mode, and authority kind. A gap shall retain its detector, reason, and PID when attributable; it shall not fabricate process identity or writer authority. A reused PID shall not identify the same process without an equal incarnation.
 
@@ -191,7 +196,7 @@ Directory descriptors, including read-only directory descriptors, and process wo
 
 An unavailable or malformed process inventory, or malformed, inaccessible, or changing evidence for a same-user candidate, shall be an inspection gap. Access denial for an unattributed ambient candidate shall not constitute positive writer evidence. A Linux candidate positively identified as a single-task zombie by unambiguous kernel State and Threads fields, a matching singleton task inventory, and stable reinspection shall not require an executable link. A zombie thread-group leader with remaining or uncertain sibling threads shall remain an inspection gap. Missing or ambiguous state shall remain an inspection gap; transition from a live candidate during inspection shall remain unstable evidence.
 
-Observations shall be normalized child rows, not embedded collections or a parallel JSON payload. Writes shall require the exact active run, captured scope, inspection and resource binding. An identical replay may succeed without changing the row; replacement, mutation, deletion and conflicting replay shall be rejected during the owning aggregate's lifetime. Authoritative permanent Delete of an ordinary History aggregate shall remove these children by the owning product's deletion cascade in the same transaction, only after no conversation members remain. Empty membership alone shall not authorize child deletion while the owning product still exists. Observations from earlier runs shall remain attached to their original ordinal and shall not authorize a retry or process termination.
+Observations shall be normalized child rows, not embedded collections or a parallel JSON payload. Writes shall require the exact active run, captured scope, inspection and resource binding. An identical replay may succeed without changing the row; replacement, mutation, deletion and conflicting replay shall be rejected during the owning aggregate's lifetime. Empty membership alone shall not authorize child deletion while the owning product still exists. Observations from earlier runs shall remain attached to their original ordinal and shall not authorize a retry or process termination.
 
 IF the required writer observation cannot be persisted
 THE SYSTEM SHALL preserve the target and fail the retirement step rather than deleting without durable evidence

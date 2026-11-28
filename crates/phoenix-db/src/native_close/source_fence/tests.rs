@@ -361,6 +361,37 @@ async fn assert_initial_interrupted(db: &Database, run: &CloseRunRef) {
 }
 
 #[tokio::test]
+async fn generic_legacy_close_retry_refuses_owning_native_receipt() {
+    let db = Database::open_in_memory().await.unwrap();
+    create_root(&db, "root").await;
+    let command = retry_command(
+        &db,
+        "generic-retry-native-owner",
+        NativeCloseIntent::Initial {
+            target: product_id("root"),
+        },
+    )
+    .await;
+    let LocalAuthorityResult::DurableFactEstablished(Ok(
+        crate::native_close::NativeCloseInitialResult::NewlyAdmitted(receipt),
+    )) = db.apply_native_close_initial(&command).await
+    else {
+        panic!("expected initial native admission");
+    };
+    let attempt = receipt.admitted.attempt_id;
+    let before = db.get_close_obligation(attempt.as_str()).await.unwrap();
+    assert!(matches!(
+        db.admit_generic_legacy_close_retry(&attempt).await.established(),
+        Some(Err(crate::DbError::CloseFoundationPrecondition(detail)))
+            if detail.contains("requires native Retry admission")
+    ));
+    assert_eq!(
+        db.get_close_obligation(attempt.as_str()).await.unwrap().phase(),
+        before.phase(),
+    );
+}
+
+#[tokio::test]
 async fn initial_native_source_loss_suppresses_allowance_without_a_successor() {
     for replay in [false, true] {
         let db = Database::open_in_memory().await.unwrap();
@@ -1038,7 +1069,7 @@ async fn initial_source_fence_retains_no_worktree_scope_inventory_and_dispatch()
                 scope: target.scope.clone(), resource: target.resource.clone(),
             },
         ).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(()))
+        LocalAuthorityResult::DurableFactEstablished(Ok(_))
     ));
     write_source_fence_state(&db, &command, &ConvState::Idle, false).await.unwrap();
     let after = db.get_close_obligation(run.attempt_id.as_str()).await.unwrap();
@@ -1248,7 +1279,7 @@ async fn initial_source_fence_preserves_proofs_across_mixed_worktree_scopes() {
             attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
             scope: retired.scope.clone(), resource: retired.resource.clone(),
         },
-    ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+    ).await, LocalAuthorityResult::DurableFactEstablished(Ok(_))));
     assert!(matches!(db.record_native_close_initial_retirement_evidence(
         &command, &receipt, &source, RecordCloseRetirementEvidenceRequest {
             attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
@@ -1268,7 +1299,7 @@ async fn initial_source_fence_preserves_proofs_across_mixed_worktree_scopes() {
                 scope: dispatched.scope.clone(), resource: dispatched.resource.clone(),
             },
         ).await,
-        LocalAuthorityResult::DurableFactEstablished(Ok(()))
+        LocalAuthorityResult::DurableFactEstablished(Ok(_))
     ));
     let expected = db.unresolved_expected_close_cleanup_resources(run.attempt_id.as_str()).await.unwrap();
     assert_eq!(expected.len(), resources.len() - 1);
@@ -1489,7 +1520,7 @@ async fn initial_source_fence_inventory_fixture_with_db(
                 attempt_id: run.attempt_id.clone(), snapshot: snapshot.clone(),
                 scope: target.scope.clone(), resource: target.resource.clone(),
             },
-        ).await, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+        ).await, LocalAuthorityResult::DurableFactEstablished(Ok(_))));
         if config.completion == FixtureCompletion::DispatchOnly {
             continue;
         }

@@ -277,7 +277,7 @@ mod tests {
 
     #[tokio::test]
     async fn approved_explore_viewer_resolves_work_authority() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let id = "approved-explore-browser-view";
         state
             .db

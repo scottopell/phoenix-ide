@@ -80,6 +80,7 @@ pub fn discover_guidance_files(working_dir: &Path) -> Vec<GuidanceFile> {
 ///
 /// Explore mode disables bash, so the agent can't run `taskmd next` itself —
 /// we precompute the ID server-side and inject it into the prompt.
+#[cfg(test)]
 fn next_taskmd_id(working_dir: &Path, tasks_dir_name: &str) -> Option<String> {
     let tasks_dir = working_dir.join(tasks_dir_name);
     if !tasks_dir
@@ -91,6 +92,7 @@ fn next_taskmd_id(working_dir: &Path, tasks_dir_name: &str) -> Option<String> {
     Some(taskmd_core::ids::next_id(&tasks_dir))
 }
 
+#[cfg(test)]
 pub fn snapshot_next_taskmd_id_hint(
     working_dir: &Path,
     tasks_dir_name: &str,

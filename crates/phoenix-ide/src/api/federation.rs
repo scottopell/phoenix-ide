@@ -5935,7 +5935,7 @@ mod tests {
         };
         use tower::ServiceExt as _;
 
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let peer = InstanceId::new();
         let bearer = format!("phx_peer_{}", "u".repeat(43));
         state
@@ -6046,7 +6046,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_uuid_selector_does_not_switch_to_another_peers_uuid_shaped_name() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let absent_id = InstanceId::new();
         let other_id = InstanceId::new();
         save_test_peer(
@@ -6083,7 +6083,7 @@ mod tests {
 
     #[tokio::test]
     async fn saved_self_peer_resolution_obeys_explicit_policy() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let local_id = state.db.instance_id().await.unwrap();
         save_test_peer(&state, local_id, "self-alias", "https://self.example", "s").await;
 
@@ -6142,7 +6142,7 @@ mod tests {
 
     #[tokio::test]
     async fn saved_peer_selection_uses_exact_uuid_or_unique_name_and_refuses_ambiguity() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let first = InstanceId::from_str("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa").unwrap();
         let second = InstanceId::new();
         let shadow = InstanceId::new();
@@ -6339,7 +6339,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_reference_with_limits_enforces_admission_before_resolution() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let destination_instance_id = state.db.instance_id().await.unwrap();
         let peer = || {
             let caller = InstanceId::new();
@@ -6507,7 +6507,7 @@ mod tests {
 
     #[tokio::test]
     async fn remote_pages_require_exact_transcript_after_product_continuation() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let product_id = create_paginated_transition_source(&state).await;
         let caller = InstanceId::new();
         let bearer = format!("phx_peer_{}", "c".repeat(43));
@@ -6677,7 +6677,7 @@ mod tests {
     #[tokio::test]
     async fn peer_automatic_continuation_roundtrip_rejects_bad_identity_and_revocation() {
         use tower::ServiceExt as _;
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let ordinary = state
             .db
             .create_conversation("peer-settings", "peer-settings", "/tmp", true, None, None)
@@ -6861,7 +6861,7 @@ mod tests {
     async fn peer_routes_enforce_auth_destination_and_stable_exact_semantics() {
         use tower::ServiceExt as _;
 
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         state
             .db
             .create_conversation("remote-transcript", "remote", "/tmp", true, None, None)
@@ -7295,7 +7295,7 @@ mod tests {
         use phoenix_core::domain::instance_identity::{PeerBaseUrl, PeerBearerCredential};
         use tower::ServiceExt as _;
 
-        let mut state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let mut state = crate::api::handlers::api_test_support::make_test_state().await;
         state.password = Some(
             phoenix_core::domain::instance_identity::OwnerPassword::parse("owner-password".into())
                 .unwrap(),
@@ -7380,7 +7380,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_import_rejects_bundle_for_another_caller() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let response = import_peer_connection(
             OwnerAuthenticated,
             State(state),
@@ -7404,7 +7404,7 @@ mod tests {
     async fn outbound_resolve_uses_authenticated_https_and_validates_provenance() {
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let caller = state.db.instance_id().await.unwrap();
         let destination = InstanceId::new();
         let bearer = phoenix_core::domain::instance_identity::PeerBearerCredential::parse(format!(
@@ -7532,7 +7532,7 @@ mod tests {
     #[tokio::test]
     async fn authenticated_remote_query_does_not_follow_307_or_308() {
         use phoenix_core::domain::instance_identity::PeerBearerCredential;
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let peer = InstanceId::new();
         let token = PeerBearerCredential::parse(format!("phx_peer_{}", "a".repeat(43))).unwrap();
 
@@ -7763,7 +7763,7 @@ mod tests {
 
     #[tokio::test]
     async fn query_database_rejects_exhausted_admission_before_sql_execution() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let destination_instance_id = state.db.instance_id().await.unwrap();
         let admission = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let caller = InstanceId::new();
@@ -7795,7 +7795,7 @@ mod tests {
     #[tokio::test]
     async fn automatic_continuation_identity_refusals_remain_pending_after_authority_closes() {
         for mismatch in [StatusCode::CONFLICT, StatusCode::UNAUTHORIZED] {
-            let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+            let state = crate::api::handlers::api_test_support::make_test_state().await;
             let runtime = state.runtime.clone();
             let destination = state.db.instance_id().await.unwrap();
             let caller = InstanceId::new();
@@ -7903,7 +7903,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_create_error_response_remains_pending_after_authority_closes() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let caller = InstanceId::new();
         let peer = test_native_create_peer(caller);
         let request = test_native_create_request(caller, InstanceId::new(), "/tmp".to_string());
@@ -7917,7 +7917,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_create_success_response_remains_pending_after_authority_closes() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let caller = InstanceId::new();
         let local = state.db.instance_id().await.unwrap();
         let verifier =
@@ -7943,7 +7943,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_continue_conversation_never_starts_after_authority_closes() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let runtime = state.runtime.clone();
         runtime
             .acquire_local_authority_pass()
@@ -7968,7 +7968,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_continue_conversation_never_responds_when_authority_closes_mid_operation() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let runtime = state.runtime.clone();
         let owner = runtime.acquire_local_authority_pass().unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
@@ -7996,7 +7996,7 @@ mod tests {
 
     #[tokio::test]
     async fn peer_authority_closure_and_write_panic_remain_pending() {
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let runtime = state.runtime.clone();
         let owner = runtime.acquire_local_authority_pass().unwrap();
         let pass = crate::automatic_continuation_settings::native::PreferenceWritePass::new(owner);
@@ -8012,7 +8012,7 @@ mod tests {
             () = std::future::ready(()) => true,
         });
 
-        let state = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let state = crate::api::handlers::api_test_support::make_test_state().await;
         let runtime = state.runtime.clone();
         let worker_runtime = runtime.clone();
         let join = tokio::spawn(async move {

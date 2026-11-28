@@ -3200,6 +3200,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rust-embed",
+ "rustix",
  "rustls",
  "rustls-pki-types",
  "schemars",

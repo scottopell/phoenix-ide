@@ -271,19 +271,6 @@ export function notifyProductConversationDeleted(
   ));
 }
 
-export function notifyProductConversationHardDeleted(
-  productConversationId: string,
-  deletedConversationIds: string[],
-): void {
-  notifyProductConversationDeleted(productConversationId, deletedConversationIds);
-  window.dispatchEvent(new CustomEvent('phoenix:conversation-hard-deleted', {
-    detail: {
-      conversationId: productConversationId,
-      deletedConversationIds,
-    },
-  }));
-}
-
 export function getProductConversationDeleteSequence(): number {
   return productConversationDeleteSequence;
 }

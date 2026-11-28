@@ -978,23 +978,12 @@ impl ActiveTerminals {
             .is_some_and(|retirement| retirement.owner.is_some())
     }
 
-    fn build_retirement_permit(
-        scope: &ResourceScopeKey,
+    fn fence_retirement_scope(
         map: &mut ActiveTerminalRegistryState,
-        deadline: tokio::time::Instant,
+        scope: &ResourceScopeKey,
         owner: TerminalRetirementOwner,
-        registry: std::sync::Weak<Mutex<ActiveTerminalRegistryState>>,
-    ) -> TerminalRetirementPermit {
+    ) -> TerminalRetirementGeneration {
         map.spawn_reservations.remove(scope);
-        let instance = map
-            .handles
-            .get(scope)
-            .map(TerminalInstanceIdentity::from_handle);
-        let had_entry = instance.is_some();
-        let child_exit = map
-            .handles
-            .get(scope)
-            .map(|handle| handle.child_lifecycle.receipt());
         let generation = map
             .retirements
             .get(scope)
@@ -1006,7 +995,26 @@ impl ActiveTerminals {
                 owner: Some(owner),
             },
         );
-        let generation = TerminalRetirementGeneration(generation);
+        TerminalRetirementGeneration(generation)
+    }
+
+    fn build_retirement_permit(
+        scope: &ResourceScopeKey,
+        map: &mut ActiveTerminalRegistryState,
+        deadline: tokio::time::Instant,
+        owner: TerminalRetirementOwner,
+        registry: std::sync::Weak<Mutex<ActiveTerminalRegistryState>>,
+    ) -> TerminalRetirementPermit {
+        let generation = Self::fence_retirement_scope(map, scope, owner);
+        let instance = map
+            .handles
+            .get(scope)
+            .map(TerminalInstanceIdentity::from_handle);
+        let had_entry = instance.is_some();
+        let child_exit = map
+            .handles
+            .get(scope)
+            .map(|handle| handle.child_lifecycle.receipt());
         let target = map.handles.get(scope).cloned();
         TerminalRetirementPermit {
             work_scope: scope.clone(),
@@ -1027,6 +1035,17 @@ impl ActiveTerminals {
                 registry,
             }),
         }
+    }
+
+    /// Fence retirement admission for `scope` without selecting or authorizing
+    /// a teardown target. Used when durable Close state must block new sessions
+    /// but startup is observation-only.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    pub fn fence_retirement_admission(&self, scope: &ResourceScopeKey) {
+        let mut map = self.0.lock().expect("terminal registry poisoned");
+        Self::fence_retirement_scope(&mut map, scope, TerminalRetirementOwner::Close);
     }
 
     /// Fence `scope` for exact retirement and return the permit authorizing one

@@ -124,7 +124,6 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         assistant_message: AssistantMessage,
         tool_results: Vec<ToolRoundResult>,
         settlement: Option<&ActiveDirectTurnSettlement>,
-        proposal: Option<&crate::db::ForkProposal>,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
         let execution = tool_results
@@ -170,7 +169,6 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                 &checkpoint,
                 self.pending_provider_replay_update.as_ref(),
                 settlement,
-                proposal,
             )
             .await
             .inspect_err(|_| {

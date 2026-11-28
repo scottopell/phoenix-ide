@@ -1001,7 +1001,7 @@ mod tests {
     #[tokio::test]
     async fn failures_hydrate_as_terminal_with_diagnostics() {
         let home = tempfile::tempdir().unwrap();
-        let mut app = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let mut app = crate::api::handlers::api_test_support::make_test_state().await;
         app.runtime_env =
             Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(home.path()));
         let path = status_path(&app, ReleaseUpdateBackend::BareLinux).unwrap();
@@ -1056,7 +1056,7 @@ mod tests {
     #[tokio::test]
     async fn local_launchd_failure_remains_visible_without_exposing_other_local_statuses() {
         let home = tempfile::tempdir().unwrap();
-        let mut app = crate::api::handlers::hard_delete_cascade_tests::make_test_state().await;
+        let mut app = crate::api::handlers::api_test_support::make_test_state().await;
         app.runtime_env =
             Arc::new(phoenix_core::runtime_env::PhoenixRuntimeEnvironment::with_root(home.path()));
         let path = status_path(&app, ReleaseUpdateBackend::Launchd).unwrap();

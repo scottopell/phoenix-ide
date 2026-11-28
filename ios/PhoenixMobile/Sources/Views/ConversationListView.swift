@@ -81,12 +81,7 @@ struct ConversationListView: View {
             }
             .navigationTitle("Conversations")
             .navigationDestination(for: String.self) { conversationId in
-                if model.deletedProductHistoryIds.contains(conversationId) {
-                    ContentUnavailableView(
-                        "Conversation deleted",
-                        systemImage: "trash",
-                        description: Text("This Product History is no longer available."))
-                } else if let history = model.listStore.conversations.first(where: {
+                if let history = model.listStore.conversations.first(where: {
                     $0.archived == true && $0.aggregateIdentity == conversationId
                 }) {
                     ProductHistoryView(productConversationId: history.aggregateIdentity)
@@ -276,14 +271,7 @@ struct ConversationListView: View {
                         }
                     }
                     .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                        if !isCoordinator && conversation.archived == true {
-                            Button(role: .destructive) {
-                                Task { await model.deleteHistoryConversation(conversation) }
-                            } label: {
-                                Label("Delete", systemImage: "trash")
-                            }
-                            .disabled(!model.connectivity.isOnline)
-                        } else if !isCoordinator && conversation.product_close_action == .available {
+                        if !isCoordinator && conversation.product_close_action == .available {
                             Button {
                                 Task { await model.closeProductConversation(conversation) }
                             } label: {

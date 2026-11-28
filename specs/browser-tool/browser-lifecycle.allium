@@ -274,14 +274,13 @@ rule ContinuationReusesSession {
     ensures: not BrowserSessionLifecycleEvent.emitted
 }
 
--- These execution-row cascade rules apply only when the ProductConversation
--- is not being retired. Aggregate Close/Delete uses durable retirement authority:
--- same-aggregate continuation/subagent rows do not veto resource cleanup; only
--- a distinct still-Open aggregate retains a scope, with identity conflicts surfaced.
+-- This is the legacy execution-row cleanup cascade, including the retained
+-- archive-path cleanup. It is not the authority for aggregate Close; Close
+-- retirement is governed by specs/work-lifecycle/requirements.md REQ-WL-002b.
 -- REQ-BROWSER-WS-003: cleanup-cascade tear-down when no live conversation
--- other than the one being deleted still owns the scope. The orchestrator
+-- other than the row being cleaned still owns the scope. The orchestrator
 -- sets `inheritor_scope` to Some(work_scope) iff a live conversation
--- OTHER THAN the deleted one resolves to that scope (a continuation that
+-- OTHER THAN the row being cleaned resolves to that scope (a continuation that
 -- inherits it, or a live sibling such as a Work-mode sub-agent sharing its
 -- parent's scope), and None otherwise. A live conversation is one that is BOTH
 -- non-terminal in state AND not archived, determined from the persisted
@@ -291,10 +290,10 @@ rule ContinuationReusesSession {
 -- would tear down a scope whose surviving owner is handle-less. An archived
 -- conversation does not count as a live owner even while non-terminal, because
 -- archiving a chain archives earlier members before the leaf's cascade runs.
--- The deleted conversation is excluded from that
--- enumeration: the cascade runs before its terminal-state write, so it still
--- reads non-terminal, and excluding it is what makes this rule reachable when
--- it is the last live owner. Preservation is the complementary case — see
+-- The cleaned row is excluded from that
+-- enumeration: the legacy cascade runs before its terminal-state write, so it
+-- still reads non-terminal, and excluding it makes teardown reachable when it
+-- is the last live owner. Preservation is the complementary case — see
 -- CascadePreservesOnScopeMatch below.
 --
 -- The inheritor-scope derivation reads the persisted conversation rows. When

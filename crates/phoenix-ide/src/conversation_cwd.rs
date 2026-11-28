@@ -289,6 +289,20 @@ pub(crate) fn ensure_product_creation_cwd(
     }
 }
 
+pub(crate) fn validate_existing_product_creation_cwd(
+    cwd: &str,
+) -> Result<ValidConversationCwd, ConversationCwdError> {
+    let (canonical, _) = traverse_absolute_directory_without_symlinks(Path::new(cwd), false)?;
+    if canonical.parent().is_none() {
+        return Err(ConversationCwdError::FilesystemRoot);
+    }
+    Ok(ValidConversationCwd {
+        raw: canonical.to_string_lossy().into_owned(),
+        #[cfg(test)]
+        canonical,
+    })
+}
+
 pub(crate) fn validate_conversation_cwd(
     cwd: impl AsRef<str>,
 ) -> Result<ValidConversationCwd, ConversationCwdError> {

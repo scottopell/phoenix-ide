@@ -3,17 +3,217 @@ name: Close exact-source qualification
 on:
   workflow_dispatch:
   push:
-    branches: [feat/unified-close-receipts]
+    branches: [feat/unified-close-receipts, refactor/git-lifecycle-do-less]
 
 permissions:
   contents: read
 
 concurrency:
-  group: close-qualification-${{ github.ref }}
+  group: close-qualification-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: false
 
 jobs:
+  git-lifecycle-public-http:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/refactor/git-lifecycle-do-less'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_TERM_COLOR: never
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+          rustflags: ''
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: close-http-qualification
+      - uses: astral-sh/setup-uv@v7
+      - name: Verify disposable runner dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          /usr/bin/python3 -VV
+          /usr/bin/tmux -V
+          /usr/bin/git --version
+          /usr/bin/unshare --version
+          /usr/bin/setpriv --version
+      - name: Build and record reviewed source as the runner
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          payload="$RUNNER_TEMP/close-http-payload"
+          mkdir -p "$evidence" "$payload"
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          printf '%s\n' "$GITHUB_SHA" > "$payload/source.sha"
+          git rev-parse HEAD^{tree} > "$evidence/source.tree"
+          cp "$payload/source.sha" "$evidence/source.sha"
+          cp tests/e2e/{run.py,coordinator_home_resolution_contract.py} "$payload/"
+          PHOENIX_BUILD_GIT_SHA="$GITHUB_SHA" PHOENIX_BUILD_GIT_DIRTY=clean \
+            cargo build --locked --bin phoenix_ide --target-dir "$GITHUB_WORKSPACE/target" \
+            2>&1 | tee "$evidence/build.log"
+          test -z "$(git status --porcelain)"
+          uv pip install --python /usr/bin/python3 --target "$payload/deps" --only-binary :all: --no-deps \
+            httpx==0.28.1 httpx-sse==0.4.3 httpcore==1.0.9 h11==0.16.0 \
+            anyio==4.11.0 idna==3.11 certifi==2025.11.12 typing-extensions==4.15.0
+          tar -C "$payload" -cf "$RUNNER_TEMP/close-http-payload.tar" run.py coordinator_home_resolution_contract.py source.sha deps
+          sha256sum target/debug/phoenix_ide "$RUNNER_TEMP/close-http-payload.tar" > "$evidence/input-sha256.txt"
+      - name: Run only the public Git lifecycle with the real Close detector
+        timeout-minutes: 6
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          sha256sum --check "$evidence/input-sha256.txt"
+          mapfile -t digests < <(cut -d ' ' -f 1 "$evidence/input-sha256.txt")
+          timeout --kill-after=10s 2m bash scripts/ci/close-unprivileged-qualification.sh \
+            "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/target/debug/phoenix_ide" \
+            "$RUNNER_TEMP/close-http-payload.tar" "$(id -u)" git_lifecycle_public_http "${digests[@]}" \
+            2>&1 | tee "$evidence/git-lifecycle-http.log"
+          grep -E "^\[e2e\] isolated server source=$GITHUB_SHA uid=[1-9][0-9]* pid=[1-9][0-9]*$" "$evidence/git-lifecycle-http.log"
+          grep -E '^  ✓ git_lifecycle_public_http +[0-9.]+s$' "$evidence/git-lifecycle-http.log"
+          grep -F '✓ all 1 e2e scenarios passed' "$evidence/git-lifecycle-http.log"
+      - name: Verify public Close on the ordinary Linux runner
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 8
+        env:
+          E2E_RUST_LOG: warn,phoenix_ide::runtime::close_retirement=debug
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          sha256sum --check "$evidence/input-sha256.txt"
+          timeout --kill-after=10s 6m uv run tests/e2e/run.py --ordinary-git-lifecycle "$evidence/source.sha" \
+            2>&1 | tee "$evidence/ordinary-linux-git-lifecycle-http.log"
+          sha256sum --check "$evidence/input-sha256.txt"
+          grep -E "^\[e2e\] ordinary Linux server source=$GITHUB_SHA uid=[1-9][0-9]* pid=[1-9][0-9]*$" "$evidence/ordinary-linux-git-lifecycle-http.log"
+          grep -E '^  ✓ git_lifecycle_public_http +[0-9.]+s$' "$evidence/ordinary-linux-git-lifecycle-http.log"
+          grep -F '✓ all 1 e2e scenarios passed' "$evidence/ordinary-linux-git-lifecycle-http.log"
+      - name: Build and inventory exact Runtime controls
+        id: controls
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          cargo test --locked -p phoenix_ide --lib --no-run --message-format=json \
+            --target-dir "$GITHUB_WORKSPACE/target" > "$evidence/writer-control-build.jsonl"
+          runtime_test_binary="$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "phoenix_ide" and .profile.test == true and .executable != null) | .executable' "$evidence/writer-control-build.jsonl")"
+          test -x "$runtime_test_binary"
+          printf 'PHOENIX_RUNTIME_TEST_BINARY=%s\n' "$runtime_test_binary" >> "$GITHUB_ENV"
+          printf 'PHOENIX_BASH_LAUNCH_TEST_EXE=%s\n' "$GITHUB_WORKSPACE/target/debug/phoenix_ide" >> "$GITHUB_ENV"
+          printf 'PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1\n' >> "$GITHUB_ENV"
+          (cd crates/phoenix-ide && "$runtime_test_binary" --list) | tee "$evidence/runtime-inventory.log"
+          absence_test=runtime::close_retirement::tests::completed_cleanup_crash_boundary_requires_both_paths_and_planned_admin_absent
+          grep -Fx "$absence_test: test" "$evidence/runtime-inventory.log"
+          "$runtime_test_binary" --exact "$absence_test" | tee "$evidence/retained-absence-paths.log"
+          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$evidence/retained-absence-paths.log"
+      - name: Verify generic and native durable settlement controls
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          for selector in \
+            generic_dispatch_and_failure_preserve_observe_adopted_legacy_initial \
+            dispatched_absence_retry_resumes_retirement_with_retained_snapshot \
+            generic_close_process_batch_replay_rolls_back_unclaimed_resources \
+            migration_197_preserves_existing_evidence_and_round_trips_tmux_replacement \
+            migration_198_preserves_dispatch_dml_and_adds_no_confirmation \
+            migration_199_installs_immutable_legacy_retry_claims_with_exact_plan_fk \
+            generic_legacy_close_retry_serializes_with_native_adoption \
+            generic_legacy_close_retry_refuses_owning_native_receipt \
+            generic_close_no_actor_cancels_and_releases_exact_target_atomically \
+            generic_close_stopped_run_cannot_cancel_captured_turn \
+            interrupted_generic_handoffs_stop_without_retirement_authority \
+            native_retry_tmux_replacement_settles_without_dispatch_and_replays_exactly \
+            settlement_dispatch_no_actor_terminalizes_only_the_captured_target; do
+            cargo test --locked -p phoenix-db --lib "$selector" -- --nocapture 2>&1 | tee "$evidence/$selector.log"
+            grep -E "^test .*::$selector \.\.\. ok$" "$evidence/$selector.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$evidence/$selector.log"
+          done
+      - name: Required production writer detection on the ordinary Linux runner
+        if: ${{ !cancelled() && steps.controls.outcome == 'success' }}
+        shell: bash
+        run: bash scripts/ci/close-ordinary-writer-qualification.sh "$PHOENIX_RUNTIME_TEST_BINARY" "$RUNNER_TEMP/close-http-evidence"
+      - name: Run the isolated writer veto and captured-loss Retry controls
+        if: ${{ !cancelled() && steps.controls.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          for test_name in \
+            runtime::close_retirement::tests::quarantine_rejects_live_linux_descriptor_writer_before_deletion \
+            runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays; do
+            log="$evidence/${test_name##*::}.log"
+            grep -Fx "$test_name: test" "$evidence/runtime-inventory.log"
+            timeout --kill-after=10s 6m bash scripts/ci/close-unprivileged-qualification.sh \
+              "$GITHUB_WORKSPACE" "$PHOENIX_RUNTIME_TEST_BINARY" "$PHOENIX_BASH_LAUNCH_TEST_EXE" \
+              "$(id -u)" "$test_name" --exact --nocapture --test-threads=1 2>&1 | tee "$log"
+            grep -F "$test_name ... ok" "$log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
+          done
+      - name: Run shared inspection, fetched pin, strict Retry gap and deadline controls
+        if: ${{ !cancelled() && steps.controls.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          for selector in \
+            actor_cancel_of_parked_native_initial_releases_target_gate_without_source_write \
+            actor_stop_confirmation_of_parked_native_initial_releases_target_gate \
+            actor_refuses_stale_native_initial_target_control_route \
+            native_direct_turn_cancellation_reservation_does_not_enqueue \
+            queued_native_close_settlement_stop_refuses_after_source_revocation \
+            generic_cancel_rejects_native_initial_before_reopening_resource_fences \
+            cancel_close_settles_only_the_requested_attempt_without_reclaiming_custody \
+            shared_close_inspection_distinguishes_absence_from_quarantine_probe_failure \
+            external_writer_detector_gap_does_not_mask_independent_evidence_or_target_failure \
+            stranded_generic_dispatch_cannot_reenter_original_worktree \
+            recorded_final_tombstone_root_only_refuses_original_checkout \
+            generic_close_worker_survives_waiter_drop_and_serializes_reinspection \
+            public_close_observes_unprepared_attempt_without_advancing_it \
+            concurrent_initial_observes_winner_but_later_http_close_sees_history \
+            public_close_routes_keep_the_open_observation_across_winner_archival \
+            public_close_projects_committed_cleanup_attention_as_success \
+            public_close_does_not_report_fenced_settlement_as_in_progress \
+            initial_close_owner_survives_waiter_drop_before_admission \
+            generic_settlement_failure_is_classified_or_fences_authority \
+            close_settlement_sends_live_runtime_cancel_without_terminalizing_its_turn \
+            process_exit_and_reopen_observes_persisted_generic_close_without_redrive \
+            restarted_tmux_rehydration_persists_absence_proof_and_leaves_replacement_untouched \
+            restarted_missing_tmux_requires_exact_prior_dispatch \
+            close_settlement_treats_evicted_actor_as_pending_until_cleanup \
+            failed_pre_runtime_worktree_reinspection_persists_typed_residual \
+            anchored_native_retry_assessment_preserves_writer_inspection_gap \
+            registered_native_close_origin_only_fetched_pin_public_retry_preserves_owner_ref \
+            detached_unreachable_commits_until_rejects_expired_deadline_before_repository_access \
+            detached_reachability_evidence_until_rejects_expired_deadline_before_repository_access; do
+            test_name="$(grep -E "::${selector}: test$" "$evidence/runtime-inventory.log" | sed 's/: test$//')"
+            log="$evidence/$selector.log"
+            (cd crates/phoenix-ide && timeout --kill-after=10s 2m "$PHOENIX_RUNTIME_TEST_BINARY" "$test_name" --exact --nocapture --test-threads=1) 2>&1 | tee "$log"
+            grep -F "$test_name ... ok" "$log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$log"
+          done
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: close-http-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/close-http-evidence/
+          if-no-files-found: error
+          retention-days: 14
   specifications:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/feat/unified-close-receipts'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -50,6 +250,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
   frontend:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/feat/unified-close-receipts'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -93,6 +294,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
   database:
+    if: github.event_name != 'push' || github.ref == 'refs/heads/feat/unified-close-receipts'
     runs-on: ubuntu-latest
     # The exact-source DB and runtime suites share this job. Hosted cold builds
     # and repeated Cargo invocations exceeded 60m before physical actor coverage.
@@ -177,39 +379,8 @@ jobs:
         if: success() || failure()
         shell: bash
         run: |
-          set -euo pipefail
-          test "$(id -u)" -ne 0
-          test -n "${PHOENIX_RUNTIME_TEST_BINARY:-}"
-          for test_name in \
-            runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_with_production_detector_retires_worktree_and_replays \
-            runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_refuses_a_live_writable_descriptor \
-            runtime::close_retirement::tests::linux_writer_scan_keeps_searching_after_an_unavailable_process \
-            runtime::close_retirement::tests::linux_mapping_scan_requires_writable_shared_authority; do
-            grep -Fx "$test_name: test" evidence/runtime-inventory.log
-            (
-              cd crates/phoenix-ide
-              # Keep an unrelated, same-UID process alive whose /proc/PID/exe
-              # cannot be read. No target handle, namespaces, sudo or UID change.
-              timeout --kill-after=10s 6m python3 - "$PHOENIX_RUNTIME_TEST_BINARY" "$test_name" --exact --show-output --test-threads=1 <<'PYTHON'
-          import ctypes
-          import os
-          import subprocess
-          import sys
+          bash scripts/ci/close-ordinary-writer-qualification.sh "$PHOENIX_RUNTIME_TEST_BINARY" "$GITHUB_WORKSPACE/evidence"
 
-          PR_SET_DUMPABLE = 4
-          libc = ctypes.CDLL(None, use_errno=True)
-          if libc.prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) != 0:
-              raise OSError(ctypes.get_errno(), "cannot create disposable opaque process")
-          env = dict(os.environ, PHOENIX_TEST_OPAQUE_CLOSE_PID=str(os.getpid()))
-          raise SystemExit(subprocess.call(sys.argv[1:], env=env))
-          PYTHON
-            ) 2>&1 | tee "evidence/ordinary-linux-${test_name##*::}.log"
-            grep -F "$test_name ... ok" "evidence/ordinary-linux-${test_name##*::}.log"
-            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "evidence/ordinary-linux-${test_name##*::}.log"
-            if [[ "$test_name" == *::registered_native_close_with_production_detector_retires_worktree_and_replays ]]; then
-              grep -F 'ordinary Linux: opaque process witnessed; durable gap precedes removal of the exact checkout and registration' "evidence/ordinary-linux-${test_name##*::}.log"
-            fi
-          done
       - name: Required public Worktree retirement with production writer detector
         if: success() || failure()
         shell: bash
@@ -328,6 +499,12 @@ jobs:
           test -s evidence/selected-tests.txt
           grep -F 'close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules: test' evidence/selected-tests.txt
           for test in \
+            native_initial_control_route_confirms_stop_and_captures_settlement_targets \
+            native_initial_control_cancel_terminalizes_only_unencumbered_stop_confirmation \
+            native_initial_control_refuses_cancel_after_stop_settlement_begins \
+            prepared_native_initial_is_not_generic_settlement_work \
+            settlement_dispatch_no_actor_terminalizes_only_the_captured_target \
+            settlement_stop_claim_rejects_revoked_source_and_competing_delivery \
             initial_effect_admission_rejects_retained_losses_even_in_anomalous_phase \
             initial_loss_inspection_is_retained_and_terminalized_atomically_without_dispatch \
             initial_loss_terminalization_guards_authority_and_rolls_back_late_failure \
@@ -558,6 +735,11 @@ jobs:
           set -euo pipefail
           cargo test -p phoenix-db --lib close_foundation::tests:: -- --nocapture --test-threads=1 2>&1 | tee evidence/close-foundation.log
           grep -F 'test close_foundation::tests::inspection_aggregate_validator_preserves_exact_content_and_empty_generation_rules ... ok' evidence/close-foundation.log
+          grep -F 'test close_foundation::tests::concurrent_generic_close_admission_captures_direct_turns_once ... ok' evidence/close-foundation.log
+          grep -F 'test close_foundation::tests::existing_generic_close_admission_does_not_advance_legacy_blocker ... ok' evidence/close-foundation.log
+          grep -F 'test close_foundation::tests::generic_settlement_advances_to_inspection_once ... ok' evidence/close-foundation.log
+          grep -F 'test close_foundation::tests::generic_stop_confirmation_hands_off_only_the_exact_target ... ok' evidence/close-foundation.log
+          grep -F 'test close_foundation::tests::interrupted_generic_handoffs_stop_without_retirement_authority ... ok' evidence/close-foundation.log
           for test in \
             initial_process_first_effect_preserves_nested_error_and_confirms_release \
             initial_pty_process_first_effect_preserves_nested_error_and_confirms_release \
@@ -612,6 +794,12 @@ jobs:
             grep -F "test native_close::captured_loss_retry::tests::$test ... ok" evidence/native-close-db.log
           done
           for test in \
+            native_initial_control_route_confirms_stop_and_captures_settlement_targets \
+            native_initial_control_cancel_terminalizes_only_unencumbered_stop_confirmation \
+            native_initial_control_refuses_cancel_after_stop_settlement_begins \
+            prepared_native_initial_is_not_generic_settlement_work \
+            settlement_dispatch_no_actor_terminalizes_only_the_captured_target \
+            settlement_stop_claim_rejects_revoked_source_and_competing_delivery \
             initial_effect_admission_rejects_retained_losses_even_in_anomalous_phase \
             initial_loss_inspection_is_retained_and_terminalized_atomically_without_dispatch \
             initial_loss_terminalization_guards_authority_and_rolls_back_late_failure \
@@ -732,6 +920,9 @@ jobs:
         run: |
           set -euo pipefail
           grep -F 'native_close_admission_tests::native_close_backend_requires_actor_database_authority_not_matching_path: test' evidence/runtime-selected-tests.txt
+          grep -F 'native_close_admission_tests::actor_cancel_of_parked_native_initial_releases_target_gate_without_source_write: test' evidence/runtime-selected-tests.txt
+          grep -F 'native_close_admission_tests::actor_stop_confirmation_of_parked_native_initial_releases_target_gate: test' evidence/runtime-selected-tests.txt
+          grep -F 'native_close_admission_tests::actor_refuses_stale_native_initial_target_control_route: test' evidence/runtime-selected-tests.txt
           grep -F 'native_close_admission_tests::bash_stage2_stop_ack::bash_stage_two_stop_ack_reaches_real_second_writer_and_cleans_once: test' evidence/runtime-selected-tests.txt
           grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_injected_unknown_release_quarantines_original_owner: test' evidence/runtime-selected-tests.txt
           grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_unknown_release_retains_owner_after_public_close_waiter_drop: test' evidence/runtime-selected-tests.txt
@@ -827,6 +1018,10 @@ jobs:
           grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_injected_unknown_release_quarantines_original_owner ... ok' evidence/native-close-runtime-actor.log
           grep -F 'native_close_admission_tests::bash_stage2_unknown_release::bash_second_writer_unknown_release_retains_owner_after_public_close_waiter_drop ... ok' evidence/native-close-runtime-actor.log
           grep -F 'native_close_admission_tests::queued_stop_in_cancellation_inbox_wins_over_due_close_settlement ... ok' evidence/native-close-runtime-actor.log
+          grep -F 'native_close_admission_tests::actor_cancel_of_parked_native_initial_releases_target_gate_without_source_write ... ok' evidence/native-close-runtime-actor.log
+          grep -F 'native_close_admission_tests::actor_stop_confirmation_of_parked_native_initial_releases_target_gate ... ok' evidence/native-close-runtime-actor.log
+          grep -F 'native_close_admission_tests::queued_native_close_settlement_stop_refuses_after_source_revocation ... ok' evidence/native-close-runtime-actor.log
+          grep -F 'native_close_admission_tests::actor_refuses_stale_native_initial_target_control_route ... ok' evidence/native-close-runtime-actor.log
           grep -F 'native_close_admission_tests::initial_exit_retains_inspection_collector_before_terminal_interruption ... ok' evidence/native-close-runtime-actor.log
           for test in \
             native_close_retires_one_registered_real_bash_group \
@@ -1232,6 +1427,9 @@ jobs:
             tmux::registry::tests::prepared_retirement_entry::entry_refusal_before_kill_preserves_live_server_and_registry_entry
             tmux::registry::tests::prepared_retirement_entry::entry_refusal_after_kill_preserves_residual_before_final_gone
             tmux::registry::tests::prepared_retirement_entry::ordinary_prepared_complete_still_retires_without_entry_callback
+            tmux::registry::tests::prepared_retirement_entry::strict_replacement_before_approval_never_dispatches_or_finalizes
+            tmux::registry::tests::prepared_retirement_entry::strict_dispatch_confirmation_precedes_refused_finalization
+            tmux::registry::tests::prepared_retirement_entry::strict_final_probe_observes_replacement_without_finalizing
           )
           for test in "${tests[@]}"; do
             grep -Fx "$test: test" evidence/tmux-inventory.log
@@ -1255,6 +1453,7 @@ jobs:
             disposable::token_change_while_helper_waits_preserves_the_original_server
             disposable::cancellation_before_helper_approval_never_kills_the_server
             disposable::exact_gate_kills_only_the_original_disposable_server
+            disposable::exact_gate_queue_completion_does_not_prove_built_in_kill_executed
             disposable::exact_gate_rejects_birth_and_token_mismatch_without_killing
             disposable::exact_gate_rejects_unsupported_or_format_embedded_helper
           )
@@ -1262,7 +1461,7 @@ jobs:
             grep -Fx "$test: test" evidence/tmux-gate-inventory.log
           done
           cargo test -p phoenix_ide --test tmux_close_gate -- --nocapture --test-threads=1 2>&1 | tee evidence/tmux-gate-execution.log
-          grep -F 'test result: ok. 8 passed; 0 failed; 0 ignored;' evidence/tmux-gate-execution.log
+          grep -F "test result: ok. ${#tests[@]} passed; 0 failed; 0 ignored;" evidence/tmux-gate-execution.log
           for test in "${tests[@]}"; do
             grep -Fx "test $test ... ok" evidence/tmux-gate-execution.log
           done

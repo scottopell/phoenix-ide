@@ -2524,8 +2524,6 @@ fn creation_provisioned_transition(
             | Effect::ContinuationCommit { .. }
             | Effect::NotifyContextExhausted { .. }
             | Effect::ApproveTask { .. }
-            | Effect::ApproveTaskFreshHandoff { .. }
-            | Effect::PersistForkProposal { .. }
             | Effect::ResolveTask { .. }
             | Effect::PersistUserInputMessage { .. }
             | Effect::CommitSteeringDrain { .. } => {}
@@ -2627,37 +2625,6 @@ pub fn transition_parent(
                 .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),
-        (
-            ParentState::AwaitingTaskApproval {
-                task_file,
-                title,
-                priority,
-                plan,
-                reviewed_proposal,
-            },
-            ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
-                outcome:
-                    TaskApprovalOutcome::Approved {
-                        handoff: TaskApprovalHandoff::StartFreshWorkConversation,
-                    },
-            }),
-        ) => Ok(
-            ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
-                task_file: task_file.clone(),
-                title: title.clone(),
-                priority: *priority,
-                plan: plan.clone(),
-                reviewed_proposal: reviewed_proposal.clone(),
-            })
-            .with_effect(Effect::ApproveTaskFreshHandoff {
-                task_file: task_file.clone(),
-                title: title.clone(),
-                priority: *priority,
-                plan: plan.clone(),
-                reviewed_proposal: reviewed_proposal.clone(),
-            }),
-        ),
-
         (
             ParentState::AwaitingTaskApproval { .. },
             ParentEvent::Parent(ParentOnlyEvent::TaskHandoffComplete { .. }),
@@ -3294,45 +3261,6 @@ pub fn transition_parent(
                         .with_effect(Effect::notify_state_change()),
                     );
                 }
-
-                let proposal_id = uuid::Uuid::new_v4().to_string();
-                // The success ack carries ONLY the proposal_id as a discoverable
-                // handle (in display_data, UI-only — never replayed into the LLM
-                // transcript, which sees only the output text). The snapshot body
-                // is deliberately absent so the shed work cannot leak back into
-                // the origin's context on later turns (REQ-PROJ-035). The UI keys
-                // the Review affordance off `display_data.fork_proposal_id`.
-                let tool_result = ToolResult::success_with_display(
-                    tool.id.clone(),
-                    "Fork proposal recorded — pending your review; continue your work".to_string(),
-                    Some(serde_json::json!({ "fork_proposal_id": proposal_id })),
-                );
-                let display_data = make_display_data(&content);
-                let assistant_message = AssistantMessage::new(
-                    request_id.clone(),
-                    content,
-                    Some(usage_data),
-                    display_data,
-                );
-                let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])?;
-
-                // The conversation continues: LlmRequesting, parent_status
-                // untouched. One atomic persist (checkpoint + proposal row) via
-                // PersistForkProposal — no separate PersistCheckpoint on this arm.
-                return Ok(ParentTransitionResult::new(ParentState::Core(
-                    CoreState::LlmRequesting { attempt: 1 },
-                ))
-                .with_effect(Effect::PersistForkProposal {
-                    proposal_id,
-                    task_file: snapshot.task_file.clone(),
-                    title: snapshot.title.clone(),
-                    priority: snapshot.priority,
-                    body: snapshot.body_raw.clone(),
-                    checkpoint,
-                })
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_state_change())
-                .with_effect(Effect::RequestLlm));
             }
 
             // REQ-AUQ-001: ask_user_question interception. Same shape as
@@ -10028,14 +9956,8 @@ mod tests {
         ));
     }
 
-    // ========================================================================
-    // Fork proposal interception (REQ-PROJ-033/036).
-    //
-    // Explore parks in the blocking review path, including when an approved
-    // objective has already granted write authority. Work/Branch take the fork
-    // path below; Direct is rejected even if a stale call is replayed.
-    // ========================================================================
-    mod fork_proposal {
+    // Blocking propose_task approval behavior.
+    mod propose_task_approval {
         use super::*;
         use crate::state::{ProposeTaskInput, ToolInput};
         use phoenix_core::domain::db_schema::ToolOutcome;
@@ -10050,7 +9972,7 @@ mod tests {
             let rel = "tasks/12345-p1-ready--fix-the-bug.md".to_string();
             std::fs::write(
                 tmp.path().join(&rel),
-                "# Fix the bug\n\nplan body for the fork\n",
+                "# Fix the bug\n\nplan body for approval\n",
             )
             .unwrap();
             (tmp, rel)
@@ -10097,33 +10019,8 @@ mod tests {
             }
         }
 
-        fn fork_proposal_effect(
-            effects: &[Effect],
-        ) -> Option<(
-            &String,
-            &String,
-            &String,
-            phoenix_core::task_source::Priority,
-            &String,
-        )> {
-            // reason: selecting one Effect variant out of ~22; listing the rest just to
-            // map them all to None would obscure the single variant of interest.
-            #[allow(clippy::wildcard_enum_match_arm)]
-            effects.iter().find_map(|e| match e {
-                Effect::PersistForkProposal {
-                    proposal_id,
-                    task_file,
-                    title,
-                    priority,
-                    body,
-                    ..
-                } => Some((proposal_id, task_file, title, *priority, body)),
-                _ => None,
-            })
-        }
-
         #[test]
-        fn approved_explore_with_write_authority_parks_without_git_or_fork_effects() {
+        fn approved_explore_with_write_authority_parks_for_task_approval() {
             let (tmp, rel) = worktree_with_task();
             let mut ctx = ctx_for(
                 &tmp,
@@ -10162,22 +10059,16 @@ mod tests {
                 "approved Explore persists AwaitingTaskApproval"
             );
             assert!(
-                fork_proposal_effect(&result.effects).is_none(),
-                "approved Explore must not record a fork proposal"
-            );
-            assert!(
                 !result.effects.iter().any(|effect| matches!(
                     effect,
-                    Effect::ApproveTask { .. }
-                        | Effect::ApproveTaskFreshHandoff { .. }
-                        | Effect::ResolveTask { .. }
+                    Effect::ApproveTask { .. } | Effect::ResolveTask { .. }
                 )),
                 "proposal interception must not perform an approval or lifecycle Git effect"
             );
         }
 
         #[test]
-        fn work_valid_file_parks_for_approval() {
+        fn work_valid_file_parks_for_task_approval() {
             let (tmp, rel) = worktree_with_task();
             let ctx = ctx_for(
                 &tmp,
@@ -10200,7 +10091,6 @@ mod tests {
                 result.new_state,
                 ConvState::AwaitingTaskApproval { .. }
             ));
-            assert!(fork_proposal_effect(&result.effects).is_none());
             assert!(result
                 .effects
                 .iter()
@@ -10208,7 +10098,7 @@ mod tests {
         }
 
         #[test]
-        fn branch_valid_file_parks_for_approval() {
+        fn branch_valid_file_parks_for_task_approval() {
             let (tmp, rel) = worktree_with_task();
             let ctx = ctx_for(
                 &tmp,
@@ -10231,7 +10121,6 @@ mod tests {
                 result.new_state,
                 ConvState::AwaitingTaskApproval { .. }
             ));
-            assert!(fork_proposal_effect(&result.effects).is_none());
         }
 
         #[test]
@@ -10251,7 +10140,6 @@ mod tests {
                 result.new_state,
                 ConvState::LlmRequesting { attempt: 1 }
             ));
-            assert!(fork_proposal_effect(&result.effects).is_none());
             let checkpoint = result
                 .effects
                 .iter()
@@ -10305,20 +10193,15 @@ mod tests {
             };
             assert_eq!(request.rejected_tool_calls.len(), 1);
             assert_eq!(request.rejected_tool_calls[0].name(), "propose_task");
-            assert!(fork_proposal_effect(&result.effects).is_none());
         }
 
-        /// REQ-PROJ-033: the fork snapshot is the authoritative file BYTES. A
-        /// brief with significant leading/trailing whitespace and a trailing
-        /// newline must reach `Effect::PersistForkProposal { body }` unaltered —
-        /// it is the verbatim source for the approval checkpoint, not the
-        /// trimmed display plan.
+        /// Approval captures the raw task file bytes as reviewed provenance.
         #[test]
         fn approval_plan_preserves_raw_file_bytes() {
             let tmp = TempDir::new().unwrap();
             std::fs::create_dir(tmp.path().join("tasks")).unwrap();
             let rel = "tasks/12345-p1-ready--fix-the-bug.md".to_string();
-            let raw = "\n\n  # Fix the bug\n\nplan body for the fork\n\n  \n";
+            let raw = "\n\n  # Fix the bug\n\nplan body for approval\n\n  \n";
             std::fs::write(tmp.path().join(&rel), raw).unwrap();
 
             let ctx = ctx_for(
@@ -10374,7 +10257,7 @@ mod tests {
         }
 
         #[test]
-        fn invalid_file_in_fork_mode_records_nothing() {
+        fn invalid_task_file_is_rejected_before_approval() {
             let tmp = TempDir::new().unwrap();
             std::fs::create_dir(tmp.path().join("tasks")).unwrap();
             // Closed `done` status — rejected by the shared validation.
@@ -10403,8 +10286,11 @@ mod tests {
                 result.new_state
             );
             assert!(
-                fork_proposal_effect(&result.effects).is_none(),
-                "an invalid file must NOT record a fork proposal"
+                !result
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, Effect::ApproveTask { .. })),
+                "an invalid file must not be approved"
             );
             assert!(
                 result
@@ -10423,7 +10309,7 @@ mod tests {
         }
 
         #[test]
-        fn propose_task_with_second_tool_still_errors_in_fork_mode() {
+        fn propose_task_with_second_tool_is_rejected() {
             let (tmp, rel) = worktree_with_task();
             let ctx = ctx_for(
                 &tmp,
@@ -10468,10 +10354,6 @@ mod tests {
             let result = transition(&ConvState::LlmRequesting { attempt: 1 }, &ctx, event)
                 .expect("transition must succeed");
 
-            assert!(
-                fork_proposal_effect(&result.effects).is_none(),
-                "the 'must be the only tool' error pre-empts the fork path"
-            );
             assert!(
                 result
                     .effects

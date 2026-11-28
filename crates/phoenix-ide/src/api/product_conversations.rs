@@ -105,12 +105,14 @@ pub async fn close_product_conversation(
             .await
             .map_err(db_to_app)?
             .aggregate;
-        match crate::api::lifecycle_handlers::close_product_conversation_with_active_work(
-            &state,
-            &product_conversation.latest_transcript_row_id,
+        #[cfg(test)]
+        crate::close_service::pause_after_close_observation(
+            product_conversation
+                .product_conversation
+                .ordinary_lifecycle(),
         )
-        .await
-        {
+        .await;
+        match crate::close_service::run_observed_close(&state, &product_conversation).await {
             Ok(()) => break,
             Err(AppError::Conflict(conflict))
                 if should_retry_aggregate_close(attempt, &conflict.error_type) => {}
@@ -1661,7 +1663,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::api::handlers::{create_router, hard_delete_cascade_tests::make_test_state};
+    use crate::api::handlers::{api_test_support::make_test_state, create_router};
     use crate::db::{ContinuationContent, ContinueOutcome, ConvState, MessageContent};
     use phoenix_workflow::ClientTurnKey;
 

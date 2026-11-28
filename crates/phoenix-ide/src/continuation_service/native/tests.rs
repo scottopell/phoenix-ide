@@ -223,8 +223,7 @@ async fn automatic_recovery_publishes_link_after_successor_was_reserved() {
         recovered.phase,
         AutomaticContinuationPhase::SuccessorReserved
     );
-    f.runtime.get_or_create(&f.predecessor).await.unwrap();
-    let mut updates = f.runtime.subscribe(&f.predecessor).await.unwrap();
+    let mut updates = f.subscribe_to_exhausted_predecessor().await;
 
     assert!(f
         .service()
@@ -1028,6 +1027,15 @@ impl Fixture {
         ContinuationApplicationService::new(self.runtime.clone())
     }
 
+    async fn subscribe_to_exhausted_predecessor(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<crate::runtime::SseEvent> {
+        self.runtime
+            .conversation_broadcaster(&self.predecessor)
+            .await
+            .subscribe()
+    }
+
     async fn reserve(&self) -> ContinuationDispatchIntent {
         let result = self
             .db
@@ -1266,8 +1274,7 @@ async fn completed_generated_opening_replays_without_a_provider_or_new_successor
 async fn pending_replay_requires_current_successor_capacity_and_retains_winning_intent() {
     let f = Fixture::new().await;
     let intent = f.reserve().await;
-    f.runtime.get_or_create(&f.predecessor).await.unwrap();
-    let mut predecessor_events = f.runtime.subscribe(&f.predecessor).await.unwrap();
+    let mut predecessor_events = f.subscribe_to_exhausted_predecessor().await;
     let error = tokio::time::timeout(
         std::time::Duration::from_secs(30),
         f.service()
@@ -1434,8 +1441,7 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
         .await;
     let (left_waiting, left_wait) = oneshot::channel();
     let (right_waiting, right_wait) = oneshot::channel();
-    f.runtime.get_or_create(&f.predecessor).await.unwrap();
-    let mut predecessor_events = f.runtime.subscribe(&f.predecessor).await.unwrap();
+    let mut predecessor_events = f.subscribe_to_exhausted_predecessor().await;
     let mut left_request = f.request("fresh-concurrent-left");
     left_request.source_gate_wait = Some(left_waiting);
     let mut right_request = f.request("fresh-concurrent-right");
@@ -1655,7 +1661,6 @@ async fn fresh_concurrent_requests_dispatch_one_opening_through_exact_turn_settl
                 | SseEvent::AgentDone { .. }
                 | SseEvent::ConversationBecameTerminal { .. }
                 | SseEvent::ConversationUpdate { .. }
-                | SseEvent::ConversationHardDeleted { .. }
                 | SseEvent::BrowserSessionState { .. }
                 | SseEvent::BashToolProgress { .. }
                 | SseEvent::SteerMessageQueued { .. }

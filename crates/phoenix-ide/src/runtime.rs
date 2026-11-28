@@ -18,12 +18,12 @@ pub use native_spawn::{
     NativeSpawnClosureReceipt, NativeSpawnControl, NativeSpawnTerminalEvidence,
     SubAgentAdmissionReceipt,
 };
+pub(crate) mod close_authority;
 pub(crate) mod close_retirement;
 pub(crate) mod creation_worker;
 pub mod deny_gate;
 pub(crate) mod direct_turn_worker;
 pub(crate) mod executor;
-pub(crate) mod fork_resolve;
 pub mod pr_status_poll;
 mod recovery;
 #[cfg(test)]
@@ -303,6 +303,7 @@ pub(crate) enum AcknowledgedRuntimeRequest {
     ExecuteNativeCloseInitial(Box<native_close_application::NativeCloseInitialRequest>),
     ExecuteNativeCloseObserve(Box<native_close_application::NativeCloseObserveRequest>),
     ExecuteNativeCloseRetry(Box<native_close_application::NativeCloseRetryRequest>),
+    ControlNativeCloseInitial(Box<native_close_application::NativeCloseInitialControlRequest>),
 }
 
 mod native_close_application;
@@ -323,7 +324,8 @@ impl AcknowledgedRuntimeRequest {
             Self::Event(event) => *event,
             Self::ExecuteNativeCloseInitial(_)
             | Self::ExecuteNativeCloseObserve(_)
-            | Self::ExecuteNativeCloseRetry(_) => panic!("expected event request"),
+            | Self::ExecuteNativeCloseRetry(_)
+            | Self::ControlNativeCloseInitial(_) => panic!("expected event request"),
         }
     }
 }
@@ -401,20 +403,7 @@ pub(crate) struct HandoffReviewRequest {
     pub response: oneshot::Sender<Result<HandoffReviewResponse, String>>,
 }
 
-pub struct TaskApprovalHandoffRequest {
-    pub parent_conversation_id: String,
-    pub approval: TaskApprovalHandoffData,
-    pub authority: AdmittedOperation,
-    pub response_tx: oneshot::Sender<Result<TaskApprovalHandoffResponse, String>>,
-}
-
 pub use phoenix_core::task_handoff::TaskApprovalHandoffData;
-
-#[derive(Debug, Clone)]
-pub struct TaskApprovalHandoffResponse {
-    pub successor_conv_id: String,
-    pub state_updated_at: DateTime<Utc>,
-}
 
 #[derive(Default)]
 struct ConversationMutexGates {
@@ -789,12 +778,21 @@ pub struct RuntimeManager {
     #[cfg(test)]
     clean_close_writer_fixture: bool,
     close_retirement_execution: ConversationMutexGates,
+    waiting_generic_close_owners: AsyncMutex<
+        HashMap<
+            phoenix_core::domain::close::CloseAttemptId,
+            close_authority::GenericCloseSettlementOwner,
+        >,
+    >,
+    scheduled_close_rechecks:
+        std::sync::Mutex<HashSet<phoenix_core::domain::close::CloseAttemptId>>,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Per-conversation single-flight results for slow runtime materialization.
     /// The mutex protects only map admission/removal; unrelated conversations
     /// materialize concurrently, while callers for one conversation observe the
     /// same typed success or failure.
     runtime_creations: AsyncMutex<HashMap<String, Arc<RuntimeMaterializationSlot>>>,
+    primary_actor_lifetimes: std::sync::Mutex<HashMap<String, usize>>,
     conversation_admissions: AsyncMutex<HashMap<String, std::sync::Weak<AsyncMutex<()>>>>,
     subagent_dispatch: ConversationMutexGates,
     #[cfg(test)]
@@ -812,13 +810,10 @@ pub struct RuntimeManager {
     #[cfg(test)]
     runtime_exit_barriers: AsyncMutex<HashMap<String, Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
-    fork_command_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
-    #[cfg(test)]
     native_admission_prewrite_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     browser_retirement_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
-    hard_delete_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     creation_worker_idle_signal: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     #[cfg(test)]
@@ -827,8 +822,6 @@ pub struct RuntimeManager {
     terminal_cleanup_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     bash_reconciliation_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
-    #[cfg(test)]
-    fork_runtime_start_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
     runtime_authority_transfer_barrier: AsyncMutex<Option<Arc<tokio::sync::Barrier>>>,
     #[cfg(test)]
@@ -868,15 +861,6 @@ pub struct RuntimeManager {
     /// Channel for sub-agent cancel requests
     cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
     cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
-    handoff_tx: mpsc::Sender<TaskApprovalHandoffRequest>,
-    handoff_rx: RwLock<Option<mpsc::Receiver<TaskApprovalHandoffRequest>>>,
-    /// Channel to the single serialized fork-resolution consumer. Every fork
-    /// proposal resolution (approve / request-changes) and cleanup (dismiss /
-    /// retire-on-terminal / hard-delete) is a [`fork_resolve::ForkCommand`]
-    /// processed one at a time by that consumer, so mutual exclusion between a
-    /// resolve and a cleanup is structural rather than lock-based.
-    fork_cmd_tx: mpsc::Sender<fork_resolve::ForkCommand>,
-    fork_cmd_rx: RwLock<Option<mpsc::Receiver<fork_resolve::ForkCommand>>>,
     /// Credential helper for recovery settlement (REQ-BED-030).
     credential_helper: Option<Arc<phoenix_llm::CredentialHelper>>,
     /// Receiver for browser session lifecycle edges. Taken once by
@@ -977,6 +961,52 @@ impl ExecutionOccurrenceRecovery {
 
     fn restart_loop_detected(&self) -> bool {
         self.disposition == ExecutionOccurrenceDisposition::RestartLoopDetected
+    }
+}
+
+enum CloseSettlementActor<'a> {
+    Absent,
+    Pending,
+    Live(&'a ConversationHandle),
+}
+
+#[derive(PartialEq, Eq)]
+enum CloseTurnDispatchPass {
+    Dispatched,
+    NoTransition,
+}
+
+#[derive(Debug)]
+enum GenericCloseApplyError {
+    Definite(String),
+    Unclassified,
+}
+
+impl From<String> for GenericCloseApplyError {
+    fn from(error: String) -> Self {
+        Self::Definite(error)
+    }
+}
+
+struct CloseSettlementDelivery {
+    actor: Arc<()>,
+    application: Option<oneshot::Receiver<cancellation_inbox::ScopedStopHandling>>,
+}
+
+impl CloseSettlementDelivery {
+    fn poll_handling(&mut self) -> bool {
+        let Some(application) = self.application.as_mut() else {
+            return true;
+        };
+        match application.try_recv() {
+            Ok(cancellation_inbox::ScopedStopHandling::Handled) => {
+                self.application = None;
+                true
+            }
+            Err(oneshot::error::TryRecvError::Empty) => true,
+            Ok(cancellation_inbox::ScopedStopHandling::Refused)
+            | Err(oneshot::error::TryRecvError::Closed) => false,
+        }
     }
 }
 
@@ -1280,7 +1310,7 @@ struct QueuedBroadcast {
 struct BroadcastGate {
     reserved_until: Option<i64>,
     queued: Vec<QueuedBroadcast>,
-    hard_deleted: bool,
+    publication_closed: bool,
 }
 
 pub struct PersistedMessageReservationAuthority {
@@ -1724,7 +1754,7 @@ impl SseBroadcaster {
             None => QueuedBroadcastAuthority::Unfenced,
         };
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-        if gate.hard_deleted {
+        if gate.publication_closed {
             return Err(());
         }
         if gate
@@ -1746,33 +1776,7 @@ impl SseBroadcaster {
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         gate.queued.clear();
         gate.reserved_until = None;
-        gate.hard_deleted = true;
-    }
-
-    pub fn send_hard_deleted_and_close(
-        &self,
-        conversation_id: String,
-        deleted_conversation_ids: Vec<String>,
-    ) -> Result<usize, ()> {
-        let _fatal_guard = self.fatal_publication_guard()?;
-        let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-        if gate.hard_deleted {
-            return Err(());
-        }
-        gate.queued.clear();
-        gate.reserved_until = None;
-        let sequence_id = self.last_seq.load(Ordering::Acquire);
-        let result = self.send_with_ring_unlocked(
-            SseEvent::ConversationHardDeleted {
-                sequence_id,
-                conversation_id,
-                deleted_conversation_ids,
-            },
-            sequence_id,
-            RingOp::BroadcastOnly,
-        );
-        gate.hard_deleted = true;
-        result
+        gate.publication_closed = true;
     }
 
     pub async fn persisted_message_reservation_authority(
@@ -1794,7 +1798,7 @@ impl SseBroadcaster {
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
         let mut queued = std::mem::take(&mut gate.queued);
         queued.sort_by_key(|entry| entry.seq);
-        if !gate.hard_deleted {
+        if !gate.publication_closed {
             for QueuedBroadcast {
                 event,
                 seq,
@@ -1857,7 +1861,7 @@ impl SseBroadcaster {
     fn send_broadcast_only(&self, build: impl FnOnce(i64) -> SseEvent) -> Result<usize, ()> {
         let _fatal_guard = self.fatal_publication_guard()?;
         let gate = self.gate.lock().expect("BroadcastGate mutex");
-        if gate.hard_deleted {
+        if gate.publication_closed {
             return Err(());
         }
         let witnessed_seq = self.last_seq.load(Ordering::Acquire);
@@ -1935,7 +1939,7 @@ impl SseBroadcaster {
         op: RingOp,
     ) -> Result<usize, ()> {
         let mut gate = self.gate.lock().expect("BroadcastGate mutex");
-        if gate.hard_deleted {
+        if gate.publication_closed {
             return Err(());
         }
         if gate
@@ -2412,17 +2416,6 @@ pub enum SseEvent {
         sequence_id: i64,
         error: user_facing_error::UserFacingError,
     },
-    /// REQ-BED-032 step 6: emitted exactly once after a hard-delete cascade
-    /// completes. UI consumers (sidebar, navigation) use it to refresh
-    /// views. The `conversation_id` field is redundant with the broadcaster
-    /// scope today (the per-conversation channel implies the id) but is
-    /// carried explicitly so a future user-scope broadcaster can
-    /// disambiguate without changing the wire shape.
-    ConversationHardDeleted {
-        sequence_id: i64,
-        conversation_id: String,
-        deleted_conversation_ids: Vec<String>,
-    },
     /// Browser session liveness changed for this conversation. Emitted on
     /// the create edge (`active = true`, fired only on actual `HashMap`
     /// insertion in `BrowserSessionManager::get_session`) and the destroy
@@ -2599,47 +2592,6 @@ async fn accepts_browser_scope_event(
         .is_ok_and(|authority| authority.authority == crate::work_scope::ResourceAuthority::Work)
 }
 
-fn deterministic_explore_branch_for_worktree(worktree_path: &std::path::Path) -> Option<String> {
-    let owner_id = worktree_path.file_name()?.to_str()?;
-    let id_prefix: String = owner_id.chars().take(8).collect();
-    Some(format!("task-pending-{id_prefix}"))
-}
-
-pub(crate) fn cleanup_branch_for_unretained_work_scope<'a>(
-    worktree_path: &std::path::Path,
-    conversations: impl IntoIterator<Item = &'a crate::db::Conversation>,
-) -> Option<String> {
-    use phoenix_core::domain::db_schema::ConvMode;
-
-    let conversations: Vec<_> = conversations.into_iter().collect();
-    if let Some(branch) = conversations.iter().find_map(|conv| match &conv.conv_mode {
-        ConvMode::Work { branch_name, .. } => Some(branch_name.as_str().to_string()),
-        ConvMode::Explore { .. }
-        | ConvMode::AttachedWorkChild
-        | ConvMode::Direct
-        | ConvMode::Branch { .. }
-        | ConvMode::DetachedProductCreation { .. }
-        | ConvMode::DetachedApprovedTask { .. } => None,
-    }) {
-        if crate::git_ops::run_git(worktree_path, &["symbolic-ref", "-q", "HEAD"]).is_err() {
-            return None;
-        }
-        return Some(branch);
-    }
-    if !conversations.iter().any(|conv| {
-        matches!(
-            conv.conv_mode,
-            ConvMode::Explore {
-                worktree_path: Some(_),
-                ..
-            }
-        )
-    }) {
-        return None;
-    }
-    deterministic_explore_branch_for_worktree(worktree_path)
-}
-
 impl RuntimeManager {
     pub(crate) fn live_materialized_handle_count(&self) -> Option<u64> {
         self.runtimes
@@ -2697,8 +2649,6 @@ impl RuntimeManager {
     ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
-        let (handoff_tx, handoff_rx) = mpsc::channel(32);
-        let (fork_cmd_tx, fork_cmd_rx) = mpsc::channel(32);
         // Browser session lifecycle channel. Unbounded because the volume is
         // O(user-clicks-on-browser-tools) — a tightly bounded channel could
         // drop edges and desync the UI's "session live" indicator. The
@@ -2752,8 +2702,11 @@ impl RuntimeManager {
             #[cfg(test)]
             clean_close_writer_fixture: false,
             close_retirement_execution: ConversationMutexGates::default(),
+            waiting_generic_close_owners: AsyncMutex::new(HashMap::new()),
+            scheduled_close_rechecks: std::sync::Mutex::new(HashSet::new()),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
+            primary_actor_lifetimes: std::sync::Mutex::new(HashMap::new()),
             conversation_admissions: AsyncMutex::new(HashMap::new()),
             subagent_dispatch: ConversationMutexGates::default(),
             #[cfg(test)]
@@ -2771,13 +2724,10 @@ impl RuntimeManager {
             #[cfg(test)]
             runtime_exit_barriers: AsyncMutex::new(HashMap::new()),
             #[cfg(test)]
-            fork_command_barrier: AsyncMutex::new(None),
-            #[cfg(test)]
             native_admission_prewrite_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             browser_retirement_barrier: AsyncMutex::new(None),
             #[cfg(test)]
-            hard_delete_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             creation_worker_idle_signal: Mutex::new(None),
             #[cfg(test)]
@@ -2786,8 +2736,6 @@ impl RuntimeManager {
             terminal_cleanup_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             bash_reconciliation_barrier: AsyncMutex::new(None),
-            #[cfg(test)]
-            fork_runtime_start_barrier: AsyncMutex::new(None),
             #[cfg(test)]
             runtime_authority_transfer_barrier: AsyncMutex::new(None),
             #[cfg(test)]
@@ -2810,10 +2758,6 @@ impl RuntimeManager {
             spawn_rx: RwLock::new(Some(spawn_rx)),
             cancel_tx,
             cancel_rx: RwLock::new(Some(cancel_rx)),
-            handoff_tx,
-            handoff_rx: RwLock::new(Some(handoff_rx)),
-            fork_cmd_tx,
-            fork_cmd_rx: RwLock::new(Some(fork_cmd_rx)),
             credential_helper,
             browser_lifecycle_rx: RwLock::new(Some(browser_lifecycle_rx)),
             bash_lifecycle_rx: RwLock::new(Some(bash_lifecycle_rx)),
@@ -3061,7 +3005,7 @@ impl RuntimeManager {
         &self.work_scope_load
     }
 
-    /// Get the tmux server registry (REQ-TMUX-007 hard-delete cascade,
+    /// Get the tmux server registry (REQ-TMUX-WS-001 resource cleanup,
     /// terminal attach path).
     pub fn tmux_registry(&self) -> &Arc<TmuxRegistry> {
         &self.tmux_registry
@@ -3747,123 +3691,431 @@ impl RuntimeManager {
         Ok(completed)
     }
 
-    async fn settle_close_direct_turn_targets(&self, attempt_id: &str) -> Result<(), String> {
+    fn close_settlement_actor<'a>(
+        &self,
+        conversation_id: &str,
+        creations: &HashMap<String, Arc<RuntimeMaterializationSlot>>,
+        runtimes: &'a HashMap<String, ConversationHandle>,
+    ) -> CloseSettlementActor<'a> {
+        let actors = self
+            .primary_actor_lifetimes
+            .lock()
+            .expect("actor lifetime registry");
+        let count = actors.get(conversation_id).copied().unwrap_or(0);
+        match runtimes.get(conversation_id) {
+            Some(actor)
+                if (count == 1 || (cfg!(test) && count == 0))
+                    && !actor.event_tx.is_cancellation_closed() =>
+            {
+                CloseSettlementActor::Live(actor)
+            }
+            None if count == 0 && !creations.contains_key(conversation_id) => {
+                CloseSettlementActor::Absent
+            }
+            _ => CloseSettlementActor::Pending,
+        }
+    }
+
+    async fn settle_close_direct_turn_targets(
+        &self,
+        settlement: &crate::db::GenericCloseSettlement,
+        deliveries: &mut HashMap<u64, CloseSettlementDelivery>,
+    ) -> Result<CloseTurnDispatchPass, GenericCloseApplyError> {
+        use crate::db::GenericCloseTurnRelease;
+        use phoenix_db::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        let attempt_id = settlement.obligation().attempt_id().as_str();
         let targets = self
             .db
             .list_unsettled_close_direct_turn_settlement_targets(attempt_id)
             .await
             .map_err(|error| error.to_string())?;
         for target in targets {
-            let live_runtime = {
-                let runtimes = self.runtimes.read().await;
-                runtimes
-                    .get(&target.conversation_id)
-                    .map(|handle| handle.event_tx.clone())
-            };
-            if let Some(event_tx) = live_runtime {
-                if event_tx
-                    .send(Event::UserCancel {
-                        reason: Some("active Close settlement".to_string()),
-                        cause: crate::state_machine::event::CancelCause::UserRequested,
-                    })
-                    .await
-                    .is_ok()
-                {
-                    continue;
+            let creations = self.runtime_creations.lock().await;
+            let runtimes = self.runtimes.read().await;
+            match self.close_settlement_actor(&target.conversation_id, &creations, &runtimes) {
+                CloseSettlementActor::Pending => continue,
+                CloseSettlementActor::Live(actor) => {
+                    if let Some(delivery) = deliveries.get_mut(&target.turn_id) {
+                        if Arc::ptr_eq(&delivery.actor, &actor.identity) && delivery.poll_handling()
+                        {
+                            continue;
+                        }
+                        match self
+                            .db
+                            .reconcile_lost_generic_close_turn_offer(settlement, &target)
+                            .await
+                        {
+                            DurableFactEstablished(Ok(GenericCloseTurnRelease::Released)) => {
+                                deliveries.remove(&target.turn_id);
+                                continue;
+                            }
+                            DurableFactEstablished(Ok(GenericCloseTurnRelease::NoTransition)) => {
+                                return Ok(CloseTurnDispatchPass::NoTransition);
+                            }
+                            DurableFactEstablished(Ok(GenericCloseTurnRelease::Unclaimed)) => {
+                                deliveries.remove(&target.turn_id);
+                            }
+                            DurableFactEstablished(Err(error)) => {
+                                return Err(error.to_string().into())
+                            }
+                            DurableFactUnclassified => {
+                                self.signal_fatal_local_authority(
+                                    "generic_close_turn_offer_reconcile_unclassified",
+                                );
+                                return Err(GenericCloseApplyError::Unclassified);
+                            }
+                        }
+                    }
+                    if let Ok(reservation) = actor.event_tx.try_reserve_direct_turn_cancellation() {
+                        let offer = settlement.offer_turn(target.clone()).ok_or_else(|| {
+                            GenericCloseApplyError::Definite(
+                                "Close has no live ingress owner".into(),
+                            )
+                        })?;
+                        let application = reservation.send(
+                            cancellation_inbox::CloseSettlementStopOffer::Generic(
+                                self.db.clone(),
+                                offer,
+                            ),
+                        );
+                        deliveries.insert(
+                            target.turn_id,
+                            CloseSettlementDelivery {
+                                actor: Arc::clone(&actor.identity),
+                                application: Some(application),
+                            },
+                        );
+                    }
                 }
+                CloseSettlementActor::Absent => match self
+                    .db
+                    .cancel_generic_close_turn_without_actor(settlement, &target)
+                    .await
+                {
+                    DurableFactEstablished(Ok(
+                        GenericCloseTurnRelease::Released | GenericCloseTurnRelease::Unclaimed,
+                    )) => {}
+                    DurableFactEstablished(Ok(GenericCloseTurnRelease::NoTransition)) => {
+                        return Ok(CloseTurnDispatchPass::NoTransition);
+                    }
+                    DurableFactEstablished(Err(error)) => return Err(error.to_string().into()),
+                    DurableFactUnclassified => {
+                        self.signal_fatal_local_authority(
+                            "generic_close_turn_cancellation_unclassified",
+                        );
+                        return Err(GenericCloseApplyError::Unclassified);
+                    }
+                },
             }
-            match self
-                .db
-                .workflow_repository()
-                .terminate_authoritative_turn(phoenix_workflow::TurnCommand::Cancel {
-                    turn_id: phoenix_workflow::TurnAuthorityId(target.turn_id),
-                    expected_generation: target.expected_generation,
-                })
-                .await
-            {
-                Ok(_)
-                | Err(crate::db::DbError::DirectTurnConflict(
-                    phoenix_workflow::TurnConflict::StaleGeneration { .. }
-                    | phoenix_workflow::TurnConflict::AlreadyTerminal,
-                )) => {}
-                Err(error) => return Err(error.to_string()),
-            }
-            self.db
-                .record_close_direct_turn_settlement_if_released(attempt_id, &target)
-                .await
-                .map_err(|error| error.to_string())?;
         }
-        Ok(())
+        Ok(CloseTurnDispatchPass::Dispatched)
+    }
+
+    async fn dispatch_native_close_settlement_work(
+        &self,
+        command: &phoenix_db::native_close::NativeCloseCommand,
+        receipt: &phoenix_db::native_close::NativeCloseReceipt,
+        live_source: &ConvState,
+        source_entry: &executor::SourceEntryWorker,
+        deliveries: &mut HashMap<u64, CloseSettlementDelivery>,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<crate::db::DbResult<bool>> {
+        use phoenix_db::native_close::{
+            NativeCloseInitialTurnDispatch as Offer,
+            NativeCloseInitialTurnDispatchResult as Offered,
+        };
+        use phoenix_db::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        let targets = match self
+            .db
+            .prepare_native_close_initial_settlement_dispatch(command, receipt, live_source)
+            .await
+        {
+            DurableFactEstablished(Ok(targets)) => targets,
+            DurableFactEstablished(Err(error)) => return DurableFactEstablished(Err(error)),
+            DurableFactUnclassified => return DurableFactUnclassified,
+        };
+        self.kick_creation_worker();
+        let mut all_released = true;
+        for target in targets {
+            if let Some(delivery) = deliveries.get_mut(&target.turn_id) {
+                let retained = self
+                    .runtimes
+                    .read()
+                    .await
+                    .get(&target.conversation_id)
+                    .is_some_and(|actor| {
+                        Arc::ptr_eq(&actor.identity, &delivery.actor) && !actor.event_tx.is_closed()
+                    });
+                if !retained || !delivery.poll_handling() {
+                    // The prior unsettled snapshot can race a normal terminal write and
+                    // actor exit. Reconcile again without offering a duplicate Stop.
+                    match self
+                        .db
+                        .dispatch_native_close_initial_settlement_turn(
+                            command,
+                            receipt,
+                            live_source,
+                            &target,
+                            || Offer::<()>::Backpressure,
+                        )
+                        .await
+                    {
+                        DurableFactEstablished(Ok(Offered::Released)) => continue,
+                        DurableFactEstablished(Ok(_)) => {
+                            return DurableFactEstablished(Err(crate::db::DbError::CloseFoundationPrecondition(
+                                "captured turn's Stop delivery was refused or lost before durable settlement".into(),
+                            )));
+                        }
+                        DurableFactEstablished(Err(error)) => {
+                            return DurableFactEstablished(Err(error))
+                        }
+                        DurableFactUnclassified => return DurableFactUnclassified,
+                    }
+                }
+                all_released = false;
+                continue;
+            }
+            // Materialization reserves its slot before reading the durable turn. Hold
+            // admission across a no-actor fallback; an older slot must finish first.
+            let creations = self.runtime_creations.lock().await;
+            let runtimes = self.runtimes.read().await;
+            let actor = self.close_settlement_actor(&target.conversation_id, &creations, &runtimes);
+            let result = self
+                .db
+                .dispatch_native_close_initial_settlement_turn(
+                    command,
+                    receipt,
+                    live_source,
+                    &target,
+                    || match actor {
+                        CloseSettlementActor::Absent => Offer::NoLiveActor,
+                        CloseSettlementActor::Pending => Offer::Backpressure,
+                        CloseSettlementActor::Live(actor) => {
+                            match actor.event_tx.try_reserve_direct_turn_cancellation() {
+                                Ok(reservation) => {
+                                    Offer::Reserved((Arc::clone(&actor.identity), reservation))
+                                }
+                                Err(
+                                    mpsc::error::TrySendError::Full(())
+                                    | mpsc::error::TrySendError::Closed(()),
+                                ) => Offer::Backpressure,
+                            }
+                        }
+                    },
+                )
+                .await;
+            match result {
+                DurableFactEstablished(Ok(Offered::Released)) => {}
+                DurableFactEstablished(Ok(Offered::Backpressure)) => all_released = false,
+                DurableFactEstablished(Ok(Offered::Reserved((actor, reservation)))) => {
+                    let application =
+                        reservation.send(cancellation_inbox::CloseSettlementStopOffer::Native(
+                            Box::new(cancellation_inbox::NativeCloseSettlementStopOffer::new(
+                                self.db.clone(),
+                                command.clone(),
+                                receipt.clone(),
+                                source_entry.clone(),
+                                live_source.clone(),
+                                target.clone(),
+                            )),
+                        ));
+                    deliveries.insert(
+                        target.turn_id,
+                        CloseSettlementDelivery {
+                            actor,
+                            application: Some(application),
+                        },
+                    );
+                    all_released = false;
+                }
+                DurableFactEstablished(Err(error)) => return DurableFactEstablished(Err(error)),
+                DurableFactUnclassified => return DurableFactUnclassified,
+            }
+        }
+        DurableFactEstablished(Ok(all_released))
+    }
+
+    fn schedule_generic_close_recheck(
+        self: &Arc<Self>,
+        attempt: phoenix_core::domain::close::CloseAttemptId,
+    ) {
+        if !self
+            .scheduled_close_rechecks
+            .lock()
+            .expect("Close rechecks")
+            .insert(attempt.clone())
+        {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        let recheck: futures::future::BoxFuture<'static, ()> = Box::pin(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            let Some(manager) = weak.upgrade() else {
+                return;
+            };
+            manager
+                .scheduled_close_rechecks
+                .lock()
+                .expect("Close rechecks")
+                .remove(&attempt);
+            let result = match manager.start_generic_close_recheck(attempt.clone()) {
+                Ok(worker) => match worker.await {
+                    Ok(result) => result,
+                    Err(error) => Err(error.to_string()),
+                },
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                tracing::error!(%attempt, %error, "Close settlement recheck failed");
+            }
+        });
+        tokio::spawn(recheck);
     }
 
     pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {
-        let obligations = self
-            .db
-            .list_pending_generic_close_settlements()
+        self.resume_close_settlements(None).await
+    }
+
+    pub(crate) async fn resume_close_settlements(
+        self: &Arc<Self>,
+        attempt_id: Option<&phoenix_core::domain::close::CloseAttemptId>,
+    ) -> Result<usize, String> {
+        let attempts: Vec<_> = self
+            .waiting_generic_close_owners
+            .lock()
             .await
-            .map_err(|error| error.to_string())?;
-        let manager = Arc::clone(self);
-        self.run_authority_units(obligations, move |obligation| {
-            let manager = Arc::clone(&manager);
-            async move { manager.settle_close_obligation(obligation).await }
-        })
-        .await
+            .keys()
+            .filter(|attempt| attempt_id.is_none_or(|exact| *attempt == exact))
+            .cloned()
+            .collect();
+        let mut completed = 0;
+        let mut first_error = None;
+        for attempt in attempts {
+            let worker = self.start_generic_close_recheck(attempt)?;
+            match worker.await {
+                Ok(Ok(true)) => completed += 1,
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    first_error
+                        .get_or_insert_with(|| format!("Close settlement worker failed: {error}"));
+                }
+            }
+        }
+        first_error.map_or(Ok(completed), Err)
     }
 
     async fn settle_close_obligation(
         self: &Arc<Self>,
-        settlement: crate::db::GenericCloseSettlement,
+        active: close_authority::ActiveGenericCloseSettlement,
     ) -> Result<bool, String> {
-        let obligation = settlement.obligation();
-        if !matches!(
-            obligation.phase(),
-            phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-                | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
-        ) {
-            return Ok(false);
-        }
-        if !self
-            .db
-            .validate_generic_close_settlement(&settlement)
+        let (execution, mut owner) = active.into_parts();
+        let (settlement, deliveries) = owner.settlement_and_deliveries();
+        match self
+            .apply_generic_close_settlement(settlement, deliveries)
             .await
-            .map_err(|error| error.to_string())?
         {
-            return Ok(false);
+            Ok(crate::db::GenericCloseSettlementAdvance::Inspect(inspection)) => {
+                self.continue_settled_generic_close(&execution, inspection)
+                    .await?;
+                Ok(true)
+            }
+            Ok(crate::db::GenericCloseSettlementAdvance::Interrupted(run)) => {
+                self.classify_generic_close_interruption(&run).await?;
+                Ok(true)
+            }
+            Ok(crate::db::GenericCloseSettlementAdvance::Cancelled) => Ok(true),
+            Ok(crate::db::GenericCloseSettlementAdvance::NoTransition) => Ok(false),
+            Ok(crate::db::GenericCloseSettlementAdvance::WaitingForQuiescence) => {
+                let attempt = settlement.obligation().attempt_id().clone();
+                self.waiting_generic_close_owners
+                    .lock()
+                    .await
+                    .insert(attempt.clone(), owner);
+                self.schedule_generic_close_recheck(attempt);
+                Ok(false)
+            }
+            Err(GenericCloseApplyError::Unclassified) => {
+                Err("Close could not classify the captured turn cancellation commit".to_string())
+            }
+            Err(GenericCloseApplyError::Definite(error)) => {
+                use crate::db::GenericCloseSettlementFailure::{Classified, NoTransition};
+                use phoenix_core::domain::close::CloseRunStatus::{Completed, Running, Stopped};
+
+                match self
+                    .db
+                    .fail_generic_close_settlement(settlement, &error)
+                    .await
+                {
+                    Ok(Classified) => {
+                        self.kick_direct_turn_worker();
+                        Err(error)
+                    }
+                    Ok(NoTransition(Stopped | Completed)) => Err(error),
+                    Ok(NoTransition(Running)) => {
+                        // The failed handoff did not deliver an inspection witness to this owner.
+                        self.signal_fatal_local_authority("generic_close_settlement_unclassified");
+                        Err(format!(
+                            "{error}; Close run is still running outside settlement"
+                        ))
+                    }
+                    Err(storage_error) => {
+                        self.signal_fatal_local_authority("generic_close_settlement_unclassified");
+                        Err(format!("{error}; Close settlement failure could not be recorded: {storage_error}"))
+                    }
+                }
+            }
         }
-        let conversation_ids = self
-            .db
-            .list_close_settlement_conversation_ids(obligation.attempt_id().as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        for conversation_id in &conversation_ids {
-            match self
-                .db
-                .cancel_conversation_creation(conversation_id, Utc::now())
-                .await
-            {
-                Ok(()) | Err(crate::db::DbError::Sqlx(sqlx::Error::RowNotFound)) => {}
-                Err(error) => return Err(error.to_string()),
+    }
+
+    async fn apply_generic_close_settlement(
+        &self,
+        settlement: &crate::db::GenericCloseSettlement,
+        deliveries: &mut HashMap<u64, CloseSettlementDelivery>,
+    ) -> Result<crate::db::GenericCloseSettlementAdvance, GenericCloseApplyError> {
+        use crate::db::GenericCloseSettlementAdvance;
+
+        use phoenix_db::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+        match self.db.cancel_generic_close_provisioning(settlement).await {
+            DurableFactEstablished(Ok(true)) => {}
+            DurableFactEstablished(Ok(false)) => {
+                return Ok(GenericCloseSettlementAdvance::NoTransition)
+            }
+            DurableFactEstablished(Err(error)) => return Err(error.to_string().into()),
+            DurableFactUnclassified => {
+                self.signal_fatal_local_authority("generic_close_provisioning_unclassified");
+                return Err(GenericCloseApplyError::Unclassified);
             }
         }
         self.kick_creation_worker();
-        self.settle_close_direct_turn_targets(obligation.attempt_id().as_str())
-            .await?;
+        if self
+            .settle_close_direct_turn_targets(settlement, deliveries)
+            .await?
+            == CloseTurnDispatchPass::NoTransition
+        {
+            return Ok(GenericCloseSettlementAdvance::NoTransition);
+        }
         match self
             .db
-            .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
+            .finish_generic_close_settlement_classified(settlement)
             .await
         {
-            Ok(advanced) => {
-                if advanced.phase()
-                    == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                {
-                    self.inspect_close_retirement(advanced.attempt_id().clone())
-                        .await?;
-                }
-                Ok(true)
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map_err(|error| GenericCloseApplyError::Definite(error.to_string()))
             }
-            Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
-            Err(error) => Err(error.to_string()),
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                self.signal_fatal_local_authority("generic_close_settlement_unclassified");
+                Err(GenericCloseApplyError::Unclassified)
+            }
         }
     }
 
@@ -3944,18 +4196,6 @@ impl RuntimeManager {
     }
 
     #[cfg(test)]
-    pub(crate) async fn install_hard_delete_barrier(&self, barrier: Arc<tokio::sync::Barrier>) {
-        *self.hard_delete_barrier.lock().await = Some(barrier);
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn wait_at_hard_delete_barrier(&self) {
-        if let Some(barrier) = self.hard_delete_barrier.lock().await.take() {
-            barrier.wait().await;
-            barrier.wait().await;
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn fatal_authority_owners_at_first_close(&self) -> Option<usize> {
         self.fatal_local_authority_fence.owners_at_first_close()
@@ -4790,16 +5030,8 @@ impl RuntimeManager {
         // Take the receivers (can only be done once)
         let spawn_rx = self.spawn_rx.write().await.take();
         let cancel_rx = self.cancel_rx.write().await.take();
-        let handoff_rx = self.handoff_rx.write().await.take();
-        let fork_cmd_rx = self.fork_cmd_rx.write().await.take();
 
-        if let (
-            Some(mut spawn_rx),
-            Some(mut cancel_rx),
-            Some(mut handoff_rx),
-            Some(mut fork_cmd_rx),
-        ) = (spawn_rx, cancel_rx, handoff_rx, fork_cmd_rx)
-        {
+        if let (Some(mut spawn_rx), Some(mut cancel_rx)) = (spawn_rx, cancel_rx) {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -4811,52 +5043,12 @@ impl RuntimeManager {
                             let manager = Arc::clone(&manager);
                             tokio::spawn(async move { manager.handle_cancel_request(req).await; });
                         }
-                        Some(req) = handoff_rx.recv() => {
-                            manager.handle_task_handoff_request(req).await;
-                        }
-                        // Single serialized fork-resolution consumer: each command
-                        // is handled to completion before the next is taken, so two
-                        // fork critical sections cannot interleave (REQ-PROJ-034/035).
-                        Some(cmd) = fork_cmd_rx.recv() => {
-                            manager.handle_fork_command(cmd).await;
-                        }
                         else => break,
                     }
                 }
-                tracing::info!("Sub-agent/task-handoff/fork-resolution handler stopped");
+                tracing::info!("Sub-agent handler stopped");
             });
         }
-    }
-
-    async fn handle_task_handoff_request(self: &Arc<Self>, req: TaskApprovalHandoffRequest) {
-        let TaskApprovalHandoffRequest {
-            parent_conversation_id,
-            approval,
-            mut authority,
-            response_tx,
-        } = req;
-        let result = self
-            .create_and_start_task_handoff(&parent_conversation_id, &approval, &mut authority)
-            .await;
-        let _ = response_tx.send(result);
-    }
-
-    async fn create_and_start_task_handoff(
-        self: &Arc<Self>,
-        parent_conversation_id: &str,
-        approval: &TaskApprovalHandoffData,
-        _authority: &mut AdmittedOperation,
-    ) -> Result<TaskApprovalHandoffResponse, String> {
-        let successor = self
-            .db
-            .create_task_approval_handoff_creation_job(parent_conversation_id, approval)
-            .await
-            .map_err(|e| e.to_string())?;
-        self.kick_creation_worker();
-        Ok(TaskApprovalHandoffResponse {
-            successor_conv_id: successor.id,
-            state_updated_at: successor.state_updated_at,
-        })
     }
 
     async fn handle_runtime_exit(
@@ -5525,6 +5717,7 @@ impl RuntimeManager {
         self.get_or_create_inner(conversation_id, None).await
     }
 
+    #[cfg(test)]
     async fn get_or_create_with_authority(
         self: &Arc<Self>,
         conversation_id: &str,
@@ -5768,18 +5961,8 @@ impl RuntimeManager {
                 state: projection.state.clone(),
                 state_updated_at: projection.state_updated_at,
             });
-            executor::emit_terminal_lifecycle_event(
-                conversation_id,
-                Some(&self.fork_cmd_tx),
-                &broadcaster,
-            )
-            .await;
-        } else {
-            executor::complete_terminal_lifecycle_without_broadcast(
-                conversation_id,
-                Some(&self.fork_cmd_tx),
-            )
-            .await;
+            let _ = broadcaster
+                .send_seq(|seq| SseEvent::ConversationBecameTerminal { sequence_id: seq });
         }
     }
 
@@ -5847,20 +6030,6 @@ impl RuntimeManager {
                     .await
                     .remove(&reconciliation.conversation_id);
             }
-        }
-        let conversations = crate::reconcile_worktrees_with_terminalized(&self.db, || {
-            self.acquire_local_authority_pass()
-        })
-        .await;
-        for conversation in conversations {
-            let Ok(_owner) = self.acquire_local_authority_pass() else {
-                return Ok(());
-            };
-            executor::complete_terminal_lifecycle_without_broadcast(
-                &conversation.id,
-                Some(&self.fork_cmd_tx),
-            )
-            .await;
         }
         let repo = self.db.workflow_repository();
         let mut consumed_action_ids = HashSet::new();
@@ -5960,11 +6129,6 @@ impl RuntimeManager {
                                     DatabaseTerminalRecoveryError::Retryable(error.to_string())
                                 })?;
                             }
-                            executor::complete_terminal_lifecycle_without_broadcast(
-                                &conversation_id,
-                                Some(&self.fork_cmd_tx),
-                            )
-                            .await;
                             self.db
                                 .delete_startup_parent_action(
                                     &conversation_id,
@@ -6815,7 +6979,6 @@ impl RuntimeManager {
             .with_state_updated_at(initial_state_updated_at)
             .with_active_direct_turn(active_direct_turn)
             .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
-            .with_task_handoff_channel(self.handoff_tx.clone())
             .with_credential_helper(self.credential_helper.clone())
             .with_agent_config(agent_config);
         let runtime = if !is_sub_agent && !is_coordinator {
@@ -6841,15 +7004,6 @@ impl RuntimeManager {
             runtime
         };
 
-        // Fork proposals are bound to top-level (parent) origins; sub-agents
-        // never hold any. Give parent runtimes the fork-resolution consumer
-        // sender so a terminal transition retires their still-pending proposals
-        // through the serialized consumer (REQ-PROJ-035).
-        let runtime = if is_sub_agent {
-            runtime
-        } else {
-            runtime.with_fork_command_sender(self.fork_cmd_tx.clone())
-        };
         let runtime = if let Some((job_id, claim)) = startup_creation_completion {
             runtime.with_startup_creation_completion(job_id, claim)
         } else {
@@ -6967,6 +7121,12 @@ impl RuntimeManager {
                 reservations.remove(conversation_id);
                 return Ok(existing);
             }
+            *self
+                .primary_actor_lifetimes
+                .lock()
+                .expect("actor lifetime registry")
+                .entry(conversation_id.to_string())
+                .or_default() += 1;
             runtimes.insert(
                 conversation_id.to_string(),
                 ConversationHandle {
@@ -6997,6 +7157,17 @@ impl RuntimeManager {
             let mut recreation_broadcaster = None;
             let removed = {
                 let mut runtimes = manager_for_cleanup.runtimes.write().await;
+                {
+                    let mut actors = manager_for_cleanup
+                        .primary_actor_lifetimes
+                        .lock()
+                        .expect("actor lifetime registry");
+                    let count = actors.get_mut(&conv_id).expect("published actor lifetime");
+                    *count -= 1;
+                    if *count == 0 {
+                        actors.remove(&conv_id);
+                    }
+                }
                 if runtimes
                     .get(&conv_id)
                     .is_some_and(|h| Arc::ptr_eq(&h.identity, &cleanup_identity))
@@ -7024,8 +7195,6 @@ impl RuntimeManager {
                     "Runtime cleanup: entry replaced after eviction, skipping remove"
                 );
             }
-            manager_for_cleanup
-                .propagate_fatal_runtime_exit(disposition, "direct_turn_terminal_evidence");
             if disposition != executor::RuntimeExitDisposition::FatalLocalAuthorityLoss {
                 if let Err(error) = manager_for_cleanup.resume_pending_close_settlements().await {
                     tracing::error!(%error, conv_id = %conv_id, "failed to re-evaluate Close settlement after runtime exit");
@@ -7860,11 +8029,6 @@ impl RuntimeManager {
     /// Peek at the runtime handle for a conversation without starting one.
     /// Returns `None` if no runtime is currently registered for `conversation_id`.
     ///
-    /// REQ-BED-032: the hard-delete cascade uses this to broadcast the
-    /// `ConversationHardDeleted` event onto the existing per-conversation
-    /// channel — if any. Spinning up a runtime for a conversation that's
-    /// about to be deleted would be wasted work (the executor would
-    /// observe the row gone seconds later).
     pub async fn try_get_handle(&self, conversation_id: &str) -> Option<ConversationHandle> {
         let runtimes = self.runtimes.read().await;
         runtimes.get(conversation_id).map(|h| ConversationHandle {
@@ -8005,45 +8169,8 @@ impl RuntimeManager {
         }
     }
 
-    /// Remove and return the evicted broadcaster for `conversation_id`, if any.
-    ///
-    /// An evicted broadcaster exists in the window between `evict_runtime` (model
-    /// upgrade) and the next `get_or_create` call for the same conversation. During
-    /// this window the broadcaster is not reachable via `try_get_handle`, so any
-    /// caller that needs to push a final event — most notably the hard-delete cascade
-    /// — must also check here.
-    pub async fn take_evicted_broadcaster(&self, conversation_id: &str) -> Option<SseBroadcaster> {
-        // The model-upgrade marker is normally consumed by the next
-        // get_or_create. The hard-delete cascade is the one path that takes
-        // the evicted broadcaster without a subsequent get_or_create, so the
-        // marker would leak forever for a conversation deleted before
-        // re-access. Drop it here too — these are the same lifecycle.
-        self.evicted_model_upgrades
-            .write()
-            .await
-            .remove(conversation_id);
-        self.evicted_broadcasters
-            .write()
-            .await
-            .remove(conversation_id)
-    }
-
     pub fn subscribe_aggregate_events(&self) -> broadcast::Receiver<SseEvent> {
         self.aggregate_event_tx.subscribe()
-    }
-
-    pub fn publish_aggregate_hard_deleted(
-        &self,
-        product_conversation_id: String,
-        deleted_conversation_ids: Vec<String>,
-    ) {
-        let _ = self
-            .aggregate_event_tx
-            .send(SseEvent::ConversationHardDeleted {
-                sequence_id: 0,
-                conversation_id: product_conversation_id,
-                deleted_conversation_ids,
-            });
     }
 
     /// Determine the resume state for a conversation.
@@ -8847,84 +8974,6 @@ mod broadcaster_tests {
         ));
     }
 
-    #[test]
-    fn hard_delete_is_the_final_publication() {
-        let broadcaster = SseBroadcaster::new(16, 0);
-        let mut events = broadcaster.subscribe();
-        broadcaster
-            .send_seq(|sequence_id| SseEvent::Token {
-                sequence_id,
-                text: "before".to_string(),
-                request_id: "before-request".to_string(),
-            })
-            .unwrap();
-        broadcaster
-            .send_hard_deleted_and_close(
-                "deleted-conversation".to_string(),
-                vec!["deleted-conversation".to_string()],
-            )
-            .unwrap();
-
-        assert!(matches!(events.try_recv(), Ok(SseEvent::Token { .. })));
-        assert!(matches!(
-            events.try_recv(),
-            Ok(SseEvent::ConversationHardDeleted { ref conversation_id, .. })
-                if conversation_id == "deleted-conversation"
-        ));
-        assert!(broadcaster
-            .send_seq(|sequence_id| SseEvent::Token {
-                sequence_id,
-                text: "after".to_string(),
-                request_id: "after-request".to_string(),
-            })
-            .is_err());
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn hard_delete_discards_publications_queued_behind_a_reserved_range() {
-        let broadcaster = SseBroadcaster::new(16, 0);
-        let mut events = broadcaster.subscribe();
-        let (reserved, reserved_sequence) = broadcaster
-            .persisted_message_reservation_authority()
-            .await
-            .reserve_next_after(0)
-            .expect("reserve one persisted sequence");
-        broadcaster
-            .send_seq(|sequence_id| SseEvent::Token {
-                sequence_id,
-                text: "queued".to_string(),
-                request_id: "queued-request".to_string(),
-            })
-            .unwrap();
-        broadcaster
-            .send_hard_deleted_and_close(
-                "deleted-conversation".to_string(),
-                vec!["deleted-conversation".to_string()],
-            )
-            .unwrap();
-        drop(reserved);
-
-        assert!(matches!(
-            events.try_recv(),
-            Ok(SseEvent::ConversationHardDeleted { .. })
-        ));
-        assert!(matches!(
-            events.try_recv(),
-            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-        ));
-        assert!(broadcaster
-            .send_reserved_seq(reserved_sequence, |sequence_id| SseEvent::Token {
-                sequence_id,
-                text: "late-reserved".to_string(),
-                request_id: "late-reserved-request".to_string(),
-            })
-            .is_err());
-    }
-
     /// Regression for task 02679: when a caller pre-allocates a message's
     /// `sequence_id` from the broadcaster *before* writing to the DB, the
     /// message's seq is strictly greater than any ephemeral event emitted
@@ -9671,7 +9720,10 @@ mod scope_liveness_tests {
     }
 
     pub(super) async fn test_manager() -> RuntimeManager {
-        let db = crate::db::Database::open_in_memory().await.expect("db");
+        test_manager_with_db(crate::db::Database::open_in_memory().await.expect("db"))
+    }
+
+    fn test_manager_with_db(db: crate::db::Database) -> RuntimeManager {
         RuntimeManager::new(
             db,
             Arc::new(ModelRegistry::new_empty()),
@@ -9723,39 +9775,105 @@ mod scope_liveness_tests {
         .execute(manager.db().pool())
         .await
         .expect("insert active turn");
-        manager
+        let admission = manager
             .db()
-            .begin_close_foundation(
+            .begin_generic_close_settlement_classified(
                 &conversation.product_conversation_id,
                 &TranscriptConversationId::parse(conversation_id).unwrap(),
-                "live-attempt",
+                &CloseAttemptId::parse("live-attempt").unwrap(),
             )
             .await
-            .expect("begin close");
+            .established()
+            .expect("classified fixture transaction")
+            .unwrap();
+        let crate::db::GenericCloseAdmission::InsertedSettling(settlement) = admission else {
+            panic!("expected Initial to capture the active durable turn");
+        };
         manager
-            .db()
-            .confirm_close_stop_work("live-attempt")
-            .await
-            .expect("confirm stop work");
-        manager
-            .db()
-            .begin_close_active_work_settlement("live-attempt")
-            .await
-            .expect("begin settlement");
-        let mut events = manager
-            .inject_handle_with_event_capture_for_test(
-                conversation_id,
-                ConvState::LlmRequesting { attempt: 1 },
-            )
+            .inject_handle_for_test(conversation_id, ConvState::LlmRequesting { attempt: 1 })
             .await;
-
-        assert_eq!(manager.resume_pending_close_settlements().await.unwrap(), 0);
+        let (acknowledge, _acknowledgements) = mpsc::channel(1);
+        let (ordinary, mut events) = mpsc::channel(1);
+        let (sender, _, mut stops) = cancellation_inbox::channel(ordinary, acknowledge);
+        manager
+            .runtimes
+            .write()
+            .await
+            .get_mut(conversation_id)
+            .unwrap()
+            .event_tx = sender;
+        let mut deliveries = HashMap::new();
+        manager
+            .settle_close_direct_turn_targets(&settlement, &mut deliveries)
+            .await
+            .unwrap();
+        manager
+            .settle_close_direct_turn_targets(&settlement, &mut deliveries)
+            .await
+            .unwrap();
+        let cancellation_inbox::CancellationInput::DirectTurn(stop) = stops.try_recv().unwrap()
+        else {
+            panic!("Close must not send an unscoped cancellation");
+        };
+        assert_eq!(stop.scope.turn_id, phoenix_workflow::TurnAuthorityId(1));
+        assert_eq!(stop.scope.generation, 0);
+        let _ = stop
+            .applied
+            .send(cancellation_inbox::ScopedStopHandling::Refused);
+        manager
+            .settle_close_direct_turn_targets(&settlement, &mut deliveries)
+            .await
+            .unwrap();
+        let cancellation_inbox::CancellationInput::DirectTurn(stale) = stops.try_recv().unwrap()
+        else {
+            panic!("expected exact re-offer");
+        };
+        let target = manager
+            .db()
+            .list_unsettled_close_direct_turn_settlement_targets("live-attempt")
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        let duplicate = settlement.offer_turn(target.clone()).unwrap();
+        let late = settlement.offer_turn(target.clone()).unwrap();
+        assert!(
+            stale
+                .offer
+                .claim(Arc::clone(&manager.fatal_local_authority_fence))
+                .await
+        );
+        use phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished;
+        assert!(matches!(
+            manager.db().claim_generic_close_turn_offer(duplicate).await,
+            DurableFactEstablished(Ok(false)),
+        ));
+        assert!(matches!(
+            manager
+                .db()
+                .reconcile_lost_generic_close_turn_offer(&settlement, &target)
+                .await,
+            DurableFactEstablished(Err(crate::db::DbError::CloseFoundationPrecondition(_))),
+        ));
+        assert!(matches!(
+            manager
+                .db()
+                .fail_generic_close_settlement(&settlement, "stop before receiver")
+                .await
+                .unwrap(),
+            crate::db::GenericCloseSettlementFailure::Classified,
+        ));
+        assert!(matches!(
+            manager.db().claim_generic_close_turn_offer(late).await,
+            DurableFactEstablished(Ok(false)),
+        ));
+        assert!(matches!(
+            stops.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         assert!(matches!(
             events.try_recv(),
-            Ok(Event::UserCancel {
-                reason: Some(reason),
-                cause: crate::state_machine::event::CancelCause::UserRequested,
-            }) if reason == "active Close settlement"
+            Err(mpsc::error::TryRecvError::Empty)
         ));
         let terminal_kind: Option<String> =
             sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = 1")
@@ -9766,6 +9884,27 @@ mod scope_liveness_tests {
             terminal_kind.is_none(),
             "Close must leave live runtime terminalization to its executor"
         );
+    }
+
+    #[tokio::test]
+    async fn close_settlement_treats_evicted_actor_as_pending_until_cleanup() {
+        let manager = test_manager().await;
+        let conversation_id = "evicted-close-settlement";
+        let creations = manager.runtime_creations.lock().await;
+        let runtimes = manager.runtimes.read().await;
+        assert!(matches!(
+            manager.close_settlement_actor(conversation_id, &creations, &runtimes),
+            CloseSettlementActor::Absent,
+        ));
+        manager
+            .primary_actor_lifetimes
+            .lock()
+            .unwrap()
+            .insert(conversation_id.into(), 1);
+        assert!(matches!(
+            manager.close_settlement_actor(conversation_id, &creations, &runtimes),
+            CloseSettlementActor::Pending,
+        ));
     }
 
     async fn prepare_clean_close_with_tmux(
@@ -9933,7 +10072,7 @@ mod scope_liveness_tests {
     async fn complete_close_retirement_and_publish_persists_archive_before_emitting_update() {
         use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
 
-        let manager = test_manager().await;
+        let manager = Arc::new(test_manager().await);
         let conversation_id = "close-retirement-publish-success";
         let attempt_id = prepare_close_attempt_ready_for_completion(
             &manager,
@@ -9994,7 +10133,7 @@ mod scope_liveness_tests {
 
     #[tokio::test]
     async fn complete_close_retirement_and_publish_notifies_subordinate_participant() {
-        let manager = test_manager().await;
+        let manager = Arc::new(test_manager().await);
         let parent = manager
             .db()
             .create_conversation(
@@ -10158,6 +10297,7 @@ mod scope_liveness_tests {
         let replacement_token =
             replace_tmux_server(&manager, &fake, &scope, &socket, &stale_token).await;
 
+        let manager = Arc::new(manager);
         manager
             .retire_close_runtime_resources(attempt_id.clone())
             .await
@@ -10181,9 +10321,8 @@ mod scope_liveness_tests {
         assert_eq!(fake.kill_server_count(&socket), 0);
     }
 
-    /// REQ-WL-002d: after a restart (fresh registry, no live lease), Close
-    /// rehydrates the sealed tmux identity, proves the original server
-    /// absent, persists that proof, and leaves the replacement untouched.
+    /// REQ-WL-002d: this fresh-registry fixture exercises the no-live-lease path
+    /// without restarting the runtime manager.
     #[tokio::test]
     async fn restarted_tmux_rehydration_persists_absence_proof_and_leaves_replacement_untouched() {
         let socket_dir = tempfile::tempdir().unwrap();
@@ -10205,12 +10344,41 @@ mod scope_liveness_tests {
             .retain(|(lease_attempt, _), _| lease_attempt != attempt_id.as_str());
         manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
 
+        let manager = Arc::new(manager);
         manager
             .retire_close_runtime_resources(attempt_id.clone())
             .await
             .unwrap();
 
-        assert_tmux_absence_proof(&manager, &attempt_id).await;
+        use phoenix_core::domain::close::{AbsenceBasis, RetiredResourceKind, RetirementOutcome};
+
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+        let proof = evidence
+            .iter()
+            .find(|entry| entry.resource.kind() == RetiredResourceKind::TmuxServer)
+            .expect("durable tmux evidence");
+        assert_eq!(
+            proof.outcome,
+            RetirementOutcome::AbsenceAdopted {
+                absence_basis: AbsenceBasis::VerifiedTmuxReplacement {
+                    replacement_token: uuid::Uuid::parse_str(&replacement_token).unwrap(),
+                },
+            },
+        );
+        assert!(!manager
+            .db()
+            .close_retirement_resource_was_dispatched(
+                &attempt_id,
+                &scope,
+                &proof.snapshot,
+                &proof.resource,
+            )
+            .await
+            .unwrap());
         let survivor = fake.server(&socket).unwrap();
         assert!(survivor.live, "replacement was retired");
         assert_eq!(survivor.token, Some(replacement_token));
@@ -10218,14 +10386,144 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn failed_pre_runtime_worktree_reinspection_persists_typed_residual() {
-        #![allow(clippy::too_many_lines)]
+    async fn restarted_missing_tmux_requires_exact_prior_dispatch() {
         use phoenix_core::domain::close::{
-            CapturedWorktreeIdentity, CloseAttemptId, CloseCompletionOutcome, ClosePhase,
-            CloseRunRef, RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
+            AbsenceBasis, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+            RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
         };
+        use phoenix_db::workflow::LocalAuthorityResult;
+        use phoenix_db::{CloseRetirementBatchDispatch, RecordCloseRetirementDispatchRequest};
 
-        let manager = test_manager().await;
+        for dispatched in [false, true] {
+            let socket_dir = tempfile::tempdir().unwrap();
+            let fake = phoenix_tools::tmux::fake_backend::FakeTmuxBackend::new();
+            let mut manager = test_manager().await;
+            manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
+            manager.clean_close_writer_fixture = true;
+            let (_repository, attempt_id, scope, socket_path, server_token) =
+                prepare_clean_close_with_tmux(
+                    &manager,
+                    "missing-tmux-close",
+                    "missing-tmux-attempt",
+                )
+                .await;
+            let snapshot = manager
+                .db()
+                .get_close_obligation(attempt_id.as_str())
+                .await
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .clone();
+            let identity = phoenix_tools::tmux::registry::TmuxServerInstanceIdentity {
+                socket_path: socket_path.clone(),
+                server_token,
+            };
+            let resource = RetiredResourceIdentity::parse(
+                RetiredResourceKind::TmuxServer,
+                LossItemIdentity::Opaque(
+                    OpaqueIdentity::parse(identity.stable_identity()).unwrap(),
+                ),
+            )
+            .unwrap();
+            if dispatched {
+                assert!(matches!(
+                    manager
+                        .db()
+                        .claim_generic_close_process_dispatches(&[
+                            RecordCloseRetirementDispatchRequest {
+                                attempt_id: attempt_id.clone(),
+                                scope: scope.clone(),
+                                snapshot: snapshot.clone(),
+                                resource: resource.clone(),
+                            },
+                        ])
+                        .await,
+                    LocalAuthorityResult::DurableFactEstablished(Ok(
+                        CloseRetirementBatchDispatch::First(_)
+                    ))
+                ));
+            }
+            fake.kill_server(&socket_path);
+            manager
+                .close_retirement_leases
+                .lock()
+                .await
+                .complete
+                .clear();
+            manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
+            let manager = Arc::new(manager);
+            let result = manager
+                .retire_close_runtime_resources(attempt_id.clone())
+                .await;
+            assert_eq!(result.is_ok(), dispatched, "{result:?}");
+            if dispatched {
+                let evidence = manager
+                    .db()
+                    .list_close_retirement_evidence(attempt_id.as_str())
+                    .await
+                    .unwrap();
+                let proof = evidence
+                    .iter()
+                    .find(|entry| entry.resource == resource)
+                    .unwrap();
+                assert_eq!(proof.snapshot, snapshot);
+                assert_eq!(
+                    proof.outcome,
+                    RetirementOutcome::AbsenceAdopted {
+                        absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+                    },
+                );
+            } else {
+                let evidence = manager
+                    .db()
+                    .list_close_retirement_evidence(attempt_id.as_str())
+                    .await
+                    .unwrap();
+                assert!(evidence.iter().all(|entry| entry.resource != resource
+                    || !matches!(
+                        entry.outcome,
+                        RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. }
+                    )));
+                let failures = manager
+                    .db()
+                    .list_close_cleanup_failures(attempt_id.as_str())
+                    .await
+                    .unwrap();
+                assert_eq!(failures.len(), 1);
+                assert_eq!(
+                    failures[0].occurrence.reason,
+                    RetirementFailureReason::IdentityNotProven
+                );
+                assert!(!manager
+                    .db()
+                    .close_retirement_resource_was_dispatched(
+                        &attempt_id,
+                        &scope,
+                        &snapshot,
+                        &resource
+                    )
+                    .await
+                    .unwrap());
+            }
+            assert_eq!(fake.kill_server_count(&socket_path), 0);
+        }
+    }
+
+    async fn prepare_generic_close_with_worktree(
+        conversation_id: &str,
+    ) -> (
+        Arc<RuntimeManager>,
+        tempfile::TempDir,
+        CloseAttemptId,
+        phoenix_core::domain::close::CloseAttemptScope,
+        phoenix_core::domain::close::WorktreeIdentity,
+    ) {
+        use phoenix_core::domain::close::CapturedWorktreeIdentity;
+
+        let mut manager = test_manager().await;
+        manager.clean_close_writer_fixture = true;
+        let manager = Arc::new(manager);
         let repository = tempfile::tempdir().unwrap();
         let git = |arguments: &[&str]| {
             let output = phoenix_core::git::command()
@@ -10248,14 +10546,16 @@ mod scope_liveness_tests {
         git(&["add", "tracked"]);
         git(&["commit", "--quiet", "-m", "initial"]);
 
-        let conversation_id = "failed-close-reinspection";
-        create_handleless_work_conv(
-            &manager,
-            conversation_id,
-            repository.path().to_str().unwrap(),
-            None,
-        )
-        .await;
+        let checkout = repository.path().join("linked-worktree");
+        git(&[
+            "worktree",
+            "add",
+            "--quiet",
+            "--detach",
+            checkout.to_str().unwrap(),
+        ]);
+        create_handleless_work_conv(&manager, conversation_id, checkout.to_str().unwrap(), None)
+            .await;
         sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
             .bind(conversation_id)
             .execute(manager.db().pool())
@@ -10266,7 +10566,7 @@ mod scope_liveness_tests {
             .get_conversation(conversation_id)
             .await
             .unwrap();
-        let attempt_id = CloseAttemptId::parse("failed-close-reinspection-attempt").unwrap();
+        let attempt_id = CloseAttemptId::parse(conversation_id).unwrap();
         manager
             .db()
             .begin_close_foundation(
@@ -10304,11 +10604,392 @@ mod scope_liveness_tests {
             .next()
             .unwrap();
         let CapturedWorktreeIdentity::Resolved(captured_worktree) =
-            captured.captured_worktree.unwrap()
+            captured.captured_worktree.clone().unwrap()
         else {
             panic!("test worktree identity must be resolved");
         };
 
+        (manager, repository, attempt_id, captured, captured_worktree)
+    }
+
+    #[tokio::test]
+    async fn stranded_generic_dispatch_cannot_reenter_original_worktree() {
+        use phoenix_core::domain::close::{
+            CloseCompletionOutcome, LossItemIdentity, RetiredResourceKind, RetirementFailureReason,
+            RetirementOutcome,
+        };
+
+        let (manager, _repository, attempt_id, captured, worktree) =
+            prepare_generic_close_with_worktree("stranded-generic-worktree-dispatch").await;
+        let obligation = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        let snapshot = obligation.snapshot().unwrap().clone();
+        manager
+            .capture_close_retirement_inventory(attempt_id.clone(), snapshot.clone())
+            .await
+            .unwrap();
+        let target = manager
+            .db()
+            .list_close_expected_retirement_resources(attempt_id.as_str())
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|target| target.resource.kind() == RetiredResourceKind::Worktree)
+            .unwrap();
+        assert_eq!(
+            target.resource.identity(),
+            &LossItemIdentity::Worktree(worktree.clone())
+        );
+        manager
+            .db()
+            .record_close_retirement_dispatch(crate::db::RecordCloseRetirementDispatchRequest {
+                attempt_id: attempt_id.clone(),
+                scope: captured.scope,
+                snapshot,
+                resource: target.resource.clone(),
+            })
+            .await
+            .unwrap();
+        let error = manager
+            .retire_close_runtime_resources(attempt_id.clone())
+            .await
+            .unwrap_err();
+        assert!(error.contains("refusing to replay the effect"));
+
+        let obligation = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            obligation.close_outcome(),
+            Some(CloseCompletionOutcome::ArchivedCleanupAttention)
+        );
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert!(evidence.iter().any(|item| {
+            item.resource == target.resource
+                && item.outcome
+                    == RetirementOutcome::Residual {
+                        residual_reason: RetirementFailureReason::ManualRepairRequired,
+                    }
+                && item
+                    .detail
+                    .as_deref()
+                    .is_some_and(|detail| detail.contains("refusing to replay"))
+        }));
+        let locator = worktree.locator().as_bytes();
+        #[cfg(unix)]
+        let checkout = {
+            use std::os::unix::ffi::OsStrExt;
+            std::path::Path::new(std::ffi::OsStr::from_bytes(locator))
+        };
+        #[cfg(not(unix))]
+        let checkout = std::path::Path::new(std::str::from_utf8(locator).unwrap());
+        assert!(checkout.join(".git").is_file());
+        assert_eq!(
+            std::fs::read(checkout.join("tracked")).unwrap(),
+            b"initial\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_close_owner_survives_waiter_drop_before_admission() {
+        use phoenix_core::domain::close::{CloseCompletionOutcome, TranscriptConversationId};
+
+        let manager = Arc::new(test_manager().await);
+        let id = "initial-close-detached-ingress";
+        manager
+            .db()
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let target = manager
+            .db()
+            .get_conversation(id)
+            .await
+            .unwrap()
+            .product_conversation_id;
+        let latest = TranscriptConversationId::parse(id).unwrap();
+        let attempt = CloseAttemptId::parse(id).unwrap();
+        let gate = manager.close_retirement_execution.lock(id).await;
+        let worker = manager
+            .start_generic_close_ingress(
+                attempt.clone(),
+                target,
+                latest,
+                close_retirement::GenericCloseIngress::Initial,
+            )
+            .unwrap();
+        drop(worker);
+        assert!(matches!(
+            manager.db().get_close_obligation(id).await,
+            Err(crate::db::DbError::CloseFoundationNotFound(_))
+        ));
+        assert_eq!(manager.fatal_authority_owner_count(), 1);
+        drop(gate);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            manager.fatal_local_authority_fence.wait_for_owners(),
+        )
+        .await
+        .expect("the detached ingress owner must settle and release authority");
+        let obligation = manager
+            .db()
+            .get_close_obligation(attempt.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            obligation.close_outcome(),
+            Some(CloseCompletionOutcome::Archived)
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_settlement_failure_is_classified_or_fences_authority() {
+        use crate::db::{CloseCleanupFailureAuthority, CloseCleanupResourceDisposition};
+        use phoenix_core::domain::close::{
+            CloseCompletionOutcome, ClosePhase, CloseRunRef, CloseRunStatus, RetiredResourceKind,
+            RetirementFailureReason, TranscriptConversationId,
+        };
+        use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
+
+        for (terminalization_available, work_mode) in [(true, false), (true, true), (false, true)] {
+            let manager = Arc::new(test_manager().await);
+            let id = "generic-settlement-write-failure";
+            let db = manager.db().clone();
+            let checkout = tempfile::tempdir().unwrap();
+            let scope = if work_mode {
+                let ResourceScopeKey::Work(scope) = create_handleless_work_conv(
+                    &manager,
+                    id,
+                    checkout.path().to_str().unwrap(),
+                    None,
+                )
+                .await
+                else {
+                    panic!("Work conversation must have a WorkScope");
+                };
+                sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
+                    .bind(id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                Some(scope)
+            } else {
+                db.create_conversation(id, id, "/tmp", true, None, None)
+                    .await
+                    .unwrap()
+                    .attached_work_scope_id
+            }
+            .expect("ordinary Close fixture owns a WorkScope in both Explore and Work modes");
+            let target = db
+                .get_conversation(id)
+                .await
+                .unwrap()
+                .product_conversation_id;
+            let attempt = CloseAttemptId::parse(id).unwrap();
+            let run = CloseRunRef::initial(attempt.clone());
+            sqlx::query(
+                "CREATE TRIGGER fail_settlement_handoff BEFORE UPDATE OF phase ON close_obligations
+                 WHEN OLD.phase = 'settling_active_work' AND NEW.phase = 'awaiting_retirement_inspection'
+                 BEGIN SELECT RAISE(ABORT, 'injected settlement handoff failure'); END",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            if !terminalization_available {
+                sqlx::query(
+                    "CREATE TRIGGER fail_settlement_terminalization BEFORE INSERT ON close_cleanup_failures
+                     BEGIN SELECT RAISE(ABORT, 'injected terminalization failure'); END",
+                )
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+
+            let result = manager
+                .start_generic_close_ingress(
+                    attempt.clone(),
+                    target,
+                    TranscriptConversationId::parse(id).unwrap(),
+                    close_retirement::GenericCloseIngress::Initial,
+                )
+                .unwrap()
+                .await
+                .unwrap();
+            assert!(
+                matches!(result, Err(close_retirement::GenericCloseIngressError::Worker(detail))
+                if detail.contains("injected settlement handoff failure")
+                    && (terminalization_available || detail.contains("injected terminalization failure")))
+            );
+            let obligation = db.get_close_obligation(id).await.unwrap();
+            assert!(!manager
+                .waiting_generic_close_owners
+                .lock()
+                .await
+                .contains_key(&attempt));
+            if terminalization_available {
+                assert!(!manager.fatal_local_authority_is_latched());
+            } else {
+                assert_eq!(obligation.phase(), ClosePhase::SettlingActiveWork);
+                assert_eq!(
+                    db.get_close_run(&run).await.unwrap().status,
+                    CloseRunStatus::Running
+                );
+                assert_eq!(
+                    manager.observed_local_authority_failure_boundary(),
+                    Some("generic_close_settlement_unclassified")
+                );
+                assert!(manager
+                    .start_generic_close_recheck(attempt.clone())
+                    .is_err());
+                sqlx::query("DROP TRIGGER fail_settlement_terminalization")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                assert_eq!(manager.fatal_authority_owner_count(), 0);
+                drop(manager);
+                let restarted = test_manager_with_db(db.clone());
+                restarted.restore_close_admission_fences().await.unwrap();
+                assert_eq!(
+                    crate::runtime::close_authority::observe_running_close_runs(&db, || restarted
+                        .kick_direct_turn_worker())
+                    .await
+                    .unwrap(),
+                    1
+                );
+                assert!(!restarted.fatal_local_authority_is_latched());
+                assert!(restarted
+                    .waiting_generic_close_owners
+                    .lock()
+                    .await
+                    .is_empty());
+            }
+            let obligation = db.get_close_obligation(id).await.unwrap();
+            assert_eq!(
+                obligation.close_outcome(),
+                Some(CloseCompletionOutcome::CloseIncomplete)
+            );
+            assert_eq!(
+                db.get_close_run(&run).await.unwrap().status,
+                CloseRunStatus::Stopped
+            );
+            assert!(obligation.snapshot().is_none());
+            let conversation = db.get_conversation(id).await.unwrap();
+            assert!(!conversation.archived);
+            let aggregate = db
+                .get_ordinary_product_conversation(&conversation.product_conversation_id)
+                .await
+                .unwrap();
+            assert_eq!(
+                aggregate.product_conversation.ordinary_lifecycle(),
+                Some(OrdinaryProductConversationLifecycle::Open)
+            );
+            let dispatches: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
+            )
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(dispatches, 0);
+            let failures = db.list_close_cleanup_failures(id).await.unwrap();
+            let [failure] = failures.as_slice() else {
+                panic!("expected exactly one failure, got {failures:?}");
+            };
+            assert_eq!(failure.run_ordinal, run.ordinal);
+            assert_eq!(
+                failure.occurrence.reason,
+                RetirementFailureReason::Interrupted
+            );
+            let events: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM coordinator_watch_events WHERE event_id = ?1",
+            )
+            .bind(&failure.occurrence.failure_occurrence_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(events, 1);
+            let CloseCleanupFailureAuthority::CapturedScope {
+                scope: failed_scope,
+                resource,
+            } = &failure.occurrence.authority
+            else {
+                panic!("expected captured WorkScope authority");
+            };
+            assert_eq!(failed_scope, &scope);
+            assert_eq!(resource.kind(), RetiredResourceKind::WorkScope);
+            let [child] = failure.occurrence.remaining_resources.as_slice() else {
+                panic!("expected the exact captured WorkScope child");
+            };
+            assert_eq!(child.scope, scope);
+            assert_eq!(&child.resource, resource);
+            assert_eq!(child.disposition, CloseCleanupResourceDisposition::Failed);
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_close_worker_survives_waiter_drop_and_serializes_reinspection() {
+        use phoenix_core::domain::close::{
+            CloseCompletionOutcome, RetiredResourceKind, RetirementOutcome,
+        };
+
+        let (manager, repository, attempt_id, _, _) =
+            prepare_generic_close_with_worktree("generic-close-worker-ownership").await;
+        let (resume, paused) = tokio::sync::oneshot::channel();
+        let worker = manager
+            .start_paused_generic_close_retirement(attempt_id.clone(), paused)
+            .await
+            .unwrap();
+        drop(worker);
+        assert!(manager
+            .close_retirement_execution
+            .try_lock(attempt_id.as_str())
+            .await
+            .is_none());
+        let mut competing_inspection = Box::pin(manager.wait_for_close_owner(&attempt_id));
+        assert!(futures::poll!(&mut competing_inspection).is_pending());
+        resume.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(60), competing_inspection)
+            .await
+            .expect("the admitted worker must persist its outcome and release ownership");
+        let obligation = manager
+            .db()
+            .get_close_obligation(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            obligation.close_outcome(),
+            Some(CloseCompletionOutcome::Archived)
+        );
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+        assert!(evidence.iter().any(|entry| {
+            entry.resource.kind() == RetiredResourceKind::Worktree
+                && entry.outcome == RetirementOutcome::Retired
+        }));
+        assert!(!repository.path().join("linked-worktree").exists());
+    }
+
+    #[tokio::test]
+    async fn failed_pre_runtime_worktree_reinspection_persists_typed_residual() {
+        use phoenix_core::domain::close::{
+            CloseCompletionOutcome, ClosePhase, CloseRunRef, RetiredResourceKind,
+            RetirementFailureReason, RetirementOutcome,
+        };
+
+        let (manager, repository, attempt_id, captured, captured_worktree) =
+            prepare_generic_close_with_worktree("failed-close-reinspection").await;
         std::fs::remove_dir_all(repository.path().join(".git")).unwrap();
         let error = manager
             .retire_close_runtime_resources(attempt_id.clone())
@@ -10368,9 +11049,7 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
-    async fn second_startup_worktree_scan_retires_top_level_fork_proposals() {
-        use crate::db::{ForkProposal, ForkProposalStatus};
-
+    async fn startup_obligation_recovery_leaves_unrelated_missing_worktree_alone() {
         let mgr = Arc::new(test_manager().await);
         mgr.start_sub_agent_handler().await;
         let root = tempfile::tempdir().unwrap();
@@ -10378,20 +11057,6 @@ mod scope_liveness_tests {
         let conversation_id = "missing-top-level-worktree";
         create_handleless_work_conv(&mgr, conversation_id, worktree_path.to_str().unwrap(), None)
             .await;
-        let proposal = ForkProposal {
-            id: "missing-worktree-proposal".to_string(),
-            origin_conversation_id: conversation_id.to_string(),
-            task_file: "tasks/12345-p1-ready--missing.md".to_string(),
-            title: "Missing".to_string(),
-            priority: "p1".to_string(),
-            body: "# Missing".to_string(),
-            status: ForkProposalStatus::Pending,
-            fork_conversation_id: None,
-            refinement_conversation_id: None,
-            created_at: chrono::Utc::now(),
-            resolved_at: None,
-        };
-        mgr.db().insert_fork_proposal(&proposal).await.unwrap();
         assert!(mgr
             .db()
             .list_startup_parent_actions()
@@ -10401,7 +11066,7 @@ mod scope_liveness_tests {
 
         mgr.reconcile_startup_obligated_parents().await.unwrap();
 
-        assert!(matches!(
+        assert!(!matches!(
             mgr.db()
                 .get_conversation(conversation_id)
                 .await
@@ -10409,15 +11074,6 @@ mod scope_liveness_tests {
                 .state,
             ConvState::Terminal
         ));
-        assert_eq!(
-            mgr.db()
-                .get_fork_proposal(&proposal.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .status,
-            ForkProposalStatus::Dismissed
-        );
     }
 
     fn stale_creation_event() -> Event {
@@ -11233,39 +11889,6 @@ mod scope_liveness_tests {
                 .len(),
             1
         );
-    }
-
-    #[tokio::test]
-    async fn admitted_task_handoff_persists_creation_job_before_authority_closes() {
-        let manager = Arc::new(test_manager().await);
-        create_handleless_work_conv(&manager, "handoff-parent", "/tmp", None).await;
-        let mut authority = manager.acquire_local_authority_pass().unwrap();
-        let approval = TaskApprovalHandoffData {
-            task_id: "12345".to_string(),
-            task_title: "Inherited handoff".to_string(),
-            title: "Inherited handoff".to_string(),
-            priority: crate::task_source::Priority::P1,
-            plan: "Do the work".to_string(),
-            task_file: "tasks/12345-p1-ready--inherited-handoff.md".to_string(),
-            artifact_body: "# Inherited handoff\n\nDo the work\n".to_string(),
-        };
-        let response = manager
-            .create_and_start_task_handoff("handoff-parent", &approval, &mut authority)
-            .await
-            .unwrap();
-        manager.signal_fatal_local_authority("test_handoff_after_commit");
-        let successor = manager
-            .db()
-            .get_conversation(&response.successor_conv_id)
-            .await
-            .unwrap();
-        assert!(matches!(successor.state, ConvState::Provisioning { .. }));
-        assert!(manager
-            .db()
-            .get_conversation_creation_job_for_conversation(&successor.id)
-            .await
-            .unwrap()
-            .is_some());
     }
 
     fn cancellation_boundary_spec(agent_id: &str) -> SubAgentSpec {

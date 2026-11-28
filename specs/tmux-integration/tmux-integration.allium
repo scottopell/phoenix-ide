@@ -9,7 +9,7 @@
 --
 -- Includes: socket-path scoping via `-S <absolute-path>`, lazy server spawn,
 --           stale-socket detection (silent recreate, no breadcrumb),
---           hard-delete cascade, raw tool pass-through invocation,
+--           owner-lifecycle resource retirement, raw tool pass-through invocation,
 --           tmux_run inspectable command invocation, terminal
 --           attach fallback to direct PTY when tmux is absent.
 -- Excludes:
@@ -614,13 +614,15 @@ rule UserOpensTerminalWithoutTmux {
 }
 
 ------------------------------------------------------------
--- Rules — hard-delete cascade and soft-state no-ops
+-- Rules — legacy archive cleanup and soft-state no-ops
 ------------------------------------------------------------
 
--- REQ-TMUX-007, REQ-TMUX-WS-002: conversation hard-delete cascades to the
--- tmux server. The orchestrator resolves the deleted conversation's WorkScope
--- and passes a preservation signal `inheritor_scope` — Some(work_scope) iff a
--- live conversation OTHER THAN the deleted one resolves to that scope
+-- REQ-TMUX-008, REQ-TMUX-WS-002: the retained legacy archive cleanup path
+-- cleans up the tmux server. Aggregate Close is governed by
+-- specs/work-lifecycle/requirements.md REQ-WL-002b, not this row-level rule.
+-- The orchestrator resolves the cleaned conversation's WorkScope and passes a
+-- preservation signal `inheritor_scope` — Some(work_scope) iff a
+-- live conversation OTHER THAN the cleaned one resolves to that scope
 -- (a continuation that inherits it, or a live sibling such as a Work-mode
 -- sub-agent sharing its parent's scope), None otherwise. A live conversation
 -- is one that is BOTH non-terminal in state AND not archived, determined from
@@ -631,12 +633,12 @@ rule UserOpensTerminalWithoutTmux {
 -- archived conversation does not count as a live owner even while its state row
 -- still reads non-terminal, because archiving a chain archives earlier members
 -- before the leaf's cascade runs. The
--- deleted conversation is excluded from that enumeration: the cascade runs
+-- cleaned conversation is excluded from that enumeration: archive cleanup runs
 -- before its terminal-state write, so it still reads non-terminal, and
 -- excluding it is what makes teardown reachable when it is the last live
 -- owner. Tear down only when the signal is absent — kill, unlink, and drop the
 -- entry.
-rule ServerKilledByConversationDelete {
+rule ServerKilledOnOwnerRetirement {
     when: CleanupCascadeRunFor(conversation, inheritor_scope)
 
     let work_scope = resolve_work_scope(conversation)
@@ -651,8 +653,8 @@ rule ServerKilledByConversationDelete {
     ensures: not exists TmuxServer{work_scope_id: attached_work_scope_id(conversation)}
 
     @guidance
-        -- Runs synchronously in the conversation hard-delete handler,
-        -- alongside the bash handle cascade (specs/bash/REQ-BASH-006).
+        -- Runs synchronously in the legacy archive cleanup operation,
+        -- alongside cleanup of other resources in that WorkScope.
         -- Failures of `kill-server` (e.g., server already dead, socket
         -- file already gone) are not errors; the post-condition (file
         -- gone, registry empty) is what matters. tmux kill-server is a
@@ -663,9 +665,9 @@ rule ServerKilledByConversationDelete {
 }
 
 -- REQ-TMUX-WS-002: when the scope is still owned by a live conversation other
--- than the one being deleted — a continuation that inherits it, or a live
--- sibling such as a Work-mode sub-agent sharing its parent's scope — the
--- hard-delete leaves the tmux server, its socket file, AND the shared registry
+-- than the cleaned row — a continuation that inherits it, or a live
+-- sibling such as a Work-mode sub-agent sharing its parent's scope — legacy
+-- archive cleanup leaves the tmux server, its socket file, AND the shared registry
 -- entry intact for the surviving owner to use.
 rule ServerPreservedForLiveOwner {
     when: CleanupCascadeRunFor(conversation, inheritor_scope)
@@ -698,8 +700,7 @@ rule ServerPreservedForLiveOwner {
 -- listens to a non-existent event was previously a dangling reference.
 -- The contract that "tmux servers survive archive/close-tab" is
 -- enforced structurally by the absence of any rule that destroys a
--- TmuxServer except ServerKilledByConversationDelete (which fires on
--- ConversationHardDeleted only). The requirements text REQ-TMUX-008
+-- TmuxServer except ServerKilledOnOwnerRetirement. The requirements text REQ-TMUX-008
 -- documents the intent for human readers.
 
 ------------------------------------------------------------
@@ -719,7 +720,6 @@ invariant OneServerPerWorkScope {
         count(TmuxServer{work_scope_id: server.work_scope_id, status: live}) <= 1
 }
 
--- REQ-TMUX-007
 invariant LiveServerHasSocketPath {
     for s in TmuxServer where s.status = live:
         s.socket_path != ""
@@ -854,7 +854,7 @@ deferred TmuxSocketRelocation    -- see: src/tools/tmux/registry.rs
 --   - Socket dir at ~/.phoenix-ide/tmux-sockets/, explicit naming for
 --     discoverability.
 --   - Lazy spawn on first operation; default session name `main`.
---   - Lifetime until conversation hard-delete.
+--   - Lifetime until owner lifecycle retirement.
 --   - Survives Phoenix restart; stale-socket detection on system reboot,
 --     silent recreate (no breadcrumb).
 --   - In-app terminal auto-attaches when tmux available; falls back to

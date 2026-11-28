@@ -50,7 +50,7 @@ impl From<GitOpError> for GitStartError {
     fn from(value: GitOpError) -> Self {
         match value {
             GitOpError::BranchNotFound(branch) => Self::BranchNotFound(branch),
-            GitOpError::Git(message) | GitOpError::Io(message) => Self::Git(message),
+            GitOpError::Git(message) => Self::Git(message),
         }
     }
 }

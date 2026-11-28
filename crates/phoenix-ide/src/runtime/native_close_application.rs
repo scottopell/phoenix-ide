@@ -129,6 +129,45 @@ fn command_from_executing_source(
     .map_err(|_| invalid)
 }
 
+pub(crate) struct NativeCloseInitialControlRequest {
+    pub route: phoenix_db::native_close::NativeCloseInitialControlRoute,
+    pub action: phoenix_db::native_close::NativeCloseInitialControl,
+    pub response: tokio::sync::oneshot::Sender<Result<(), NativeCloseApplicationError>>,
+}
+
+impl super::RuntimeManager {
+    pub(crate) async fn control_native_close_initial(
+        &self,
+        route: phoenix_db::native_close::NativeCloseInitialControlRoute,
+        action: phoenix_db::native_close::NativeCloseInitialControl,
+    ) -> Result<(), NativeCloseApplicationError> {
+        let handle = self
+            .runtimes
+            .read()
+            .await
+            .get(route.source_transcript_id().as_str())
+            .cloned()
+            .ok_or(NativeCloseApplicationError::Unavailable)?;
+        let (response, reply) = tokio::sync::oneshot::channel();
+        handle
+            .acknowledged_event_tx
+            .send(
+                super::AcknowledgedRuntimeRequest::ControlNativeCloseInitial(Box::new(
+                    NativeCloseInitialControlRequest {
+                        route,
+                        action,
+                        response,
+                    },
+                )),
+            )
+            .await
+            .map_err(|_| NativeCloseApplicationError::Unavailable)?;
+        reply
+            .await
+            .map_err(|_| NativeCloseApplicationError::Unavailable)?
+    }
+}
+
 /// Owned queue envelope: neither caller cancellation nor a dropped reply can
 /// release the target gate or abandon a started database transaction.
 /// The source actor never acquires this gate and never calls another actor.

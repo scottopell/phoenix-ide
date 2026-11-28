@@ -49,7 +49,6 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
   const originalListModels = api.listModels;
   const originalGetSystemPrompt = api.getSystemPrompt;
   const originalGetWorkScopeInventory = api.getWorkScopeInventory;
-  const originalListForkProposals = api.listForkProposals;
   const originalReconcileAcceptedMessages = api.reconcileAcceptedMessages;
   const originalUploadAttachments = api.uploadAttachments;
   const originalContinueConversation = api.continueConversation;
@@ -268,7 +267,6 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     tmux: null,
     browser: null,
   });
-  api.listForkProposals = async () => [];
   api.reconcileAcceptedMessages = async (_conversationId, messageIds) => ({
     conversation_idle: false,
     entries: messageIds.map((messageId) => ({
@@ -728,7 +726,6 @@ export function installProductConversationFixtureApi(scenario: ProductConversati
     api.listModels = originalListModels;
     api.getSystemPrompt = originalGetSystemPrompt;
     api.getWorkScopeInventory = originalGetWorkScopeInventory;
-    api.listForkProposals = originalListForkProposals;
     api.reconcileAcceptedMessages = originalReconcileAcceptedMessages;
     api.continueConversation = originalContinueConversation;
     api.retryContinuationOpening = originalRetryContinuationOpening;

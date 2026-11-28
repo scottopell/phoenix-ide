@@ -11,17 +11,24 @@ use phoenix_core::work_scope::WorkScopeId;
 use sqlx::{Row, Sqlite, Transaction};
 use uuid::Uuid;
 
-use super::{NativeCloseCommand, NativeCloseIntent};
-use crate::close_foundation::ensure_close_retirement_loss_free_tx;
+use super::{
+    CloseTargetControlResolution, NativeCloseCommand, NativeCloseInitialControl,
+    NativeCloseInitialControlRoute, NativeCloseIntent,
+};
+use crate::close_foundation::{
+    ensure_close_retirement_loss_free_tx, require_control_target_latest_tx,
+    require_exact_live_settlement_target_tx, CloseProcessDispatchCoverage,
+    SealedCloseProcessDispatchBatch,
+};
 use crate::workflow::LocalAuthorityResult;
 use crate::{
     BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     CaptureCloseRetirementInventoryRequest, CloseCleanupFailureAuthority,
-    CloseCleanupFailureResource, CloseCleanupResourceDisposition, Database, DbError, DbResult,
-    RecordCloseRetirementDispatchRequest, RecordCloseRetirementEvidenceRequest,
-    RecordCloseWorktreeCleanupPlanRequest, ReplaceCloseInspectionRequest,
-    TerminalizeInitialCloseCleanupFailureRequest, WorkScopeRetirementBlocker,
-    WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
+    CloseCleanupFailureResource, CloseCleanupResourceDisposition, CloseRetirementBatchDispatch,
+    CloseRetirementDispatch, Database, DbError, DbResult, RecordCloseRetirementDispatchRequest,
+    RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
+    ReplaceCloseInspectionRequest, TerminalizeInitialCloseCleanupFailureRequest,
+    WorkScopeRetirementBlocker, WorkScopeRetirementOutcome, WorkScopeRetirementPrecondition,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +56,20 @@ pub enum NativeCloseInitialResult {
 pub struct NativeCloseInitialExecution {
     pub run: NativeCloseRunRef,
     pub phase: phoenix_core::domain::close::ClosePhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeCloseInitialTurnDispatch<Reservation> {
+    Reserved(Reservation),
+    Backpressure,
+    NoLiveActor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeCloseInitialTurnDispatchResult<Reservation> {
+    Reserved(Reservation),
+    Backpressure,
+    Released,
 }
 
 /// One source-owned settlement step, not a terminal Close result.
@@ -277,7 +298,7 @@ enum InitialWorktreeMetadata {
     TombstoneObject(BindCloseWorktreeFinalTombstoneObjectRequest),
 }
 
-async fn require_initial_original_dispatch_tx(
+async fn require_initial_original_resource_tx(
     tx: &mut Transaction<'_, Sqlite>,
     admitted: &NativeCloseRunRef,
     scope: &WorkScopeId,
@@ -332,6 +353,18 @@ async fn require_initial_original_dispatch_tx(
             "initial metadata resource is not in the exact original inventory".into(),
         ));
     }
+    Ok(expected)
+}
+
+async fn require_initial_original_dispatch_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    admitted: &NativeCloseRunRef,
+    scope: &WorkScopeId,
+    snapshot: &phoenix_core::domain::close::CloseRetirementSnapshot,
+    resource: &RetiredResourceIdentity,
+) -> DbResult<Vec<CloseExpectedRetirementResource>> {
+    let expected =
+        require_initial_original_resource_tx(tx, admitted, scope, snapshot, resource).await?;
     let identity = resource.identity();
     let dispatched: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches
@@ -380,39 +413,182 @@ async fn validate_initial_worktree_entry_tx(
         ));
     }
     require_initial_original_dispatch_tx(tx, &admitted, scope, snapshot, resource).await?;
-    let identity = resource.identity();
-    let already_proven: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_history
-         WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
-           AND inspection_fingerprint = ?4 AND resource_kind = ?5
-           AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
-           AND proof_kind IN ('retired', 'absence_adopted'))
-         OR EXISTS(SELECT 1 FROM close_retirement_resources
-         WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
-           AND inspection_fingerprint = ?4 AND resource_kind = ?5
-           AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
-           AND proof_kind IN ('retired', 'absence_adopted'))",
+    Database::require_original_worktree_unsettled_tx(
+        tx,
+        &admitted.attempt_id,
+        scope,
+        snapshot,
+        resource,
     )
-    .bind(admitted.attempt_id.as_str())
-    .bind(scope.as_str())
-    .bind(snapshot.generation())
-    .bind(snapshot.fingerprint())
-    .bind(resource.kind().as_str())
-    .bind(identity.identity_kind())
-    .bind(identity.codec())
-    .bind(identity.value())
-    .fetch_one(&mut **tx)
-    .await?;
-    if already_proven {
-        return Err(DbError::CloseFoundationPrecondition(
-            "initial worktree entry refuses an exact resource with positive retirement evidence"
-                .into(),
-        ));
-    }
-    Ok(())
+    .await
 }
 
 impl Database {
+    /// Resolves control routing for the exact Close attempt and latest target transcript.
+    ///
+    /// # Errors
+    /// Returns an error for a stale target or if the retained routing state cannot be read.
+    pub async fn resolve_close_target_control(
+        &self,
+        target: &ProductConversationId,
+        target_latest: &TranscriptConversationId,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseTargetControlResolution> {
+        let mut tx = self.pool.begin().await?;
+        require_control_target_latest_tx(&mut tx, target, target_latest).await?;
+        let row = sqlx::query(
+            "SELECT receipt.source_transcript_id, receipt.source_message_id, receipt.source_tool_use_id,
+                    obligation.phase
+             FROM native_close_initial_receipts receipt
+             JOIN close_obligations obligation ON obligation.attempt_id = receipt.attempt_id
+             JOIN close_runs run ON run.attempt_id = receipt.attempt_id AND run.run_ordinal = receipt.run_ordinal
+             WHERE receipt.product_conversation_id = ?1
+               AND receipt.attempt_id = ?2
+               AND receipt.intent = 'initial' AND receipt.run_ordinal = 1
+               AND obligation.native_managed = 1
+               AND obligation.phase IN ('awaiting_stop_work_confirmation', 'settling_active_work')
+               AND obligation.chronology_ordinal = (
+                   SELECT MAX(current.chronology_ordinal) FROM close_obligations current
+                   WHERE current.product_conversation_id = obligation.product_conversation_id
+               )
+               AND run.status = 'running'
+               AND run.run_ordinal = (SELECT MAX(latest.run_ordinal) FROM close_runs latest WHERE latest.attempt_id = run.attempt_id)",
+        )
+        .bind(target.as_str())
+        .bind(attempt_id.as_str())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            Database::require_generic_close_settlement_tx(
+                &mut tx,
+                attempt_id.as_str(),
+                target.as_str(),
+            )
+            .await?;
+            tx.commit().await?;
+            return Ok(CloseTargetControlResolution::Generic);
+        };
+        tx.commit().await?;
+        let phase = row.try_get::<&str, _>("phase")?;
+        match ClosePhase::from_db_str(phase) {
+            Some(ClosePhase::SettlingActiveWork) => {
+                Ok(CloseTargetControlResolution::NativeInitialSettlementInProgress)
+            }
+            Some(ClosePhase::AwaitingStopWorkConfirmation) => {
+                let route = NativeCloseInitialControlRoute {
+                    target: target.clone(),
+                    target_latest: target_latest.clone(),
+                    attempt_id: attempt_id.clone(),
+                    run_ordinal: CloseRunOrdinal::INITIAL,
+                    source_transcript_id: TranscriptConversationId::parse(
+                        row.try_get::<String, _>("source_transcript_id")?,
+                    )
+                    .map_err(|error| DbError::Serialization(error.to_string()))?,
+                    source_message_id: row.try_get("source_message_id")?,
+                    source_tool_use_id: row.try_get("source_tool_use_id")?,
+                };
+                Ok(CloseTargetControlResolution::ParkedNativeInitial(route))
+            }
+            _ => Err(DbError::Serialization(format!(
+                "unexpected Close control phase: {phase}"
+            ))),
+        }
+    }
+
+    pub async fn apply_native_initial_close_control(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        route: &NativeCloseInitialControlRoute,
+        control: NativeCloseInitialControl,
+    ) -> LocalAuthorityResult<DbResult<CloseObligation>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let (admitted, _) = require_initial_execution_tx(
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                ClosePhase::AwaitingStopWorkConfirmation,
+            )
+            .await?;
+            if route.target != admitted.target
+                || route.attempt_id != admitted.attempt_id
+                || route.run_ordinal != admitted.run_ordinal
+                || route.source_transcript_id.as_str() != command.source_transcript_id()
+                || route.source_message_id != command.source().message_id
+                || route.source_tool_use_id != command.source().tool_use_id
+            {
+                return Err(DbError::CloseFoundationPrecondition("native initial control route is stale or mismatched".into()));
+            }
+            require_control_target_latest_tx(&mut tx, &route.target, &route.target_latest).await?;
+            let latest_attempt: String = sqlx::query_scalar(
+                "SELECT attempt_id FROM close_obligations WHERE product_conversation_id = ?1
+                 ORDER BY chronology_ordinal DESC LIMIT 1",
+            ).bind(route.target.as_str()).fetch_one(&mut *tx).await?;
+            if latest_attempt != route.attempt_id.as_str() {
+                return Err(DbError::CloseFoundationPrecondition("native initial control no longer addresses the latest Close attempt".into()));
+            }
+            let obligation = crate::close_foundation::close_obligation_for_update(
+                &mut tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await?;
+            match control {
+                NativeCloseInitialControl::ConfirmStopWork => {
+                    Database::begin_close_active_work_settlement_tx(
+                        &mut tx,
+                        admitted.attempt_id.as_str(),
+                        &obligation,
+                    )
+                    .await?;
+                }
+                NativeCloseInitialControl::Cancel => {
+                    if obligation.phase() != ClosePhase::AwaitingStopWorkConfirmation {
+                        return Err(DbError::CloseFoundationPrecondition("native Initial cancellation requires awaiting_stop_work_confirmation".into()));
+                    }
+                    ensure_native_initial_cancel_unencumbered_tx(
+                        &mut tx,
+                        admitted.attempt_id.as_str(),
+                    )
+                    .await?;
+                    let now = chrono::Utc::now();
+                    let updated = sqlx::query(
+                        "UPDATE close_obligations SET phase = 'completed', close_outcome = 'cancelled',
+                             completed_at = ?2, updated_at = ?2
+                         WHERE attempt_id = ?1 AND phase = 'awaiting_stop_work_confirmation' AND native_managed = 1",
+                    )
+                    .bind(admitted.attempt_id.as_str())
+                    .bind(now.to_rfc3339())
+                    .execute(&mut *tx)
+                    .await?;
+                    if updated.rows_affected() != 1 {
+                        return Err(DbError::CloseFoundationPrecondition("native Initial cancellation lost its current obligation".into()));
+                    }
+                }
+            }
+            crate::close_foundation::close_obligation_for_update(
+                &mut tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await
+        }.await;
+        match result {
+            Ok(obligation) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(obligation)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
     /// Runs a bounded synchronous real first-effect callback under the same live and
     /// durable source, exact-run, original-dispatch, exact-resource and not-completed
     /// validation as `enter_native_close_initial_worktree_resource`.
@@ -862,7 +1038,7 @@ impl Database {
                     "initial WorkScope retirement requires its exact opaque scope identity".into(),
                 ));
             }
-            let expected = require_initial_original_dispatch_tx(
+            let expected = require_initial_original_resource_tx(
                 &mut tx, &admitted, &scope, &snapshot, &resource,
             )
             .await?;
@@ -909,6 +1085,18 @@ impl Database {
                     WorkScopeRetirementBlocker::CoordinatorOwned,
                 ));
             }
+            // WorkScope retirement and its proof are SQL-only. The dispatch
+            // must not commit independently of that mutation and proof.
+            Self::insert_close_retirement_dispatch_tx(
+                &mut tx,
+                &RecordCloseRetirementDispatchRequest {
+                    attempt_id: admitted.attempt_id.clone(),
+                    scope: scope.clone(),
+                    snapshot: snapshot.clone(),
+                    resource: resource.clone(),
+                },
+            )
+            .await?;
             let outcome = Database::retire_work_scope_lifecycle_tx(
                 &mut tx,
                 precondition,
@@ -1097,7 +1285,7 @@ impl Database {
         receipt: &NativeCloseReceipt,
         live_source: &phoenix_core::domain::sm_state::ConvState,
         request: RecordCloseRetirementDispatchRequest,
-    ) -> LocalAuthorityResult<DbResult<()>> {
+    ) -> LocalAuthorityResult<DbResult<CloseRetirementDispatch>> {
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
@@ -1162,8 +1350,8 @@ impl Database {
         }
         .await;
         match result {
-            Ok(()) => match tx.commit().await {
-                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(())),
+            Ok(dispatch) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(dispatch)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
             },
             Err(error) => match tx.rollback().await {
@@ -1171,6 +1359,52 @@ impl Database {
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
             },
         }
+    }
+
+    /// Claims a process-kind batch together. If any member is already dispatched,
+    /// roll back the entire batch instead of stranding new claims without an owner.
+    pub async fn record_native_close_initial_process_dispatches(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        requests: &[RecordCloseRetirementDispatchRequest],
+    ) -> LocalAuthorityResult<DbResult<CloseRetirementBatchDispatch>> {
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let (admitted, _) = require_initial_execution_tx(
+                &mut tx,
+                command,
+                receipt,
+                live_source,
+                ClosePhase::RetirementRequested,
+            )
+            .await?;
+            let Some(first) = requests.first() else {
+                return Err(DbError::CloseFoundationPrecondition(
+                    "initial process dispatch requires a nonempty batch".into(),
+                ));
+            };
+            let expected = require_initial_original_resource_tx(
+                &mut tx,
+                &admitted,
+                &first.scope,
+                &first.snapshot,
+                &first.resource,
+            )
+            .await?;
+            let batch = SealedCloseProcessDispatchBatch::validate(
+                requests,
+                &expected,
+                CloseProcessDispatchCoverage::EntireKind,
+            )?;
+            Self::insert_close_process_dispatch_batch_tx(&mut tx, batch).await
+        }
+        .await;
+        Self::release_close_process_dispatch_batch(tx, result).await
     }
 
     /// Records process teardown success only under the exact source-owned initial authority.
@@ -1944,6 +2178,170 @@ impl Database {
         }
     }
 
+    /// Cancels captured participant creation work, reconciles released direct turns,
+    /// and returns the exact remaining settlement targets under the source fence.
+    pub async fn prepare_native_close_initial_settlement_dispatch(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+    ) -> LocalAuthorityResult<DbResult<Vec<crate::CloseDirectTurnSettlementTarget>>> {
+        let workflow = self.workflow_repository();
+        let mut tx = match workflow.begin_immediate_tx().await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        };
+        let result = async {
+            let admitted = require_initial_settlement_dispatch_tx(
+                &mut tx.tx, command, receipt, live_source,
+            )
+            .await?;
+            let creation_ids: Vec<String> = sqlx::query_scalar(
+                "SELECT participant.id
+                 FROM close_attempt_participants captured
+                 JOIN conversations participant ON participant.id = captured.conversation_id
+                 JOIN conversation_creation_jobs creation ON creation.conversation_id = participant.id
+                 WHERE captured.attempt_id = ?1 AND captured.settlement_state = 'live'
+                   AND participant.state_kind = 'provisioning'
+                   AND creation.status IN ('accepted', 'claimed', 'retry_scheduled')
+                 ORDER BY participant.id",
+            )
+            .bind(admitted.attempt_id.as_str())
+            .fetch_all(&mut *tx.tx)
+            .await?;
+            for conversation_id in creation_ids {
+                Database::cancel_conversation_creation_tx(
+                    &mut tx.tx,
+                    &conversation_id,
+                    chrono::Utc::now(),
+                )
+                .await?;
+            }
+            Database::reconcile_close_direct_turn_settlement_receipts_tx(
+                &mut tx.tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await?;
+            Database::list_unsettled_close_direct_turn_settlement_targets_tx(
+                &mut tx.tx,
+                admitted.attempt_id.as_str(),
+            )
+            .await
+        }
+        .await;
+        match result {
+            Ok(targets) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(targets)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    /// Validates one captured direct-turn target before reserving mailbox capacity.
+    /// The callback must not enqueue a command; the reservation is returned only
+    /// after a classified commit.
+    pub async fn dispatch_native_close_initial_settlement_turn<Reservation>(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        target: &crate::CloseDirectTurnSettlementTarget,
+        reserve: impl FnOnce() -> NativeCloseInitialTurnDispatch<Reservation>,
+    ) -> LocalAuthorityResult<DbResult<NativeCloseInitialTurnDispatchResult<Reservation>>> {
+        let workflow = self.workflow_repository();
+        let mut tx = match workflow.begin_immediate_tx().await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error)),
+        };
+        let result = async {
+            let admitted =
+                require_initial_settlement_dispatch_tx(&mut tx.tx, command, receipt, live_source)
+                    .await?;
+            let Some(live_target) =
+                require_exact_live_settlement_target_tx(&mut tx, &admitted.attempt_id, target)
+                    .await?
+            else {
+                return Ok(NativeCloseInitialTurnDispatchResult::Released);
+            };
+            match reserve() {
+                NativeCloseInitialTurnDispatch::Reserved(reservation) => {
+                    Ok(NativeCloseInitialTurnDispatchResult::Reserved(reservation))
+                }
+                NativeCloseInitialTurnDispatch::Backpressure => {
+                    Ok(NativeCloseInitialTurnDispatchResult::Backpressure)
+                }
+                NativeCloseInitialTurnDispatch::NoLiveActor => {
+                    live_target.cancel_without_actor(&workflow).await?;
+                    Ok(NativeCloseInitialTurnDispatchResult::Released)
+                }
+            }
+        }
+        .await;
+        match result {
+            Ok(result) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(result)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        }
+    }
+
+    /// Claims one exact captured direct-turn target before entering its stop path.
+    /// The entry callback runs under the transaction after authority validation and
+    /// before the durable one-shot claim is inserted. A returned lease is retained
+    /// even when transaction release is unclassified.
+    pub async fn claim_native_close_initial_settlement_stop<L>(
+        &self,
+        command: &NativeCloseCommand,
+        receipt: &NativeCloseReceipt,
+        live_source: &phoenix_core::domain::sm_state::ConvState,
+        target: &crate::CloseDirectTurnSettlementTarget,
+        enter: impl FnOnce() -> DbResult<L>,
+    ) -> (LocalAuthorityResult<DbResult<bool>>, Option<L>) {
+        let workflow = self.workflow_repository();
+        let mut tx = match workflow.begin_immediate_tx().await {
+            Ok(tx) => tx,
+            Err(error) => {
+                return (
+                    LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                    None,
+                );
+            }
+        };
+        let mut lease = None;
+        let result = async {
+            let admitted =
+                require_initial_settlement_dispatch_tx(&mut tx.tx, command, receipt, live_source)
+                    .await?;
+            let Some(live_target) =
+                require_exact_live_settlement_target_tx(&mut tx, &admitted.attempt_id, target)
+                    .await?
+            else {
+                return Ok(false);
+            };
+            live_target.claim_stop(enter, &mut lease).await
+        }
+        .await;
+        let authority = match result {
+            Ok(claimed) => match tx.commit().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(claimed)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+            Err(error) => match tx.rollback().await {
+                Ok(()) => LocalAuthorityResult::DurableFactEstablished(Err(error)),
+                Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+            },
+        };
+        (authority, lease)
+    }
+
     /// Prepares execution of the one exact newly admitted initial run.
     ///
     /// `live_source` must be the trusted source snapshot held by the source actor;
@@ -2069,15 +2467,31 @@ impl Database {
     /// An unclassified commit/rollback is NOT a refusal or a successful receipt:
     /// the source owner must enter its existing fatal-authority path. A cancelled
     /// caller must not release transferred actor/admission ownership prematurely.
+    ///
+    /// # Panics
+    /// Panics if a freshly generated UUID is not a valid Close attempt identifier.
     pub async fn apply_native_close_initial(
         &self,
         command: &NativeCloseCommand,
+    ) -> LocalAuthorityResult<DbResult<NativeCloseInitialResult>> {
+        let attempt =
+            CloseAttemptId::parse(Uuid::new_v4().to_string()).expect("UUID is an attempt ID");
+        self.apply_native_close_initial_for_attempt(command, &attempt)
+            .await
+    }
+
+    /// Admits a source-bound Initial Close with its proposed fresh attempt ID.
+    /// Exact replay and existing operations never adopt the proposed ID.
+    pub async fn apply_native_close_initial_for_attempt(
+        &self,
+        command: &NativeCloseCommand,
+        attempt: &CloseAttemptId,
     ) -> LocalAuthorityResult<DbResult<NativeCloseInitialResult>> {
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
-        match apply_initial_tx(&mut tx, command).await {
+        match apply_initial_tx(&mut tx, command, attempt).await {
             Ok(result) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(result)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
@@ -2096,7 +2510,7 @@ async fn prepare_initial_execution_tx(
     receipt: &NativeCloseReceipt,
     live_source: &phoenix_core::domain::sm_state::ConvState,
 ) -> DbResult<NativeCloseInitialExecution> {
-    let (admitted, busy) = require_initial_execution_tx(
+    let (admitted, _) = require_initial_execution_tx(
         tx,
         command,
         receipt,
@@ -2104,21 +2518,8 @@ async fn prepare_initial_execution_tx(
         phoenix_core::domain::close::ClosePhase::AwaitingBlockerResolution,
     )
     .await?;
-    let next_phase = if busy {
-        phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation
-    } else {
-        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-    };
-    super::super::close_foundation::set_close_phase_tx(
-        tx,
-        admitted.attempt_id.as_str(),
-        next_phase,
-    )
-    .await?;
-    if !busy {
-        Database::capture_close_direct_turn_settlement_targets_tx(tx, admitted.attempt_id.as_str())
-            .await?;
-    }
+    let next_phase =
+        Database::prepare_close_initial_settlement_tx(tx, admitted.attempt_id.as_str()).await?;
     Ok(NativeCloseInitialExecution {
         run: admitted,
         phase: next_phase,
@@ -2193,6 +2594,72 @@ pub(super) async fn require_initial_identity_tx(
     Ok(admitted)
 }
 
+async fn ensure_native_initial_cancel_unencumbered_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    attempt_id: &str,
+) -> DbResult<()> {
+    let encumbered: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM close_attempt_direct_turn_settlement_captures WHERE attempt_id = ?1)
+          OR EXISTS(SELECT 1 FROM close_retirement_inspections WHERE attempt_id = ?1)
+          OR EXISTS(SELECT 1 FROM close_retirement_inventories WHERE attempt_id = ?1)
+          OR EXISTS(SELECT 1 FROM close_retirement_losses WHERE attempt_id = ?1)
+          OR EXISTS(SELECT 1 FROM close_expected_retirement_resources WHERE attempt_id = ?1)
+          OR EXISTS(SELECT 1 FROM close_retirement_resources WHERE attempt_id = ?1)
+          OR EXISTS(SELECT 1 FROM close_retirement_resource_dispatches WHERE attempt_id = ?1)
+          OR EXISTS(SELECT 1 FROM close_run_retry_effects WHERE attempt_id = ?1)
+          OR EXISTS(SELECT 1 FROM close_run_retry_successes WHERE attempt_id = ?1)
+          OR EXISTS(SELECT 1 FROM native_close_retry_plans WHERE attempt_id = ?1)",
+    ).bind(attempt_id).fetch_one(&mut **tx).await?;
+    if encumbered {
+        return Err(DbError::CloseFoundationPrecondition(
+            "native Initial cancellation is unsafe after settlement or retirement custody exists"
+                .into(),
+        ));
+    }
+    ensure_close_retirement_loss_free_tx(tx, attempt_id).await?;
+    Ok(())
+}
+
+async fn require_initial_settlement_dispatch_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    command: &NativeCloseCommand,
+    receipt: &NativeCloseReceipt,
+    live_source: &phoenix_core::domain::sm_state::ConvState,
+) -> DbResult<NativeCloseRunRef> {
+    let (admitted, _) = require_initial_execution_tx(
+        tx,
+        command,
+        receipt,
+        live_source,
+        ClosePhase::SettlingActiveWork,
+    )
+    .await?;
+    let latest = crate::close_foundation::read_topology_tx(tx, &admitted.target)
+        .await?
+        .ok_or_else(|| {
+            DbError::CloseFoundationPrecondition("Close target topology is missing".into())
+        })?;
+    let current: Option<(String, String)> = sqlx::query_as(
+        "SELECT obligation.attempt_id, member.conversation_id
+         FROM close_obligations obligation
+         JOIN close_attempt_members member ON member.attempt_id = obligation.attempt_id
+           AND member.member_role IN ('latest', 'root_latest')
+         WHERE obligation.product_conversation_id = ?1
+         ORDER BY obligation.chronology_ordinal DESC LIMIT 1",
+    )
+    .bind(admitted.target.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if !current.is_some_and(|(attempt, captured_latest)| {
+        attempt == admitted.attempt_id.as_str() && captured_latest == latest.latest.id
+    }) {
+        return Err(DbError::CloseFoundationPrecondition(
+            "Initial settlement dispatch no longer addresses the latest Close attempt and transcript".into(),
+        ));
+    }
+    Ok(admitted)
+}
+
 async fn require_initial_execution_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeCloseCommand,
@@ -2239,6 +2706,10 @@ async fn require_initial_execution_tx(
             "initial Close operation is stale or has advanced".into(),
         ));
     }
+    if expected_phase == phoenix_core::domain::close::ClosePhase::RetirementRequested {
+        Database::require_no_retained_legacy_creation_for_attempt_tx(tx, &admitted.attempt_id)
+            .await?;
+    }
     let captured_state = captured_state.ok_or_else(|| {
         DbError::CloseFoundationPrecondition("initial Close has no captured latest state".into())
     })?;
@@ -2255,6 +2726,7 @@ async fn require_initial_execution_tx(
 async fn apply_initial_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeCloseCommand,
+    attempt: &CloseAttemptId,
 ) -> DbResult<NativeCloseInitialResult> {
     super::receipts::require_source_and_target_tx(tx, command).await?;
     let NativeCloseIntent::Initial { target } = command.intent() else {
@@ -2289,10 +2761,9 @@ async fn apply_initial_tx(
         .ok_or_else(|| {
             DbError::CloseFoundationPrecondition("Close target has no retained topology".into())
         })?;
-    // Allocate only after source, exact replay, existing operation and topology checks.
     let latest = TranscriptConversationId::parse(topology.latest.id)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-    let attempt_id = Uuid::new_v4().to_string();
+    let attempt_id = attempt.as_str();
     // Deferred exact receipt/operation FKs bind original source before creation.
     // A retained unreceipted operation cannot acquire provenance by late adoption.
     sqlx::query(
@@ -2301,7 +2772,7 @@ async fn apply_initial_tx(
           source_message_id, source_tool_use_id, product_conversation_id, initial_run_ordinal)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
     )
-    .bind(&attempt_id)
+    .bind(attempt_id)
     .bind(command.request_id().to_string())
     .bind(command.fingerprint())
     .bind(command.source_transcript_id())
@@ -2310,8 +2781,13 @@ async fn apply_initial_tx(
     .bind(target.as_str())
     .execute(&mut **tx)
     .await?;
-    let obligation =
-        Database::begin_close_foundation_inner(tx, target, &latest, &attempt_id, false).await?;
+    let crate::CloseFoundationAdmission::Inserted(obligation) =
+        Database::begin_close_foundation_inner(tx, target, &latest, attempt_id, false).await?
+    else {
+        return Err(DbError::CloseFoundationConflict(
+            "cannot attach a native Initial receipt to an existing Close attempt".into(),
+        ));
+    };
     super::receipts::adopt_and_insert_receipt_tx(
         tx,
         command,

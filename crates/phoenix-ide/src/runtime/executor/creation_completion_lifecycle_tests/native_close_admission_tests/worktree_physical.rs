@@ -22,7 +22,6 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod captured_loss_public_retry;
-use captured_loss_public_retry::RetryCompletion;
 
 #[tokio::test]
 async fn registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays(
@@ -98,6 +97,11 @@ async fn registered_native_close_refuses_a_live_writable_descriptor() {
 #[tokio::test]
 async fn registered_native_close_with_loss_content_stops_incomplete_without_retirement() {
     run_public_worktree_close(WorktreeJourney::RetainContentBlockers).await;
+}
+
+#[tokio::test]
+async fn registered_native_close_origin_only_fetched_pin_public_retry_preserves_owner_ref() {
+    run_public_worktree_close(WorktreeJourney::FetchedPinPublicRetry).await;
 }
 
 #[tokio::test]
@@ -196,6 +200,7 @@ enum WorktreeJourney {
     CapturedLossPublicRetryResumedDuringPhysicalMutation,
     RetainContentBlockers,
     ReflogOnlyBlocker,
+    FetchedPinPublicRetry,
     ReinspectCapturedLossAfterCleanup,
     RetryLossClassification,
     StopBeforeAdmission,
@@ -284,7 +289,10 @@ struct DisposableGit {
     original_registrations: Vec<u8>,
 }
 
+const FIXTURE_CREATION_REPOSITORY_IDENTITY: &str = "physical-close-fixture-incarnation";
+
 impl DisposableGit {
+    #[allow(clippy::too_many_lines)]
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
@@ -374,7 +382,15 @@ impl DisposableGit {
         git.fingerprint = phoenix_core::git::observe_linked_worktree_fingerprint(&git.worktree)
             .expect("real linked Worktree has its original administrative fingerprint");
         assert!(git
-            .run(&git.worktree, &["status", "--porcelain=v1", "--ignored"])
+            .run(
+                &git.worktree,
+                &[
+                    "--no-optional-locks",
+                    "status",
+                    "--porcelain=v1",
+                    "--ignored"
+                ]
+            )
             .is_empty());
         git.original_refs = git.run(
             &git.repo,
@@ -382,6 +398,106 @@ impl DisposableGit {
         );
         git.original_registrations = git.run(&git.repo, &["worktree", "list", "--porcelain", "-z"]);
         git
+    }
+
+    fn prepare_origin_only_fetched_pin(&mut self) -> phoenix_core::domain::close::GitOidIdentity {
+        let origin = self.root.join("origin.git");
+        let origin_checkout = self.root.join("origin checkout");
+        self.run(
+            &self.root,
+            &[
+                "clone",
+                "--bare",
+                self.repo.to_str().unwrap(),
+                origin.to_str().unwrap(),
+            ],
+        );
+        self.run(
+            &self.root,
+            &[
+                "clone",
+                origin.to_str().unwrap(),
+                origin_checkout.to_str().unwrap(),
+            ],
+        );
+        self.run(
+            &origin_checkout,
+            &["config", "user.name", "Disposable Origin Fixture"],
+        );
+        self.run(
+            &origin_checkout,
+            &["config", "user.email", "origin-fixture@example.invalid"],
+        );
+        std::fs::write(origin_checkout.join("origin-only.txt"), b"origin pin\n").unwrap();
+        self.run(&origin_checkout, &["add", "--", "origin-only.txt"]);
+        self.run(&origin_checkout, &["commit", "-m", "Origin-only pin"]);
+        let oid = self.run(&origin_checkout, &["rev-parse", "HEAD"]);
+        let oid = std::str::from_utf8(&oid).unwrap().trim().to_owned();
+        self.run(&origin_checkout, &["push", "origin", "HEAD:refs/heads/pin"]);
+        assert_eq!(
+            self.run(&origin, &["rev-parse", "refs/heads/pin"]),
+            format!("{oid}\n").as_bytes(),
+            "the fetched pin is an actual origin commit"
+        );
+        let refs_before = self.run(
+            &self.repo,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        );
+        let origin_path = origin.to_str().unwrap();
+        self.run(&self.repo, &["remote", "add", "origin", origin_path]);
+        self.run(
+            &self.repo,
+            &[
+                "fetch",
+                "--no-write-fetch-head",
+                "--no-tags",
+                "--refmap=",
+                "origin",
+                &oid,
+            ],
+        );
+        assert_eq!(
+            self.run(
+                &self.repo,
+                &["for-each-ref", "--format=%(refname) %(objectname)"],
+            ),
+            refs_before,
+            "fetching the exact advertised OID must not update local refs"
+        );
+        assert_eq!(
+            self.run(&self.repo, &["cat-file", "-t", &oid]),
+            b"commit\n",
+            "fetch makes the origin commit available by OID"
+        );
+        let target = self.worktree.to_str().unwrap();
+        self.run(&self.repo, &["worktree", "remove", target]);
+        self.run(&self.repo, &["worktree", "add", "--detach", target, &oid]);
+        self.worktree = self.worktree.canonicalize().unwrap();
+        self.admin = self.administrative_directory(&self.worktree);
+        self.checkout_identity = directory_identity(&self.worktree);
+        self.admin_identity = directory_identity(&self.admin);
+        self.fingerprint = phoenix_core::git::observe_linked_worktree_fingerprint(&self.worktree)
+            .expect("fetched-pin fixture has a linked worktree fingerprint");
+        assert_eq!(
+            self.run(&self.worktree, &["rev-parse", "HEAD"]),
+            format!("{oid}\n").as_bytes()
+        );
+        assert!(self.worktree_status().is_empty());
+        self.original_registrations =
+            self.run(&self.repo, &["worktree", "list", "--porcelain", "-z"]);
+        phoenix_core::domain::close::GitOidIdentity::parse_hex(&oid).unwrap()
+    }
+
+    fn worktree_status(&self) -> Vec<u8> {
+        self.run(
+            &self.worktree,
+            &[
+                "--no-optional-locks",
+                "status",
+                "--porcelain=v1",
+                "--ignored",
+            ],
+        )
     }
 
     fn run(&self, cwd: &Path, args: &[&str]) -> Vec<u8> {
@@ -439,6 +555,7 @@ impl DisposableGit {
         let (claimed, oid) = self
             .accept_claim_and_stage(fixture, &request_id, &intent, &cwd)
             .await;
+        crate::runtime::creation_worker::write_test_owner_marker(&self.worktree, "fixture-owner");
         let scope = WorkScopeId::new();
         let product_id = claimed.job.product_conversation_id.clone();
         let conversation = self.conversation(product_id.clone(), scope.clone());
@@ -451,6 +568,12 @@ impl DisposableGit {
             phoenix_db::ProductCreationGitPublicationFacts {
                 exact_checkout_oid: oid,
                 repository_root: cwd,
+                repository_identity: FIXTURE_CREATION_REPOSITORY_IDENTITY.to_string(),
+                ownership_token: "fixture-owner".to_string(),
+                checkout_fingerprint: phoenix_core::git::observe_linked_worktree_fingerprint(
+                    &self.worktree,
+                )
+                .unwrap(),
             },
         )
         .await;
@@ -521,17 +644,23 @@ impl DisposableGit {
             .unwrap()
             .trim()
             .to_owned();
-        assert!(fixture
-            .db
-            .record_product_creation_staging(
-                request_id,
-                &claimed.claim,
-                &self.worktree.to_string_lossy(),
-                cwd,
-                &oid,
-            )
-            .await
-            .unwrap());
+        assert!(matches!(
+            fixture
+                .db
+                .pin_product_creation_once(
+                    request_id,
+                    &claimed.claim,
+                    &oid,
+                    "main",
+                    "fresh",
+                    FIXTURE_CREATION_REPOSITORY_IDENTITY,
+                )
+                .await
+                .unwrap(),
+            phoenix_db::ProductCreationPinOutcome::Pinned(_)
+        ));
+        self.reserve_physical_worktree(fixture, request_id, cwd, &claimed, &oid)
+            .await;
         assert!(fixture
             .db
             .advance_product_creation_provisioning_stage(
@@ -542,6 +671,63 @@ impl DisposableGit {
             .await
             .unwrap());
         (claimed, oid)
+    }
+
+    async fn reserve_physical_worktree(
+        &self,
+        fixture: &CloseFixture,
+        request_id: &str,
+        cwd: &str,
+        claimed: &phoenix_db::ClaimedProductCreationJob,
+        oid: &str,
+    ) {
+        let path = self.worktree.to_string_lossy();
+        let now = chrono::Utc::now();
+        assert!(fixture
+            .db
+            .reserve_product_creation_resource(
+                request_id,
+                request_id,
+                &claimed.claim,
+                FIXTURE_CREATION_REPOSITORY_IDENTITY,
+                &path,
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(fixture
+            .db
+            .record_product_creation_resource_ownership(
+                request_id,
+                &claimed.claim,
+                &path,
+                "fixture-owner",
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(fixture
+            .db
+            .mark_product_creation_resource_present(
+                request_id,
+                &claimed.claim,
+                &path,
+                "fixture-owner",
+                now,
+            )
+            .await
+            .unwrap());
+        assert!(fixture
+            .db
+            .record_product_creation_staging(
+                request_id,
+                &claimed.claim,
+                &self.worktree.to_string_lossy(),
+                cwd,
+                oid,
+            )
+            .await
+            .unwrap());
     }
 
     fn conversation(
@@ -775,6 +961,8 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
     use tokio_util::sync::CancellationToken;
 
     let mut git = DisposableGit::new();
+    let origin_only_fetched_pin = matches!(journey, WorktreeJourney::FetchedPinPublicRetry)
+        .then(|| git.prepare_origin_only_fetched_pin());
     // Keep a real writable handle on tracked content without changing its bytes.
     let _writer = matches!(journey, WorktreeJourney::RefuseDescriptorWriter).then(|| {
         std::fs::OpenOptions::new()
@@ -832,11 +1020,13 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation
             | WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation
             | WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation
+            | WorktreeJourney::FetchedPinPublicRetry
     );
     let mut captured_retry_run = None;
     let content_blocked = matches!(
         journey,
         WorktreeJourney::RetainContentBlockers
+            | WorktreeJourney::FetchedPinPublicRetry
             | WorktreeJourney::ReflogOnlyBlocker
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
@@ -850,7 +1040,10 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             | WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation
     );
     if content_blocked {
-        if !matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
+        if !matches!(
+            journey,
+            WorktreeJourney::ReflogOnlyBlocker | WorktreeJourney::FetchedPinPublicRetry
+        ) {
             std::fs::create_dir_all(git.repo.join(".git/info")).unwrap();
             std::fs::write(git.repo.join(".git/info/exclude"), b"build/\n").unwrap();
             std::fs::create_dir(git.worktree.join("build")).unwrap();
@@ -858,7 +1051,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             std::fs::write(git.worktree.join("build/b.bin"), b"retained build b").unwrap();
             std::fs::write(git.worktree.join("tracked.txt"), b"unpreserved edits\n").unwrap();
         }
-        if public_captured_retry {
+        if public_captured_retry && origin_only_fetched_pin.is_none() {
             std::fs::write(
                 git.worktree.join("untracked.txt"),
                 b"unpreserved new file\n",
@@ -872,6 +1065,7 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         WorktreeJourney::Retire
             | WorktreeJourney::RetainContentBlockers
             | WorktreeJourney::ReflogOnlyBlocker
+            | WorktreeJourney::FetchedPinPublicRetry
             | WorktreeJourney::RetryLossClassification
             | WorktreeJourney::ReinspectCapturedLossAfterCleanup
             | WorktreeJourney::CapturedLossPublicRetryFinalWriterGap
@@ -1239,19 +1433,22 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             .unwrap();
         assert_eq!(
             losses.len(),
-            if reflog_only_commit.is_some() {
+            if reflog_only_commit.is_some() || origin_only_fetched_pin.is_some() {
                 1
             } else {
                 3 + usize::from(public_captured_retry)
             }
         );
-        if let Some(commit) = &reflog_only_commit {
+        if let Some(commit) = reflog_only_commit
+            .as_ref()
+            .or(origin_only_fetched_pin.as_ref())
+        {
             assert!(losses.iter().any(|loss| {
                 loss.scope == scope
                     && loss.item == CloseLossItem::DetachedUnreachableCommit(commit.clone())
             }));
         }
-        if public_captured_retry {
+        if public_captured_retry && origin_only_fetched_pin.is_none() {
             assert!(losses.iter().any(|loss| {
                 loss.scope == scope
                     && loss.item
@@ -1259,9 +1456,11 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
                             b"untracked.txt".to_vec(),
                         ))
             }));
+        }
+        if public_captured_retry {
             captured_retry_run = Some(run.clone());
         }
-        if reflog_only_commit.is_none() {
+        if reflog_only_commit.is_none() && origin_only_fetched_pin.is_none() {
             for item in [
                 CloseLossItem::UnstagedTrackedPath(GitPathIdentity::from_bytes(
                     b"tracked.txt".to_vec(),
@@ -1316,6 +1515,23 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         assert_eq!(physical_snapshot(&git.root), physical_before_admission);
         assert_eq!(directory_identity(&git.worktree), git.checkout_identity);
         assert_eq!(directory_identity(&git.admin), git.admin_identity);
+        if let Some(pin) = origin_only_fetched_pin.as_ref() {
+            let pin = pin.as_str();
+            assert_eq!(
+                git.run(&git.worktree, &["rev-parse", "HEAD"]),
+                format!("{pin}\n").as_bytes(),
+                "the untouched target remains checked out directly at the fetched OID"
+            );
+            assert!(
+                git.worktree.is_dir(),
+                "the exact target checkout remains present"
+            );
+            assert!(
+                git.admin.is_dir(),
+                "the exact target registration remains present"
+            );
+            assert!(git.worktree_status().is_empty());
+        }
         if matches!(journey, WorktreeJourney::ReflogOnlyBlocker) {
             assert_eq!(
                 git.run(&git.worktree, &["rev-parse", "HEAD"]),
@@ -1828,6 +2044,9 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
         .expect("source actor must shut down after qualification")
         .unwrap();
     if let Some(run) = captured_retry_run {
+        use crate::runtime::executor::native_close_retry::test_hooks::Point;
+        use captured_loss_public_retry::RetryJourney;
+
         fixture
             .db
             .update_conversation_state(&fixture.source_transcript_id, &ConvState::Idle)
@@ -1838,39 +2057,39 @@ async fn run_public_worktree_close_inner(journey: WorktreeJourney) {
             .read_native_close_captured_loss_retry_context(&fixture.target, &run)
             .await
             .expect("acknowledged initial result must remain eligible after source shutdown");
+
+        let retry_journey = match journey {
+            WorktreeJourney::FetchedPinPublicRetry => {
+                RetryJourney::PreserveOriginPin(origin_only_fetched_pin.as_ref().unwrap())
+            }
+            WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment => {
+                RetryJourney::StopAt(Point::CapturedLossAssessmentReady)
+            }
+            WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch => {
+                RetryJourney::StopAt(Point::WorktreeDispatchBeforeWriter)
+            }
+            WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation => {
+                RetryJourney::StopAt(Point::WorktreePreparationReady)
+            }
+            WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation => {
+                RetryJourney::StopAt(Point::PhysicalBeforeObservation)
+            }
+            WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation => {
+                RetryJourney::StopAt(Point::PhysicalBeforeMutation)
+            }
+            WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation => {
+                RetryJourney::ResumeAt(Point::PhysicalBeforeMutation)
+            }
+            WorktreeJourney::CapturedLossPublicRetryFinalWriterGap => RetryJourney::FinalWriterGap,
+            _ => RetryJourney::Uninterrupted,
+        };
         captured_loss_public_retry::retry_after_public_capture(
             &fixture,
-            &git,
+            &mut git,
             backend,
             &scope,
             &run,
-            match journey {
-                WorktreeJourney::CapturedLossPublicRetryStoppedDuringAssessment => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::CapturedLossAssessmentReady,
-                ),
-                WorktreeJourney::CapturedLossPublicRetryStoppedBeforeWorktreeDispatch => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::WorktreeDispatchBeforeWriter,
-                ),
-                WorktreeJourney::CapturedLossPublicRetryStoppedDuringPreparation => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::WorktreePreparationReady,
-                ),
-                WorktreeJourney::CapturedLossPublicRetryStoppedBeforePhysicalObservation => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeObservation,
-                ),
-                WorktreeJourney::CapturedLossPublicRetryStoppedDuringPhysicalMutation => Some(
-                    crate::runtime::executor::native_close_retry::test_hooks::Point::PhysicalBeforeMutation,
-                ),
-                _ => None,
-            },
-            match journey {
-                WorktreeJourney::CapturedLossPublicRetryResumedDuringPhysicalMutation => {
-                    RetryCompletion::ResumePhysicalMutation
-                }
-                WorktreeJourney::CapturedLossPublicRetryFinalWriterGap => {
-                    RetryCompletion::FinalWriterGap
-                }
-                _ => RetryCompletion::Normal,
-            },
+            retry_journey,
         )
         .await;
     }

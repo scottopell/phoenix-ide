@@ -49,7 +49,6 @@ export function MobileConversationListFixtureBody({ scenario }: Props) {
           onProductConversationClick={() => {}}
           onProductConversationRename={() => {}}
           onProductConversationClose={() => {}}
-          onProductConversationDelete={() => {}}
           listDensity="mobile"
           authChip={<span className="mobile-conversation-list-fixture-auth">✓</span>}
           utilityActions={(

@@ -30,7 +30,7 @@ async fn migration_180_pending_fixture_with_options(
         }).await.unwrap();
     }
     for pending in &failure.remaining_resources {
-        db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+        db.seed_pre_197_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
             attempt_id: failure.attempt_id.clone(),
             scope: pending.scope.clone(),
             snapshot: g1.clone(),
@@ -40,8 +40,7 @@ async fn migration_180_pending_fixture_with_options(
             },
             detail: Some("original G1 residual".into()),
         })
-        .await
-        .unwrap();
+        .await;
     }
     if fresh_snapshot {
         let scope = failure.authority.scope().unwrap().clone();
@@ -60,7 +59,7 @@ async fn migration_180_pending_fixture_with_options(
         let g2 = current_test_snapshot(&db, failure.attempt_id.as_str()).await;
         capture_test_inventory(&db, failure.attempt_id.as_str(), &scope, &g2, Vec::new()).await;
         for pending in &failure.remaining_resources {
-            db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+            db.seed_pre_197_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
                 attempt_id: failure.attempt_id.clone(),
                 scope: pending.scope.clone(),
                 snapshot: g2.clone(),
@@ -74,8 +73,7 @@ async fn migration_180_pending_fixture_with_options(
                 },
                 detail: Some("current G2 evidence".into()),
             })
-            .await
-            .unwrap();
+            .await;
         }
         let resource = failure.remaining_resources.iter()
             .find(|pending| pending.scope == scope && pending.resource.kind() == RetiredResourceKind::WorkScope)

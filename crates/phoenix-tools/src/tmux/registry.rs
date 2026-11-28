@@ -2,7 +2,7 @@
 //!
 //! REQ-TMUX-001 (socket isolation), REQ-TMUX-002 (lazy spawn),
 //! REQ-TMUX-005 (Phoenix-restart probe re-use), REQ-TMUX-006
-//! (stale-socket detection), REQ-TMUX-007 (hard-delete cascade),
+//! (stale-socket detection),
 //! REQ-TMUX-013 (`ToolContext` accessor shape),
 //! REQ-TMUX-WS-001 (`ResourceScopeKey` ownership).
 //!
@@ -44,7 +44,7 @@ use tokio::sync::{OnceCell, RwLock};
 
 use super::backend::{
     ExactProcessState, GlobalEnvRead, SocketEndpoint, SocketFileIdentity, SystemTmuxBackend,
-    TmuxBackend, TmuxDestructiveEntry, TokenBoundKill, SERVER_TOKEN_VAR,
+    TmuxBackend, TokenBoundKill, SERVER_TOKEN_VAR,
 };
 use super::{parse_last_exit_marker, probe::ProbeResult};
 
@@ -173,6 +173,26 @@ enum TmuxRetirementAuthority {
     EndpointAbsent,
 }
 
+/// Exact instance reported killed by the token-bound backend.
+pub struct StrictTmuxDispatchConfirmation<'a>(&'a TmuxServerInstanceIdentity);
+
+impl StrictTmuxDispatchConfirmation<'_> {
+    #[must_use]
+    pub fn instance(&self) -> &TmuxServerInstanceIdentity {
+        self.0
+    }
+}
+
+/// Events at the strict Retry boundary. Only the first and last carry effects.
+pub enum StrictTmuxRetirementEntry<'a> {
+    AuthenticatedApproval(&'a mut dyn FnMut() -> Result<(), String>),
+    DispatchConfirmed(StrictTmuxDispatchConfirmation<'a>),
+    FinalizeRegistry(&'a mut dyn FnMut() -> Result<(), String>),
+}
+
+type TypedRetirementEntry<'a> =
+    dyn FnMut(StrictTmuxRetirementEntry<'_>) -> Result<(), String> + Send + 'a;
+
 /// Immutable authority captured when the permit is issued.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TmuxRetirementOriginal {
@@ -284,6 +304,28 @@ impl PreparedTmuxRetirement {
         self.complete_with_sink(&mut with_entry).await
     }
 
+    /// Completes strict retirement against the exact prepared registry owner.
+    ///
+    /// # Errors
+    /// Returns an error if the final exact endpoint probe fails.
+    pub async fn complete_strict_with_typed_sink<F>(
+        self,
+        mut with_entry: F,
+    ) -> Result<TmuxRetirementOutcome, TmuxError>
+    where
+        F: FnMut(StrictTmuxRetirementEntry<'_>) -> Result<(), String> + Send,
+    {
+        self.registry
+            .complete_retirement_on_entry(
+                &self.permit,
+                Some(self.entry),
+                true,
+                true,
+                &mut with_entry,
+            )
+            .await
+    }
+
     /// Wrap each synchronous destructive sink, including the final registry mutation.
     ///
     /// # Errors
@@ -295,8 +337,13 @@ impl PreparedTmuxRetirement {
     where
         F: FnMut(&mut dyn FnMut() -> Result<(), String>) -> Result<(), String> + Send,
     {
+        let mut typed = |entry: StrictTmuxRetirementEntry<'_>| match entry {
+            StrictTmuxRetirementEntry::AuthenticatedApproval(sink)
+            | StrictTmuxRetirementEntry::FinalizeRegistry(sink) => with_entry(sink),
+            StrictTmuxRetirementEntry::DispatchConfirmed(_) => Ok(()),
+        };
         self.registry
-            .complete_retirement_on_entry(&self.permit, Some(self.entry), true, &mut with_entry)
+            .complete_retirement_on_entry(&self.permit, Some(self.entry), true, false, &mut typed)
             .await
     }
 }
@@ -351,23 +398,44 @@ impl std::error::Error for TmuxRetirementBatchCancellationError {}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "proof_kind", rename_all = "snake_case")]
 pub enum TmuxRetirementOutcome {
+    #[serde(skip)]
+    ReplacementLive(TmuxReplacementObservation),
     Retired,
     AbsenceVerified,
-    IdentityNotProven { reason: String },
-    RemovalFailed { reason: String },
+    IdentityNotProven {
+        reason: String,
+    },
+    RemovalFailed {
+        reason: String,
+    },
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum TmuxRetirementRehydration {
     Permit(Box<TmuxRetirementPermit>),
-    AbsenceVerified,
+    EndpointAbsent,
+    ReplacementLive(TmuxReplacementObservation),
     Residual { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ExactTmuxIdentityState {
+pub struct TmuxReplacementObservation {
+    sealed: TmuxServerInstanceIdentity,
+    replacement_token: uuid::Uuid,
+}
+
+impl TmuxReplacementObservation {
+    #[must_use]
+    pub fn into_parts(self) -> (TmuxServerInstanceIdentity, uuid::Uuid) {
+        (self.sealed, self.replacement_token)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExactTmuxIdentityState {
     Live,
-    Absent,
+    EndpointAbsent,
+    ReplacementLive(TmuxReplacementObservation),
     Ambiguous { reason: String },
 }
 
@@ -1340,7 +1408,11 @@ impl TmuxRegistry {
             .map(|entry| entry.server.clone())
     }
 
-    async fn exact_identity_state(
+    /// Observe the exact socket and token without acquiring registry custody.
+    ///
+    /// # Errors
+    /// Returns [`TmuxError`] when the socket probe fails.
+    pub async fn exact_identity_state(
         &self,
         identity: &TmuxServerInstanceIdentity,
         expires: tokio::time::Instant,
@@ -1367,8 +1439,15 @@ impl TmuxRegistry {
         result: ProbeResult,
         expires: tokio::time::Instant,
     ) -> Result<ExactTmuxIdentityState, TmuxError> {
+        let Ok(expected_token) = uuid::Uuid::parse_str(&identity.server_token) else {
+            return Ok(ExactTmuxIdentityState::Ambiguous {
+                reason: "invalid sealed tmux server token".into(),
+            });
+        };
         match result {
-            ProbeResult::NoSocket | ProbeResult::NoServer => Ok(ExactTmuxIdentityState::Absent),
+            ProbeResult::NoSocket | ProbeResult::NoServer => {
+                Ok(ExactTmuxIdentityState::EndpointAbsent)
+            }
             ProbeResult::DeadSocket => Ok(ExactTmuxIdentityState::Ambiguous {
                 reason: format!(
                     "tmux probe failed for existing socket {}; cannot prove whether {} is absent",
@@ -1380,20 +1459,30 @@ impl TmuxRegistry {
                 .read_server_token_until(&identity.socket_path, expires)
                 .await
             {
-                Some(Some(token)) if token == identity.server_token => {
-                    Ok(ExactTmuxIdentityState::Live)
+                Some(raw) => {
+                    match raw.as_deref().and_then(|token| uuid::Uuid::parse_str(token).ok()) {
+                        Some(token) if token == expected_token => {
+                            Ok(ExactTmuxIdentityState::Live)
+                        }
+                        Some(replacement_token) => {
+                            Ok(ExactTmuxIdentityState::ReplacementLive(TmuxReplacementObservation {
+                                sealed: identity.clone(),
+                                replacement_token,
+                            }))
+                        }
+                        None => Ok(ExactTmuxIdentityState::Ambiguous {
+                            reason: format!(
+                                "live tmux server at {} did not report a valid {}; cannot prove whether {} is still current",
+                                identity.socket_path.display(),
+                                SERVER_TOKEN_VAR,
+                                identity.stable_identity()
+                            ),
+                        }),
+                    }
                 }
-                Some(Some(_)) => Ok(ExactTmuxIdentityState::Absent),
-                Some(None) => Ok(ExactTmuxIdentityState::Ambiguous {
-                    reason: format!(
-                        "live tmux server at {} did not report {}; cannot prove whether {} is still current",
-                        identity.socket_path.display(),
-                        SERVER_TOKEN_VAR,
-                        identity.stable_identity()
-                    ),
-                }),
                 None => Ok(ExactTmuxIdentityState::Ambiguous {
-                    reason: "tmux exact-identity token read exceeded the Close deadline".to_string(),
+                    reason: "tmux exact-identity token read exceeded the Close deadline"
+                        .to_string(),
                 }),
             },
         }
@@ -1613,15 +1702,33 @@ impl TmuxRegistry {
             .await
     }
 
+    fn strict_pre_entry_absence(&self, permit: &TmuxRetirementPermit) -> TmuxRetirementOutcome {
+        if self.strict_retirement_endpoint_absent(&permit.instance)
+            && tokio::time::Instant::now() < permit.expires
+        {
+            TmuxRetirementOutcome::AbsenceVerified
+        } else {
+            TmuxRetirementOutcome::IdentityNotProven {
+                reason: "strict tmux endpoint is not proven absent before dispatch".into(),
+            }
+        }
+    }
+
+    pub fn strict_retirement_endpoint_absent(&self, identity: &TmuxServerInstanceIdentity) -> bool {
+        matches!(
+            self.backend.endpoint(&identity.socket_path),
+            Ok(SocketEndpoint::Absent)
+        )
+    }
+
     /// Rehydrate exact retirement authority for a persisted tmux server identity
     /// after a Phoenix restart.
     ///
     /// The persisted identity is authoritative only when the same live server is
     /// still reachable at the same socket path and reports the same
-    /// `PHOENIX_TMUX_SERVER_TOKEN`. A missing socket or replacement token proves
-    /// exact absence. Any scope conflict or live server without a token remains a
-    /// residual ambiguity so callers do not take destructive action on path or
-    /// token evidence alone.
+    /// `PHOENIX_TMUX_SERVER_TOKEN`. A missing endpoint and a live replacement
+    /// with a different valid token are separate observations. A cached scope
+    /// conflict or an unreadable or malformed live token is not replacement proof.
     ///
     /// # Errors
     /// Returns [`TmuxError`] when probing the persisted socket path fails.
@@ -1648,15 +1755,17 @@ impl TmuxRegistry {
             };
             let exact_current = current.socket_path == persisted.socket_path
                 && current.server_token == persisted.server_token;
-            let current_socket_matches = current.socket_path == persisted.socket_path;
             let current_identity = current.exact_identity();
             let current_fenced = current.retirement_fenced;
             drop(current);
 
             if exact_current {
                 return match self.exact_identity_state(persisted, expires).await? {
-                    ExactTmuxIdentityState::Absent => {
-                        Ok(TmuxRetirementRehydration::AbsenceVerified)
+                    ExactTmuxIdentityState::EndpointAbsent => {
+                        Ok(TmuxRetirementRehydration::EndpointAbsent)
+                    }
+                    ExactTmuxIdentityState::ReplacementLive(observation) => {
+                        Ok(TmuxRetirementRehydration::ReplacementLive(observation))
                     }
                     ExactTmuxIdentityState::Ambiguous { reason } => {
                         Ok(TmuxRetirementRehydration::Residual { reason })
@@ -1744,12 +1853,13 @@ impl TmuxRegistry {
                 };
             }
 
-            if current_socket_matches {
-                return Ok(TmuxRetirementRehydration::AbsenceVerified);
-            }
-
             return match self.exact_identity_state(persisted, expires).await? {
-                ExactTmuxIdentityState::Absent => Ok(TmuxRetirementRehydration::AbsenceVerified),
+                ExactTmuxIdentityState::EndpointAbsent => {
+                    Ok(TmuxRetirementRehydration::EndpointAbsent)
+                }
+                ExactTmuxIdentityState::ReplacementLive(observation) => {
+                    Ok(TmuxRetirementRehydration::ReplacementLive(observation))
+                }
                 ExactTmuxIdentityState::Live => Ok(TmuxRetirementRehydration::Residual {
                     reason: format!(
                         "work scope {} is already materialized as {}; persisted server {} also remains live",
@@ -1785,7 +1895,10 @@ impl TmuxRegistry {
         expires: tokio::time::Instant,
     ) -> Result<TmuxRetirementRehydration, TmuxError> {
         match self.exact_identity_state(persisted, expires).await? {
-            ExactTmuxIdentityState::Absent => Ok(TmuxRetirementRehydration::AbsenceVerified),
+            ExactTmuxIdentityState::EndpointAbsent => Ok(TmuxRetirementRehydration::EndpointAbsent),
+            ExactTmuxIdentityState::ReplacementLive(observation) => {
+                Ok(TmuxRetirementRehydration::ReplacementLive(observation))
+            }
             ExactTmuxIdentityState::Ambiguous { reason } => {
                 Ok(TmuxRetirementRehydration::Residual { reason })
             }
@@ -1818,7 +1931,9 @@ impl TmuxRegistry {
                                 .to_string(),
                         });
                     };
-                    if server.socket_path == persisted.socket_path {
+                    if server.socket_path == persisted.socket_path
+                        && server.server_token == persisted.server_token
+                    {
                         None
                     } else {
                         Some(server.exact_identity())
@@ -1835,8 +1950,11 @@ impl TmuxRegistry {
                     });
                 }
                 match self.exact_identity_state(persisted, expires).await? {
-                    ExactTmuxIdentityState::Absent => {
-                        Ok(TmuxRetirementRehydration::AbsenceVerified)
+                    ExactTmuxIdentityState::EndpointAbsent => {
+                        Ok(TmuxRetirementRehydration::EndpointAbsent)
+                    }
+                    ExactTmuxIdentityState::ReplacementLive(observation) => {
+                        Ok(TmuxRetirementRehydration::ReplacementLive(observation))
                     }
                     ExactTmuxIdentityState::Ambiguous { reason } => {
                         Ok(TmuxRetirementRehydration::Residual { reason })
@@ -2364,8 +2482,14 @@ impl TmuxRegistry {
             Ok(entry) => entry,
             Err(reason) => return Ok(TmuxRetirementOutcome::RemovalFailed { reason }),
         };
-        self.complete_retirement_on_entry(permit, current_entry, false, &mut |sink| sink())
-            .await
+        self.complete_retirement_on_entry(permit, current_entry, false, false, &mut |entry| {
+            match entry {
+                StrictTmuxRetirementEntry::AuthenticatedApproval(sink)
+                | StrictTmuxRetirementEntry::FinalizeRegistry(sink) => sink(),
+                StrictTmuxRetirementEntry::DispatchConfirmed(_) => Ok(()),
+            }
+        })
+        .await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2374,7 +2498,8 @@ impl TmuxRegistry {
         permit: &TmuxRetirementPermit,
         current_entry: Option<Arc<TmuxScopeEntry>>,
         exact_owner: bool,
-        enter: &mut TmuxDestructiveEntry<'_>,
+        strict_endpoint_absence: bool,
+        enter: &mut TypedRetirementEntry<'_>,
     ) -> Result<TmuxRetirementOutcome, TmuxError> {
         let deadline = RetirementDeadline::new(permit.expires);
         // Keep map membership fixed through the token-bound kill on the exact
@@ -2431,6 +2556,28 @@ impl TmuxRegistry {
             entered.notify_one();
             release.notified().await;
         }
+        if strict_endpoint_absence {
+            let observed = self
+                .exact_identity_state(&permit.instance, permit.expires)
+                .await?;
+            if tokio::time::Instant::now() >= permit.expires {
+                return Ok(TmuxRetirementOutcome::RemovalFailed {
+                    reason: "strict tmux retirement probe exceeded the Close deadline".into(),
+                });
+            }
+            match observed {
+                ExactTmuxIdentityState::Live => {}
+                ExactTmuxIdentityState::EndpointAbsent => {
+                    return Ok(self.strict_pre_entry_absence(permit));
+                }
+                ExactTmuxIdentityState::ReplacementLive(observation) => {
+                    return Ok(TmuxRetirementOutcome::ReplacementLive(observation));
+                }
+                ExactTmuxIdentityState::Ambiguous { reason } => {
+                    return Ok(TmuxRetirementOutcome::IdentityNotProven { reason });
+                }
+            }
+        }
         let pre_teardown = if self.backend.binary_available() {
             match self.backend.endpoint(&permit.instance.socket_path) {
                 Ok(observation) => Some(observation),
@@ -2478,7 +2625,9 @@ impl TmuxRegistry {
                                 &permit.instance.server_token,
                                 process,
                                 permit.expires,
-                                enter,
+                                &mut |sink| {
+                                    enter(StrictTmuxRetirementEntry::AuthenticatedApproval(sink))
+                                },
                             )
                             .await
                         {
@@ -2501,7 +2650,26 @@ impl TmuxRegistry {
                     .await
             };
             match kill {
-                TokenBoundKill::Killed => None,
+                TokenBoundKill::Killed => {
+                    if strict_endpoint_absence {
+                        if let Err(reason) = enter(StrictTmuxRetirementEntry::DispatchConfirmed(
+                            StrictTmuxDispatchConfirmation(&permit.instance),
+                        )) {
+                            return Ok(TmuxRetirementOutcome::RemovalFailed { reason });
+                        }
+                    }
+                    None
+                }
+                TokenBoundKill::QueueCompletedWithoutExecutionWitness
+                    if strict_endpoint_absence =>
+                {
+                    return Ok(TmuxRetirementOutcome::RemovalFailed {
+                        reason:
+                            "tmux close queue completed without proof of exact command execution"
+                                .into(),
+                    });
+                }
+                TokenBoundKill::QueueCompletedWithoutExecutionWitness => None,
                 TokenBoundKill::DeadlineExceeded => Some(TmuxRetirementOutcome::RemovalFailed {
                     reason: "tmux exact teardown command exceeded the Close deadline".to_string(),
                 }),
@@ -2558,7 +2726,7 @@ impl TmuxRegistry {
             _ => self.verify_exact_absence(permit).await?,
         };
         if let Some(failure) = kill_failure {
-            if exact_process_exit != ExactProcessState::DeadOrReused {
+            if strict_endpoint_absence || exact_process_exit != ExactProcessState::DeadOrReused {
                 return Ok(failure);
             }
         }
@@ -2602,15 +2770,64 @@ impl TmuxRegistry {
                             });
                         };
                         if Self::matches_exact_instance(&server, permit) {
-                            if let Err(reason) = enter(&mut || {
+                            if strict_endpoint_absence {
+                                let observed = self
+                                    .exact_identity_state(&permit.instance, permit.expires)
+                                    .await?;
                                 if tokio::time::Instant::now() >= permit.expires {
-                                    return Err(
-                                        "tmux final authority exceeded the Close deadline".into()
-                                    );
+                                    return Ok(TmuxRetirementOutcome::RemovalFailed {
+                                        reason: "strict tmux retirement final probe exceeded the Close deadline".into(),
+                                    });
                                 }
-                                server.status = ServerStatus::Gone;
-                                Ok(())
-                            }) {
+                                match observed {
+                                    ExactTmuxIdentityState::EndpointAbsent => {}
+                                    ExactTmuxIdentityState::ReplacementLive(observation) => {
+                                        return Ok(TmuxRetirementOutcome::ReplacementLive(
+                                            observation,
+                                        ));
+                                    }
+                                    ExactTmuxIdentityState::Ambiguous { reason } => {
+                                        return Ok(TmuxRetirementOutcome::IdentityNotProven {
+                                            reason,
+                                        });
+                                    }
+                                    ExactTmuxIdentityState::Live => {
+                                        return Ok(TmuxRetirementOutcome::IdentityNotProven {
+                                            reason:
+                                                "original tmux server live at strict final probe"
+                                                    .into(),
+                                        });
+                                    }
+                                }
+                            }
+                            if let Err(reason) = enter(StrictTmuxRetirementEntry::FinalizeRegistry(
+                                &mut || {
+                                    if tokio::time::Instant::now() >= permit.expires {
+                                        return Err(
+                                            "tmux final authority exceeded the Close deadline"
+                                                .into(),
+                                        );
+                                    }
+                                    if strict_endpoint_absence
+                                        && !matches!(
+                                            self.backend.endpoint(&permit.instance.socket_path),
+                                            Ok(SocketEndpoint::Absent)
+                                        )
+                                    {
+                                        return Err("strict tmux endpoint changed before registry finalization".into());
+                                    }
+                                    if strict_endpoint_absence
+                                        && tokio::time::Instant::now() >= permit.expires
+                                    {
+                                        return Err(
+                                            "strict tmux final probe exceeded the Close deadline"
+                                                .into(),
+                                        );
+                                    }
+                                    server.status = ServerStatus::Gone;
+                                    Ok(())
+                                },
+                            )) {
                                 return Ok(TmuxRetirementOutcome::RemovalFailed { reason });
                             }
                             true
@@ -2636,6 +2853,7 @@ impl TmuxRegistry {
                 Ok(TmuxRetirementOutcome::Retired)
             }
             residual @ (TmuxRetirementOutcome::Retired
+            | TmuxRetirementOutcome::ReplacementLive(_)
             | TmuxRetirementOutcome::IdentityNotProven { .. }
             | TmuxRetirementOutcome::RemovalFailed { .. }) => Ok(residual),
         }
@@ -2857,7 +3075,7 @@ impl TmuxRegistry {
     /// `kill-server` (server already dead) and `remove_file` (file already
     /// gone) are non-fatal.
     ///
-    /// REQ-TMUX-007, REQ-TMUX-WS-001, REQ-TMUX-WS-002.
+    /// REQ-TMUX-WS-001, REQ-TMUX-WS-002.
     #[allow(clippy::too_many_lines)]
     pub async fn cascade_on_delete(
         &self,
@@ -2956,8 +3174,15 @@ impl TmuxRegistry {
                         },
                     }
                 }
-                Ok(TmuxRetirementRehydration::AbsenceVerified) => {
-                    TmuxRetirementOutcome::AbsenceVerified
+                Ok(
+                    TmuxRetirementRehydration::EndpointAbsent
+                    | TmuxRetirementRehydration::ReplacementLive(_),
+                ) => {
+                    return CascadeReport {
+                        socket_path: identity.socket_path,
+                        kill_server_error: None,
+                        unlink_error: None,
+                    };
                 }
                 Ok(TmuxRetirementRehydration::Residual { reason }) => {
                     TmuxRetirementOutcome::IdentityNotProven { reason }
@@ -2995,6 +3220,13 @@ impl TmuxRegistry {
                         unlink_error: None,
                     }
                 }
+                TmuxRetirementOutcome::ReplacementLive(_) => CascadeReport {
+                    socket_path: identity.socket_path,
+                    kill_server_error: Some(
+                        "strict tmux replacement is not cascade retirement".into(),
+                    ),
+                    unlink_error: None,
+                },
                 TmuxRetirementOutcome::IdentityNotProven { reason }
                 | TmuxRetirementOutcome::RemovalFailed { reason } => CascadeReport {
                     socket_path: identity.socket_path,
@@ -3085,6 +3317,11 @@ impl TmuxRegistry {
                     unlink_error: None,
                 }
             }
+            TmuxRetirementOutcome::ReplacementLive(_) => CascadeReport {
+                socket_path,
+                kill_server_error: Some("strict tmux replacement is not cascade retirement".into()),
+                unlink_error: None,
+            },
             TmuxRetirementOutcome::IdentityNotProven { reason }
             | TmuxRetirementOutcome::RemovalFailed { reason } => CascadeReport {
                 socket_path,
@@ -3123,7 +3360,7 @@ impl Default for TmuxRegistry {
     }
 }
 
-/// Best-effort cascade outcome (REQ-TMUX-007). Both error fields are
+/// Best-effort legacy archive cleanup outcome. Both error fields are
 /// surfaced to the caller (the unified `run_resource_cleanup_cascade`
 /// in handlers.rs) so partial failures can be logged. Neither field is
 /// fatal.
@@ -3140,6 +3377,11 @@ impl From<TmuxRetirementOutcome> for CascadeReport {
             TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::AbsenceVerified => Self {
                 socket_path: PathBuf::new(),
                 kill_server_error: None,
+                unlink_error: None,
+            },
+            TmuxRetirementOutcome::ReplacementLive(_) => Self {
+                socket_path: PathBuf::new(),
+                kill_server_error: Some("strict tmux replacement is not cascade retirement".into()),
                 unlink_error: None,
             },
             TmuxRetirementOutcome::IdentityNotProven { reason }
@@ -4530,14 +4772,32 @@ mod tests {
         let work_scope = scope("missing-proves-absence");
         let identity = TmuxServerInstanceIdentity {
             socket_path: tmp.path().join("missing.sock"),
-            server_token: "persisted-token".to_string(),
+            server_token: uuid::Uuid::new_v4().to_string(),
         };
+        let malformed = TmuxServerInstanceIdentity {
+            server_token: "not-a-uuid".into(),
+            ..identity.clone()
+        };
+        assert!(matches!(
+            registry
+                .exact_identity_state(&malformed, close_deadline())
+                .await
+                .unwrap(),
+            ExactTmuxIdentityState::Ambiguous { .. },
+        ));
+        assert_eq!(
+            registry
+                .exact_identity_state(&identity, close_deadline())
+                .await
+                .unwrap(),
+            ExactTmuxIdentityState::EndpointAbsent,
+        );
         assert_eq!(
             registry
                 .rehydrate_retirement(&work_scope, &identity, close_deadline())
                 .await
                 .unwrap(),
-            TmuxRetirementRehydration::AbsenceVerified
+            TmuxRetirementRehydration::EndpointAbsent
         );
         let permit = TmuxRetirementPermit::new(TmuxRetirementOriginal {
             work_scope,
@@ -5008,15 +5268,54 @@ mod tests {
         let restarted = with_fake(tmp.path(), &fake);
         assert_eq!(
             restarted
+                .exact_identity_state(&persisted, close_deadline())
+                .await
+                .unwrap(),
+            ExactTmuxIdentityState::ReplacementLive(TmuxReplacementObservation {
+                sealed: persisted.clone(),
+                replacement_token: uuid::Uuid::parse_str(&replacement.server_token).unwrap(),
+            }),
+        );
+        assert!(restarted.get_existing(&work_scope).await.is_none());
+        assert_eq!(
+            restarted
                 .rehydrate_retirement(&work_scope, &persisted, close_deadline())
                 .await
                 .unwrap(),
-            TmuxRetirementRehydration::AbsenceVerified
+            TmuxRetirementRehydration::ReplacementLive(TmuxReplacementObservation {
+                sealed: persisted.clone(),
+                replacement_token: uuid::Uuid::parse_str(&replacement.server_token).unwrap(),
+            }),
         );
         let survivor = fake.server(&persisted.socket_path).unwrap();
         assert!(survivor.live);
         assert_eq!(survivor.token, Some(replacement.server_token));
         assert_eq!(fake.kill_server_count(&persisted.socket_path), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_cached_tmux_token_cannot_prove_live_target_absent() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = with_fake(tmp.path(), &fake);
+        let work_scope = scope("stale-token-custody");
+        let server = registry
+            .ensure_live(&work_scope, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let target = live_identity(&server).await;
+        let cached = registry.get_existing(&work_scope).await.unwrap();
+        cached.write().await.server_token = "stale-cached-token".into();
+
+        assert!(matches!(
+            registry.rehydrate_retirement(&work_scope, &target, close_deadline()).await.unwrap(),
+            TmuxRetirementRehydration::Residual { reason } if reason.contains("also remains live")
+        ));
+        assert!(!registry.is_retirement_fenced(&work_scope).await);
+        let survivor = fake.server(&target.socket_path).unwrap();
+        assert!(survivor.live);
+        assert_eq!(survivor.token, Some(target.server_token));
+        assert_eq!(fake.kill_server_count(&target.socket_path), 0);
     }
 
     /// REQ-WL-002d: when the identity cannot be proven, rehydration fails
@@ -5026,6 +5325,38 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let fake = FakeTmuxBackend::new();
         let bootstrap = with_fake(tmp.path(), &fake);
+        let spelling_scope = scope("rehydrate-uuid-spelling");
+        let spelling = live_identity(
+            &bootstrap
+                .ensure_live(&spelling_scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
+        )
+        .await;
+        let alternate = uuid::Uuid::parse_str(&spelling.server_token)
+            .unwrap()
+            .simple()
+            .to_string();
+        fake.set_global_env(&spelling.socket_path, SERVER_TOKEN_VAR, &alternate)
+            .await;
+        assert_eq!(
+            bootstrap
+                .exact_identity_state(&spelling, close_deadline())
+                .await
+                .unwrap(),
+            ExactTmuxIdentityState::Live,
+        );
+        fake.set_global_env(&spelling.socket_path, SERVER_TOKEN_VAR, "not-a-uuid")
+            .await;
+        assert!(matches!(
+            bootstrap
+                .exact_identity_state(&spelling, close_deadline())
+                .await
+                .unwrap(),
+            ExactTmuxIdentityState::Ambiguous { .. },
+        ));
+        assert_eq!(fake.kill_server_count(&spelling.socket_path), 0);
+
         let tokenless_scope = scope("rehydrate-tokenless");
         let tokenless = live_identity(
             &bootstrap
@@ -5339,7 +5670,7 @@ mod tests {
         );
     }
 
-    /// REQ-TMUX-007: cascade on a scope with no registry entry (restarted
+    /// Legacy archive cleanup on a scope with no registry entry (restarted
     /// Phoenix) still discovers and retires the persistent server.
     #[tokio::test]
     async fn cascade_on_delete_reclaims_a_persistent_server_with_an_empty_registry() {

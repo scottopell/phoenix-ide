@@ -71,7 +71,8 @@ THE SYSTEM SHALL reject the call because task-management authority belongs to th
 
 WHEN a conversation enters AwaitingTaskApproval state
 THE SYSTEM SHALL open the prose reader with the plan content from the state
-AND present **Continue here**, **Start in new conversation**, and **Request changes / discard** actions alongside the standard annotation feedback
+AND present **Continue here** and **Request changes / discard** actions alongside the standard annotation feedback
+AND SHALL NOT offer a new-conversation placement or handoff action
 
 WHEN the user sends annotation feedback
 THE SYSTEM SHALL close the prose reader
@@ -80,7 +81,8 @@ AND return the conversation to its prior Open planning state
 AND the agent MAY revise the plan and call `propose_task` again
 
 WHEN the user approves the task and chooses **Continue here**
-THE SYSTEM SHALL commit the approved task artifact according to REQ-PROJ-006
+THE SYSTEM SHALL persist approval of the exact reviewed snapshot according to REQ-PROJ-006
+AND SHALL NOT perform Git writes, stage changes, or create an approval commit
 AND SHALL approve only the same reviewed snapshot identity rather than whatever file currently exists at approval time
 AND SHALL persist one typed approved-task objective that references the normalized approved-task source record
 AND SHALL persist Git-backed write authority by referencing that approved-task objective on the same Open conversation and the same attached `WorkScope`
@@ -88,26 +90,14 @@ AND keep the same Open conversation and the same `WorkScope`
 AND resume execution in that conversation without changing its mode
 AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
 
-WHEN the user approves the task and chooses **Start in new conversation**
-THE SYSTEM SHALL create a separate Open conversation derived from the source conversation
-AND SHALL approve only the same reviewed snapshot identity rather than whatever file currently exists at approval time
-AND provision a fresh detached-default-branch disposable worktree for the spawned conversation
-AND SHALL treat that spawned conversation as an independent ProductConversation with its own fresh `WorkScope`, not as a sub-agent attachment to the source conversation's worktree
-AND seed only the exact approved task as the spawned conversation's starting context
-AND preserve the approved task artifact independently of the source worktree's eventual closure by storing one normalized approved-task source record and by materializing the approved artifact in the spawned worktree
-AND SHALL complete that materialization before dispatching the spawned conversation's first LLM request
-AND record exactly one source relation of kind `approved_task` on the spawned conversation that points to the source conversation
-AND dispatch execution in the spawned conversation only after successful durable typed provisioning completion for that spawned ProductConversation, concrete spawned transcript conversation, attached `WorkScope`/worktree, and approved-artifact materialization
-AND leave the source conversation Open and no longer blocked in task-approval state
-AND SHALL NOT create, rename, select, or delete a branch as an approval side effect
-AND SHALL NOT copy, summarize, or inject the source conversation transcript into the spawned conversation as part of approval placement
-AND SHALL NOT dispatch the spawned conversation when provisioning finishes in an unresolved failure result
+WHEN an approval request selects any placement other than **Continue here**
+THE SYSTEM SHALL reject it without creating a conversation, worktree, provenance relation, or execution dispatch
 
 WHEN the user rejects or discards the task
 THE SYSTEM SHALL return a rejection result to the agent
 AND SHALL NOT perform any Git side effects
 
-**Rationale:** Approval is a user decision about placement and authority, not a hidden transition into branch-backed lifecycle modes. The system offers two deliberate placements — continue in the same conversation or start in a new conversation — while keeping branch ownership out of the approval contract.
+**Rationale:** Approval authorizes the reviewed task in the existing conversation and checkout. It neither creates another conversation nor changes branch ownership.
 
 ---
 
@@ -121,9 +111,8 @@ AND the body SHALL be free-form markdown
 
 WHEN the user approves a taskmd task
 THE SYSTEM SHALL parse the task ID, priority, status, and slug from the filename
-AND rename the file to `...-in-progress--{slug}.md` if its status is not already `in-progress`
-AND persist the approved content so the chosen conversation placement can continue to use the exact approved task
 AND SHALL persist the exact approved body together with the reviewed snapshot identity that justified that approval
+AND SHALL NOT rename, stage, commit, or otherwise mutate Git state as an approval side effect
 
 WHEN the agent later updates the task file during active work
 THE SYSTEM SHALL allow edits to it like any other workspace file
@@ -179,7 +168,7 @@ THE SYSTEM SHALL reject it
 
 `propose_task` is a pure data carrier intercepted at the LlmResponse handler. It never performs Git side effects directly.
 
-**Rationale:** `propose_task` is the agent's way of saying “here's a task artifact for human review.” The key distinction is whether the parent is asking for blocking approval in place or proposing a separate derived conversation — not whether the product is in one named lifecycle mode or another.
+**Rationale:** `propose_task` requests blocking human review in the parent conversation, whether the conversation is still planning or already has write authority.
 
 ---
 
@@ -962,8 +951,6 @@ AND SHALL keep the user on the handoff surface when dispatch remains unsuccessfu
 AND SHALL NOT replace the original intent with later request text
 AND SHALL NOT create a second manual-send path for the same handoff
 AND SHALL NOT duplicate an opening message when an idempotent dispatch is retried
-AND SHALL require Start in new conversation provisioning to derive any Git-backed starting pin under `specs/conversation-creation/` rather than from approval state alone
-AND SHALL NOT let approval metadata publish a target conversation, target `WorkScope`, or target starting pin before creation publication commits atomically
 
 WHEN the opening handoff is persisted as the successor's message or steering entry
 THE SYSTEM SHALL atomically consume the pending dispatch intent
@@ -1144,22 +1131,20 @@ THE HandedOff state SHALL reject further user messages;
 WHEN the user approves the task while in AwaitingTaskApproval with the
 Continue here policy
 THE SYSTEM SHALL record the approved task as the conversation's next objective through a typed approved-task objective value
-AND SHALL promote the task file's status to `in-progress` if needed
-AND SHALL commit only the approved task artifact if that task-tracking contract requires it
+AND SHALL preserve the exact reviewed task artifact without renaming, staging, committing, or otherwise mutating Git state as an approval side effect
 AND SHALL durably persist typed Git-backed write authority referencing that approved-task objective against the existing attached `WorkScope` before resuming execution
 AND SHALL continue the same product conversation as the current live writable conversation
 AND SHALL treat the approval as a checkpoint only
 AND SHALL NOT create a fresh conversation row
 AND SHALL NOT encode the approved task as `mode=work`-only conversation shape data
 AND SHALL leave the conversation's mode unchanged, including when the pre-approval mode is Explore
-AND SHALL NOT change `continued_in_conv_id`, `work_scope_id`, lifecycle, mode, repository state beyond the
-  approved task commit, `WorkScope` attachment, source/provenance records beyond the approval itself,
-  or branch/worktree provenance
+AND SHALL NOT change `continued_in_conv_id`, `work_scope_id`, lifecycle, mode, repository state, `WorkScope` attachment, source/provenance records beyond the approval itself, or branch/worktree provenance
 
 ### REQ-BED-046: Publish Approved Capabilities as One Authority Projection
 
-WHEN task approval grants Work authority to a conversation's `WorkScope`
+WHEN task approval grants Work authority to a conversation's existing `WorkScope`
 THE SYSTEM SHALL derive the conversation runtime's tool surface, tool execution policy, Bash isolation policy, tool context, and sub-agent admission policy from that same `WorkScope` authority before accepting post-approval work
+AND SHALL NOT create a new worktree or mutate Git refs, index, ignore configuration, or commits as part of approval
 AND SHALL NOT use conversation mode provenance as capability authority
 
 IF the system cannot project the granted authority to every runtime capability consumer
@@ -1184,33 +1169,11 @@ WHEN upgrading rows created before operation-scoped approval provenance exists
 THE SYSTEM SHALL NOT infer a pending approval request from lifetime objectives or message presentation text
 AND SHALL retain the ordinary interrupted-request recovery behavior for those rows
 
-WHEN approval performs Git or worktree mutation before adopting `LlmRequesting`
-THE SYSTEM SHALL capture the requesting-state timestamp after that mutation succeeds and immediately before atomic persistence and live-state adoption
-
 WHEN a runtime is reconstructed after interruption
 THE SYSTEM SHALL derive every capability consumer from persisted `WorkScope` authority rather than from conversation mode provenance
 
 WHILE an Explore-origin conversation has not received approved `WorkScope` authority
 THE SYSTEM SHALL retain its Restricted tool surface, sandboxed Bash policy, and prohibition on Work sub-agents
-
-WHEN the user approves the task while in AwaitingTaskApproval with the
-Start in new conversation policy
-THE SYSTEM SHALL perform the same task-approval artifact persistence
-AND create a fresh Open conversation with a fresh attached `WorkScope`
-  and worktree
-AND record exactly one visible typed source relation of kind `approved_task` on the new conversation that points to the source conversation
-AND SHALL treat that typed source relation as the sole current authority for visible provenance, deleted-source status, and source breadcrumb derivation for the spawned conversation
-AND SHALL NOT treat any legacy raw source-conversation-id field as current writer or reader authority for approved-task provenance
-AND keep the source conversation Open rather than linking it through `continued_in_conv_id`
-AND SHALL exit the source conversation from AwaitingTaskApproval once the start-fresh approval is accepted
-AND dispatch the next LLM request only in the spawned conversation
-AND SHALL gate that dispatch on successful durable typed provisioning completion for the spawned ProductConversation and its attached `WorkScope`/worktree
-AND SHALL materialize the exact approved artifact in the spawned worktree before that first dispatch
-AND seed that conversation's first LLM-visible context from the approved task brief
-  and approval metadata, excluding the source transcript
-AND SHALL treat the spawned conversation as a separate Open conversation derived from the source conversation rather than as an in-place continuation of the predecessor's runtime environment
-AND SHALL carry only the exact approved task as the derived starting context
-AND SHALL NOT dispatch the spawned conversation when provisioning ends in an unresolved failure result
 
 WHEN the user provides annotation feedback while in AwaitingTaskApproval
 THE SYSTEM SHALL close the prose reader
@@ -1237,9 +1200,8 @@ AND the UI SHALL re-open the task-approval reader on reconnect from the conversa
 set of valid incoming events (approve, discard, feedback) and a distinct UI
 representation (the task-approval reader). `propose_task` follows the submit_result
 interception pattern — pure data carrier (its `run()` is an unreachable fallback), no
-side effects, no tool execution. The plan is a real file the agent edits with `patch`,
-so revisions are file edits; all git operations are deferred to the approval moment and
-happen when the approved task artifact is committed; approval itself does not imply a task-branch lifecycle.
+side effects, no tool execution. The plan is a real file the agent edits with `patch`.
+Approval accepts the exact reviewed file as the objective without mutating Git state.
 
 **Dependencies:** REQ-PROJ-003, REQ-PROJ-004
 
@@ -1314,7 +1276,7 @@ AND SHALL represent independent remaining WorkScope retirement as an exact typed
 AND SHALL retire that scope only after all pending scoped resource effects succeed and fresh proof excludes distinct live owners/live scoped resources; retained prior successes SHALL NOT be replayed, and a scope-only residual SHALL remain expressible as one nonempty exact effect
 AND SHALL require independent scope success in plan completeness and any later completion-only proof; process-epoch stop effects SHALL remain excluded from retry and missing original live permits SHALL fail closed without generic fallback or permit reconstruction
 AND SHALL require explicit Retry for every successor, including a zero-effect verified-completion successor; observation, metadata, elapsed time, startup, or changed external preconditions SHALL NOT admit a run
-AND SHALL retain completed Close attempts as historical records until permanent Delete removes their ProductConversation aggregate
+AND SHALL retain completed Close attempts as historical records of their ProductConversation
 AND SHALL create a new Close-attempt identity after cancellation only with an exact cancelled-predecessor reference and explicit new Close intent, when no earlier Close attempt for that ProductConversation remains active
 AND SHALL allocate every Close-attempt identity uniquely across active and historical attempts
 AND SHALL retain a typed terminal outcome of `archived` or `cancelled` whenever an attempt becomes completed
@@ -1533,24 +1495,10 @@ AND SHALL render that Follow-up relationship visibly from the source conversatio
 
 ---
 
-### REQ-BED-031B: Permanent Delete Removes Only the Conversation Aggregate and Is Idempotent
+### REQ-BED-031B: Permanent Delete Is Not Offered
 
-WHEN the user permanently deletes a History conversation
-THE SYSTEM SHALL remove the complete ProductConversation aggregate that is solely owned by that History conversation, including every transcript row in that aggregate plus every solely-owned normalized child row required by that aggregate
-AND SHALL explicitly delete solely-owned Close-obligation, Close-attempt-member, inspection, inventory, loss, retirement-evidence, lineage-Q&A, message, tool-call, approval, message/file-attachment, retrieval-chunk, retrieval-locator, and FTS rows for that aggregate rather than relying on an unspecified catch-all such as "messages deleted"
-AND SHALL preserve typed tombstone-grade source identity needed by surviving provenance consumers
-AND SHALL NOT cascade the deletion into related but separately-owned conversations, branches, or pull requests
-
-WHEN source relations on surviving conversations still point to the deleted conversation
-THE SYSTEM SHALL preserve tombstone-grade source root identity and deleted status sufficient for later UI and retrieval surfaces to distinguish **Deleted source** from an absent or never-recorded source
-
-WHEN conversation content has been removed by permanent Delete
-THE SYSTEM SHALL remove the corresponding FTS/index rows in the same delete path or a deterministic reconciliation path before deleted content can surface again
-
-WHEN the same permanent Delete request is retried after the aggregate has already been removed
-THE SYSTEM SHALL treat the operation as idempotent success rather than recreating work, failing because rows are already gone, or cascading into unrelated records
-
-**Rationale:** Permanent Delete is about one conversation aggregate and its solely-owned data, not about erasing every related object in the repository or navigation graph. Tombstone-grade source identity preserves truthful surviving provenance.
+THE SYSTEM SHALL retain ProductConversation history and its associated resources
+AND SHALL NOT expose permanent Delete or a hard-delete cascade through any conversation lifecycle surface
 
 ---
 
@@ -1594,97 +1542,11 @@ THE `propose_task` tool SHALL be available as follows:
 
 ---
 
-### REQ-BED-032: Conversation Terminal-Transition Cascade
+### REQ-BED-032: Conversation Terminal-Transition Cascade Is Limited to Safe Close
 
+Conversation lifecycle offers explicit Close under REQ-BED-029 and `specs/work-lifecycle/requirements.md`. It does not offer permanent Delete, a hard-delete cascade, startup orphan detection, or automatic resource reclamation. Historical data and resources remain retained; Close safety and its exact ownership, blocker, retry, and uncertainty contracts remain unchanged.
 
-Permanent Delete is the only terminal transition this requirement owns directly. Close-to-History resource retirement is specified by REQ-BED-029 plus `specs/work-lifecycle/requirements.md`; it is not a parallel hard-delete path.
-
-WHEN a permanent Delete request targets a History conversation
-THE SYSTEM SHALL run the hard-delete resource-cleanup cascade, which performs the
-following sequence of direct calls in order:
-1. Reject if the conversation is still busy or otherwise not yet eligible for permanent Delete
-2. `cascade_bash_on_delete(conversation)` — kills live bash handles for
-   the conversation and drops in-memory tombstones (REQ-BASH-006)
-3. `cascade_tmux_on_delete(work_scope, inheritor_scope)` — runs
-   `tmux kill-server` against the scope's socket, unlinks the socket
-   file, removes the registry entry, unless another still-live owner retains
-   the same `WorkScope` (REQ-TMUX-007, REQ-TMUX-WS-002)
-4. `cascade_projects_on_delete(conversation, inheritor_scope)` —
-   worktree cleanup only when no other live conversation still has the same
-   attached `WorkScope`; hard delete does not create, move, or delete branches
-   as part of cleanup (REQ-PROJ-015)
-5. `cascade_browser_on_delete(work_scope, inheritor_scope)` — drops the
-   Chrome session for the scope unless another still-live owner retains the
-   same `WorkScope` (REQ-BROWSER-WS-003)
-6. `db.delete_product_conversation(product_conversation_id)` — permanent Delete removes the complete History ProductConversation aggregate, including every transcript row plus solely-owned Close-obligation, Close-attempt-member, inspection, inventory, loss, retirement-evidence, lineage-Q&A, message, tool-call, approval, message/file-attachment, retrieval-chunk, retrieval-locator, and FTS rows, while retaining typed tombstones for surviving provenance links and leaving related but
-   separately-owned conversations, branches, and pull requests untouched
-7. Broadcast `ConversationHardDeleted` for UI consumers
-
-THE handler SHALL invoke each cascade step on its own; there is no
-event bus, no subscriber registration, and no dynamic dispatch. The
-"subscribers first, row last" ordering is a property of the call sequence
-in the handler. Each cascade function reads whatever conversation state
-it needs before the row delete in step 6.
-
-WHEN a cascade step fails (subprocess error, file system error,
-registry-state inconsistency)
-THE SYSTEM SHALL log the failure at WARN level with structured fields
-sufficient for an operator to manually clean up — at minimum the
-process group ids of any surviving processes and the absolute paths
-of any surviving sockets or worktrees
-AND continue to the next cascade step — failing steps SHALL NOT block
-the conversation row deletion
-AND THE SYSTEM SHALL NOT attempt automatic recovery on a subsequent
-Phoenix startup. Orphans created by failed cleanup are the operator's
-problem; reconciliation machinery for hard-delete orphans is
-intentionally out of scope here.
-
-THE SYSTEM SHALL distinguish permanent Delete from UI-only state changes (close-tab, blur, parent window closed — which
-do NOT run the cascade). The latter category exists purely to support
-"close the tab, come back later" — for those, long-lived per-scope
-resources (tmux servers, browser sessions) survive (REQ-TMUX-008
-makes this explicit on the tmux side; REQ-BROWSER-WS-003 on the
-browser side).
-
-History after Close is NOT reversible in place. Close moves the conversation to History through the separate Close lifecycle; permanent Delete later removes that retained aggregate entirely. There is
-no `unarchive` operation because Archive is not a normative lifecycle concept.
-
-THE `ConversationHardDeleted` SSE wire event (step 7) SHALL be emitted
-exactly once per hard-delete operation, after all cascade steps have
-completed. UI consumers use it to refresh sidebar, navigation, and
-related views. It is NOT a subscriber-dispatch hook for cleanup logic;
-cleanup runs synchronously inside the handler.
-
-**Rationale:** Bash handles live in-process; tmux servers and project
-worktrees live outside Phoenix. Without an explicit hard-delete cascade, deleting a
-conversation aggregate leaves these resources orphaned: the OS-visible processes
-keep running, socket files accumulate in `~/.phoenix-ide/tmux-sockets/`,
-worktrees stay on disk. A direct-call orchestrator in the hard-delete
-handler is the simplest shape that satisfies the cleanup contract — a
-lifecycle-event/subscriber-bus pattern was considered and rejected as
-overengineering for three known callsites in one binary, with no third-
-party subscribers and no plugin system planned. Spec elegance traded
-for an event-bus abstraction Phoenix doesn't otherwise have.
-
-The not-attempting-recovery decision is deliberate. Cascade failures
-should be rare on healthy systems (kill-tree is well-behaved when the
-kernel is responsive; `tmux kill-server` rarely hangs). When they do
-occur, the failure cause (frozen mount, hung tmux server, file system
-error) is also what would prevent automatic recovery from succeeding —
-adding a startup orphan-walker would carry complexity without
-materially improving reliability. Operators who do encounter orphans
-have the WARN-level structured logs to act on.
-
-The not-busy precondition mirrors the Close confirmation contract in
-`specs/work-lifecycle/`. Hard-delete during a live tool execution would race
-the tool's own cleanup code; canceling first is the deterministic order.
-The permissive choice between (a) reject and (b) cancel-first leaves
-that policy to the API layer; the bedrock contract is the not-busy
-postcondition before cascade fires.
-
-**Dependencies:** REQ-BASH-006 (`specs/bash/`), REQ-TMUX-007
-(`specs/tmux-integration/`), REQ-PROJ-WS-001
-(`specs/work-lifecycle/`), and REQ-GITREP-007 (`specs/git-repository/`).
+---
 
 ### REQ-BED-020a: Capacity Pressure Enters Real Handoff Generation
 

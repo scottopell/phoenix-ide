@@ -35,10 +35,6 @@ export class SyncQueue {
         }
         break;
       
-      case 'delete':
-        await api.deleteConversation(op.conversationId);
-        break;
-      
       case 'rename':
         if (!op.payload.name) {
           throw new Error('rename requires name');
@@ -57,10 +53,6 @@ export class SyncQueue {
         }
         break;
 
-      case 'delete_chain':
-        await api.deleteChain(op.conversationId);
-        break;
-
       default: {
         // Legacy queue entries: `unarchive` / `unarchive_chain` ops that were
         // persisted in IndexedDB before archive became a terminal lifecycle
@@ -70,8 +62,8 @@ export class SyncQueue {
         // deleted and the offline banner clears, instead of throwing
         // `Unknown operation type` forever and wedging the pending-op queue.
         const legacyType = (op as { type: string }).type;
-        if (legacyType === 'unarchive' || legacyType === 'unarchive_chain') {
-          console.debug('Draining legacy queue op (archive is now terminal):', legacyType);
+        if (['unarchive', 'unarchive_chain', 'delete', 'delete_chain'].includes(legacyType)) {
+          console.debug('Draining retired lifecycle queue op:', legacyType);
           break;
         }
         throw new Error(`Unknown operation type: ${(op as PendingOperation).type}`);

@@ -18,7 +18,8 @@ use phoenix_core::domain::close::{
 use phoenix_core::work_scope::WorkScopeId;
 use phoenix_db::workflow::LocalAuthorityResult;
 use phoenix_db::{
-    CloseProcessStepOutcome, CloseProcessStepSuccess, RecordCloseRetirementDispatchRequest,
+    CloseProcessStepOutcome, CloseProcessStepSuccess, CloseRetirementBatchDispatch,
+    FirstCloseRetirementDispatch, RecordCloseRetirementDispatchRequest,
     RecordCloseRetirementEvidenceRequest,
 };
 use std::sync::Arc;
@@ -55,7 +56,7 @@ pub(super) struct ProcessRetirement {
     scopes: Vec<WorkScopeId>,
     scope_index: usize,
     kind_index: usize,
-    dispatch_index: usize,
+    pending_dispatches: std::collections::VecDeque<FirstCloseRetirementDispatch>,
     // Only inert preparation belongs to the actor and may be aborted.
     worker:
         Option<tokio::task::JoinHandle<Result<NativeInitialPreparedEntry, NativeInitialStepError>>>,
@@ -114,7 +115,7 @@ impl ProcessRetirement {
             scopes,
             scope_index: 0,
             kind_index: 0,
-            dispatch_index: 0,
+            pending_dispatches: std::collections::VecDeque::new(),
             worker: None,
             entry: None,
             resource_index: 0,
@@ -229,7 +230,7 @@ impl ProcessRetirement {
         self.pending = None;
         self.evidence_index = 0;
         self.process_receipt_recorded = false;
-        self.dispatch_index = 0;
+        debug_assert!(self.pending_dispatches.is_empty());
         self.resource_index = 0;
         self.observer = None;
         self.kind_index += 1;
@@ -266,28 +267,44 @@ impl NativeCloseInitialContinuation {
         };
         let resources = progress.current_resources(&scope, step);
         progress.retry_backoff = false;
-        if let Some(resource) = resources.get(progress.dispatch_index) {
+        if !resources.is_empty()
+            && progress.resource_index == 0
+            && progress.pending_dispatches.is_empty()
+            && progress.entry.is_none()
+            && progress.pending.is_none()
+            && progress.observer.is_none()
+        {
+            let requests = resources
+                .iter()
+                .map(|resource| RecordCloseRetirementDispatchRequest {
+                    attempt_id: resource.attempt_id.clone(),
+                    scope: resource.scope.clone(),
+                    snapshot: resource.snapshot.clone(),
+                    resource: resource.resource.clone(),
+                })
+                .collect::<Vec<_>>();
             match self
                 .db
-                .record_native_close_initial_retirement_dispatch(
+                .record_native_close_initial_process_dispatches(
                     &self.command,
                     &self.receipt,
                     live_source,
-                    RecordCloseRetirementDispatchRequest {
-                        attempt_id: resource.attempt_id.clone(),
-                        scope: resource.scope.clone(),
-                        snapshot: resource.snapshot.clone(),
-                        resource: resource.resource.clone(),
-                    },
+                    &requests,
                 )
                 .await
             {
-                LocalAuthorityResult::DurableFactEstablished(Ok(())) => {
-                    progress.dispatch_index += 1;
+                LocalAuthorityResult::DurableFactEstablished(Ok(
+                    CloseRetirementBatchDispatch::First(dispatches),
+                )) => {
+                    progress.pending_dispatches = dispatches.into();
+                }
+                LocalAuthorityResult::DurableFactEstablished(Ok(
+                    CloseRetirementBatchDispatch::Replay,
+                )) => {
+                    self.phase = Phase::ObservingTerminal;
                 }
                 LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
-                    // No effect has started for this kind; retry this immutable dispatch only.
-                    tracing::warn!(%error, "native initial runtime dispatch rolled back; retaining cursor");
+                    tracing::warn!(%error, "native initial process dispatch batch rolled back");
                     progress.retry_backoff = true;
                 }
                 LocalAuthorityResult::DurableFactUnclassified => {
@@ -389,9 +406,20 @@ impl NativeCloseInitialContinuation {
             // open eligibility: the actor-owned worker gates the physical sink.
             let durable_source = live_source.clone();
             let backend = Arc::clone(&self.backend);
+            let dispatch = progress
+                .pending_dispatches
+                .pop_front()
+                .expect("prepared process resource retains its first dispatch");
             progress.entry = Some(spawn_retained_entry(backend, async move {
-                Box::pin(prepared.enter(&db, &command, &receipt, &durable_source, &source_entry))
-                    .await
+                Box::pin(prepared.enter(
+                    &db,
+                    &command,
+                    &receipt,
+                    &durable_source,
+                    &source_entry,
+                    dispatch,
+                ))
+                .await
             }));
             return Ok(self.phase);
         }

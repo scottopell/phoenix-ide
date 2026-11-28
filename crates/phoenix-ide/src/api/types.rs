@@ -1144,21 +1144,6 @@ pub struct SuccessResponse {
     pub success: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ChainDeleteResponse {
-    pub success: bool,
-    pub outcome: ChainDeleteOutcome,
-}
-
-#[derive(Debug, Serialize, PartialEq, Eq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum ChainDeleteOutcome {
-    Deleted {
-        deleted_conversation_ids: Vec<String>,
-    },
-    AlreadyAbsent,
-}
-
 /// Frozen compatibility wire shape for the reject-only loss-retirement route.
 /// Fields remain required for deserialization but never authorize retirement.
 #[derive(Debug, Deserialize)]
@@ -1626,65 +1611,6 @@ pub struct TaskApprovalResponse {
     /// True when this was the first task created in the project (tasks/ didn't exist)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub first_task: Option<bool>,
-}
-
-// ============================================================
-// Fork proposal resolution (REQ-PROJ-034 / 037)
-//
-// Plain `Serialize` (no `ts_rs::TS`), matching every other API response type in
-// this module. The UI chunk that consumes these can add codegen derives if it
-// adopts the typed-SSE pattern; that decision is left to that chunk.
-// ============================================================
-
-/// Body for `POST /proposals/:proposal_id/request-changes` — the user's
-/// free-text change request (REQ-PROJ-037).
-#[derive(Debug, Deserialize)]
-pub struct RequestChangesRequest {
-    pub note: String,
-}
-
-/// Response for approving a fork proposal (REQ-PROJ-034).
-#[derive(Debug, Serialize)]
-pub struct ForkSpawnResponse {
-    pub fork_conversation_id: String,
-}
-
-/// Response for promoting a fork proposal to an Explore refinement (REQ-PROJ-037).
-#[derive(Debug, Serialize)]
-pub struct ForkPromoteResponse {
-    pub refinement_conversation_id: String,
-}
-
-/// Response for dismissing a fork proposal (REQ-PROJ-034). `no_op` is true when
-/// the proposal was already resolved (idempotent dismiss).
-#[derive(Debug, Serialize)]
-pub struct ForkDismissResponse {
-    pub success: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub no_op: bool,
-}
-
-/// One fork proposal as rendered to the review surface.
-#[derive(Debug, Serialize)]
-pub struct ForkProposalSummary {
-    pub id: String,
-    pub status: String,
-    pub title: String,
-    pub priority: String,
-    pub task_file: String,
-    /// Snapshotted brief body — the snapshot is not in the transcript, so the
-    /// review modal renders it from here keyed by proposal id.
-    pub body: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fork_conversation_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub refinement_conversation_id: Option<String>,
-}
-
-/// Response listing a conversation's fork proposals.
-#[derive(Debug, Serialize)]
-pub struct ForkProposalListResponse {
-    pub proposals: Vec<ForkProposalSummary>,
 }
 
 /// 409 Conflict error with typed `error_type` for frontend dispatch

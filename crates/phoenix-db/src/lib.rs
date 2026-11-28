@@ -455,11 +455,6 @@ pub enum DbError {
     SubAgentLifecycleConflict(String),
     #[error("Direct-turn conflict: {0:?}")]
     DirectTurnConflict(phoenix_workflow::TurnConflict),
-    /// A fork-proposal resolution was attempted but the proposal is already
-    /// resolved to a different state or child id (REQ-PROJ-034/037). Distinct
-    /// from the idempotent no-op case (same child id), which returns `Ok`.
-    #[error("Fork proposal conflict: {0}")]
-    ForkProposalConflict(String),
     #[error("git repository work-scope project conflict for {work_scope_id}: {project_ids:?}")]
     GitRepositoryWorkScopeProjectConflict {
         work_scope_id: WorkScopeId,
@@ -2603,6 +2598,7 @@ impl Database {
                     "Close attempt {attempt_id} is not active with a sealed topology capturing work scope {scope_id}"
                 )));
             }
+            Self::require_no_retained_legacy_creation_for_attempt_tx(&mut tx, attempt_id).await?;
             let resources_retired: bool = sqlx::query_scalar(
                 "SELECT NOT EXISTS(
                      SELECT 1
@@ -3457,12 +3453,11 @@ impl Database {
         .transpose()
     }
 
-    /// Reconcile persisted worktree identity with the current Git administrative marker.
+    /// Enroll worktree identities for legacy scopes that have never recorded one.
     ///
-    /// Inaccessible worktrees remain unresolved instead of receiving fabricated continuity.
+    /// Startup does not clear or replace a recorded identity when the marker cannot be verified.
     /// # Errors
     /// Returns a database error when an observed identity cannot be persisted.
-    #[allow(clippy::too_many_lines)]
     pub async fn reconcile_worktree_identities(&self) -> DbResult<()> {
         let mut conn = self.pool.acquire().await?;
         let mut tx = conn.begin_with("BEGIN IMMEDIATE").await?;
@@ -3472,6 +3467,8 @@ impl Database {
              WHERE lifecycle = 'active'
                AND environment_kind = 'allocated_worktree'
                AND worktree_path IS NOT NULL
+               AND worktree_id IS NULL
+               AND worktree_fingerprint IS NULL
              ORDER BY id",
         )
         .fetch_all(&mut *tx)
@@ -3484,46 +3481,12 @@ impl Database {
             })
             .collect::<Vec<_>>();
 
-        for (scope_id, path, observed_fingerprint) in &observations {
-            let revalidated = Self::observe_worktree_fingerprint(path);
-            let stable_fingerprint = match (observed_fingerprint, revalidated) {
-                (Some(observed), Some(revalidated)) if observed == &revalidated => Some(observed),
-                _ => None,
-            };
-            sqlx::query(
-                "UPDATE work_scopes
-                 SET worktree_id = NULL, worktree_fingerprint = NULL
-                 WHERE id = ?1
-                   AND lifecycle = 'active'
-                   AND environment_kind = 'allocated_worktree'
-                   AND worktree_path = ?2
-                   AND (?3 IS NULL OR NOT (worktree_id IS NOT NULL AND worktree_fingerprint = ?3))
-                   AND NOT EXISTS (
-                       SELECT 1
-                       FROM close_attempt_scopes captured
-                       JOIN close_obligations obligation
-                         ON obligation.attempt_id = captured.attempt_id
-                       WHERE captured.scope = work_scopes.id
-                         AND (obligation.phase <> 'completed'
-                              OR obligation.close_outcome IN ('archived_cleanup_attention', 'close_incomplete'))
-                         AND obligation.topology_sealed = 1
-                   )",
-            )
-            .bind(scope_id)
-            .bind(path)
-            .bind(stable_fingerprint)
-            .execute(&mut *tx)
-            .await?;
-        }
-
+        let mut enrolled = Vec::new();
         for (scope_id, path, observed_fingerprint) in &observations {
             let Some(observed_fingerprint) = observed_fingerprint else {
                 continue;
             };
-            let Some(revalidated_fingerprint) = Self::observe_worktree_fingerprint(path) else {
-                continue;
-            };
-            if &revalidated_fingerprint != observed_fingerprint {
+            if Self::observe_worktree_fingerprint(path).as_ref() != Some(observed_fingerprint) {
                 continue;
             }
             let result = sqlx::query(
@@ -3556,7 +3519,9 @@ impl Database {
             .bind(path)
             .execute(&mut *tx)
             .await?;
-            if result.rows_affected() == 0 {
+            if result.rows_affected() == 1 {
+                enrolled.push((scope_id, path, observed_fingerprint));
+            } else {
                 tracing::debug!(
                     work_scope_id = %scope_id,
                     "worktree identity reconciliation deferred or unresolved"
@@ -3564,8 +3529,8 @@ impl Database {
             }
         }
 
-        for (scope_id, path, observed_fingerprint) in &observations {
-            if Self::observe_worktree_fingerprint(path).as_ref() == observed_fingerprint.as_ref() {
+        for (scope_id, path, enrolled_fingerprint) in enrolled {
+            if Self::observe_worktree_fingerprint(path).as_ref() == Some(enrolled_fingerprint) {
                 continue;
             }
             sqlx::query(
@@ -3735,8 +3700,12 @@ impl Database {
         in_memory_template::open_migrated_for_test(path).await
     }
 
-    #[cfg(test)]
-    pub(crate) async fn open_prefix_for_test(path: &str, through: u32) -> DbResult<Self> {
+    /// Open a disposable fixture with numbered migrations through `through`.
+    ///
+    /// # Errors
+    /// Returns a [`DbError`] if opening or seeding the fixture fails.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn open_prefix_for_test(path: &str, through: u32) -> DbResult<Self> {
         in_memory_template::open_prefix_for_test(path, through).await
     }
 
@@ -6011,19 +5980,6 @@ impl Database {
                  SELECT lease_until AS deadline
                  FROM conversation_creation_jobs
                  WHERE status = 'claimed'
-                 UNION ALL
-                 SELECT CASE
-                            WHEN cleanup_lease_until IS NOT NULL
-                            THEN cleanup_lease_until
-                            ELSE updated_at
-                        END AS deadline
-                 FROM conversation_creation_jobs
-                 WHERE status IN ('cancelling', 'deletion_pending')
-                    OR (status = 'failed' AND EXISTS (
-                        SELECT 1 FROM conversation_creation_resource_reservations r
-                        WHERE r.job_id = conversation_creation_jobs.id
-                          AND r.status != 'released'
-                    ))
              )",
         )
         .fetch_one(&self.pool)
@@ -6031,84 +5987,84 @@ impl Database {
         Ok(deadline.as_deref().map(parse_datetime))
     }
 
-    /// Revoke provisioning authority and preserve a visible cancelled record.
+    /// Cancel provisioning without changing resource ownership.
+    /// Returns false if the conversation no longer has cancellable provisioning.
     ///
     /// # Errors
     ///
-    /// Returns [`DbError`] if the transaction fails or no creation job exists.
+    /// Returns [`DbError`] if the transaction fails.
     pub async fn cancel_conversation_creation(
         &self,
         conversation_id: &str,
         now: DateTime<Utc>,
-    ) -> DbResult<()> {
+    ) -> DbResult<bool> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let cancelled =
+            Self::cancel_conversation_creation_tx(&mut tx, conversation_id, now).await?;
+        tx.commit().await?;
+        Ok(cancelled)
+    }
+
+    pub(crate) async fn cancel_conversation_creation_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        conversation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
         let now = now.to_rfc3339();
-        let mut tx = self.pool.begin().await?;
         let job: Option<(String, i64)> = sqlx::query_as(
-            "SELECT id, generation FROM conversation_creation_jobs
-             WHERE conversation_id = ?1
-               AND status IN ('accepted', 'claimed', 'retry_scheduled')",
+            "SELECT j.id, j.generation FROM conversation_creation_jobs j
+             JOIN conversations c ON c.id = j.conversation_id
+             WHERE j.conversation_id = ?1 AND c.state_kind = 'provisioning'
+               AND j.status IN ('accepted', 'claimed', 'retry_scheduled')",
         )
         .bind(conversation_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         let Some((job_id, generation)) = job else {
-            tx.rollback().await?;
-            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+            return Ok(false);
         };
         let result = sqlx::query(
             "UPDATE conversation_creation_jobs
-             SET status = 'cancelling', generation = generation + 1,
+             SET status = 'cancelled', generation = generation + 1,
                  claim_worker_id = NULL, claim_token = NULL, lease_until = NULL,
                  cleanup_worker_id = NULL, cleanup_token = NULL, cleanup_lease_until = NULL,
-                 next_attempt_at = NULL, updated_at = ?1
+                 next_attempt_at = NULL, cancelled_at = ?1, updated_at = ?1
              WHERE id = ?2 AND generation = ?3
                AND status IN ('accepted', 'claimed', 'retry_scheduled')",
         )
         .bind(&now)
         .bind(&job_id)
         .bind(generation)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if result.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Err(DbError::Sqlx(sqlx::Error::RowNotFound));
+            return Ok(false);
         }
         native_close::fence_native_retry_sources_tx(
-            &mut tx,
+            tx,
             conversation_id,
             &ConvState::CreationCancelled {
                 job_id: job_id.clone(),
             },
         )
         .await?;
-        let state = serde_json::to_string(&ConvState::CreationCancelled {
+        let cancelled_state = ConvState::CreationCancelled {
             job_id: job_id.clone(),
-        })
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
+        };
+        let state = serde_json::to_string(&cancelled_state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
              WHERE id = ?4",
         )
         .bind(state)
-        .bind(conv_state_kind(&ConvState::CreationCancelled {
-            job_id: job_id.clone(),
-        }))
+        .bind(conv_state_kind(&cancelled_state))
         .bind(&now)
         .bind(conversation_id)
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE conversation_creation_resource_reservations
-             SET generation = ?3, status = 'cleanup_required', updated_at = ?1
-             WHERE job_id = ?2 AND status IN ('reserved', 'present')",
-        )
-        .bind(now)
-        .bind(&job_id)
-        .bind(generation + 1)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         crate::coordinator_watches::record_creation_event_tx(
-            &mut tx,
+            tx,
             &job_id,
             u64::try_from(generation).map_err(|error| DbError::Serialization(error.to_string()))?,
             conversation_id,
@@ -6116,8 +6072,7 @@ impl Database {
             None,
         )
         .await?;
-        tx.commit().await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Revoke provisioning authority and hide a deletion tombstone.
@@ -10543,64 +10498,6 @@ impl Database {
         Ok(usize::try_from(result.rows_affected()).unwrap_or(0))
     }
 
-    // ==================== Fork Proposal Operations ====================
-
-    /// Insert a new fork proposal (REQ-PROJ-033).
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn insert_fork_proposal(&self, p: &ForkProposal) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-        insert_fork_proposal_tx(&mut tx, p).await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// Atomically persist a fork proposal together with the originating turn's
-    /// tool round (REQ-PROJ-033): in a single transaction, write the assistant
-    /// message row, each synthetic tool-result row, and the `fork_proposals`
-    /// row. The synthetic success ack must never be durable without the
-    /// control-plane row the review/approve surface reads, so a crash between
-    /// the two is structurally impossible — either both commit or neither does.
-    ///
-    /// Message inserts use `INSERT OR IGNORE` on `message_id` so a crash-retry
-    /// that finds the assistant/tool rows already present is a no-op rather than
-    /// a UNIQUE failure; the proposal insert is keyed on its own `id`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn persist_fork_proposal_with_tool_round(
-        &self,
-        origin_conv_id: &str,
-        assistant: &Message,
-        tool_results: &[Message],
-        proposal: &ForkProposal,
-    ) -> DbResult<()> {
-        let mut tx = self.pool.begin().await?;
-
-        insert_message_tx(&mut tx, assistant).await?;
-        for msg in tool_results {
-            insert_message_tx(&mut tx, msg).await?;
-        }
-
-        tool_discovery::record_round_tx(&mut tx, assistant, tool_results, false).await?;
-
-        // Mirror `add_message_with_seq`'s side-effect: bump the conversation's
-        // `updated_at` so list-ordering stays current.
-        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
-            .bind(Utc::now().to_rfc3339())
-            .bind(origin_conv_id)
-            .execute(&mut *tx)
-            .await?;
-
-        insert_fork_proposal_tx(&mut tx, proposal).await?;
-
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// Atomically persist a completed tool round: the assistant message row and
     /// each of its tool-result rows commit in a single transaction, or none do.
     ///
@@ -10948,289 +10845,6 @@ impl Database {
             ));
         }
         Ok(transcript_generation)
-    }
-
-    /// Fetch a fork proposal by id.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn get_fork_proposal(&self, id: &str) -> DbResult<Option<ForkProposal>> {
-        let row = sqlx::query(FORK_PROPOSAL_SELECT_COLUMNS)
-            .bind(id)
-            .try_map(parse_fork_proposal_row)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row)
-    }
-
-    /// List all fork proposals for an origin conversation, oldest first.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn list_fork_proposals_for_origin(
-        &self,
-        origin_conv_id: &str,
-    ) -> DbResult<Vec<ForkProposal>> {
-        let rows = sqlx::query(
-            "SELECT id, origin_conv_id, task_file, title, priority, body, status,
-                    fork_conv_id, refinement_conv_id, created_at, resolved_at
-             FROM fork_proposals
-             WHERE origin_conv_id = ?1
-             ORDER BY created_at ASC, id ASC",
-        )
-        .bind(origin_conv_id)
-        .try_map(parse_fork_proposal_row)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    /// List every still-`pending` fork proposal across all origins, oldest
-    /// first. Used by the startup reconciliation pass that retires proposals
-    /// whose origin conversation has reached a terminal state (REQ-PROJ-035):
-    /// a crash after the origin went terminal but before its proposals were
-    /// retired leaves them `pending`, so they must be swept on restart.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn list_pending_fork_proposals(&self) -> DbResult<Vec<ForkProposal>> {
-        let rows = sqlx::query(
-            "SELECT id, origin_conv_id, task_file, title, priority, body, status,
-                    fork_conv_id, refinement_conv_id, created_at, resolved_at
-             FROM fork_proposals
-             WHERE status = ?1
-             ORDER BY created_at ASC, id ASC",
-        )
-        .bind(ForkProposalStatus::Pending.as_str())
-        .try_map(parse_fork_proposal_row)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows)
-    }
-
-    /// Dismiss a pending fork proposal (REQ-PROJ-034). Idempotent: returns
-    /// `true` iff a pending row was transitioned to `dismissed`; a second
-    /// call (or dismissing an already-resolved proposal) updates nothing and
-    /// returns `false`.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn dismiss_fork_proposal(&self, id: &str) -> DbResult<bool> {
-        let now = Utc::now();
-        let result = sqlx::query(
-            "UPDATE fork_proposals
-             SET status = ?1, resolved_at = ?2
-             WHERE id = ?3 AND status = ?4",
-        )
-        .bind(ForkProposalStatus::Dismissed.as_str())
-        .bind(now.to_rfc3339())
-        .bind(id)
-        .bind(ForkProposalStatus::Pending.as_str())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Retire every still-`pending` proposal for an origin conversation by
-    /// transitioning it to `dismissed` (REQ-PROJ-035 retire-on-terminal).
-    /// Already-resolved proposals are untouched.
-    ///
-    /// # Errors
-    ///
-    /// Returns a [`DbError`] if the underlying database operation fails.
-    pub async fn retire_pending_fork_proposals_for_origin(
-        &self,
-        origin_conv_id: &str,
-    ) -> DbResult<()> {
-        let now = Utc::now();
-        sqlx::query(
-            "UPDATE fork_proposals
-             SET status = ?1, resolved_at = ?2
-             WHERE origin_conv_id = ?3 AND status = ?4",
-        )
-        .bind(ForkProposalStatus::Dismissed.as_str())
-        .bind(now.to_rfc3339())
-        .bind(origin_conv_id)
-        .bind(ForkProposalStatus::Pending.as_str())
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Atomically resolve a pending proposal as `spawned` (REQ-PROJ-034): in a
-    /// single transaction, persist the fork `Conversation` and its `seed`
-    /// messages, then record the `spawned { fork_conv_id }` resolution.
-    ///
-    /// Idempotent on crash-retry: the fork conversation id is deterministic, so
-    /// a retry may find the child row and/or the resolution already present. If
-    /// the proposal is already `spawned` to the **same** `fork.id`, this is a
-    /// no-op returning `Ok(())`. If it is resolved to a different state or id,
-    /// returns [`DbError::ForkProposalConflict`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError::ForkProposalConflict`] on a divergent prior
-    /// resolution, or a [`DbError`] for an underlying database failure.
-    pub async fn resolve_fork_proposal_spawned(
-        &self,
-        proposal_id: &str,
-        fork: &Conversation,
-        seed_messages: &[Message],
-    ) -> DbResult<()> {
-        self.resolve_fork_proposal(
-            proposal_id,
-            fork,
-            seed_messages,
-            ForkProposalStatus::Spawned,
-        )
-        .await
-    }
-
-    /// Atomically resolve a pending proposal as `promoted` (REQ-PROJ-037): in a
-    /// single transaction, persist the Explore refinement `Conversation` and
-    /// its `seed` messages, then record the `promoted { refinement_conv_id }`
-    /// resolution. Same idempotency / conflict semantics as
-    /// [`Database::resolve_fork_proposal_spawned`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DbError::ForkProposalConflict`] on a divergent prior
-    /// resolution, or a [`DbError`] for an underlying database failure.
-    pub async fn resolve_fork_proposal_promoted(
-        &self,
-        proposal_id: &str,
-        refinement: &Conversation,
-        seed_messages: &[Message],
-    ) -> DbResult<()> {
-        self.resolve_fork_proposal(
-            proposal_id,
-            refinement,
-            seed_messages,
-            ForkProposalStatus::Promoted,
-        )
-        .await
-    }
-
-    /// Shared body for the two atomic resolve paths. `terminal_status` is
-    /// `Spawned` or `Promoted`; the corresponding `fork_conv_id` /
-    /// `refinement_conv_id` column is set from `child.id` while the other stays
-    /// NULL.
-    async fn resolve_fork_proposal(
-        &self,
-        proposal_id: &str,
-        child: &Conversation,
-        seed_messages: &[Message],
-        terminal_status: ForkProposalStatus,
-    ) -> DbResult<()> {
-        debug_assert!(matches!(
-            terminal_status,
-            ForkProposalStatus::Spawned | ForkProposalStatus::Promoted
-        ));
-
-        // Idempotent short-circuit: a prior identical resolution converges to a
-        // no-op; a divergent one is a conflict.
-        let Some(existing) = self.get_fork_proposal(proposal_id).await? else {
-            return Err(DbError::ConversationNotFound(format!(
-                "fork proposal {proposal_id}"
-            )));
-        };
-        if existing.status != ForkProposalStatus::Pending {
-            // Already resolved: an identical prior resolution (same terminal
-            // state + same child id) converges to a no-op; anything else is a
-            // conflict.
-            if existing.status == terminal_status
-                && resolution_child_id(&existing) == Some(child.id.as_str())
-            {
-                return Ok(());
-            }
-            return Err(DbError::ForkProposalConflict(format!(
-                "proposal {proposal_id} already resolved as {}",
-                existing.status.as_str()
-            )));
-        }
-
-        let now = Utc::now();
-        let (fork_conv_id, refinement_conv_id) = match terminal_status {
-            ForkProposalStatus::Spawned => (Some(child.id.as_str()), None),
-            ForkProposalStatus::Promoted => (None, Some(child.id.as_str())),
-            ForkProposalStatus::Pending | ForkProposalStatus::Dismissed => {
-                // Excluded by the debug_assert at the top of this fn; treat as
-                // a programmer error rather than silently mis-binding columns.
-                return Err(DbError::ForkProposalConflict(format!(
-                    "invalid terminal status {} for resolve",
-                    terminal_status.as_str()
-                )));
-            }
-        };
-
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-
-        sqlx::query(
-            "INSERT INTO product_conversations (id, kind, ordinary_lifecycle, auto_continue_on_context_exhaustion)
-             VALUES (?1, 'ordinary', 'open', 1)
-             ON CONFLICT(id) DO NOTHING",
-        )
-        .bind(child.product_conversation_id.as_str())
-        .execute(&mut *tx)
-        .await?;
-        insert_conversation_tx(&mut tx, child).await?;
-
-        for msg in seed_messages {
-            insert_message_tx(&mut tx, msg).await?;
-        }
-        if let ConvState::SeededLlmRequesting {
-            seed_message_id, ..
-        } = &child.state
-        {
-            let seed = seed_messages
-                .iter()
-                .find(|message| message.message_id == *seed_message_id.as_str())
-                .ok_or_else(|| {
-                    DbError::Serialization("seeded fork seed message is missing".to_string())
-                })?;
-            sqlx::query(
-                "INSERT INTO steering_execution_occurrences(conversation_id, message_id, source_kind)
-                 VALUES (?1, ?2, 'seeded_fork')
-                 ON CONFLICT(conversation_id) DO UPDATE SET
-                     message_id = excluded.message_id,
-                     source_kind = excluded.source_kind",
-            )
-            .bind(&child.id)
-            .bind(&seed.message_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        // Guard the resolution on the pending state so a concurrent resolver
-        // cannot double-resolve; the idempotent short-circuit above already
-        // handled the same-id retry.
-        let updated = sqlx::query(
-            "UPDATE fork_proposals
-             SET status = ?1, fork_conv_id = ?2, refinement_conv_id = ?3, resolved_at = ?4
-             WHERE id = ?5 AND status = ?6",
-        )
-        .bind(terminal_status.as_str())
-        .bind(fork_conv_id)
-        .bind(refinement_conv_id)
-        .bind(now.to_rfc3339())
-        .bind(proposal_id)
-        .bind(ForkProposalStatus::Pending.as_str())
-        .execute(&mut *tx)
-        .await?;
-
-        if updated.rows_affected() == 0 {
-            tx.rollback().await?;
-            return Err(DbError::ForkProposalConflict(format!(
-                "proposal {proposal_id} was resolved concurrently"
-            )));
-        }
-
-        tx.commit().await?;
-        Ok(())
     }
 
     /// Normalize a tier only if the model and tier still match a previously read snapshot.
@@ -15919,46 +15533,6 @@ fn parse_chain_qa_row(row: SqliteRow) -> Result<ChainQaRow, sqlx::Error> {
     })
 }
 
-/// Single-row SELECT for a fork proposal addressed by `?1` = id.
-const FORK_PROPOSAL_SELECT_COLUMNS: &str =
-    "SELECT id, origin_conv_id, task_file, title, priority, body, status, \
-     fork_conv_id, refinement_conv_id, created_at, resolved_at \
-     FROM fork_proposals WHERE id = ?1";
-
-/// The raw child conversation id a resolved proposal points at: `fork_conv_id`
-/// for `spawned`, `refinement_conv_id` for `promoted`, `None` otherwise.
-fn resolution_child_id(p: &ForkProposal) -> Option<&str> {
-    match p.status {
-        ForkProposalStatus::Spawned => p.fork_conversation_id.as_deref(),
-        ForkProposalStatus::Promoted => p.refinement_conversation_id.as_deref(),
-        ForkProposalStatus::Pending | ForkProposalStatus::Dismissed => None,
-    }
-}
-
-/// Parse a fork-proposal row. Unknown `status` values surface as a typed
-/// decode error rather than being silently coerced.
-#[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
-fn parse_fork_proposal_row(row: SqliteRow) -> Result<ForkProposal, sqlx::Error> {
-    let status_str: String = row.try_get("status")?;
-    let status = ForkProposalStatus::from_db_str(&status_str).ok_or_else(|| {
-        sqlx::Error::Decode(format!("unknown fork_proposals.status value: {status_str:?}").into())
-    })?;
-    let resolved_at: Option<String> = row.try_get("resolved_at")?;
-    Ok(ForkProposal {
-        id: row.try_get("id")?,
-        origin_conversation_id: row.try_get("origin_conv_id")?,
-        task_file: row.try_get("task_file")?,
-        title: row.try_get("title")?,
-        priority: row.try_get("priority")?,
-        body: row.try_get("body")?,
-        status,
-        fork_conversation_id: row.try_get("fork_conv_id")?,
-        refinement_conversation_id: row.try_get("refinement_conv_id")?,
-        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
-        resolved_at: resolved_at.as_deref().map(parse_datetime),
-    })
-}
-
 /// Insert a fully-formed `Conversation` row inside a transaction, writing every
 /// persisted column (including `spawned_from_conversation_id`). Idempotent on
 /// the PRIMARY KEY ONLY via `ON CONFLICT(id) DO NOTHING`, so a crash-retry that
@@ -17118,34 +16692,6 @@ pub(crate) async fn hydrate_attachments_conn(
     message_attachments::hydrate(connection, messages).await
 }
 
-/// Insert a `fork_proposals` row inside a transaction, reusing the same column
-/// mapping as [`Database::insert_fork_proposal`].
-async fn insert_fork_proposal_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-    p: &ForkProposal,
-) -> DbResult<()> {
-    sqlx::query(
-        "INSERT INTO fork_proposals (
-            id, origin_conv_id, task_file, title, priority, body, status,
-            fork_conv_id, refinement_conv_id, created_at, resolved_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-    )
-    .bind(&p.id)
-    .bind(&p.origin_conversation_id)
-    .bind(&p.task_file)
-    .bind(&p.title)
-    .bind(&p.priority)
-    .bind(&p.body)
-    .bind(p.status.as_str())
-    .bind(p.fork_conversation_id.as_deref())
-    .bind(p.refinement_conversation_id.as_deref())
-    .bind(p.created_at.to_rfc3339())
-    .bind(p.resolved_at.map(|t| t.to_rfc3339()))
-    .execute(&mut **tx)
-    .await?;
-    Ok(())
-}
-
 /// Parse a project row from the database
 #[allow(clippy::needless_pass_by_value)]
 fn parse_project_row(row: SqliteRow) -> Result<Project, sqlx::Error> {
@@ -17450,7 +16996,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worktree_reconciliation_releases_stale_owner_before_claim_arbitration() {
+    async fn worktree_reconciliation_preserves_recorded_owner_across_ambiguous_observations() {
         let db = Database::open_in_memory().await.unwrap();
         let temp = tempfile::tempdir().unwrap();
         let claimant = temp.path().join("claimant");
@@ -17459,10 +17005,12 @@ mod tests {
         std::fs::create_dir_all(&stale_owner).unwrap();
         std::fs::write(claimant.join(".git"), "gitdir: /tmp/original\n").unwrap();
         std::fs::write(stale_owner.join(".git"), "gitdir: /tmp/replacement\n").unwrap();
-        let released_fingerprint =
+        let recorded_fingerprint =
             Database::observe_worktree_fingerprint(claimant.to_str().unwrap()).unwrap();
-        let replacement_fingerprint =
-            Database::observe_worktree_fingerprint(stale_owner.to_str().unwrap()).unwrap();
+        assert_ne!(
+            Database::observe_worktree_fingerprint(stale_owner.to_str().unwrap()).as_ref(),
+            Some(&recorded_fingerprint)
+        );
 
         sqlx::query(
             "INSERT INTO work_scopes (
@@ -17477,33 +17025,44 @@ mod tests {
         .bind(claimant.to_str().unwrap())
         .bind(stale_owner.to_str().unwrap())
         .bind(Utc::now().to_rfc3339())
-        .bind(&released_fingerprint)
+        .bind(&recorded_fingerprint)
         .execute(db.pool())
         .await
         .unwrap();
 
-        db.reconcile_worktree_identities().await.unwrap();
+        for change in ["replacement", "malformed-marker", "missing"] {
+            match change {
+                "replacement" => {}
+                "malformed-marker" => {
+                    std::fs::write(stale_owner.join(".git"), b"invalid").unwrap();
+                }
+                "missing" => std::fs::rename(&stale_owner, temp.path().join("moved")).unwrap(),
+                _ => unreachable!(),
+            }
+            db.reconcile_worktree_identities().await.unwrap();
 
-        let identities = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
-            "SELECT id, worktree_id, worktree_fingerprint
-             FROM work_scopes
-             WHERE id IN ('a-claimant', 'b-stale-owner')
-             ORDER BY id",
-        )
-        .fetch_all(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(identities.len(), 2);
-        assert!(identities[0].1.is_some());
-        assert_eq!(
-            identities[0].2.as_deref(),
-            Some(released_fingerprint.as_str())
-        );
-        assert!(identities[1].1.is_some());
-        assert_eq!(
-            identities[1].2.as_deref(),
-            Some(replacement_fingerprint.as_str())
-        );
+            let identities = sqlx::query_as::<_, (String, Option<String>, Option<String>)>(
+                "SELECT id, worktree_id, worktree_fingerprint
+                 FROM work_scopes
+                 WHERE id IN ('a-claimant', 'b-stale-owner')
+                 ORDER BY id",
+            )
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                identities,
+                vec![
+                    ("a-claimant".into(), None, None),
+                    (
+                        "b-stale-owner".into(),
+                        Some("stale-id".into()),
+                        Some(recorded_fingerprint.clone()),
+                    ),
+                ],
+                "{change} must not transfer the recorded identity"
+            );
+        }
     }
 
     #[tokio::test]
@@ -18450,7 +18009,7 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn creation_cancel_and_delete_revoke_claim_before_cleanup() {
+    async fn historical_creation_cleanup_and_deletion_revoke_claim() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-cancel", "conv-cancel").await;
         let now = Utc::now();
@@ -18480,9 +18039,32 @@ mod tests {
         .await
         .unwrap();
 
-        db.cancel_conversation_creation("conv-cancel", now)
-            .await
-            .unwrap();
+        db.update_conversation_state(
+            "conv-cancel",
+            &ConvState::CreationCancelled {
+                job_id: "job-cancel".into(),
+            },
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE conversation_creation_jobs
+             SET status = 'cancelling', generation = generation + 1,
+                 claim_worker_id = NULL, claim_token = NULL, lease_until = NULL
+             WHERE id = ?",
+        )
+        .bind("job-cancel")
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE conversation_creation_resource_reservations
+             SET status = 'cleanup_required', generation = generation + 1 WHERE job_id = ?",
+        )
+        .bind("job-cancel")
+        .execute(db.pool())
+        .await
+        .unwrap();
         assert_eq!(
             db.fail_conversation_creation_job(
                 "job-cancel",
@@ -18708,9 +18290,19 @@ mod tests {
         let CreationStatus::Claimed(stale_claim) = job.protocol.status else {
             panic!("expected stale authority");
         };
-        db.cancel_conversation_creation("conv-seeded-stale", now)
+        db.update_conversation_state(
+            "conv-seeded-stale",
+            &ConvState::Provisioning {
+                job_id: "job-seeded-stale".into(),
+                phase: ConversationCreationPhase::Provisioning,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .cancel_conversation_creation("conv-seeded-stale", now)
             .await
-            .unwrap();
+            .unwrap());
         assert_eq!(
             db.complete_seeded_empty_conversation_creation(
                 "job-seeded-stale",
@@ -18751,14 +18343,10 @@ mod tests {
             .unwrap()
             .state;
 
-        let result = db
+        assert!(!db
             .cancel_conversation_creation("conv-ready-cancel", Utc::now())
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(DbError::Sqlx(sqlx::Error::RowNotFound))
-        ));
+            .await
+            .unwrap());
         assert_eq!(
             db.get_conversation("conv-ready-cancel")
                 .await
@@ -18979,9 +18567,19 @@ mod tests {
         let CreationStatus::Claimed(claim) = job.protocol.status else {
             panic!("expected claim authority");
         };
-        db.cancel_conversation_creation("conv-stale-metadata", now)
+        db.update_conversation_state(
+            "conv-stale-metadata",
+            &ConvState::Provisioning {
+                job_id: "job-stale-metadata".into(),
+                phase: ConversationCreationPhase::Provisioning,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(db
+            .cancel_conversation_creation("conv-stale-metadata", now)
             .await
-            .unwrap();
+            .unwrap());
 
         let before = db.get_conversation("conv-stale-metadata").await.unwrap();
         let outcome = db
@@ -19111,11 +18709,146 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creation_cleanup_retry_clears_lease_and_uses_retry_deadline() {
+    async fn legacy_stop_and_completion_have_one_winner() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stop-completion.db");
+        let db = Database::open_migrated_for_test(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let job_id = "job-stop-completion";
+        let conversation_id = "conv-stop-completion";
+        insert_test_creation_job(&db, job_id, conversation_id).await;
+        db.update_conversation_state(
+            conversation_id,
+            &ConvState::Provisioning {
+                job_id: job_id.into(),
+                phase: ConversationCreationPhase::Provisioning,
+            },
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let CreationClaimOutcome::Claimed(job) = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker".into()),
+                &CreationClaimToken("token".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected provisioning claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        let (stopped, completed) = tokio::join!(
+            db.cancel_conversation_creation(conversation_id, now),
+            db.complete_seeded_empty_conversation_creation(job_id, &claim, conversation_id, now),
+        );
+        let state = db.get_conversation(conversation_id).await.unwrap().state;
+        match (stopped.unwrap(), completed.unwrap()) {
+            (true, CreationCasOutcome::ClaimLost) => {
+                assert!(matches!(state, ConvState::CreationCancelled { .. }));
+            }
+            (false, CreationCasOutcome::Applied) => {
+                assert_eq!(state, ConvState::Idle);
+            }
+            outcome => panic!("Stop and completion must have exactly one winner: {outcome:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn competing_legacy_stops_settle_once_without_changing_reservations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stop.db");
+        let db = Database::open_migrated_for_test(db_path.to_str().unwrap())
+            .await
+            .unwrap();
+        let job_id = "job-stop";
+        let conversation_id = "conv-stop";
+        insert_test_creation_job(&db, job_id, conversation_id).await;
+        db.update_conversation_state(
+            conversation_id,
+            &ConvState::Provisioning {
+                job_id: job_id.into(),
+                phase: ConversationCreationPhase::Provisioning,
+            },
+        )
+        .await
+        .unwrap();
+        let now = Utc::now();
+        let CreationClaimOutcome::Claimed(job) = db
+            .claim_next_conversation_creation_job(
+                &CreationWorkerId("worker".into()),
+                &CreationClaimToken("token".into()),
+                now,
+                chrono::Duration::seconds(30),
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("expected provisioning claim");
+        };
+        let CreationStatus::Claimed(claim) = job.protocol.status else {
+            panic!("expected claim authority");
+        };
+        assert_eq!(
+            db.reserve_conversation_creation_resource(
+                "reservation-stop",
+                job_id,
+                &claim,
+                "/repo",
+                "/repo/worktree",
+                now,
+            )
+            .await
+            .unwrap(),
+            CreationCasOutcome::Applied
+        );
+        let before = db.get_creation_resource_reservations(job_id).await.unwrap();
+        let (first, second) = tokio::join!(
+            db.cancel_conversation_creation(conversation_id, now),
+            db.cancel_conversation_creation(conversation_id, now),
+        );
+        assert_ne!(first.unwrap(), second.unwrap());
+        assert_eq!(
+            db.complete_seeded_empty_conversation_creation(job_id, &claim, conversation_id, now)
+                .await
+                .unwrap(),
+            CreationCasOutcome::ClaimLost
+        );
+        assert_eq!(
+            db.get_conversation_creation_job(job_id)
+                .await
+                .unwrap()
+                .protocol
+                .status,
+            CreationStatus::Cancelled
+        );
+        assert!(matches!(
+            db.get_conversation(conversation_id).await.unwrap().state,
+            ConvState::CreationCancelled { .. }
+        ));
+        assert_eq!(
+            db.get_creation_resource_reservations(job_id).await.unwrap(),
+            before
+        );
+        assert_eq!(
+            db.next_conversation_creation_deadline().await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_cleanup_retry_stays_out_of_creation_scheduler_deadline() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-cleanup-retry", "conv-cleanup-retry").await;
         let now = Utc::now();
-        db.cancel_conversation_creation("conv-cleanup-retry", now)
+        sqlx::query("UPDATE conversation_creation_jobs SET status = 'cancelling' WHERE id = ?")
+            .bind("job-cleanup-retry")
+            .execute(db.pool())
             .await
             .unwrap();
         let cleanup = db
@@ -19138,7 +18871,7 @@ mod tests {
         );
         assert_eq!(
             db.next_conversation_creation_deadline().await.unwrap(),
-            Some(retry_at)
+            None
         );
         assert!(db
             .claim_next_conversation_creation_cleanup(
@@ -19163,11 +18896,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn creation_cleanup_deadline_waits_for_live_cleanup_lease() {
+    async fn creation_scheduler_deadline_ignores_legacy_cleanup_lease() {
         let db = Database::open_in_memory().await.unwrap();
         insert_test_creation_job(&db, "job-cleanup-deadline", "conv-cleanup-deadline").await;
         let now = Utc::now();
-        db.cancel_conversation_creation("conv-cleanup-deadline", now)
+        sqlx::query("UPDATE conversation_creation_jobs SET status = 'cancelling' WHERE id = ?")
+            .bind("job-cleanup-deadline")
+            .execute(db.pool())
             .await
             .unwrap();
         let lease_duration = chrono::Duration::seconds(30);
@@ -19185,7 +18920,7 @@ mod tests {
         assert_eq!(cleanup.lease_until, now + lease_duration);
         assert_eq!(
             db.next_conversation_creation_deadline().await.unwrap(),
-            Some(cleanup.lease_until)
+            None
         );
         assert!(db
             .claim_next_conversation_creation_cleanup(
@@ -31374,136 +31109,27 @@ mod tests {
         assert_eq!(owner_count, 0);
     }
 
-    // ==================== Fork Proposal Tests ====================
-
-    fn fork_proposal_fixture(id: &str, origin: &str) -> ForkProposal {
-        ForkProposal {
-            id: id.to_string(),
-            origin_conversation_id: origin.to_string(),
-            task_file: "tasks/00042-p1-ready--fix-thing.md".to_string(),
-            title: "Fix Thing".to_string(),
-            priority: "p1".to_string(),
-            body: "# Fix Thing\n\nDo the thing.".to_string(),
-            status: ForkProposalStatus::Pending,
-            fork_conversation_id: None,
-            refinement_conversation_id: None,
-            created_at: Utc::now(),
-            resolved_at: None,
-        }
-    }
-
-    /// Build a child fork/refinement `Conversation` carrying the breadcrumb.
-    async fn child_conv_fixture(db: &Database, id: &str, spawned_from: &str) -> Conversation {
-        // Persist + read a base row, then mutate into the child shape.
-        let base = db
-            .create_conversation(id, &format!("slug-{id}"), "/tmp/fork", true, None, None)
-            .await
-            .unwrap();
-        // Remove it so the resolve path inserts it fresh inside its own tx.
-        db.delete_conversation(id).await.unwrap();
-        Conversation {
-            spawned_from_conversation_id: Some(spawned_from.to_string()),
-            ..base
-        }
-    }
-
-    fn seed_msg(conv_id: &str) -> Message {
-        Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: format!("seed-{conv_id}"),
-            conversation_id: conv_id.to_string(),
-            sequence_id: 1,
-            message_type: MessageType::User,
-            content: MessageContent::user("seed brief body"),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        }
-    }
-
     #[tokio::test]
-    async fn fork_proposal_insert_get_roundtrip() {
+    async fn spawned_from_conversation_provenance_survives_hydration() {
         let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-1", "o1", "/tmp", true, None, None)
+        db.create_conversation("origin", "origin", "/tmp", true, None, None)
             .await
             .unwrap();
-
-        let p = fork_proposal_fixture("fp-1", "origin-1");
-        db.insert_fork_proposal(&p).await.unwrap();
-
-        let got = db.get_fork_proposal("fp-1").await.unwrap().unwrap();
-        assert_eq!(got.id, "fp-1");
-        assert_eq!(got.origin_conversation_id, "origin-1");
-        assert_eq!(got.status, ForkProposalStatus::Pending);
-        assert_eq!(got.task_file, p.task_file);
-        assert_eq!(got.body, p.body);
-        assert_eq!(got.fork_conversation_id, None);
-        assert!(got.resolved_at.is_none());
-
-        assert!(db.get_fork_proposal("missing").await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn persist_fork_proposal_with_tool_round_commits_both() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-tr", "otr", "/tmp", true, None, None)
+        db.create_conversation("child", "child", "/tmp", true, None, None)
             .await
             .unwrap();
+        db.delete_conversation("origin").await.unwrap();
 
-        let assistant = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "asst-1".to_string(),
-            conversation_id: "origin-tr".to_string(),
-            sequence_id: 10,
-            message_type: MessageType::Agent,
-            content: MessageContent::agent(vec![]),
-            display_data: None,
-            usage_data: None,
-            created_at: Utc::now(),
-        };
-        let tool_result = Message {
-            origin: phoenix_core::domain::db_schema::InputOrigin::UnknownHistorical,
-            message_id: "tool-1-result".to_string(),
-            conversation_id: "origin-tr".to_string(),
-            sequence_id: 11,
-            message_type: MessageType::Tool,
-            content: MessageContent::tool("tool-1", "Fork proposal recorded", false),
-            display_data: Some(serde_json::json!({ "fork_proposal_id": "fp-tr" })),
-            usage_data: None,
-            created_at: Utc::now(),
-        };
-
-        let proposal = fork_proposal_fixture("fp-tr", "origin-tr");
-        db.persist_fork_proposal_with_tool_round(
-            "origin-tr",
-            &assistant,
-            &[tool_result],
-            &proposal,
-        )
-        .await
-        .unwrap();
-
-        // The control-plane row committed.
-        let got = db.get_fork_proposal("fp-tr").await.unwrap().unwrap();
-        assert_eq!(got.status, ForkProposalStatus::Pending);
-
-        // The tool round committed in the same transaction.
-        let msgs = db.get_messages("origin-tr").await.unwrap();
-        assert!(
-            msgs.iter().any(|m| m.message_id == "asst-1"),
-            "assistant message must be durable"
-        );
-        let ack = msgs
-            .iter()
-            .find(|m| m.message_id == "tool-1-result")
-            .expect("synthetic ack must be durable");
+        sqlx::query("UPDATE conversations SET spawned_from_conversation_id = ?1 WHERE id = ?2")
+            .bind("origin")
+            .bind("child")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let child = db.get_conversation("child").await.unwrap();
         assert_eq!(
-            ack.display_data
-                .as_ref()
-                .and_then(|d| d.get("fork_proposal_id"))
-                .and_then(|v| v.as_str()),
-            Some("fp-tr"),
-            "ack must carry the fork_proposal_id handle"
+            child.spawned_from_conversation_id.as_deref(),
+            Some("origin")
         );
     }
 
@@ -32401,94 +32027,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fork_proposal_list_for_origin_ordered() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-2", "o2", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.create_conversation("origin-3", "o3", "/tmp", true, None, None)
-            .await
-            .unwrap();
-
-        let mut a = fork_proposal_fixture("fp-a", "origin-2");
-        a.created_at = Utc::now() - chrono::Duration::seconds(10);
-        let b = fork_proposal_fixture("fp-b", "origin-2");
-        let other = fork_proposal_fixture("fp-c", "origin-3");
-        db.insert_fork_proposal(&a).await.unwrap();
-        db.insert_fork_proposal(&b).await.unwrap();
-        db.insert_fork_proposal(&other).await.unwrap();
-
-        let list = db.list_fork_proposals_for_origin("origin-2").await.unwrap();
-        assert_eq!(
-            list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
-            vec!["fp-a", "fp-b"]
-        );
-    }
-
-    #[tokio::test]
-    async fn fork_proposal_dismiss_is_idempotent() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-4", "o4", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-d", "origin-4"))
-            .await
-            .unwrap();
-
-        assert!(db.dismiss_fork_proposal("fp-d").await.unwrap());
-        let got = db.get_fork_proposal("fp-d").await.unwrap().unwrap();
-        assert_eq!(got.status, ForkProposalStatus::Dismissed);
-        assert!(got.resolved_at.is_some());
-
-        // Second dismiss updates nothing.
-        assert!(!db.dismiss_fork_proposal("fp-d").await.unwrap());
-        // Dismissing an unknown id is also false (no row updated).
-        assert!(!db.dismiss_fork_proposal("ghost").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn fork_proposal_retire_pending_only() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-5", "o5", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-p1", "origin-5"))
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-p2", "origin-5"))
-            .await
-            .unwrap();
-        // Resolve one to spawned so retire must leave it alone.
-        let child = child_conv_fixture(&db, "fork-x", "origin-5").await;
-        db.resolve_fork_proposal_spawned("fp-p2", &child, &[seed_msg("fork-x")])
-            .await
-            .unwrap();
-
-        db.retire_pending_fork_proposals_for_origin("origin-5")
-            .await
-            .unwrap();
-
-        let p1 = db.get_fork_proposal("fp-p1").await.unwrap().unwrap();
-        let p2 = db.get_fork_proposal("fp-p2").await.unwrap().unwrap();
-        assert_eq!(p1.status, ForkProposalStatus::Dismissed);
-        assert_eq!(p2.status, ForkProposalStatus::Spawned);
-    }
-
-    #[tokio::test]
-    async fn fork_proposal_cascade_deletes_with_origin() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-6", "o6", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-cas", "origin-6"))
-            .await
-            .unwrap();
-
-        db.delete_conversation("origin-6").await.unwrap();
-        assert!(db.get_fork_proposal("fp-cas").await.unwrap().is_none());
-    }
-
-    #[tokio::test]
     async fn sub_agent_cwd_override_survives_hydration() {
         let db = Database::open_in_memory().await.unwrap();
         let parent = db
@@ -32546,84 +32084,6 @@ mod tests {
         let hydrated = db.get_conversation(&child.id).await.unwrap();
         assert_eq!(hydrated.cwd, "/tmp/worktree/subdir");
         assert!(hydrated.continued_in_conv_id.is_none());
-    }
-
-    #[tokio::test]
-    async fn resolve_spawned_happy_path_and_idempotent_retry() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-7", "o7", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-s", "origin-7"))
-            .await
-            .unwrap();
-        let child = child_conv_fixture(&db, "fork-7", "origin-7").await;
-        let seeds = vec![seed_msg("fork-7")];
-
-        db.resolve_fork_proposal_spawned("fp-s", &child, &seeds)
-            .await
-            .unwrap();
-
-        let p = db.get_fork_proposal("fp-s").await.unwrap().unwrap();
-        assert_eq!(p.status, ForkProposalStatus::Spawned);
-        assert_eq!(p.fork_conversation_id.as_deref(), Some("fork-7"));
-        assert!(p.refinement_conversation_id.is_none());
-        assert!(p.resolved_at.is_some());
-
-        // Child + breadcrumb + seed message present.
-        let fork = db.get_conversation("fork-7").await.unwrap();
-        assert_eq!(
-            fork.spawned_from_conversation_id.as_deref(),
-            Some("origin-7")
-        );
-        let msgs = db.get_messages("fork-7").await.unwrap();
-        assert_eq!(msgs.len(), 1);
-
-        // Idempotent re-run: same id, no duplicate rows, still one spawned.
-        db.resolve_fork_proposal_spawned("fp-s", &child, &seeds)
-            .await
-            .unwrap();
-        let p2 = db.get_fork_proposal("fp-s").await.unwrap().unwrap();
-        assert_eq!(p2.status, ForkProposalStatus::Spawned);
-        assert_eq!(db.get_messages("fork-7").await.unwrap().len(), 1);
-        let orphan_scopes: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM work_scopes ws
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM conversations c WHERE c.work_scope_id = ws.id
-             )",
-        )
-        .fetch_one(db.pool())
-        .await
-        .unwrap();
-        assert_eq!(orphan_scopes, 0);
-    }
-
-    #[tokio::test]
-    async fn resolve_promoted_happy_path_and_idempotent_retry() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-8", "o8", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-pr", "origin-8"))
-            .await
-            .unwrap();
-        let child = child_conv_fixture(&db, "refine-8", "origin-8").await;
-        let seeds = vec![seed_msg("refine-8")];
-
-        db.resolve_fork_proposal_promoted("fp-pr", &child, &seeds)
-            .await
-            .unwrap();
-
-        let p = db.get_fork_proposal("fp-pr").await.unwrap().unwrap();
-        assert_eq!(p.status, ForkProposalStatus::Promoted);
-        assert_eq!(p.refinement_conversation_id.as_deref(), Some("refine-8"));
-        assert!(p.fork_conversation_id.is_none());
-
-        // Idempotent re-run.
-        db.resolve_fork_proposal_promoted("fp-pr", &child, &seeds)
-            .await
-            .unwrap();
-        assert_eq!(db.get_messages("refine-8").await.unwrap().len(), 1);
     }
 
     /// N7: `insert_conversation_tx` is idempotent on the PRIMARY KEY ONLY
@@ -32688,224 +32148,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_conflicts_on_divergent_prior_resolution() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-9", "o9", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-cf", "origin-9"))
-            .await
-            .unwrap();
-        let child = child_conv_fixture(&db, "fork-9", "origin-9").await;
-        db.resolve_fork_proposal_spawned("fp-cf", &child, &[seed_msg("fork-9")])
-            .await
-            .unwrap();
-
-        // Re-resolving spawned to a DIFFERENT id is a conflict.
-        let other = child_conv_fixture(&db, "fork-9b", "origin-9").await;
-        let err = db
-            .resolve_fork_proposal_spawned("fp-cf", &other, &[seed_msg("fork-9b")])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DbError::ForkProposalConflict(_)));
-
-        // Promoting an already-spawned proposal is a conflict.
-        let err = db
-            .resolve_fork_proposal_promoted("fp-cf", &other, &[seed_msg("fork-9b")])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DbError::ForkProposalConflict(_)));
-    }
-
-    #[tokio::test]
-    async fn dangling_breadcrumb_and_fork_id_tolerated() {
+    async fn spawned_from_conversation_provenance_can_dangle() {
         let db = Database::open_in_memory().await.unwrap();
         db.create_conversation("origin-10", "o10", "/tmp", true, None, None)
             .await
             .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-dang", "origin-10"))
-            .await
-            .unwrap();
-        let child = child_conv_fixture(&db, "fork-10", "origin-10").await;
-        db.resolve_fork_proposal_spawned("fp-dang", &child, &[seed_msg("fork-10")])
-            .await
-            .unwrap();
-
-        // Hard-delete the fork: its raw id on the proposal must dangle (no FK
-        // error), the proposal survives, and the origin breadcrumb pointing at a
-        // (here also deletable) conversation is non-FK.
-        db.delete_conversation("fork-10").await.unwrap();
-        let p = db.get_fork_proposal("fp-dang").await.unwrap().unwrap();
-        assert_eq!(p.status, ForkProposalStatus::Spawned);
-        assert_eq!(p.fork_conversation_id.as_deref(), Some("fork-10"));
-        assert!(db.get_conversation("fork-10").await.is_err());
-
-        // A conversation whose breadcrumb points at a since-deleted origin
-        // persists and reads back.
-        db.create_conversation("late-fork", "lf", "/tmp", true, None, None)
+        db.create_conversation("child-10", "c10", "/tmp", true, None, None)
             .await
             .unwrap();
         db.delete_conversation("origin-10").await.unwrap();
-        // Breadcrumb to the now-gone origin is a raw, dangle-tolerant id.
-        sqlx::query("UPDATE conversations SET spawned_from_conversation_id = 'origin-10' WHERE id = 'late-fork'")
+        sqlx::query("UPDATE conversations SET spawned_from_conversation_id = 'origin-10' WHERE id = 'child-10'")
             .execute(&db.pool)
             .await
             .unwrap();
-        let got = db.get_conversation("late-fork").await.unwrap();
+        let child = db.get_conversation("child-10").await.unwrap();
         assert_eq!(
-            got.spawned_from_conversation_id.as_deref(),
+            child.spawned_from_conversation_id.as_deref(),
             Some("origin-10")
         );
-    }
-
-    /// Transition-graph negative edges out of the `dismissed` terminal
-    /// (REQ-PROJ-034, `ForkProposal` `transitions status`): once a proposal is
-    /// `dismissed` it has no outbound resolution edge, so resolving it as
-    /// `spawned` or `promoted` is a conflict, and a second `dismiss` is a no-op.
-    /// `resolve_conflicts_on_divergent_prior_resolution` only exercises edges out
-    /// of `spawned`; this covers the `dismissed` source row.
-    #[tokio::test]
-    async fn resolve_out_of_dismissed_terminal_is_rejected() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-dt", "odt", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-dt", "origin-dt"))
-            .await
-            .unwrap();
-        assert!(db.dismiss_fork_proposal("fp-dt").await.unwrap());
-
-        let child = child_conv_fixture(&db, "fork-dt", "origin-dt").await;
-        // dismissed -> spawned: undeclared edge, rejected.
-        let err = db
-            .resolve_fork_proposal_spawned("fp-dt", &child, &[seed_msg("fork-dt")])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DbError::ForkProposalConflict(_)), "{err:?}");
-        // dismissed -> promoted: undeclared edge, rejected.
-        let err = db
-            .resolve_fork_proposal_promoted("fp-dt", &child, &[seed_msg("fork-dt")])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DbError::ForkProposalConflict(_)), "{err:?}");
-        // dismissed -> dismissed: terminal self-edge is a no-op (no row updated).
-        assert!(!db.dismiss_fork_proposal("fp-dt").await.unwrap());
-
-        // The proposal is unchanged: still dismissed, both resolution ids absent.
-        let p = db.get_fork_proposal("fp-dt").await.unwrap().unwrap();
-        assert_eq!(p.status, ForkProposalStatus::Dismissed);
-        assert!(p.fork_conversation_id.is_none());
-        assert!(p.refinement_conversation_id.is_none());
-    }
-
-    /// Transition-graph negative edges out of the `promoted` terminal
-    /// (REQ-PROJ-037, `ForkProposal` `transitions status`): `promoted` is terminal,
-    /// so a second `promote` to a different id, a cross-resolution to `spawned`,
-    /// and a `dismiss` are all rejected / no-ops. Complements
-    /// `resolve_conflicts_on_divergent_prior_resolution` (spawned source) and
-    /// `resolve_out_of_dismissed_terminal_is_rejected` (dismissed source).
-    #[tokio::test]
-    async fn resolve_out_of_promoted_terminal_is_rejected() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-pt", "opt", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-pt", "origin-pt"))
-            .await
-            .unwrap();
-        let child = child_conv_fixture(&db, "refine-pt", "origin-pt").await;
-        db.resolve_fork_proposal_promoted("fp-pt", &child, &[seed_msg("refine-pt")])
-            .await
-            .unwrap();
-
-        let other = child_conv_fixture(&db, "refine-pt-b", "origin-pt").await;
-        // promoted -> promoted (different id): conflict.
-        let err = db
-            .resolve_fork_proposal_promoted("fp-pt", &other, &[seed_msg("refine-pt-b")])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DbError::ForkProposalConflict(_)), "{err:?}");
-        // promoted -> spawned: undeclared cross-resolution edge, rejected.
-        let err = db
-            .resolve_fork_proposal_spawned("fp-pt", &other, &[seed_msg("refine-pt-b")])
-            .await
-            .unwrap_err();
-        assert!(matches!(err, DbError::ForkProposalConflict(_)), "{err:?}");
-        // promoted -> dismissed: terminal, dismiss is a no-op.
-        assert!(!db.dismiss_fork_proposal("fp-pt").await.unwrap());
-
-        // Field invariant: a `promoted` proposal has refinement present, fork absent.
-        let p = db.get_fork_proposal("fp-pt").await.unwrap().unwrap();
-        assert_eq!(p.status, ForkProposalStatus::Promoted);
-        assert_eq!(p.refinement_conversation_id.as_deref(), Some("refine-pt"));
-        assert!(p.fork_conversation_id.is_none());
-    }
-
-    /// `spawned -> dismissed` is an undeclared edge: `dismiss_fork_proposal` is
-    /// guarded `WHERE status = pending`, so dismissing an already-`spawned`
-    /// proposal updates nothing and leaves the spawned resolution intact. The
-    /// fork conversation id survives (the live, decoupled child).
-    #[tokio::test]
-    async fn dismiss_after_spawned_is_a_noop() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-sd", "osd", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-sd", "origin-sd"))
-            .await
-            .unwrap();
-        let child = child_conv_fixture(&db, "fork-sd", "origin-sd").await;
-        db.resolve_fork_proposal_spawned("fp-sd", &child, &[seed_msg("fork-sd")])
-            .await
-            .unwrap();
-
-        assert!(!db.dismiss_fork_proposal("fp-sd").await.unwrap());
-        let p = db.get_fork_proposal("fp-sd").await.unwrap().unwrap();
-        assert_eq!(p.status, ForkProposalStatus::Spawned);
-        assert_eq!(p.fork_conversation_id.as_deref(), Some("fork-sd"));
-        assert!(p.refinement_conversation_id.is_none());
-    }
-
-    /// State-dependent field invariant (`ForkProposal` entity): the resolution
-    /// fields are present iff in their matching terminal state. A freshly
-    /// inserted `pending` proposal carries BOTH `fork` and `refinement` absent.
-    /// `fork_proposal_insert_get_roundtrip` asserts `fork` is absent; this also
-    /// pins `refinement` absent while pending.
-    #[tokio::test]
-    async fn pending_proposal_has_no_resolution_fields() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-pp", "opp", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-pp", "origin-pp"))
-            .await
-            .unwrap();
-
-        let p = db.get_fork_proposal("fp-pp").await.unwrap().unwrap();
-        assert_eq!(p.status, ForkProposalStatus::Pending);
-        assert!(p.fork_conversation_id.is_none());
-        assert!(p.refinement_conversation_id.is_none());
-    }
-
-    /// State-dependent field invariant: a `dismissed` proposal has BOTH `fork`
-    /// and `refinement` absent (the resolution spawned/promoted nothing).
-    /// `fork_proposal_dismiss_is_idempotent` checks the status; this pins the
-    /// field absence the entity's present-iff-terminal contract requires.
-    #[tokio::test]
-    async fn dismissed_proposal_has_no_resolution_fields() {
-        let db = Database::open_in_memory().await.unwrap();
-        db.create_conversation("origin-df", "odf", "/tmp", true, None, None)
-            .await
-            .unwrap();
-        db.insert_fork_proposal(&fork_proposal_fixture("fp-df", "origin-df"))
-            .await
-            .unwrap();
-        assert!(db.dismiss_fork_proposal("fp-df").await.unwrap());
-
-        let p = db.get_fork_proposal("fp-df").await.unwrap().unwrap();
-        assert_eq!(p.status, ForkProposalStatus::Dismissed);
-        assert!(p.fork_conversation_id.is_none());
-        assert!(p.refinement_conversation_id.is_none());
     }
 
     async fn retirement_fixture(

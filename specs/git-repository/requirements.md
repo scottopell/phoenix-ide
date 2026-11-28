@@ -174,32 +174,22 @@ WHEN a Phoenix-owned disposable worktree exists for a ProductConversation
 THE SYSTEM SHALL register enough data to report that stable ProductConversation identity, its topology-derived latest parent transcript row, worktree path, attached `WorkScope`, and singular attached `GitRepository`
 
 WHEN the server starts
-THE SYSTEM SHALL reconcile the registry against worktrees on disk
-AND clean up orphaned registry entries
-AND report worktrees that exist on disk but have no registry entry
+THE SYSTEM SHALL NOT scan for orphaned worktrees, reclaim worktrees, remove registry entries, or prune Git worktree metadata
+AND any repository/worktree status shown to a user SHALL derive from a requested, read-only observation
 
 WHEN a parent transcript row is in context-exhausted state and has no continuation successor through `continued_in_conv_id`
-THE SYSTEM SHALL NOT treat its worktree as orphaned during reconciliation
+THE SYSTEM SHALL retain its worktree association as repository state without automatic orphan classification
 
 WHEN a transcript row has transferred execution through `continued_in_conv_id`
 THE SYSTEM SHALL treat that row as a historical transcript segment rather than as an independent `WorkScope` authority
 AND SHALL derive the latest execution row from continuation topology rather than storing a second ownership authority
 AND SHALL keep the same stable ProductConversation-scoped `WorkScope` identity, the same singular `GitRepository` association, and the same filesystem worktree path across that continuation
-AND SHALL preserve the worktree only while an ordinary Open ProductConversation still has that same `WorkScope` attached
+AND SHALL preserve the worktree association across retained conversation history; only the owning safe Close contract may retire the resource
 
-WHEN teardown or startup reconciliation evaluates a Phoenix-owned worktree
-AND a distinct ordinary Open ProductConversation still resolves to the same `WorkScope`, or persisted transcript membership and attachment records cannot prove whether such a distinct Open aggregate exists
-THE SYSTEM SHALL preserve the worktree
-
-WHEN teardown or startup reconciliation evaluates a Phoenix-owned worktree
-AND no distinct ordinary Open ProductConversation resolves to its `WorkScope`
-AND every persisted transcript row and attachment record for that `WorkScope` resolves to a known ProductConversation
-THE SYSTEM SHALL remove the worktree when safe to do so
-AND SHALL NOT create, delete, or rewrite a branch as part of that reclamation
-
-WHEN startup reconciliation finds tracked or untracked changes or cannot determine worktree safety
-THE SYSTEM SHALL retain the worktree for manual recovery
-AND SHALL report why safe reclamation was skipped
+WHEN an explicit Close operation evaluates a Phoenix-owned worktree
+THE SYSTEM SHALL apply the exact Close inspection, blocker, and retirement contract in `specs/work-lifecycle/requirements.md`
+AND SHALL retain the worktree whenever ownership, contents, or safe retirement is uncertain
+AND SHALL NOT perform cleanup based solely on startup discovery, registry absence, age, or repository metadata
 
 **Rationale:** Worktree ownership belongs to the live `WorkScope`, not to stale mode data or branch ownership. The hidden `GitRepository` record helps Phoenix reason about repository-backed resources, but preserving or reclaiming the disposable workspace must never imply that Phoenix also owns a branch lifecycle or a user-facing repository object.
 
@@ -207,15 +197,14 @@ AND SHALL report why safe reclamation was skipped
 
 ### REQ-GITREP-007: Hidden Repository Identity Survives Conversation Deletion When Phoenix Still Needs Repository Truth
 
-WHEN a ProductConversation is deleted
-THE SYSTEM SHALL remove only the conversation-owned aggregate and scope attachments that deletion owns
-AND SHALL preserve the hidden `GitRepository` whenever Phoenix still needs it for orphan recovery, default-branch observation history, restart repair evidence, or repository-scoped mutation locking
+WHEN a ProductConversation enters History through Close
+THE SYSTEM SHALL retain the hidden `GitRepository` and `WorkScope` evidence needed to preserve that conversation's historical identity and Close outcome
+AND SHALL NOT reclaim repository resources through deletion or startup orphan recovery
 
 THE SYSTEM SHALL NOT require a surviving user-visible conversation, task, branch, or pull request association in order to retain hidden repository identity
 
-WHEN no surviving WorkScope attachment, provisioning/repair evidence, orphan resource, default-branch observation needed by a consumer, or repository-scoped mutation lock refers to a hidden `GitRepository`
-THE SYSTEM MAY retire that hidden repository and its locator/default-branch observations
-AND SHALL NOT retain it solely to populate a user-visible catalog, favorite, recent-location suggestion, or grouping surface
+THE SYSTEM SHALL NOT retire hidden repository identity or observations through a startup sweep or generic resource-reclamation process
+AND SHALL retain repository facts while they are needed by a conversation, its Close evidence, or a pending provisioning record
 
 **Rationale:** Repository identity outlives one conversation when Phoenix still needs it to reason safely about remaining local repository facts.
 

@@ -23,20 +23,405 @@ use crate::{
     Database, DbError, DbResult,
 };
 
-/// Database-admitted input for the generic background settlement worker.
+pub(crate) struct LiveCloseSettlementTarget<'a, 'db> {
+    tx: &'a mut crate::workflow::WorkflowTx<'db>,
+    attempt_id: &'a CloseAttemptId,
+    target: &'a CloseDirectTurnSettlementTarget,
+}
+
+pub(crate) async fn require_exact_live_settlement_target_tx<'a, 'db>(
+    tx: &'a mut crate::workflow::WorkflowTx<'db>,
+    attempt_id: &'a CloseAttemptId,
+    target: &'a CloseDirectTurnSettlementTarget,
+) -> DbResult<Option<LiveCloseSettlementTarget<'a, 'db>>> {
+    let turn_id = i64::try_from(target.turn_id)
+        .map_err(|error| DbError::Serialization(format!("turn id overflow: {error}")))?;
+    let generation = i64::try_from(target.expected_generation)
+        .map_err(|error| DbError::Serialization(format!("turn generation overflow: {error}")))?;
+    let row = sqlx::query(
+        "SELECT settlement.settled_at, turn.generation, turn.terminal_kind,
+                turn.owns_conversation, turn.conversation_id, captured.settlement_state
+         FROM close_attempt_direct_turn_settlements settlement
+         JOIN durable_turns turn ON turn.turn_id = settlement.turn_id
+         JOIN close_attempt_participants captured
+           ON captured.attempt_id = settlement.attempt_id
+          AND captured.conversation_id = turn.conversation_id
+         WHERE settlement.attempt_id = ?1 AND settlement.turn_id = ?2
+           AND settlement.expected_generation = ?3",
+    )
+    .bind(attempt_id.as_str())
+    .bind(turn_id)
+    .bind(generation)
+    .fetch_optional(&mut *tx.tx)
+    .await?
+    .ok_or_else(|| close_precondition("direct-turn target is not a captured settlement target"))?;
+    let settled: Option<String> = row.try_get("settled_at")?;
+    let actual_generation: i64 = row.try_get("generation")?;
+    let terminal: Option<String> = row.try_get("terminal_kind")?;
+    let owns_conversation: i64 = row.try_get("owns_conversation")?;
+    let conversation_id: String = row.try_get("conversation_id")?;
+    let settlement_state: String = row.try_get("settlement_state")?;
+    if conversation_id != target.conversation_id {
+        return Err(DbError::CloseFoundationPrecondition(
+            "direct-turn target conversation changed".into(),
+        ));
+    }
+    if settled.is_some() {
+        return Ok(None);
+    }
+    if generation.checked_add(1) == Some(actual_generation)
+        && terminal.is_some()
+        && owns_conversation == 0
+    {
+        let released = sqlx::query(
+            "UPDATE close_attempt_direct_turn_settlements SET settled_at = ?4
+             WHERE attempt_id = ?1 AND turn_id = ?2 AND expected_generation = ?3
+               AND settled_at IS NULL",
+        )
+        .bind(attempt_id.as_str())
+        .bind(turn_id)
+        .bind(generation)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx.tx)
+        .await?;
+        if released.rows_affected() != 1 {
+            return Err(close_precondition(
+                "exact direct-turn settlement receipt was not released",
+            ));
+        }
+        return Ok(None);
+    }
+    if settlement_state != "live"
+        || actual_generation != generation
+        || terminal.is_some()
+        || owns_conversation != 1
+    {
+        return Err(DbError::CloseFoundationPrecondition(
+            "direct-turn target generation or live ownership changed".into(),
+        ));
+    }
+    Ok(Some(LiveCloseSettlementTarget {
+        tx,
+        attempt_id,
+        target,
+    }))
+}
+
+impl LiveCloseSettlementTarget<'_, '_> {
+    pub(crate) async fn claim_stop<L>(
+        mut self,
+        enter: impl FnOnce() -> DbResult<L>,
+        lease: &mut Option<L>,
+    ) -> DbResult<bool> {
+        let turn_id = i64::try_from(self.target.turn_id)
+            .map_err(|error| DbError::Serialization(format!("turn id overflow: {error}")))?;
+        let generation = i64::try_from(self.target.expected_generation).map_err(|error| {
+            DbError::Serialization(format!("turn generation overflow: {error}"))
+        })?;
+        if self.stop_already_claimed().await? {
+            return Ok(false);
+        }
+        *lease = Some(enter()?);
+        let inserted = sqlx::query(
+            "INSERT INTO close_settlement_stop_claims
+             (attempt_id, run_ordinal, turn_id, expected_generation) VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(self.attempt_id.as_str())
+        .bind(CloseRunOrdinal::INITIAL.get())
+        .bind(turn_id)
+        .bind(generation)
+        .execute(&mut *self.tx.tx)
+        .await?;
+        if inserted.rows_affected() != 1 {
+            return Err(close_precondition("settlement Stop claim was not recorded"));
+        }
+        Ok(true)
+    }
+
+    async fn stop_already_claimed(&mut self) -> DbResult<bool> {
+        let turn_id = i64::try_from(self.target.turn_id)
+            .map_err(|error| DbError::Serialization(format!("turn id overflow: {error}")))?;
+        let generation = i64::try_from(self.target.expected_generation).map_err(|error| {
+            DbError::Serialization(format!("turn generation overflow: {error}"))
+        })?;
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_settlement_stop_claims
+             WHERE attempt_id = ?1 AND run_ordinal = ?2 AND turn_id = ?3
+               AND expected_generation = ?4)",
+        )
+        .bind(self.attempt_id.as_str())
+        .bind(CloseRunOrdinal::INITIAL.get())
+        .bind(turn_id)
+        .bind(generation)
+        .fetch_one(&mut *self.tx.tx)
+        .await?)
+    }
+
+    pub(crate) async fn cancel_without_actor(
+        mut self,
+        workflow: &crate::workflow::WorkflowRepository,
+    ) -> DbResult<()> {
+        if self.stop_already_claimed().await? {
+            return Err(close_precondition(
+                "claimed settlement Stop lost its actor before durable turn release",
+            ));
+        }
+        let terminal = crate::workflow::TerminalizeAuthoritativeTurnInput {
+            command: phoenix_workflow::TurnCommand::Cancel {
+                turn_id: phoenix_workflow::TurnAuthorityId(self.target.turn_id),
+                expected_generation: self.target.expected_generation,
+            },
+            projection: None,
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+        };
+        workflow
+            .terminalize_authoritative_turn_in_tx(self.tx, &terminal)
+            .await?;
+        if require_exact_live_settlement_target_tx(self.tx, self.attempt_id, self.target)
+            .await?
+            .is_some()
+        {
+            return Err(close_precondition(
+                "fallback terminalization did not release its exact settlement target",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Database-admitted input for the generic Close settlement worker.
 ///
 /// Initial-origin receipts are immutable: observation adoption does not transfer
 /// a generic operation to the source-owned initial driver. The private field
 /// prevents callers from passing arbitrary native obligations to that worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct GenericCloseSettlement {
     obligation: CloseObligation,
+    provenance: GenericSettlementProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenericSettlementProvenance {
+    CommittedIngress,
+    #[cfg(test)]
+    RetainedSettlement,
 }
 
 impl GenericCloseSettlement {
     #[must_use]
     pub fn obligation(&self) -> &CloseObligation {
         &self.obligation
+    }
+
+    #[must_use]
+    pub fn is_committed_ingress(&self) -> bool {
+        self.provenance == GenericSettlementProvenance::CommittedIngress
+    }
+
+    #[must_use]
+    pub fn offer_turn(
+        &self,
+        target: CloseDirectTurnSettlementTarget,
+    ) -> Option<GenericCloseTurnOffer> {
+        self.is_committed_ingress().then(|| GenericCloseTurnOffer {
+            attempt: self.obligation.attempt_id().clone(),
+            product: self.obligation.product_conversation_id().clone(),
+            target,
+        })
+    }
+}
+
+/// Exact receiver-side witness for a generic settlement cancellation.
+/// This does not carry native occurrence authority or grant continuation.
+pub struct GenericCloseTurnOffer {
+    attempt: CloseAttemptId,
+    product: ProductConversationId,
+    target: CloseDirectTurnSettlementTarget,
+}
+
+impl GenericCloseTurnOffer {
+    #[must_use]
+    pub fn target(&self) -> &CloseDirectTurnSettlementTarget {
+        &self.target
+    }
+}
+
+#[derive(Debug)]
+pub enum GenericCloseAdmission {
+    InsertedSettling(GenericCloseSettlement),
+    InsertedAwaitingStopWork(CloseObligation),
+    Existing(CloseObligation),
+}
+
+/// The transaction that finishes settlement is the only one that can return
+/// `Inspect`. Observing the resulting phase does not reproduce this handoff.
+#[derive(Debug)]
+pub enum GenericCloseSettlementAdvance {
+    Inspect(GenericCloseInspection),
+    Interrupted(CloseRunRef),
+    WaitingForQuiescence,
+    Cancelled,
+    NoTransition,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GenericCloseTurnRelease {
+    Released,
+    Unclaimed,
+    NoTransition,
+}
+
+enum GenericCloseTurnFallback {
+    NoActor,
+    LostOffer,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GenericCloseSettlementFailure {
+    Classified,
+    NoTransition(CloseRunStatus),
+}
+
+struct PendingCloseQuiescence(String);
+
+#[derive(Debug)]
+pub struct GenericCloseInspection(CloseAttemptId);
+
+/// Authority from a fresh, loss-free Initial inspection commit, not a phase read.
+#[derive(Debug)]
+pub struct FreshGenericCloseRetirement {
+    attempt_id: CloseAttemptId,
+    snapshot: CloseRetirementSnapshot,
+}
+
+impl FreshGenericCloseRetirement {
+    #[must_use]
+    pub fn into_parts(self) -> (CloseAttemptId, CloseRetirementSnapshot) {
+        (self.attempt_id, self.snapshot)
+    }
+}
+
+impl GenericCloseInspection {
+    #[must_use]
+    pub fn attempt_id(&self) -> &CloseAttemptId {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_attempt_id(self) -> CloseAttemptId {
+        self.0
+    }
+}
+
+/// Authority released only by a committed legacy API Retry admission.
+#[derive(Debug)]
+pub struct AdmittedGenericLegacyCloseRetry(CloseAttemptId);
+
+impl AdmittedGenericLegacyCloseRetry {
+    #[must_use]
+    pub fn attempt_id(&self) -> &CloseAttemptId {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_attempt_id(self) -> CloseAttemptId {
+        self.0
+    }
+}
+
+/// First-only authority to begin teardown for the exact retained legacy worktree.
+#[derive(Debug)]
+pub struct FirstLegacyRetryWorktreeClaim {
+    attempt_id: CloseAttemptId,
+    scope: WorkScopeId,
+    snapshot: CloseRetirementSnapshot,
+    resource: RetiredResourceIdentity,
+}
+
+impl FirstLegacyRetryWorktreeClaim {
+    #[must_use]
+    pub fn attempt_id(&self) -> &CloseAttemptId {
+        &self.attempt_id
+    }
+    #[must_use]
+    pub fn scope(&self) -> &WorkScopeId {
+        &self.scope
+    }
+    #[must_use]
+    pub fn snapshot(&self) -> &CloseRetirementSnapshot {
+        &self.snapshot
+    }
+    #[must_use]
+    pub fn resource(&self) -> &RetiredResourceIdentity {
+        &self.resource
+    }
+}
+
+#[derive(Debug)]
+pub enum LegacyRetryWorktreeClaimRelease {
+    First(FirstLegacyRetryWorktreeClaim),
+    Replay,
+}
+
+/// Exact generic attempt accepted for pre-retirement cancellation.
+#[derive(Debug)]
+pub struct GenericCloseCancellation {
+    attempt_id: CloseAttemptId,
+}
+
+impl GenericCloseCancellation {
+    #[must_use]
+    pub fn attempt_id(&self) -> &CloseAttemptId {
+        &self.attempt_id
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum GenericCloseCancellationKind {
+    RequestDuringSettlement,
+    AlreadyRequestedDuringSettlement,
+    CompleteBeforeRetirement,
+}
+
+fn generic_close_cancellation_kind(
+    obligation: &CloseObligation,
+) -> DbResult<GenericCloseCancellationKind> {
+    match obligation.phase() {
+        ClosePhase::SettlingActiveWork => Ok(GenericCloseCancellationKind::RequestDuringSettlement),
+        ClosePhase::CancelRequestedDuringSettlement => {
+            Ok(GenericCloseCancellationKind::AlreadyRequestedDuringSettlement)
+        }
+        ClosePhase::AwaitingBlockerResolution
+        | ClosePhase::AwaitingStopWorkConfirmation
+        | ClosePhase::AwaitingRetirementInspection
+        | ClosePhase::AwaitingLossConfirmation => {
+            Ok(GenericCloseCancellationKind::CompleteBeforeRetirement)
+        }
+        phase @ (ClosePhase::RetirementRequested
+        | ClosePhase::NeedsRepair
+        | ClosePhase::Completed) => Err(close_precondition(format!(
+            "attempt {} phase {} does not admit pre-retirement cancellation",
+            obligation.attempt_id(),
+            phase.as_str()
+        ))),
+    }
+}
+
+/// Identifies whether the writer transaction inserted this Close attempt.
+/// This is provenance, not permission to dispatch a retirement effect.
+#[derive(Debug)]
+pub enum CloseFoundationAdmission {
+    Inserted(CloseObligation),
+    Existing(CloseObligation),
+}
+
+impl CloseFoundationAdmission {
+    #[must_use]
+    pub fn into_obligation(self) -> CloseObligation {
+        match self {
+            Self::Inserted(obligation) | Self::Existing(obligation) => obligation,
+        }
     }
 }
 
@@ -584,10 +969,17 @@ fn parse_retired_resource_kind(value: &str) -> DbResult<RetiredResourceKind> {
     }
 }
 
-fn parse_absence_basis(value: &str) -> DbResult<AbsenceBasis> {
+fn parse_absence_basis(value: &str, replacement_token: Option<String>) -> DbResult<AbsenceBasis> {
     match value {
         "same_attempt_prior_retirement" => Ok(AbsenceBasis::SameAttemptPriorRetirement),
         "preexisting_exact_identity_evidence" => Ok(AbsenceBasis::PreexistingExactIdentityEvidence),
+        "verified_tmux_replacement" => {
+            let replacement_token = replacement_token
+                .as_deref()
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .ok_or_else(|| DbError::Serialization("invalid tmux replacement token".into()))?;
+            Ok(AbsenceBasis::VerifiedTmuxReplacement { replacement_token })
+        }
         other => Err(DbError::Serialization(format!(
             "unknown absence basis {other}"
         ))),
@@ -720,6 +1112,9 @@ pub(crate) async fn validate_adopted_absence_evidence(
     absence_basis: AbsenceBasis,
 ) -> DbResult<()> {
     let evidence_matches_basis = match absence_basis {
+        AbsenceBasis::VerifiedTmuxReplacement { replacement_token } => {
+            verified_generic_tmux_replacement(tx, request, replacement_token).await?
+        }
         AbsenceBasis::SameAttemptPriorRetirement => {
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(
@@ -800,6 +1195,35 @@ pub(crate) async fn validate_adopted_absence_evidence(
     }
 }
 
+async fn verified_generic_tmux_replacement(
+    tx: &mut Transaction<'_, Sqlite>,
+    request: &RecordCloseRetirementEvidenceRequest,
+    replacement_token: uuid::Uuid,
+) -> DbResult<bool> {
+    Database::generic_close_settlement_for_update(tx, request.attempt_id.as_str()).await?;
+    let identity = request.resource.identity().value();
+    let running: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM close_runs run
+            JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
+            WHERE run.attempt_id = ?1 AND run.run_ordinal = 1 AND run.status = 'running'
+              AND obligation.phase = 'retirement_requested'
+         )",
+    )
+    .bind(request.attempt_id.as_str())
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(running
+        && request.resource.kind() == RetiredResourceKind::TmuxServer
+        && matches!(request.resource.identity(), LossItemIdentity::Opaque(_))
+        && identity
+            .strip_prefix("tmux-v1:")
+            .and_then(|value| value.rsplit_once(':'))
+            .filter(|(socket, _)| !socket.is_empty())
+            .and_then(|(_, token)| uuid::Uuid::parse_str(token).ok())
+            .is_some_and(|target| target != replacement_token))
+}
+
 fn parse_close_inspection_row(row: SqliteRow) -> DbResult<CloseInspection> {
     let snapshot = CloseRetirementSnapshot::parse(
         row.try_get::<String, _>("generation")?,
@@ -839,13 +1263,17 @@ fn parse_retirement_outcome(
     proof_kind: &str,
     absence_basis: Option<String>,
     residual_reason: Option<String>,
+    replacement_token: Option<String>,
 ) -> DbResult<RetirementOutcome> {
     match proof_kind {
         "retired" => Ok(RetirementOutcome::Retired),
         "absence_adopted" => Ok(RetirementOutcome::AbsenceAdopted {
-            absence_basis: parse_absence_basis(&absence_basis.ok_or_else(|| {
-                DbError::Serialization("absence_adopted missing absence_basis".to_string())
-            })?)?,
+            absence_basis: parse_absence_basis(
+                &absence_basis.ok_or_else(|| {
+                    DbError::Serialization("absence_adopted missing absence_basis".to_string())
+                })?,
+                replacement_token,
+            )?,
         }),
         "residual" => Ok(RetirementOutcome::Residual {
             residual_reason: parse_retirement_failure_reason(&residual_reason.ok_or_else(
@@ -886,6 +1314,7 @@ fn parse_close_retired_resource_row(row: SqliteRow) -> DbResult<CloseRetiredReso
             &proof_kind,
             row.try_get("absence_basis")?,
             row.try_get("residual_reason")?,
+            row.try_get("tmux_replacement_token")?,
         )?,
         detail: row.try_get("detail")?,
         created_at: parse_rfc3339_utc(row.try_get("created_at")?, "created_at")?,
@@ -1436,6 +1865,11 @@ pub struct CloseSafeRetryProgress {
     pub pending: Vec<CloseSafeRetryEffect>,
 }
 
+pub(crate) enum CloseRetrySuccessWrite {
+    Inserted,
+    Replay,
+}
+
 async fn close_safe_retry_progress_tx(
     tx: &mut Transaction<'_, Sqlite>,
     run: &CloseRunRef,
@@ -1569,6 +2003,35 @@ pub struct RecordCloseRetirementDispatchRequest {
     pub scope: WorkScopeId,
     pub snapshot: CloseRetirementSnapshot,
     pub resource: RetiredResourceIdentity,
+}
+
+/// Proof of the first durable dispatch of an exact retirement resource.
+/// Reading or replaying the dispatch row cannot reconstruct it.
+#[derive(Debug)]
+pub struct FirstCloseRetirementDispatch(RecordCloseRetirementDispatchRequest);
+
+impl FirstCloseRetirementDispatch {
+    #[must_use]
+    pub fn request(&self) -> &RecordCloseRetirementDispatchRequest {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_request(self) -> RecordCloseRetirementDispatchRequest {
+        self.0
+    }
+}
+
+#[derive(Debug)]
+pub enum CloseRetirementDispatch {
+    First(FirstCloseRetirementDispatch),
+    Replay,
+}
+
+#[derive(Debug)]
+pub enum CloseRetirementBatchDispatch {
+    First(Vec<FirstCloseRetirementDispatch>),
+    Replay,
 }
 
 #[derive(Debug, Clone)]
@@ -1828,6 +2291,23 @@ async fn validate_topology_tx(
         }
     }
 
+    Ok(())
+}
+
+pub(crate) async fn require_control_target_latest_tx(
+    tx: &mut Transaction<'_, Sqlite>,
+    target: &ProductConversationId,
+    latest: &TranscriptConversationId,
+) -> DbResult<()> {
+    let current = read_topology_tx(tx, target)
+        .await?
+        .ok_or_else(|| close_precondition("Close target topology is missing"))?;
+    if current.latest.id != latest.as_str() {
+        return Err(DbError::CloseFoundationStaleLatest {
+            expected: latest.as_str().to_owned(),
+            actual: current.latest.id,
+        });
+    }
     Ok(())
 }
 
@@ -2153,7 +2633,7 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
-        Ok(obligation)
+        Ok(obligation.into_obligation())
     }
 
     pub async fn begin_direct_close_foundation(
@@ -2178,7 +2658,132 @@ impl Database {
         )
         .await?;
         tx.commit().await?;
-        Ok(obligation)
+        Ok(obligation.into_obligation())
+    }
+
+    /// Admit and capture the first settlement phase in the same writer
+    /// transaction. This is a generic ingress: it creates no native receipt.
+    /// An Initial submitted from an Open observation can observe the exact
+    /// attempt that moved that product to History before this transaction.
+    pub async fn begin_generic_close_settlement_classified(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        expected_latest_transcript_id: &TranscriptConversationId,
+        attempt_id: &CloseAttemptId,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseAdmission>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            // Preserve exact-ID replay (including conflicts) ahead of observing another attempt.
+            let candidates: Vec<(String, bool)> = sqlx::query_as(
+                "SELECT o.attempt_id,
+                    (o.phase <> 'completed' OR o.close_outcome = 'close_incomplete') AS active
+             FROM close_obligations o
+             JOIN product_conversations p ON p.id = o.product_conversation_id
+             WHERE o.product_conversation_id = ?1
+               AND (o.phase <> 'completed' OR o.close_outcome = 'close_incomplete'
+                    OR (p.ordinary_lifecycle = 'history'
+                        AND o.close_outcome IN ('archived', 'archived_cleanup_attention')))
+               AND NOT EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = ?2)
+             ORDER BY active DESC LIMIT 2",
+            )
+            .bind(product_conversation_id.as_str())
+            .bind(attempt_id.as_str())
+            .fetch_all(&mut *tx)
+            .await?;
+            let observed_attempt_id = match candidates.as_slice() {
+                [(_, first), (_, second)] if first == second => {
+                    return Err(DbError::CloseFoundationConflict(format!(
+                    "ProductConversation {product_conversation_id} has ambiguous Close ownership"
+                )));
+                }
+                [(winner, _), ..] => Some(winner.as_str()),
+                [] => None,
+            };
+            let admission = Self::begin_close_foundation_inner(
+                &mut tx,
+                product_conversation_id,
+                expected_latest_transcript_id,
+                observed_attempt_id.unwrap_or(attempt_id.as_str()),
+                false,
+            )
+            .await?;
+            let admission = match admission {
+                CloseFoundationAdmission::Inserted(obligation) => {
+                    let obligation =
+                        Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation)
+                            .await?;
+                    let phase = obligation.phase();
+                    match phase {
+                        ClosePhase::SettlingActiveWork => {
+                            GenericCloseAdmission::InsertedSettling(GenericCloseSettlement {
+                                obligation,
+                                provenance: GenericSettlementProvenance::CommittedIngress,
+                            })
+                        }
+                        ClosePhase::AwaitingStopWorkConfirmation => {
+                            GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
+                        }
+                        ClosePhase::AwaitingBlockerResolution
+                        | ClosePhase::CancelRequestedDuringSettlement
+                        | ClosePhase::AwaitingRetirementInspection
+                        | ClosePhase::AwaitingLossConfirmation
+                        | ClosePhase::RetirementRequested
+                        | ClosePhase::NeedsRepair
+                        | ClosePhase::Completed => {
+                            return Err(close_precondition(format!(
+                                "new generic Close cannot start in phase {}",
+                                phase.as_str(),
+                            )));
+                        }
+                    }
+                }
+                CloseFoundationAdmission::Existing(obligation) => {
+                    GenericCloseAdmission::Existing(obligation)
+                }
+            };
+            Ok(admission)
+        }
+        .await;
+        let released = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match released {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn begin_generic_close_settlement(
+        &self,
+        product_conversation_id: &ProductConversationId,
+        expected_latest_transcript_id: &TranscriptConversationId,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<GenericCloseAdmission> {
+        match self
+            .begin_generic_close_settlement_classified(
+                product_conversation_id,
+                expected_latest_transcript_id,
+                attempt_id,
+            )
+            .await
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::CloseFoundationConflict(
+                    "generic Close admission transaction release is unclassified".into(),
+                ))
+            }
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2188,7 +2793,7 @@ impl Database {
         expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &str,
         require_idle_latest: bool,
-    ) -> DbResult<CloseObligation> {
+    ) -> DbResult<CloseFoundationAdmission> {
         if let Some(row) = sqlx::query(
             "SELECT attempt_id, product_conversation_id, phase, inspection_generation,
                     inspection_fingerprint, created_at, updated_at, completed_at, close_outcome,
@@ -2241,7 +2846,7 @@ impl Database {
                 )));
             }
 
-            return Ok(obligation);
+            return Ok(CloseFoundationAdmission::Existing(obligation));
         }
 
         let lifecycle: Option<String> = sqlx::query_scalar(
@@ -2311,6 +2916,8 @@ impl Database {
                 "ProductConversation {product_conversation_id} has pending automatic continuation"
             )));
         }
+
+        Self::require_no_retained_legacy_creation_tx(tx, product_conversation_id).await?;
 
         let now_utc = Utc::now();
         let now = now_utc.to_rfc3339();
@@ -2417,7 +3024,7 @@ impl Database {
         .fetch_one(&mut **tx)
         .await?;
         let obligation = parse_close_obligation_row(row)?;
-        Ok(obligation)
+        Ok(CloseFoundationAdmission::Inserted(obligation))
     }
 
     pub(crate) async fn capture_close_direct_turn_settlement_targets_tx(
@@ -2449,9 +3056,68 @@ impl Database {
         Ok(())
     }
 
-    pub async fn confirm_close_stop_work(&self, attempt_id: &str) -> DbResult<CloseObligation> {
+    /// Advances an admitted Initial to its first settlement phase using the
+    /// captured target state, never a state supplied by an ingress adapter.
+    pub async fn prepare_close_initial_settlement(
+        &self,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        let obligation =
+            Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    async fn prepare_generic_close_initial_settlement_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        obligation: CloseObligation,
+    ) -> DbResult<CloseObligation> {
+        let attempt_id = obligation.attempt_id().as_str();
+        Self::require_generic_close_settlement_tx(
+            tx,
+            attempt_id,
+            obligation.product_conversation_id().as_str(),
+        )
+        .await?;
+        Self::prepare_close_initial_settlement_tx(tx, attempt_id).await?;
+        close_obligation_for_update(tx, attempt_id).await
+    }
+
+    pub(crate) async fn prepare_close_initial_settlement_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+    ) -> DbResult<ClosePhase> {
+        let phase = close_obligation_for_update(tx, attempt_id).await?.phase();
+        if phase != ClosePhase::AwaitingBlockerResolution {
+            return Ok(phase);
+        }
+        let captured_state: String = sqlx::query_scalar(
+            "SELECT captured_state_kind
+             FROM close_attempt_members
+             WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+        )
+        .bind(attempt_id)
+        .fetch_one(&mut **tx)
+        .await?;
+        let captured_state = CapturedConversationStateKind::from_db_str(&captured_state)
+            .ok_or_else(|| DbError::Serialization("unknown captured state kind".to_string()))?;
+        let next = if captured_state.is_busy() {
+            ClosePhase::AwaitingStopWorkConfirmation
+        } else {
+            ClosePhase::SettlingActiveWork
+        };
+        set_close_phase_tx(tx, attempt_id, next).await?;
+        if next == ClosePhase::SettlingActiveWork {
+            Self::capture_close_direct_turn_settlement_targets_tx(tx, attempt_id).await?;
+        }
+        Ok(next)
+    }
+
+    pub async fn confirm_close_stop_work(&self, attempt_id: &str) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
         match obligation.phase() {
             ClosePhase::AwaitingBlockerResolution => {
                 set_close_phase_tx(
@@ -2482,7 +3148,7 @@ impl Database {
 
     pub async fn begin_close_idle_settlement(&self, attempt_id: &str) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
         match obligation.phase() {
             ClosePhase::AwaitingBlockerResolution => {
                 set_close_phase_tx(&mut tx, attempt_id, ClosePhase::SettlingActiveWork).await?;
@@ -2507,16 +3173,109 @@ impl Database {
         Ok(obligation)
     }
 
+    /// Confirms stop-work for the exact generic target and hands the committed
+    /// settlement to the same worker used by Initial and background settlement.
+    pub async fn confirm_generic_close_stop_work_classified(
+        &self,
+        target: &ProductConversationId,
+        target_latest: &TranscriptConversationId,
+        attempt_id: &CloseAttemptId,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseSettlement>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let current =
+                Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+            if current.product_conversation_id() != target {
+                return Err(close_precondition(
+                    "Close stop-work target does not own the attempt",
+                ));
+            }
+            require_control_target_latest_tx(&mut tx, target, target_latest).await?;
+            let captured_latest: String = sqlx::query_scalar(
+                "SELECT conversation_id FROM close_attempt_members
+                 WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+            )
+            .bind(attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if captured_latest != target_latest.as_str() {
+                return Err(close_precondition(
+                    "Close stop-work transcript does not match the captured latest member",
+                ));
+            }
+            if current.phase() != ClosePhase::AwaitingStopWorkConfirmation {
+                return Err(close_precondition(
+                    "Close stop-work has already left confirmation",
+                ));
+            }
+            Self::begin_close_active_work_settlement_tx(&mut tx, attempt_id.as_str(), &current)
+                .await?;
+            let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+            Ok(GenericCloseSettlement {
+                obligation,
+                provenance: GenericSettlementProvenance::CommittedIngress,
+            })
+        }
+        .await;
+        let released = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match released {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn confirm_generic_close_stop_work(
+        &self,
+        target: &ProductConversationId,
+        target_latest: &TranscriptConversationId,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<GenericCloseSettlement> {
+        match self
+            .confirm_generic_close_stop_work_classified(target, target_latest, attempt_id)
+            .await
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::CloseFoundationConflict(
+                    "generic Close stop-work transaction release is unclassified".into(),
+                ))
+            }
+        }
+    }
+
     pub async fn begin_close_active_work_settlement(
         &self,
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
+        Self::begin_close_active_work_settlement_tx(&mut tx, attempt_id, &obligation).await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    pub(crate) async fn begin_close_active_work_settlement_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+        obligation: &CloseObligation,
+    ) -> DbResult<()> {
         match obligation.phase() {
             ClosePhase::AwaitingStopWorkConfirmation => {
-                set_close_phase_tx(&mut tx, attempt_id, ClosePhase::SettlingActiveWork).await?;
-                Self::capture_close_direct_turn_settlement_targets_tx(&mut tx, attempt_id).await?;
+                set_close_phase_tx(tx, attempt_id, ClosePhase::SettlingActiveWork).await?;
+                Self::capture_close_direct_turn_settlement_targets_tx(tx, attempt_id).await?;
             }
             ClosePhase::SettlingActiveWork => {}
             phase @ (ClosePhase::AwaitingBlockerResolution
@@ -2532,9 +3291,23 @@ impl Database {
                 )));
             }
         }
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        Ok(())
+    }
+
+    /// Checks the exact owner and phase before the attempt's execution owner reopens leases.
+    /// The terminal write still rechecks both after reopening.
+    pub async fn authorize_generic_close_cancellation(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<GenericCloseCancellation> {
+        let mut tx = self.pool.begin().await?;
+        let obligation =
+            Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+        generic_close_cancellation_kind(&obligation)?;
         tx.commit().await?;
-        Ok(obligation)
+        Ok(GenericCloseCancellation {
+            attempt_id: obligation.attempt_id().clone(),
+        })
     }
 
     pub async fn cancel_close_before_retirement(
@@ -2542,9 +3315,9 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
-        match obligation.phase() {
-            ClosePhase::SettlingActiveWork => {
+        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
+        match generic_close_cancellation_kind(&obligation)? {
+            GenericCloseCancellationKind::RequestDuringSettlement => {
                 set_close_phase_tx(
                     &mut tx,
                     attempt_id,
@@ -2552,11 +3325,8 @@ impl Database {
                 )
                 .await?;
             }
-            ClosePhase::CancelRequestedDuringSettlement => {}
-            ClosePhase::AwaitingBlockerResolution
-            | ClosePhase::AwaitingStopWorkConfirmation
-            | ClosePhase::AwaitingRetirementInspection
-            | ClosePhase::AwaitingLossConfirmation => {
+            GenericCloseCancellationKind::AlreadyRequestedDuringSettlement => {}
+            GenericCloseCancellationKind::CompleteBeforeRetirement => {
                 let now = Utc::now().to_rfc3339();
                 sqlx::query(
                     "UPDATE close_obligations
@@ -2571,14 +3341,6 @@ impl Database {
                 .execute(&mut *tx)
                 .await?;
             }
-            phase @ (ClosePhase::RetirementRequested
-            | ClosePhase::NeedsRepair
-            | ClosePhase::Completed) => {
-                return Err(close_precondition(format!(
-                    "attempt {attempt_id} phase {} does not admit pre-retirement cancellation",
-                    phase.as_str()
-                )));
-            }
         }
         let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
         tx.commit().await?;
@@ -2590,7 +3352,7 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
         match obligation.phase() {
             ClosePhase::SettlingActiveWork => {
                 set_close_phase_tx(
@@ -2649,6 +3411,55 @@ impl Database {
         Ok(unsettled)
     }
 
+    async fn require_no_retained_legacy_creation_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        product_conversation_id: &ProductConversationId,
+    ) -> DbResult<()> {
+        let retained: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM conversations member
+                 JOIN conversation_creation_jobs creation ON creation.conversation_id = member.id
+                 WHERE member.product_conversation_id = ?1
+                   AND (creation.status IN ('cancelling', 'deletion_pending')
+                        OR (creation.status != 'ready' AND EXISTS (
+                            SELECT 1 FROM conversation_creation_resource_reservations reservation
+                            WHERE reservation.job_id = creation.id AND reservation.status != 'released'
+                        )))
+             )",
+        )
+        .bind(product_conversation_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if retained {
+            return Err(close_precondition(
+                "Close cannot retire retained legacy creation resources or finish retired creation cleanup; operator review is required",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks for retained legacy creation custody before executing retirement effects.
+    ///
+    /// # Errors
+    /// Returns an error if the Close attempt cannot be loaded or custody requires operator review.
+    pub async fn require_no_retained_legacy_creation_for_retirement(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        Self::require_no_retained_legacy_creation_for_attempt_tx(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn require_no_retained_legacy_creation_for_attempt_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<()> {
+        let obligation = close_obligation_for_update(tx, attempt_id.as_str()).await?;
+        Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id()).await
+    }
+
     pub(crate) async fn count_close_settlement_active_participants_tx(
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,
@@ -2657,6 +3468,7 @@ impl Database {
             "SELECT COUNT(*)
              FROM close_attempt_participants captured
              JOIN conversations participant ON participant.id = captured.conversation_id
+             JOIN close_obligations obligation ON obligation.attempt_id = captured.attempt_id
              WHERE captured.attempt_id = ?1
                AND captured.settlement_state = 'live'
                AND (
@@ -2675,10 +3487,13 @@ impl Database {
                    SELECT 1 FROM conversation_creation_jobs creation
                    WHERE creation.conversation_id = participant.id
                      AND (
-                       creation.status IN ('accepted', 'claimed', 'retry_scheduled', 'cancelling')
-                       OR (creation.status = 'failed' AND EXISTS (
-                         SELECT 1 FROM conversation_creation_resource_reservations reservation
-                         WHERE reservation.job_id = creation.id AND reservation.status != 'released'
+                       creation.status IN ('accepted', 'claimed', 'retry_scheduled')
+                       OR (obligation.phase != 'cancel_requested_during_settlement' AND (
+                         creation.status IN ('cancelling', 'deletion_pending')
+                         OR (creation.status != 'ready' AND EXISTS (
+                           SELECT 1 FROM conversation_creation_resource_reservations reservation
+                           WHERE reservation.job_id = creation.id AND reservation.status != 'released'
+                         ))
                        ))
                      )
                  )
@@ -2690,35 +3505,61 @@ impl Database {
         Ok(active_members)
     }
 
-    async fn require_generic_close_settlement_tx(
+    async fn generic_close_settlement_for_update(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        let obligation = close_obligation_for_update(tx, attempt_id).await?;
+        Self::require_generic_close_settlement_tx(
+            tx,
+            attempt_id,
+            obligation.product_conversation_id().as_str(),
+        )
+        .await?;
+        Ok(obligation)
+    }
+
+    pub async fn read_generic_close_continuation(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin().await?;
+        let obligation =
+            Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    pub(crate) async fn require_generic_close_settlement_tx(
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,
         product_conversation_id: &str,
     ) -> DbResult<()> {
-        let native_initial: i64 = sqlx::query_scalar(
+        let native_execution: i64 = sqlx::query_scalar(
             "SELECT EXISTS (
                  SELECT 1 FROM native_close_initial_receipts receipt
                  WHERE receipt.attempt_id = ?1
                    AND receipt.product_conversation_id = ?2
-                   AND receipt.intent = 'initial'
-                   AND receipt.run_ordinal = 1
+                   AND receipt.intent IN ('initial', 'explicit_retry')
              )",
         )
         .bind(attempt_id)
         .bind(product_conversation_id)
         .fetch_one(&mut **tx)
         .await?;
-        if native_initial != 0 {
+        if native_execution != 0 {
             return Err(close_precondition(format!(
-                "attempt {attempt_id} is owned by native initial Close settlement"
+                "attempt {attempt_id} is owned by native Close execution"
             )));
         }
         Ok(())
     }
 
     /// Lists only settlement work admitted to the generic background worker.
-    pub async fn list_pending_generic_close_settlements(
+    #[cfg(test)]
+    pub(crate) async fn list_pending_generic_close_settlements(
         &self,
+        attempt_id: Option<&CloseAttemptId>,
     ) -> DbResult<Vec<GenericCloseSettlement>> {
         let rows = sqlx::query(
             "SELECT o.attempt_id, o.product_conversation_id, o.phase,
@@ -2726,6 +3567,7 @@ impl Database {
                     o.updated_at, o.completed_at, o.close_outcome
              FROM close_obligations o
              WHERE o.phase IN ('settling_active_work', 'cancel_requested_during_settlement')
+               AND (?1 IS NULL OR o.attempt_id = ?1)
                AND NOT EXISTS (
                    SELECT 1 FROM native_close_initial_receipts receipt
                    WHERE receipt.attempt_id = o.attempt_id
@@ -2734,12 +3576,15 @@ impl Database {
                )
              ORDER BY o.created_at DESC, o.attempt_id DESC",
         )
+        .bind(attempt_id.map(CloseAttemptId::as_str))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
             .map(|row| {
-                parse_close_obligation_row(row)
-                    .map(|obligation| GenericCloseSettlement { obligation })
+                parse_close_obligation_row(row).map(|obligation| GenericCloseSettlement {
+                    obligation,
+                    provenance: GenericSettlementProvenance::RetainedSettlement,
+                })
             })
             .collect()
     }
@@ -2750,23 +3595,133 @@ impl Database {
         settlement: &GenericCloseSettlement,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin().await?;
+        let current = Self::running_generic_settlement_tx(&mut tx, settlement).await?;
+        tx.commit().await?;
+        Ok(current.is_some())
+    }
+
+    async fn running_generic_settlement_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        settlement: &GenericCloseSettlement,
+    ) -> DbResult<Option<CloseObligation>> {
+        let run = CloseRunRef::initial(settlement.obligation.attempt_id().clone());
+        let (status, current) = Self::interrupted_close_run_for_update(tx, &run).await?;
+        if status != CloseRunStatus::Running
+            || current.product_conversation_id() != settlement.obligation.product_conversation_id()
+            || !matches!(
+                current.phase(),
+                ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+            )
+        {
+            return Ok(None);
+        }
         Self::require_generic_close_settlement_tx(
-            &mut tx,
-            settlement.obligation.attempt_id().as_str(),
-            settlement.obligation.product_conversation_id().as_str(),
+            tx,
+            run.attempt_id.as_str(),
+            current.product_conversation_id().as_str(),
         )
         .await?;
-        let current =
-            close_obligation_for_update(&mut tx, settlement.obligation.attempt_id().as_str())
-                .await?;
-        tx.commit().await?;
-        Ok(
-            current.product_conversation_id() == settlement.obligation.product_conversation_id()
-                && matches!(
-                    current.phase(),
-                    ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
-                ),
-        )
+        Ok(Some(current))
+    }
+
+    pub async fn finish_generic_close_settlement_classified(
+        &self,
+        settlement: &GenericCloseSettlement,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseSettlementAdvance>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        let attempt_id = settlement.obligation.attempt_id();
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let run = CloseRunRef::initial(attempt_id.clone());
+            let (status, current) = Self::interrupted_close_run_for_update(&mut tx, &run).await?;
+            if current.product_conversation_id() != settlement.obligation.product_conversation_id()
+            {
+                return Err(close_precondition(
+                    "generic Close settlement target changed",
+                ));
+            }
+            Self::require_generic_close_settlement_tx(
+                &mut tx,
+                attempt_id.as_str(),
+                current.product_conversation_id().as_str(),
+            )
+            .await?;
+            if status != CloseRunStatus::Running {
+                return Ok((GenericCloseSettlementAdvance::NoTransition, false));
+            }
+            let phase = current.phase();
+            if matches!(
+                phase,
+                ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+            ) && Self::try_advance_close_settlement_when_quiescent_tx(
+                &mut tx,
+                attempt_id.as_str(),
+            )
+            .await?
+            .is_err()
+            {
+                return Ok((GenericCloseSettlementAdvance::WaitingForQuiescence, false));
+            }
+            let outcome = match phase {
+                ClosePhase::SettlingActiveWork => match settlement.provenance {
+                    GenericSettlementProvenance::CommittedIngress => {
+                        GenericCloseSettlementAdvance::Inspect(GenericCloseInspection(
+                            attempt_id.clone(),
+                        ))
+                    }
+                    #[cfg(test)]
+                    GenericSettlementProvenance::RetainedSettlement => {
+                        GenericCloseSettlementAdvance::Interrupted(CloseRunRef::initial(
+                            attempt_id.clone(),
+                        ))
+                    }
+                },
+                ClosePhase::CancelRequestedDuringSettlement => {
+                    GenericCloseSettlementAdvance::Cancelled
+                }
+                ClosePhase::AwaitingBlockerResolution
+                | ClosePhase::AwaitingStopWorkConfirmation
+                | ClosePhase::AwaitingRetirementInspection
+                | ClosePhase::AwaitingLossConfirmation
+                | ClosePhase::RetirementRequested
+                | ClosePhase::NeedsRepair
+                | ClosePhase::Completed => GenericCloseSettlementAdvance::NoTransition,
+            };
+            Ok((outcome, true))
+        }
+        .await;
+        let released = match &result {
+            Ok((_, true)) => tx.commit().await,
+            Ok((_, false)) | Err(_) => tx.rollback().await,
+        };
+        match released {
+            Ok(()) => DurableFactEstablished(result.map(|(outcome, _)| outcome)),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn finish_generic_close_settlement(
+        &self,
+        settlement: &GenericCloseSettlement,
+    ) -> DbResult<GenericCloseSettlementAdvance> {
+        match self
+            .finish_generic_close_settlement_classified(settlement)
+            .await
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::CloseFoundationConflict(
+                    "generic Close settlement transaction release is unclassified".into(),
+                ))
+            }
+        }
     }
 
     pub async fn advance_close_settlement_when_quiescent(
@@ -2791,10 +3746,19 @@ impl Database {
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
+        Self::try_advance_close_settlement_when_quiescent_tx(tx, attempt_id)
+            .await?
+            .map_err(|PendingCloseQuiescence(detail)| close_precondition(detail))
+    }
+
+    async fn try_advance_close_settlement_when_quiescent_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+    ) -> DbResult<Result<CloseObligation, PendingCloseQuiescence>> {
         let obligation = close_obligation_for_update(tx, attempt_id).await?;
         match obligation.phase() {
             ClosePhase::AwaitingRetirementInspection | ClosePhase::Completed => {
-                return Ok(obligation);
+                return Ok(Ok(obligation));
             }
             ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement => {}
             phase @ (ClosePhase::AwaitingBlockerResolution
@@ -2811,16 +3775,16 @@ impl Database {
         let unsettled =
             Self::reconcile_close_direct_turn_settlement_receipts_tx(tx, attempt_id).await?;
         if unsettled != 0 {
-            return Err(close_precondition(format!(
+            return Ok(Err(PendingCloseQuiescence(format!(
                 "attempt {attempt_id} still has {unsettled} unsettled direct-turn receipt(s)"
-            )));
+            ))));
         }
         let active_members =
             Self::count_close_settlement_active_participants_tx(tx, attempt_id).await?;
         if active_members != 0 {
-            return Err(close_precondition(format!(
+            return Ok(Err(PendingCloseQuiescence(format!(
                 "attempt {attempt_id} still has {active_members} active durable member obligation(s)"
-            )));
+            ))));
         }
         if obligation.phase() == ClosePhase::CancelRequestedDuringSettlement {
             sqlx::query(
@@ -2835,7 +3799,7 @@ impl Database {
         } else {
             set_close_phase_tx(tx, attempt_id, ClosePhase::AwaitingRetirementInspection).await?;
         }
-        close_obligation_for_update(tx, attempt_id).await
+        close_obligation_for_update(tx, attempt_id).await.map(Ok)
     }
 
     pub async fn list_close_settlement_conversation_ids(
@@ -2878,6 +3842,18 @@ impl Database {
         &self,
         attempt_id: &str,
     ) -> DbResult<Vec<CloseDirectTurnSettlementTarget>> {
+        let mut tx = self.pool.begin().await?;
+        let targets =
+            Self::list_unsettled_close_direct_turn_settlement_targets_tx(&mut tx, attempt_id)
+                .await?;
+        tx.commit().await?;
+        Ok(targets)
+    }
+
+    pub(crate) async fn list_unsettled_close_direct_turn_settlement_targets_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+    ) -> DbResult<Vec<CloseDirectTurnSettlementTarget>> {
         let rows: Vec<(String, i64, i64)> = sqlx::query_as(
             "SELECT turn.conversation_id, target.turn_id, target.expected_generation
              FROM close_attempt_direct_turn_settlements target
@@ -2886,7 +3862,7 @@ impl Database {
              ORDER BY target.turn_id",
         )
         .bind(attempt_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **tx)
         .await?;
         rows.into_iter()
             .map(|(conversation_id, turn_id, expected_generation)| {
@@ -2903,6 +3879,209 @@ impl Database {
             .collect()
     }
 
+    /// Cancel provisioning only under the current committed Close settlement.
+    pub async fn cancel_generic_close_provisioning(
+        &self,
+        settlement: &GenericCloseSettlement,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<bool>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        if !settlement.is_committed_ingress() {
+            return DurableFactEstablished(Ok(false));
+        }
+        let workflow = self.workflow_repository();
+        let mut tx = match workflow.begin_immediate_tx().await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error)),
+        };
+        let result = async {
+            let Some(current) = Self::running_generic_settlement_tx(&mut tx.tx, settlement).await?
+            else {
+                return Ok(false);
+            };
+            let participants: Vec<String> = sqlx::query_scalar(
+                "SELECT conversation_id FROM close_attempt_participants
+                 WHERE attempt_id = ?1 ORDER BY conversation_id",
+            )
+            .bind(current.attempt_id().as_str())
+            .fetch_all(&mut *tx.tx)
+            .await?;
+            for participant in participants {
+                Self::cancel_conversation_creation_tx(&mut tx.tx, &participant, Utc::now()).await?;
+            }
+            Ok(true)
+        }
+        .await;
+        let classified = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match classified {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    /// Admit an exact cancellation offer to the receiving actor after checking
+    /// its durable Close authority. The inbox is not a settlement receipt.
+    pub async fn claim_generic_close_turn_offer(
+        &self,
+        offer: GenericCloseTurnOffer,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<bool>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        let workflow = self.workflow_repository();
+        let mut tx = match workflow.begin_immediate_tx().await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error)),
+        };
+        let result = async {
+            let run = CloseRunRef::initial(offer.attempt);
+            let (status, current) =
+                Self::interrupted_close_run_for_update(&mut tx.tx, &run).await?;
+            if status != CloseRunStatus::Running
+                || current.product_conversation_id() != &offer.product
+                || !matches!(
+                    current.phase(),
+                    ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+                )
+            {
+                return Ok(false);
+            }
+            Self::require_generic_close_settlement_tx(
+                &mut tx.tx,
+                run.attempt_id.as_str(),
+                offer.product.as_str(),
+            )
+            .await?;
+            let Some(target) =
+                require_exact_live_settlement_target_tx(&mut tx, &run.attempt_id, &offer.target)
+                    .await?
+            else {
+                return Ok(false);
+            };
+            let mut entry = None;
+            target.claim_stop(|| Ok(()), &mut entry).await
+        }
+        .await;
+        let classified = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match classified {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    /// Settle the captured turn while the runtime owner fences actor materialization.
+    ///
+    /// # Errors
+    /// Returns a classified error for invalid settlement evidence or a failed write.
+    /// An unclassified transaction release is not a settlement outcome.
+    pub async fn cancel_generic_close_turn_without_actor(
+        &self,
+        settlement: &GenericCloseSettlement,
+        target: &CloseDirectTurnSettlementTarget,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseTurnRelease>> {
+        self.apply_generic_close_turn_fallback(
+            settlement,
+            target,
+            GenericCloseTurnFallback::NoActor,
+        )
+        .await
+    }
+
+    pub async fn reconcile_lost_generic_close_turn_offer(
+        &self,
+        settlement: &GenericCloseSettlement,
+        target: &CloseDirectTurnSettlementTarget,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseTurnRelease>> {
+        self.apply_generic_close_turn_fallback(
+            settlement,
+            target,
+            GenericCloseTurnFallback::LostOffer,
+        )
+        .await
+    }
+
+    async fn apply_generic_close_turn_fallback(
+        &self,
+        settlement: &GenericCloseSettlement,
+        target: &CloseDirectTurnSettlementTarget,
+        fallback: GenericCloseTurnFallback,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseTurnRelease>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        let workflow = self.workflow_repository();
+        let mut tx = match workflow.begin_immediate_tx().await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error)),
+        };
+        let result = async {
+            let run = CloseRunRef::initial(settlement.obligation.attempt_id().clone());
+            let (status, current) =
+                Self::interrupted_close_run_for_update(&mut tx.tx, &run).await?;
+            if current.product_conversation_id() != settlement.obligation.product_conversation_id()
+            {
+                return Err(close_precondition(
+                    "generic Close settlement target changed",
+                ));
+            }
+            Self::require_generic_close_settlement_tx(
+                &mut tx.tx,
+                run.attempt_id.as_str(),
+                current.product_conversation_id().as_str(),
+            )
+            .await?;
+            if status != CloseRunStatus::Running
+                || !matches!(
+                    current.phase(),
+                    ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+                )
+            {
+                return Ok(GenericCloseTurnRelease::NoTransition);
+            }
+            if let Some(mut live_target) =
+                require_exact_live_settlement_target_tx(&mut tx, &run.attempt_id, target).await?
+            {
+                match fallback {
+                    GenericCloseTurnFallback::NoActor => {
+                        live_target.cancel_without_actor(&workflow).await?;
+                    }
+                    GenericCloseTurnFallback::LostOffer => {
+                        if live_target.stop_already_claimed().await? {
+                            return Err(close_precondition(
+                                "claimed settlement Stop was lost before durable turn release",
+                            ));
+                        }
+                        return Ok(GenericCloseTurnRelease::Unclaimed);
+                    }
+                }
+            }
+            Ok(GenericCloseTurnRelease::Released)
+        }
+        .await;
+        let classified = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match classified {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    #[cfg(test)]
     pub async fn record_close_direct_turn_settlement_if_released(
         &self,
         attempt_id: &str,
@@ -3062,20 +4241,6 @@ impl Database {
         .collect()
     }
 
-    pub async fn close_attempt_latest_was_busy(&self, attempt_id: &str) -> DbResult<bool> {
-        let captured_state: String = sqlx::query_scalar(
-            "SELECT captured_state_kind
-             FROM close_attempt_members
-             WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
-        )
-        .bind(attempt_id)
-        .fetch_one(&self.pool)
-        .await?;
-        let captured_state = CapturedConversationStateKind::from_db_str(&captured_state)
-            .ok_or_else(|| DbError::Serialization("unknown captured state kind".to_string()))?;
-        Ok(captured_state.is_busy())
-    }
-
     pub async fn list_close_attempt_scopes(
         &self,
         attempt_id: &str,
@@ -3112,6 +4277,109 @@ impl Database {
             WorkScopeId::parse(scope).map_err(|error| DbError::Serialization(error.to_string()))
         })
         .collect()
+    }
+
+    pub async fn commit_fresh_generic_close_inspection_classified(
+        &self,
+        inspection: GenericCloseInspection,
+        request: ReplaceCloseInspectionRequest,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<Option<FreshGenericCloseRetirement>>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        let attempt_id = inspection.into_attempt_id();
+        if request.attempt_id != attempt_id {
+            return DurableFactEstablished(Err(close_precondition(
+                "Initial inspection names a different Close attempt",
+            )));
+        }
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let current = Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+            if current.phase() != ClosePhase::AwaitingRetirementInspection || current.snapshot().is_some() {
+                return Err(close_precondition("Initial inspection no longer owns the fresh transition"));
+            }
+            let captured_latest: String = sqlx::query_scalar(
+                "SELECT conversation_id FROM close_attempt_members
+                 WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+            )
+            .bind(attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            let captured_latest = TranscriptConversationId::parse(captured_latest)
+                .map_err(|error| DbError::Serialization(error.to_string()))?;
+            require_control_target_latest_tx(
+                &mut tx,
+                current.product_conversation_id(),
+                &captured_latest,
+            )
+            .await?;
+            let admitted: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_runs run
+                 WHERE run.attempt_id = ?1 AND run.run_ordinal = 1 AND run.status = 'running'
+                   AND NOT EXISTS (SELECT 1 FROM close_runs later
+                       WHERE later.attempt_id = run.attempt_id AND later.run_ordinal > run.run_ordinal))",
+            )
+            .bind(attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !admitted {
+                return Err(close_precondition("Initial inspection requires the running Initial Close"));
+            }
+            self.replace_close_inspection_tx(&mut tx, &request, None).await?;
+            let committed = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+            let retirement = match committed.phase() {
+                ClosePhase::RetirementRequested => Some(FreshGenericCloseRetirement {
+                    attempt_id,
+                    snapshot: committed.snapshot().cloned().ok_or_else(|| {
+                        close_precondition("Initial retirement requires its committed inspection snapshot")
+                    })?,
+                }),
+                ClosePhase::AwaitingLossConfirmation => None,
+                ClosePhase::AwaitingBlockerResolution
+                | ClosePhase::AwaitingStopWorkConfirmation
+                | ClosePhase::SettlingActiveWork
+                | ClosePhase::CancelRequestedDuringSettlement
+                | ClosePhase::AwaitingRetirementInspection
+                | ClosePhase::NeedsRepair
+                | ClosePhase::Completed => {
+                    return Err(close_precondition("Unexpected Initial inspection outcome"));
+                }
+            };
+            Ok(retirement)
+        }.await;
+        let released = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match released {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn commit_fresh_generic_close_inspection(
+        &self,
+        inspection: GenericCloseInspection,
+        request: ReplaceCloseInspectionRequest,
+    ) -> DbResult<Option<FreshGenericCloseRetirement>> {
+        match self
+            .commit_fresh_generic_close_inspection_classified(inspection, request)
+            .await
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result,
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                Err(DbError::CloseFoundationConflict(
+                    "fresh Close inspection transaction release is unclassified".into(),
+                ))
+            }
+        }
     }
 
     pub async fn replace_close_inspection(
@@ -3173,6 +4441,8 @@ impl Database {
         .map(parse_close_obligation_row)
         .transpose()?
         .ok_or_else(|| DbError::CloseFoundationNotFound(request.attempt_id.as_str().to_string()))?;
+        Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id())
+            .await?;
         if obligation.phase() != ClosePhase::AwaitingRetirementInspection {
             let mut persisted_inspections = sqlx::query(
                 "SELECT attempt_id, scope, generation, fingerprint, inspected_at
@@ -3371,7 +4641,7 @@ impl Database {
                     resource.inspection_fingerprint, resource.resource_kind, resource.identity_kind,
                     resource.identity_codec, resource.identity_value, resource.proof_kind,
                     resource.absence_basis, resource.residual_reason, resource.detail,
-                    resource.created_at, resource.updated_at,
+                    resource.created_at, resource.updated_at, resource.tmux_replacement_token,
                     captured.captured_worktree_fingerprint, captured.captured_worktree_locator
              FROM close_retirement_resources resource
              JOIN close_attempt_scopes captured
@@ -3593,6 +4863,7 @@ impl Database {
                 request.attempt_id.as_str()
             )));
         }
+        Self::require_no_retained_legacy_creation_for_attempt_tx(tx, &request.attempt_id).await?;
         let original_anchor_eligible = match Self::classify_retirement_anchor_tx(
             tx,
             request.attempt_id.as_str(),
@@ -4541,6 +5812,74 @@ type WorktreeCleanupPlanColumns = (
     Option<String>,
 );
 
+#[derive(Clone, Copy)]
+pub(crate) enum CloseProcessDispatchCoverage {
+    ScopeSubset,
+    EntireKind,
+}
+
+pub(crate) struct SealedCloseProcessDispatchBatch<'a>(&'a [RecordCloseRetirementDispatchRequest]);
+
+impl<'a> SealedCloseProcessDispatchBatch<'a> {
+    pub(crate) fn validate(
+        requests: &'a [RecordCloseRetirementDispatchRequest],
+        expected: &[CloseExpectedRetirementResource],
+        coverage: CloseProcessDispatchCoverage,
+    ) -> DbResult<Self> {
+        let first = requests.first().ok_or_else(|| {
+            close_precondition("Close process dispatch requires a nonempty batch")
+        })?;
+        let matches_resource =
+            |request: &RecordCloseRetirementDispatchRequest,
+             item: &CloseExpectedRetirementResource| {
+                request.attempt_id == item.attempt_id
+                    && request.scope == item.scope
+                    && request.snapshot == item.snapshot
+                    && request.resource == item.resource
+            };
+        if requests.iter().any(|request| {
+            request.attempt_id != first.attempt_id
+                || request.scope != first.scope
+                || request.snapshot != first.snapshot
+                || matches!(
+                    request.resource.kind(),
+                    RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope
+                )
+                || !expected.iter().any(|item| matches_resource(request, item))
+        }) {
+            return Err(close_precondition(
+                "Close process dispatch does not match the exact sealed scope inventory",
+            ));
+        }
+        if matches!(coverage, CloseProcessDispatchCoverage::EntireKind) {
+            let kind = first.resource.kind();
+            let inventory = expected
+                .iter()
+                .filter(|item| item.scope == first.scope && item.resource.kind() == kind);
+            if requests
+                .iter()
+                .any(|request| request.resource.kind() != kind)
+                || inventory.clone().count() != requests.len()
+                || !inventory.clone().all(|item| {
+                    requests
+                        .iter()
+                        .any(|request| matches_resource(request, item))
+                })
+            {
+                return Err(close_precondition(
+                    "Close process dispatch does not cover the exact sealed process kind",
+                ));
+            }
+        }
+        Ok(Self(requests))
+    }
+}
+
+enum GenericCloseDispatchKind {
+    Legacy,
+    OriginalWorktree(Box<RecordCloseWorktreeCleanupPlanRequest>),
+}
+
 impl Database {
     /// Durably records intent to remove one exact sealed resource before external
     /// teardown begins. A restart can adopt absence only from this same-attempt
@@ -4554,13 +5893,220 @@ impl Database {
         &self,
         request: RecordCloseRetirementDispatchRequest,
     ) -> DbResult<()> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        match self
+            .record_generic_close_dispatch(request, GenericCloseDispatchKind::Legacy)
+            .await
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map(|_| ())
+            }
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => Err(
+                close_precondition("legacy Close dispatch release is unclassified"),
+            ),
+        }
+    }
+
+    /// Claims API process teardown for an exact running Initial scope. The whole
+    /// batch is rolled back on replay, so none of its effects can be redriven.
+    pub async fn claim_generic_close_process_dispatches(
+        &self,
+        requests: &[RecordCloseRetirementDispatchRequest],
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<CloseRetirementBatchDispatch>> {
+        use crate::workflow::LocalAuthorityResult;
+
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let first = requests.first().ok_or_else(|| {
+                close_precondition("generic Close process dispatch requires a nonempty batch")
+            })?;
+            let current =
+                Self::generic_close_settlement_for_update(&mut tx, first.attempt_id.as_str())
+                    .await?;
+            let running_initial: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM close_runs
+                   WHERE attempt_id = ?1 AND run_ordinal = 1 AND status = 'running')",
+            )
+            .bind(first.attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !running_initial
+                || current.phase() != ClosePhase::RetirementRequested
+                || current.snapshot() != Some(&first.snapshot)
+            {
+                return Err(close_precondition(
+                    "process dispatch requires the exact running generic Initial retirement",
+                ));
+            }
+            ensure_close_retirement_loss_free_tx(&mut tx, first.attempt_id.as_str()).await?;
+            let expected =
+                list_close_expected_retirement_resources_tx(&mut tx, first.attempt_id.as_str())
+                    .await?;
+            let batch = SealedCloseProcessDispatchBatch::validate(
+                requests,
+                &expected,
+                CloseProcessDispatchCoverage::ScopeSubset,
+            )?;
+            // Legacy reinspection can rotate the snapshot without creating a new run.
+            for request in requests {
+                let identity = request.resource.identity();
+                let prior_snapshot: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM close_retirement_resource_dispatches
+                       WHERE attempt_id = ?1 AND scope = ?2 AND resource_kind = ?3
+                         AND identity_kind = ?4 AND identity_codec = ?5 AND identity_value = ?6
+                         AND (inspection_generation <> ?7 OR inspection_fingerprint <> ?8))",
+                )
+                .bind(request.attempt_id.as_str())
+                .bind(request.scope.as_str())
+                .bind(request.resource.kind().as_str())
+                .bind(identity.identity_kind())
+                .bind(identity.codec())
+                .bind(identity.value())
+                .bind(request.snapshot.generation())
+                .bind(request.snapshot.fingerprint())
+                .fetch_one(&mut *tx)
+                .await?;
+                if prior_snapshot {
+                    return Ok(CloseRetirementBatchDispatch::Replay);
+                }
+            }
+            Self::insert_close_process_dispatch_batch_tx(&mut tx, batch).await
+        }
+        .await;
+        Self::release_close_process_dispatch_batch(tx, result).await
+    }
+
+    pub(crate) async fn insert_close_process_dispatch_batch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        SealedCloseProcessDispatchBatch(requests): SealedCloseProcessDispatchBatch<'_>,
+    ) -> DbResult<CloseRetirementBatchDispatch> {
+        let mut claimed = Vec::with_capacity(requests.len());
+        for request in requests {
+            match Self::insert_close_retirement_dispatch_tx(tx, request).await? {
+                CloseRetirementDispatch::First(dispatch) => claimed.push(dispatch),
+                CloseRetirementDispatch::Replay => return Ok(CloseRetirementBatchDispatch::Replay),
+            }
+        }
+        Ok(CloseRetirementBatchDispatch::First(claimed))
+    }
+
+    pub(crate) async fn release_close_process_dispatch_batch(
+        tx: Transaction<'_, Sqlite>,
+        result: DbResult<CloseRetirementBatchDispatch>,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<CloseRetirementBatchDispatch>> {
+        use crate::workflow::LocalAuthorityResult;
+
+        let released = if matches!(&result, Ok(CloseRetirementBatchDispatch::First(_))) {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match released {
+            Ok(()) => LocalAuthorityResult::DurableFactEstablished(result),
+            Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+        }
+    }
+
+    pub(crate) async fn require_original_worktree_unsettled_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<()> {
+        let identity = resource.identity();
+        let already_proven: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_history
+             WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+               AND inspection_fingerprint = ?4 AND resource_kind = ?5
+               AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
+               AND proof_kind IN ('retired', 'absence_adopted'))
+             OR EXISTS(SELECT 1 FROM close_retirement_resources
+             WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+               AND inspection_fingerprint = ?4 AND resource_kind = ?5
+               AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
+               AND proof_kind IN ('retired', 'absence_adopted'))",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .bind(resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_one(&mut **tx)
+        .await?;
+        if already_proven {
+            return Err(DbError::CloseFoundationPrecondition(
+                "initial worktree entry refuses an exact resource with positive retirement evidence"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Claims the first generic dispatch and commits its exact cleanup plan
+    /// together. A replay grants no ownership and cannot install a plan. Neither
+    /// result authorizes relaxed writer inspection.
+    ///
+    /// # Errors
+    /// Returns an error unless the request matches a sealed worktree in the
+    /// exact snapshot of a requested generic retirement.
+    pub async fn claim_generic_original_worktree_dispatch(
+        &self,
+        plan: RecordCloseWorktreeCleanupPlanRequest,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<CloseRetirementDispatch>> {
+        let request = RecordCloseRetirementDispatchRequest {
+            attempt_id: plan.attempt_id.clone(),
+            scope: plan.scope.clone(),
+            snapshot: plan.snapshot.clone(),
+            resource: plan.resource.clone(),
+        };
+        self.record_generic_close_dispatch(
+            request,
+            GenericCloseDispatchKind::OriginalWorktree(Box::new(plan)),
+        )
+        .await
+    }
+
+    async fn record_generic_close_dispatch(
+        &self,
+        request: RecordCloseRetirementDispatchRequest,
+        kind: GenericCloseDispatchKind,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<CloseRetirementDispatch>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error.into())),
+        };
+        let result = Self::stage_generic_close_dispatch(&mut tx, request, kind).await;
+        let released = match &result {
+            Ok(CloseRetirementDispatch::First(_)) => tx.commit().await,
+            Ok(CloseRetirementDispatch::Replay) | Err(_) => tx.rollback().await,
+        };
+        match released {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    async fn stage_generic_close_dispatch(
+        tx: &mut Transaction<'_, Sqlite>,
+        request: RecordCloseRetirementDispatchRequest,
+        kind: GenericCloseDispatchKind,
+    ) -> DbResult<CloseRetirementDispatch> {
         let native_initial: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM native_close_initial_receipts
              WHERE attempt_id = ?1 AND run_ordinal = 1 AND intent = 'initial')",
         )
         .bind(request.attempt_id.as_str())
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if native_initial {
             return Err(close_precondition(
@@ -4568,14 +6114,14 @@ impl Database {
             ));
         }
         // An observation/adoption receipt alone must not revoke a legacy initial run.
-        let current = close_obligation_for_update(&mut tx, request.attempt_id.as_str()).await?;
+        let current = close_obligation_for_update(tx, request.attempt_id.as_str()).await?;
         if current.phase() == ClosePhase::Completed {
             let native_managed: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM close_obligations
                  WHERE attempt_id = ?1 AND native_managed = 1)",
             )
             .bind(request.attempt_id.as_str())
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             if native_managed {
                 return Err(close_precondition(
@@ -4583,34 +6129,12 @@ impl Database {
                 ));
             }
         }
+        if matches!(kind, GenericCloseDispatchKind::OriginalWorktree(_)) {
+            Self::require_original_worktree_dispatch_authority_tx(tx, &request, &current).await?;
+        }
         let identity = request.resource.identity();
-        let retry_authorized = if current.phase() == ClosePhase::Completed
-            && matches!(
-                current.close_outcome(),
-                Some(
-                    CloseCompletionOutcome::CloseIncomplete
-                        | CloseCompletionOutcome::ArchivedCleanupAttention
-                )
-            )
-            && request.resource.kind() == RetiredResourceKind::Worktree
-        {
-            sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
-                   ON effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
-                 WHERE run.attempt_id = ?1 AND run.status = 'running' AND run.retry_evidence_kind = 'resource_plan'
-                   AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
-                   AND effect.scope = ?2 AND effect.resource_kind = ?3 AND effect.identity_kind = ?4
-                   AND effect.identity_codec = ?5 AND effect.identity_value = ?6
-                   AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
-                     WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
-                       AND success.ordinal = effect.ordinal))",
-            )
-            .bind(request.attempt_id.as_str()).bind(request.scope.as_str())
-            .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
-            .bind(identity.codec()).bind(identity.value()).fetch_one(&mut *tx).await?
-        } else {
-            false
-        };
+        let retry_authorized =
+            Self::generic_worktree_retry_authorizes_dispatch_tx(tx, &request, &current).await?;
         if !(matches!(
             current.phase(),
             ClosePhase::RetirementRequested | ClosePhase::NeedsRepair
@@ -4622,16 +6146,120 @@ impl Database {
                 request.attempt_id
             )));
         }
-        ensure_close_retirement_loss_free_tx(&mut tx, request.attempt_id.as_str()).await?;
-        Self::insert_close_retirement_dispatch_tx(&mut tx, &request).await?;
-        tx.commit().await?;
+        ensure_close_retirement_loss_free_tx(tx, request.attempt_id.as_str()).await?;
+        let dispatch = Self::insert_close_retirement_dispatch_tx(tx, &request).await?;
+        if let (
+            GenericCloseDispatchKind::OriginalWorktree(plan),
+            CloseRetirementDispatch::First(_),
+        ) = (kind, &dispatch)
+        {
+            let prior_dispatch: bool = sqlx::query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM close_retirement_resource_dispatches
+                     WHERE attempt_id = ?1 AND scope = ?2 AND resource_kind = 'worktree'
+                       AND identity_kind = ?3 AND identity_codec = ?4 AND identity_value = ?5
+                       AND (inspection_generation <> ?6 OR inspection_fingerprint <> ?7)
+                 )",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .bind(request.snapshot.generation())
+            .bind(request.snapshot.fingerprint())
+            .fetch_one(&mut **tx)
+            .await?;
+            if prior_dispatch {
+                return Ok(CloseRetirementDispatch::Replay);
+            }
+            Self::require_original_worktree_unsettled_tx(
+                tx,
+                &request.attempt_id,
+                &request.scope,
+                &request.snapshot,
+                &request.resource,
+            )
+            .await?;
+            Self::record_close_worktree_cleanup_plan_tx(tx, *plan).await?;
+        }
+        Ok(dispatch)
+    }
+
+    async fn require_original_worktree_dispatch_authority_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        request: &RecordCloseRetirementDispatchRequest,
+        current: &CloseObligation,
+    ) -> DbResult<()> {
+        if current.phase() != ClosePhase::RetirementRequested
+            || request.resource.kind() != RetiredResourceKind::Worktree
+        {
+            return Err(close_precondition(
+                "original worktree claim requires requested worktree retirement",
+            ));
+        }
+        let initial_run_active: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM close_runs
+                 WHERE attempt_id = ?1 AND run_ordinal = 1 AND status = 'running'
+             )",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if !initial_run_active {
+            return Err(close_precondition(
+                "original worktree claim requires a running initial Close run",
+            ));
+        }
         Ok(())
+    }
+
+    async fn generic_worktree_retry_authorizes_dispatch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        request: &RecordCloseRetirementDispatchRequest,
+        current: &CloseObligation,
+    ) -> DbResult<bool> {
+        let identity = request.resource.identity();
+        if current.phase() == ClosePhase::Completed
+            && matches!(
+                current.close_outcome(),
+                Some(
+                    CloseCompletionOutcome::CloseIncomplete
+                        | CloseCompletionOutcome::ArchivedCleanupAttention
+                )
+            )
+            && request.resource.kind() == RetiredResourceKind::Worktree
+        {
+            Ok(sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
+                   ON effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+                 WHERE run.attempt_id = ?1 AND run.status = 'running' AND run.retry_evidence_kind = 'resource_plan'
+                   AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+                   AND effect.scope = ?2 AND effect.resource_kind = ?3 AND effect.identity_kind = ?4
+                   AND effect.identity_codec = ?5 AND effect.identity_value = ?6
+                   AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+                     WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+                       AND success.ordinal = effect.ordinal))",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_one(&mut **tx)
+            .await?)
+        } else {
+            Ok(false)
+        }
     }
 
     pub(crate) async fn insert_close_retirement_dispatch_tx(
         tx: &mut Transaction<'_, Sqlite>,
         request: &RecordCloseRetirementDispatchRequest,
-    ) -> DbResult<()> {
+    ) -> DbResult<CloseRetirementDispatch> {
+        Self::require_no_retained_legacy_creation_for_attempt_tx(tx, &request.attempt_id).await?;
         let identity = request.resource.identity();
         let inserted = sqlx::query(
             "INSERT OR IGNORE INTO close_retirement_resource_dispatches (
@@ -4650,34 +6278,37 @@ impl Database {
         .bind(Utc::now().timestamp_micros())
         .execute(&mut **tx)
         .await?;
-        if inserted.rows_affected() == 0 {
-            let exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS(
-                     SELECT 1 FROM close_retirement_resource_dispatches
-                     WHERE attempt_id = ?1 AND scope = ?2
-                       AND inspection_generation = ?3 AND inspection_fingerprint = ?4
-                       AND resource_kind = ?5 AND identity_kind = ?6
-                       AND identity_codec = ?7 AND identity_value = ?8
-                 )",
-            )
-            .bind(request.attempt_id.as_str())
-            .bind(request.scope.as_str())
-            .bind(request.snapshot.generation())
-            .bind(request.snapshot.fingerprint())
-            .bind(request.resource.kind().as_str())
-            .bind(identity.identity_kind())
-            .bind(identity.codec())
-            .bind(identity.value())
-            .fetch_one(&mut **tx)
-            .await?;
-            if !exists {
-                return Err(close_precondition(format!(
-                    "attempt {} dispatch resource is not in the exact sealed inventory",
-                    request.attempt_id
-                )));
-            }
+        if inserted.rows_affected() == 1 {
+            return Ok(CloseRetirementDispatch::First(
+                FirstCloseRetirementDispatch(request.clone()),
+            ));
         }
-        Ok(())
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(
+                 SELECT 1 FROM close_retirement_resource_dispatches
+                 WHERE attempt_id = ?1 AND scope = ?2
+                   AND inspection_generation = ?3 AND inspection_fingerprint = ?4
+                   AND resource_kind = ?5 AND identity_kind = ?6
+                   AND identity_codec = ?7 AND identity_value = ?8
+             )",
+        )
+        .bind(request.attempt_id.as_str())
+        .bind(request.scope.as_str())
+        .bind(request.snapshot.generation())
+        .bind(request.snapshot.fingerprint())
+        .bind(request.resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_one(&mut **tx)
+        .await?;
+        if !exists {
+            return Err(close_precondition(format!(
+                "attempt {} dispatch resource is not in the exact sealed inventory",
+                request.attempt_id
+            )));
+        }
+        Ok(CloseRetirementDispatch::Replay)
     }
 
     pub(crate) async fn record_close_worktree_cleanup_plan_tx(
@@ -4942,6 +6573,17 @@ impl Database {
         snapshot: &CloseRetirementSnapshot,
         resource: &RetiredResourceIdentity,
     ) -> DbResult<Option<CloseWorktreeCleanupPlan>> {
+        Self::read_close_worktree_cleanup_plan(&self.pool, attempt_id, scope, snapshot, resource)
+            .await
+    }
+
+    async fn read_close_worktree_cleanup_plan<'e>(
+        executor: impl sqlx::SqliteExecutor<'e>,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<Option<CloseWorktreeCleanupPlan>> {
         let identity = resource.identity();
         let rows: Vec<WorktreeCleanupPlanColumns> = sqlx::query_as(
             "SELECT DISTINCT administrative_dir_codec, administrative_dir_value,
@@ -4963,7 +6605,7 @@ impl Database {
         .bind(identity.value())
         .bind(snapshot.generation())
         .bind(snapshot.fingerprint())
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?;
         match rows.as_slice() {
             [] => Ok(None),
@@ -5036,6 +6678,19 @@ impl Database {
         snapshot: &CloseRetirementSnapshot,
         resource: &RetiredResourceIdentity,
     ) -> DbResult<bool> {
+        Self::close_retirement_resource_was_dispatched_on(
+            &self.pool, attempt_id, scope, snapshot, resource,
+        )
+        .await
+    }
+
+    pub(crate) async fn close_retirement_resource_was_dispatched_on<'e>(
+        executor: impl sqlx::Executor<'e, Database = Sqlite>,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<bool> {
         let identity = resource.identity();
         sqlx::query_scalar(
             "SELECT EXISTS(
@@ -5054,7 +6709,7 @@ impl Database {
         .bind(identity.identity_kind())
         .bind(identity.codec())
         .bind(identity.value())
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await
         .map_err(Into::into)
     }
@@ -5216,6 +6871,60 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn seed_pre_197_close_retirement_evidence(
+        &self,
+        request: RecordCloseRetirementEvidenceRequest,
+    ) {
+        let (proof, residual) = match request.outcome {
+            RetirementOutcome::Retired => ("retired", None),
+            RetirementOutcome::Residual { residual_reason } => {
+                ("residual", Some(residual_reason.as_str()))
+            }
+            RetirementOutcome::AbsenceAdopted { .. } => panic!("unsupported historical fixture"),
+        };
+        let identity = request.resource.identity();
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await.unwrap();
+        for statement in [
+            "INSERT INTO close_retirement_resource_history (
+                attempt_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value,
+                proof_kind, residual_reason, detail, recorded_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO close_retirement_resources (
+                attempt_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value,
+                proof_kind, residual_reason, detail, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12)",
+        ] {
+            sqlx::query(statement)
+                .bind(request.attempt_id.as_str())
+                .bind(request.scope.as_str())
+                .bind(request.snapshot.generation())
+                .bind(request.snapshot.fingerprint())
+                .bind(request.resource.kind().as_str())
+                .bind(identity.identity_kind())
+                .bind(identity.codec())
+                .bind(identity.value())
+                .bind(proof)
+                .bind(residual)
+                .bind(request.detail.as_deref())
+                .bind(&now)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        if residual.is_some() {
+            sqlx::query("UPDATE close_obligations SET phase = 'needs_repair' WHERE attempt_id = ?1 AND phase = 'retirement_requested'")
+                .bind(request.attempt_id.as_str())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+    }
+
     // Keep history insertion, proof promotion, and replay checks in one shared transaction body.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn record_close_retirement_evidence_sql_tx(
@@ -5223,20 +6932,26 @@ impl Database {
         request: &RecordCloseRetirementEvidenceRequest,
         inspection_generation: &str,
     ) -> DbResult<()> {
-        let (proof_kind, absence_basis, residual_reason) = match &request.outcome {
-            RetirementOutcome::Retired => ("retired", None, None),
-            RetirementOutcome::AbsenceAdopted { absence_basis } => (
-                "absence_adopted",
-                Some(match absence_basis {
-                    AbsenceBasis::SameAttemptPriorRetirement => "same_attempt_prior_retirement",
-                    AbsenceBasis::PreexistingExactIdentityEvidence => {
-                        "preexisting_exact_identity_evidence"
+        let (proof_kind, absence_basis, residual_reason, replacement_token) = match &request.outcome
+        {
+            RetirementOutcome::Retired => ("retired", None, None, None),
+            RetirementOutcome::AbsenceAdopted { absence_basis } => {
+                let (basis, token) = match absence_basis {
+                    AbsenceBasis::SameAttemptPriorRetirement => {
+                        ("same_attempt_prior_retirement", None)
                     }
-                }),
-                None,
-            ),
+                    AbsenceBasis::PreexistingExactIdentityEvidence => {
+                        ("preexisting_exact_identity_evidence", None)
+                    }
+                    AbsenceBasis::VerifiedTmuxReplacement { replacement_token } => (
+                        "verified_tmux_replacement",
+                        Some(replacement_token.to_string()),
+                    ),
+                };
+                ("absence_adopted", Some(basis), None, token)
+            }
             RetirementOutcome::Residual { residual_reason } => {
-                ("residual", None, Some(residual_reason.as_str()))
+                ("residual", None, Some(residual_reason.as_str()), None)
             }
         };
         let now = Utc::now().to_rfc3339();
@@ -5244,8 +6959,8 @@ impl Database {
             "INSERT OR IGNORE INTO close_retirement_resource_history (
                 attempt_id, scope, inspection_generation, inspection_fingerprint,
                 resource_kind, identity_kind, identity_codec, identity_value,
-                proof_kind, absence_basis, residual_reason, detail, recorded_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                proof_kind, absence_basis, residual_reason, detail, recorded_at, tmux_replacement_token
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .bind(request.attempt_id.as_str())
         .bind(request.scope.as_str())
@@ -5260,20 +6975,22 @@ impl Database {
         .bind(residual_reason)
         .bind(request.detail.as_deref().filter(|value| !value.is_empty()))
         .bind(&now)
+        .bind(replacement_token.as_deref())
         .execute(&mut *tx)
         .await?;
 
         sqlx::query(
             "INSERT INTO close_retirement_resources (
                 attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value,
-                proof_kind, absence_basis, residual_reason, detail, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+                proof_kind, absence_basis, residual_reason, detail, created_at, updated_at, tmux_replacement_token
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14)
              ON CONFLICT(attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_value)
              DO UPDATE SET
                  proof_kind = excluded.proof_kind,
                  absence_basis = excluded.absence_basis,
                  residual_reason = excluded.residual_reason,
                  detail = excluded.detail,
+                 tmux_replacement_token = excluded.tmux_replacement_token,
                  updated_at = excluded.updated_at
              WHERE close_retirement_resources.proof_kind = 'residual'
                AND excluded.proof_kind IN ('retired', 'absence_adopted')",
@@ -5291,6 +7008,7 @@ impl Database {
         .bind(residual_reason)
         .bind(request.detail.as_deref().filter(|value| !value.is_empty()))
         .bind(&now)
+        .bind(replacement_token.as_deref())
         .execute(&mut *tx)
         .await?;
 
@@ -5302,9 +7020,11 @@ impl Database {
                 Option<String>,
                 Option<String>,
                 String,
+                Option<String>,
             ),
         >(
-            "SELECT proof_kind, absence_basis, residual_reason, detail, identity_codec
+            "SELECT proof_kind, absence_basis, residual_reason, detail, identity_codec,
+                    tmux_replacement_token
              FROM close_retirement_resources
              WHERE attempt_id = ?1 AND scope = ?2
                AND inspection_generation = ?3 AND inspection_fingerprint = ?4
@@ -5329,6 +7049,7 @@ impl Database {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned),
             request.resource.identity().codec().to_string(),
+            replacement_token,
         );
         let reuses_same_attempt_retirement = matches!(
             &request.outcome,
@@ -5569,6 +7290,7 @@ impl Database {
                     resource.identity_kind, resource.identity_codec, resource.identity_value,
                     resource.proof_kind, resource.absence_basis, resource.residual_reason,
                     resource.detail, resource.created_at, resource.updated_at,
+                    resource.tmux_replacement_token,
                     captured.captured_worktree_fingerprint, captured.captured_worktree_locator
              FROM close_retirement_resources resource
              JOIN close_attempt_scopes captured
@@ -5893,6 +7615,10 @@ impl Database {
                 "safe retry requires the latest stopped run, fresh evidence, and no running run",
             ));
         }
+        let obligation =
+            close_obligation_for_update(tx, request.failed_run.attempt_id.as_str()).await?;
+        Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id())
+            .await?;
         let completion_only = request.remaining_effects.is_empty();
         if completion_only && !verified_completion_source_tx(tx, &request.failed_run).await? {
             return Err(close_precondition(
@@ -6079,7 +7805,7 @@ impl Database {
         effect: &CloseSafeRetryEffect,
         detail: &str,
         effect_count: i64,
-    ) -> DbResult<()> {
+    ) -> DbResult<CloseRetrySuccessWrite> {
         let progress = close_safe_retry_progress_tx(tx, run).await?;
         let count = progress.successful.len() + progress.pending.len();
         if effect_count <= 0
@@ -6099,7 +7825,7 @@ impl Database {
         run: &CloseRunRef,
         effect: &CloseSafeRetryEffect,
         detail: &str,
-    ) -> DbResult<()> {
+    ) -> DbResult<CloseRetrySuccessWrite> {
         if detail.trim().is_empty() {
             return Err(close_precondition("retry success requires evidence"));
         }
@@ -6120,7 +7846,7 @@ impl Database {
             .bind(identity.value()).fetch_optional(&mut **tx).await?;
         if let Some(retained) = retained {
             if retained == detail {
-                return Ok(());
+                return Ok(CloseRetrySuccessWrite::Replay);
             }
             return Err(close_precondition(
                 "retry success replay conflicts with retained detail",
@@ -6147,7 +7873,7 @@ impl Database {
                 "retry success requires exact running planned resource",
             ));
         }
-        Ok(())
+        Ok(CloseRetrySuccessWrite::Inserted)
     }
 
     /// Atomically archives the original outcome after complete exact-run retry proof.
@@ -6225,6 +7951,7 @@ impl Database {
                 "retry completion requires exact running run and complete successful plan",
             ));
         }
+        Self::require_no_retained_legacy_creation_for_attempt_tx(tx, &run.attempt_id).await?;
         let now = Utc::now().to_rfc3339();
         let latest: String = sqlx::query_scalar("SELECT conversation_id FROM close_attempt_members WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')")
             .bind(run.attempt_id.as_str()).fetch_one(&mut **tx).await?;
@@ -6267,24 +7994,89 @@ impl Database {
     ///
     /// # Errors
     /// Rejects absent runs, unavailable captured scope authority, and persistence failures.
-    #[allow(clippy::too_many_lines)]
     pub async fn classify_interrupted_close_run(
         &self,
         run: &CloseRunRef,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let row = sqlx::query("SELECT attempt_id, run_ordinal, status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2")
-            .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut *tx).await?;
-        let retained = parse_close_run_row(row)?;
-        let obligation = close_obligation_for_update(&mut tx, run.attempt_id.as_str()).await?;
-        if retained.status != CloseRunStatus::Running {
-            tx.commit().await?;
-            return Ok(obligation);
+        let (status, obligation) = Self::interrupted_close_run_for_update(&mut tx, run).await?;
+        let result = if status == CloseRunStatus::Running {
+            let detail = format!(
+                "Close run {} interrupted in {}; startup observed retained authority only",
+                run.ordinal.get(),
+                obligation.phase().as_str()
+            );
+            Self::classify_running_close_run_tx(&mut tx, run, &obligation, detail).await?
+        } else {
+            obligation
+        };
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Classify failure before the generic settlement owner can hand off to inspection.
+    ///
+    /// # Errors
+    /// Rejects absent or inconsistent retained authority and persistence failures.
+    pub async fn fail_generic_close_settlement(
+        &self,
+        settlement: &GenericCloseSettlement,
+        detail: &str,
+    ) -> DbResult<GenericCloseSettlementFailure> {
+        let run = CloseRunRef::initial(settlement.obligation().attempt_id().clone());
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let (status, obligation) = Self::interrupted_close_run_for_update(&mut tx, &run).await?;
+        let product = settlement.obligation().product_conversation_id();
+        if obligation.product_conversation_id() != product {
+            return Err(close_precondition(
+                "generic Close settlement target changed",
+            ));
         }
-        if let Some(interrupted) =
-            crate::native_close::interrupt_native_retry_tx(&mut tx, run).await?
+        if status != CloseRunStatus::Running
+            || !matches!(
+                obligation.phase(),
+                ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+            )
         {
-            tx.commit().await?;
+            tx.rollback().await?;
+            return Ok(GenericCloseSettlementFailure::NoTransition(status));
+        }
+        Self::require_generic_close_settlement_tx(
+            &mut tx,
+            run.attempt_id.as_str(),
+            product.as_str(),
+        )
+        .await?;
+        Self::classify_running_close_run_tx(
+            &mut tx,
+            &run,
+            &obligation,
+            format!("Close settlement failed: {detail}"),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(GenericCloseSettlementFailure::Classified)
+    }
+
+    async fn interrupted_close_run_for_update(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+    ) -> DbResult<(CloseRunStatus, CloseObligation)> {
+        let row = sqlx::query("SELECT attempt_id, run_ordinal, status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2")
+            .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut **tx).await?;
+        let retained = parse_close_run_row(row)?;
+        let obligation = close_obligation_for_update(tx, run.attempt_id.as_str()).await?;
+        Ok((retained.status, obligation))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn classify_running_close_run_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+        obligation: &CloseObligation,
+        detail: String,
+    ) -> DbResult<CloseObligation> {
+        if let Some(interrupted) = crate::native_close::interrupt_native_retry_tx(tx, run).await? {
             return Ok(interrupted);
         }
         let completion_only_running: bool = if run.ordinal == CloseRunOrdinal::INITIAL {
@@ -6296,13 +8088,12 @@ impl Database {
             )
             .bind(run.attempt_id.as_str())
             .bind(run.ordinal.get())
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?
         };
         let authority = if run.ordinal == CloseRunOrdinal::INITIAL {
             let unresolved =
-                unresolved_expected_close_cleanup_resources_tx(&mut tx, run.attempt_id.as_str())
-                    .await?;
+                unresolved_expected_close_cleanup_resources_tx(tx, run.attempt_id.as_str()).await?;
             if let Some(first) = unresolved.first() {
                 CloseCleanupFailureAuthority::ExpectedResource {
                     scope: first.scope.clone(),
@@ -6315,7 +8106,7 @@ impl Database {
                 }
             } else {
                 let scope: Option<String> = sqlx::query_scalar("SELECT scope FROM close_attempt_scopes WHERE attempt_id = ?1 ORDER BY scope LIMIT 1")
-                    .bind(run.attempt_id.as_str()).fetch_optional(&mut *tx).await?;
+                    .bind(run.attempt_id.as_str()).fetch_optional(&mut **tx).await?;
                 if let Some(scope) = scope {
                     let resource = RetiredResourceIdentity::parse(
                         RetiredResourceKind::WorkScope,
@@ -6337,7 +8128,7 @@ impl Database {
         } else if completion_only_running {
             CloseCleanupFailureAuthority::AttemptInterrupted
         } else {
-            let progress = close_safe_retry_progress_tx(&mut tx, run).await?;
+            let progress = close_safe_retry_progress_tx(tx, run).await?;
             match progress.pending.first() {
                 Some(first) => CloseCleanupFailureAuthority::ExpectedResource {
                     scope: first.scope.clone(),
@@ -6352,9 +8143,9 @@ impl Database {
         let remaining_resources = if completion_only_running {
             Vec::new()
         } else if run.ordinal != CloseRunOrdinal::INITIAL {
-            let progress = close_safe_retry_progress_tx(&mut tx, run).await?;
+            let progress = close_safe_retry_progress_tx(tx, run).await?;
             match progress.pending.first() {
-                Some(first) => retry_failure_resources_tx(&mut tx, run, &progress, first).await?,
+                Some(first) => retry_failure_resources_tx(tx, run, &progress, first).await?,
                 None => Vec::new(),
             }
         } else if let CloseCleanupFailureAuthority::ExpectedResource {
@@ -6362,7 +8153,7 @@ impl Database {
         } = &authority
         {
             expected_close_cleanup_failure_resources_tx(
-                &mut tx,
+                tx,
                 run.attempt_id.as_str(),
                 scope,
                 resource,
@@ -6373,7 +8164,7 @@ impl Database {
                 "SELECT scope FROM close_attempt_scopes WHERE attempt_id = ?1 ORDER BY scope",
             )
             .bind(run.attempt_id.as_str())
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut **tx)
             .await?
             .into_iter()
             .map(|captured| {
@@ -6405,17 +8196,11 @@ impl Database {
             authority,
             remaining_resources,
             reason: RetirementFailureReason::Interrupted,
-            detail: format!(
-                "Close run {} interrupted in {}; startup observed retained authority only",
-                run.ordinal.get(),
-                obligation.phase().as_str()
-            ),
-            stop_certainty: retained_interrupted_stop_certainty_tx(&mut tx, run).await?,
+            detail,
+            stop_certainty: retained_interrupted_stop_certainty_tx(tx, run).await?,
             occurred_at_us: Utc::now().timestamp_micros(),
         };
-        let result = Self::terminalize_close_run_cleanup_failure_tx(&mut tx, run, &request).await?;
-        tx.commit().await?;
-        Ok(result)
+        Self::terminalize_close_run_cleanup_failure_tx(tx, run, &request).await
     }
 
     /// Derives every unresolved target from retained sealed inventory and exact proofs.
@@ -7061,10 +8846,10 @@ impl Database {
             .execute(&mut **tx)
             .await?;
         }
-        Self::insert_and_finish_close_resource_failure_tx(tx, run, request, obligation).await
+        Self::persist_validated_close_failure_tx(tx, run, request, obligation).await
     }
 
-    pub(crate) async fn insert_and_finish_close_resource_failure_tx(
+    pub(crate) async fn persist_validated_close_failure_tx(
         tx: &mut Transaction<'_, Sqlite>,
         run: &CloseRunRef,
         request: &TerminalizeInitialCloseCleanupFailureRequest,
@@ -7075,19 +8860,15 @@ impl Database {
                 scope,
                 resource,
                 snapshot,
-            } => (scope, resource, Some(snapshot)),
+            } => (Some(scope), Some(resource), Some(snapshot)),
             CloseCleanupFailureAuthority::CapturedScope { scope, resource }
             | CloseCleanupFailureAuthority::ObservedProcessResource { scope, resource } => {
-                (scope, resource, None)
+                (Some(scope), Some(resource), None)
             }
             CloseCleanupFailureAuthority::AttemptInterrupted
-            | CloseCleanupFailureAuthority::ExplicitlySuppressed => {
-                return Err(close_precondition(
-                    "resource occurrence requires resource authority",
-                ))
-            }
+            | CloseCleanupFailureAuthority::ExplicitlySuppressed => (None, None, None),
         };
-        let identity = resource.identity();
+        let identity = resource.map(RetiredResourceIdentity::identity);
         sqlx::query(
             "INSERT INTO close_cleanup_failures (
                 failure_occurrence_id, attempt_id, cleanup_run_ordinal,
@@ -7096,14 +8877,25 @@ impl Database {
                 stop_certainty, confirmed_at_us, occurred_at_us, authority_kind
              ) VALUES (?1, ?2, ?16, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17)",
         )
-        .bind(&request.failure_occurrence_id).bind(request.attempt_id.as_str())
-        .bind(request.source_product_conversation_id.as_str()).bind(scope.as_str())
+        .bind(&request.failure_occurrence_id)
+        .bind(run.attempt_id.as_str())
+        .bind(request.source_product_conversation_id.as_str())
+        .bind(scope.map(WorkScopeId::as_str))
         .bind(snapshot.map(CloseRetirementSnapshot::generation))
         .bind(snapshot.map(CloseRetirementSnapshot::fingerprint))
-        .bind(resource.kind().as_str()).bind(identity.identity_kind())
-        .bind(identity.codec()).bind(identity.value()).bind(request.reason.as_str()).bind(&request.detail)
-        .bind(request.stop_certainty.as_str()).bind(request.stop_certainty.confirmed_at_us())
-        .bind(request.occurred_at_us).bind(run.ordinal.get()).bind(request.authority.as_str()).execute(&mut **tx).await?;
+        .bind(resource.map(|value| value.kind().as_str()))
+        .bind(identity.map(LossItemIdentity::identity_kind))
+        .bind(identity.map(LossItemIdentity::codec))
+        .bind(identity.map(LossItemIdentity::value))
+        .bind(request.reason.as_str())
+        .bind(&request.detail)
+        .bind(request.stop_certainty.as_str())
+        .bind(request.stop_certainty.confirmed_at_us())
+        .bind(request.occurred_at_us)
+        .bind(run.ordinal.get())
+        .bind(request.authority.as_str())
+        .execute(&mut **tx)
+        .await?;
         for (ordinal, remaining) in request.remaining_resources.iter().enumerate() {
             let identity = remaining.resource.identity();
             sqlx::query(
@@ -7138,7 +8930,7 @@ impl Database {
             | CloseCleanupFailureAuthority::ExplicitlySuppressed => {
                 return Err(close_precondition(
                     "resource occurrence requires resource authority",
-                ))
+                ));
             }
         };
         let identity = resource.identity();
@@ -7246,23 +9038,7 @@ impl Database {
                 "resource-free retry failure requires a nonempty fully successful running plan",
             ));
         }
-        sqlx::query(
-            "INSERT INTO close_cleanup_failures
-            (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
-             authority_kind, reason, detail, stop_certainty, confirmed_at_us, occurred_at_us)
-            VALUES (?1, ?2, ?3, ?4, 'attempt_interrupted', 'interrupted', ?5, ?6, ?7, ?8)",
-        )
-        .bind(&request.failure_occurrence_id)
-        .bind(run.attempt_id.as_str())
-        .bind(run.ordinal.get())
-        .bind(request.source_product_conversation_id.as_str())
-        .bind(&request.detail)
-        .bind(request.stop_certainty.as_str())
-        .bind(request.stop_certainty.confirmed_at_us())
-        .bind(request.occurred_at_us)
-        .execute(&mut **tx)
-        .await?;
-        Self::finish_close_failure_tx(tx, run, request, obligation).await
+        Self::persist_validated_close_failure_tx(tx, run, request, obligation).await
     }
 
     // Keep the complete source-fence classification in one transaction boundary.
@@ -7431,24 +9207,9 @@ impl Database {
                         },
                         occurred_at_us,
                     };
-                    sqlx::query(
-                        "INSERT INTO close_cleanup_failures (
-                            failure_occurrence_id, attempt_id, cleanup_run_ordinal,
-                            source_product_conversation_id, authority_kind, reason, detail,
-                            stop_certainty, confirmed_at_us, occurred_at_us
-                         ) VALUES (?1, ?2, 1, ?3, ?4, 'interrupted', ?5,
-                                   'conversation_and_processes_stopped', ?6, ?6)",
-                    )
-                    .bind(&request.failure_occurrence_id)
-                    .bind(run.attempt_id.as_str())
-                    .bind(request.source_product_conversation_id.as_str())
-                    .bind(request.authority.as_str())
-                    .bind(&request.detail)
-                    .bind(occurred_at_us)
-                    .execute(&mut **tx)
-                    .await?;
                     let result =
-                        Self::finish_close_failure_tx(tx, &run, &request, obligation).await?;
+                        Self::persist_validated_close_failure_tx(tx, &run, &request, obligation)
+                            .await?;
                     if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
                         sqlx::query(
                             "UPDATE close_completion_retry_allowances SET suppressed = 1
@@ -7643,20 +9404,6 @@ impl Database {
             ));
         }
         let occurred_at_us = Utc::now().timestamp_micros();
-        sqlx::query(
-            "INSERT INTO close_cleanup_failures
-             (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
-              authority_kind, reason, detail, stop_certainty, occurred_at_us)
-             VALUES (?1, ?2, 1, ?3, ?4, 'interrupted', ?5, 'shutdown_uncertain', ?6)",
-        )
-        .bind(run.failure_occurrence_id())
-        .bind(run.attempt_id.as_str())
-        .bind(obligation.product_conversation_id().as_str())
-        .bind(authority.as_str())
-        .bind(detail)
-        .bind(occurred_at_us)
-        .execute(&mut **tx)
-        .await?;
         let request = TerminalizeInitialCloseCleanupFailureRequest {
             failure_occurrence_id: run.failure_occurrence_id(),
             attempt_id: run.attempt_id.clone(),
@@ -7668,7 +9415,8 @@ impl Database {
             stop_certainty: CloseStopCertainty::ShutdownUncertain,
             occurred_at_us,
         };
-        let result = Self::finish_close_failure_tx(tx, &run, &request, obligation).await?;
+        let result =
+            Self::persist_validated_close_failure_tx(tx, &run, &request, obligation).await?;
         if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
             sqlx::query("UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1 AND suppressed = 0")
                 .bind(run.attempt_id.as_str()).execute(&mut **tx).await?;
@@ -7742,39 +9490,8 @@ impl Database {
             stop_certainty: CloseStopCertainty::ShutdownUncertain,
             occurred_at_us: Utc::now().timestamp_micros(),
         };
-        sqlx::query(
-            "INSERT INTO close_cleanup_failures
-             (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
-              authority_kind, reason, detail, stop_certainty, occurred_at_us)
-             VALUES (?1, ?2, ?3, ?4, ?7, 'interrupted', ?5, 'shutdown_uncertain', ?6)",
-        )
-        .bind(&request.failure_occurrence_id)
-        .bind(run.attempt_id.as_str())
-        .bind(run.ordinal.get())
-        .bind(request.source_product_conversation_id.as_str())
-        .bind(&request.detail)
-        .bind(request.occurred_at_us)
-        .bind(request.authority.as_str())
-        .execute(&mut **tx)
-        .await?;
-        for (ordinal, resource) in request.remaining_resources.iter().enumerate() {
-            let identity = resource.resource.identity();
-            sqlx::query(
-                "INSERT INTO close_cleanup_failure_resources
-                 (failure_occurrence_id, ordinal, scope, resource_kind, identity_kind, identity_codec, identity_value, disposition)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unattempted')",
-            )
-            .bind(&request.failure_occurrence_id)
-            .bind(i64::try_from(ordinal).map_err(|_| close_precondition("too many source fence resources"))?)
-            .bind(resource.scope.as_str())
-            .bind(resource.resource.kind().as_str())
-            .bind(identity.identity_kind())
-            .bind(identity.codec())
-            .bind(identity.value())
-            .execute(&mut **tx)
-            .await?;
-        }
-        let obligation = Self::finish_close_failure_tx(tx, run, &request, obligation).await?;
+        let obligation =
+            Self::persist_validated_close_failure_tx(tx, run, &request, obligation).await?;
         if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
             sqlx::query(
                 "UPDATE close_completion_retry_allowances SET suppressed = 1
@@ -7819,6 +9536,10 @@ impl Database {
         let promote = !initial
             && archived
             && obligation.close_outcome() == Some(CloseCompletionOutcome::CloseIncomplete);
+        if promote || (initial && archived) {
+            Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id())
+                .await?;
+        }
         let attention_in_history = !initial
             && (promote
                 || obligation.close_outcome()
@@ -7947,6 +9668,8 @@ impl Database {
             )));
         }
         let now = Utc::now().to_rfc3339();
+        Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id())
+            .await?;
         let aggregate_transcript_id: String = sqlx::query_scalar(
             "SELECT conversation_id
              FROM close_attempt_members
@@ -8016,7 +9739,149 @@ impl Database {
         close_obligation_for_update(tx, attempt_id.as_str()).await
     }
 
-    /// Reopens a legacy `NeedsRepair` phase only; stopped runs require fresh-run admission.
+    /// Claim one exact worktree retirement for an admitted legacy Retry.
+    pub async fn claim_generic_legacy_retry_worktree(
+        &self,
+        admitted: &AdmittedGenericLegacyCloseRetry,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+        expected_plan: &CloseWorktreeCleanupPlan,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<LegacyRetryWorktreeClaimRelease>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error.into())),
+        };
+        let attempt_id = admitted.attempt_id();
+        let result = async {
+            let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+            if obligation.phase() != ClosePhase::RetirementRequested
+                || obligation.snapshot() != Some(snapshot)
+                || resource.kind() != RetiredResourceKind::Worktree
+            {
+                return Err(close_precondition("legacy retry worktree claim lacks exact retirement authority"));
+            }
+            let native: bool = sqlx::query_scalar(
+                "SELECT native_managed OR EXISTS (SELECT 1 FROM native_close_initial_receipts WHERE attempt_id = close_obligations.attempt_id AND run_ordinal = 1 AND intent = 'initial') FROM close_obligations WHERE attempt_id = ?1",
+            ).bind(attempt_id.as_str()).fetch_one(&mut *tx).await?;
+            if native {
+                return Err(close_precondition("native-managed attempt cannot use a legacy retry claim"));
+            }
+            let running_initial: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1 AND status = 'running')",
+            ).bind(attempt_id.as_str()).fetch_one(&mut *tx).await?;
+            if !running_initial {
+                return Err(close_precondition("legacy retry claim requires a running Initial run"));
+            }
+            Self::require_no_retained_legacy_creation_for_attempt_tx(&mut tx, attempt_id).await?;
+            ensure_close_retirement_loss_free_tx(&mut tx, attempt_id.as_str()).await?;
+            Self::require_original_worktree_unsettled_tx(
+                &mut tx, attempt_id, scope, snapshot, resource,
+            )
+            .await?;
+            if Self::read_close_worktree_cleanup_plan(&mut *tx, attempt_id, scope, snapshot, resource)
+                .await?
+                .as_ref() != Some(expected_plan)
+            {
+                return Err(close_precondition("legacy retry worktree cleanup plan changed"));
+            }
+            let identity = resource.identity();
+            let dispatch_and_plan: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches dispatch
+                   JOIN close_worktree_cleanup_plans plan
+                     ON plan.attempt_id = dispatch.attempt_id AND plan.scope = dispatch.scope
+                    AND plan.inspection_generation = dispatch.inspection_generation
+                    AND plan.inspection_fingerprint = dispatch.inspection_fingerprint
+                    AND plan.resource_kind = dispatch.resource_kind AND plan.identity_kind = dispatch.identity_kind
+                    AND plan.identity_codec = dispatch.identity_codec
+                    AND plan.identity_value = dispatch.identity_value
+                  WHERE dispatch.attempt_id = ?1 AND dispatch.scope = ?2
+                    AND dispatch.inspection_generation = ?3 AND dispatch.inspection_fingerprint = ?4
+                    AND dispatch.resource_kind = 'worktree' AND dispatch.identity_kind = ?5
+                    AND dispatch.identity_codec = ?6 AND dispatch.identity_value = ?7)",
+            ).bind(attempt_id.as_str()).bind(scope.as_str())
+                .bind(snapshot.generation()).bind(snapshot.fingerprint())
+                .bind(identity.identity_kind()).bind(identity.codec()).bind(identity.value())
+                .fetch_one(&mut *tx).await?;
+            if !dispatch_and_plan {
+                return Err(close_precondition("legacy retry claim requires the exact persisted dispatch and cleanup plan"));
+            }
+            let inserted = sqlx::query(
+                "INSERT INTO close_legacy_retry_worktree_claims
+                 (attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+                  resource_kind, identity_kind, identity_codec, identity_value, continuation_kind)
+                 VALUES (?1, 1, ?2, ?3, ?4, 'worktree', ?5, ?6, ?7, 'legacy_initial') ON CONFLICT DO NOTHING",
+            ).bind(attempt_id.as_str()).bind(scope.as_str())
+                .bind(snapshot.generation()).bind(snapshot.fingerprint())
+                .bind(identity.identity_kind()).bind(identity.codec()).bind(identity.value())
+                .execute(&mut *tx).await?;
+            if inserted.rows_affected() == 1 {
+                Ok(LegacyRetryWorktreeClaimRelease::First(FirstLegacyRetryWorktreeClaim {
+                    attempt_id: attempt_id.clone(), scope: scope.clone(),
+                    snapshot: snapshot.clone(), resource: resource.clone(),
+                }))
+            } else {
+                Ok(LegacyRetryWorktreeClaimRelease::Replay)
+            }
+        }.await;
+        let released = if result
+            .as_ref()
+            .is_ok_and(|release| matches!(release, LegacyRetryWorktreeClaimRelease::First(_)))
+        {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match released {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    pub async fn admit_generic_legacy_close_retry(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<AdmittedGenericLegacyCloseRetry>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let native_managed: bool = sqlx::query_scalar(
+                "SELECT native_managed FROM close_obligations WHERE attempt_id = ?1",
+            )
+            .bind(attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if native_managed {
+                return Err(close_precondition(
+                    "native-managed Close requires native Retry admission",
+                ));
+            }
+            Self::reopen_legacy_close_repair_tx(&mut tx, attempt_id).await?;
+            Ok(AdmittedGenericLegacyCloseRetry(attempt_id.clone()))
+        }
+        .await;
+        let released = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match released {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Reopens a legacy `NeedsRepair` fixture, including schemas predating native adoption.
     ///
     /// # Errors
     /// Returns [`DbError`] when the attempt is absent, is not in repair, or persistence fails.
@@ -8025,11 +9890,20 @@ impl Database {
         attempt_id: &CloseAttemptId,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin().await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        let obligation = Self::reopen_legacy_close_repair_tx(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    async fn reopen_legacy_close_repair_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseObligation> {
+        let obligation = close_obligation_for_update(tx, attempt_id.as_str()).await?;
         let legacy_running: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM close_runs run WHERE run.attempt_id = ?1 AND run.run_ordinal = 1
                 AND run.status = 'running' AND NOT EXISTS (SELECT 1 FROM close_cleanup_failures failure WHERE failure.attempt_id = run.attempt_id))",
-        ).bind(attempt_id.as_str()).fetch_one(&mut *tx).await?;
+        ).bind(attempt_id.as_str()).fetch_one(&mut **tx).await?;
         if !legacy_running {
             return Err(close_precondition(
                 "stopped Close outcomes require explicit fresh-run safe retry admission",
@@ -8040,15 +9914,15 @@ impl Database {
                 "attempt {attempt_id} retry requires needs_repair"
             )));
         }
+        Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id())
+            .await?;
         set_close_phase_tx(
-            &mut tx,
+            tx,
             attempt_id.as_str(),
             ClosePhase::AwaitingRetirementInspection,
         )
         .await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
-        tx.commit().await?;
-        Ok(obligation)
+        close_obligation_for_update(tx, attempt_id.as_str()).await
     }
 
     /// Lists retained retirement evidence for an attempt.
@@ -8064,6 +9938,7 @@ impl Database {
                     resource.inspection_fingerprint, resource.resource_kind, resource.identity_kind,
                     resource.identity_codec, resource.identity_value,
                     resource.proof_kind, resource.absence_basis, resource.residual_reason, resource.detail,
+                    resource.tmux_replacement_token,
                     resource.created_at, resource.updated_at,
                     captured.captured_worktree_fingerprint,
                     captured.captured_worktree_locator
@@ -9512,6 +11387,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generic_stop_confirmation_hands_off_only_the_exact_target() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        create_root(&db, "other").await;
+        let target = product_id("root");
+        let latest = transcript_id("root");
+        let attempt_id = CloseAttemptId::parse("attempt-generic-confirm").unwrap();
+        db.begin_close_foundation(&target, &latest, attempt_id.as_str())
+            .await
+            .unwrap();
+        db.confirm_close_stop_work(attempt_id.as_str())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            db.confirm_generic_close_stop_work(
+                &product_id("other"),
+                &transcript_id("other"),
+                &attempt_id,
+            )
+            .await,
+            Err(DbError::CloseFoundationPrecondition(_))
+        ));
+        assert!(matches!(
+            db.confirm_generic_close_stop_work(&target, &transcript_id("other"), &attempt_id)
+                .await,
+            Err(DbError::CloseFoundationStaleLatest { .. })
+        ));
+        assert!(db
+            .list_pending_generic_close_settlements(Some(&attempt_id))
+            .await
+            .unwrap()
+            .is_empty());
+
+        let settlement = db
+            .confirm_generic_close_stop_work(&target, &latest, &attempt_id)
+            .await
+            .unwrap();
+        assert_eq!(settlement.obligation().attempt_id(), &attempt_id);
+        assert_eq!(
+            settlement.obligation().phase(),
+            ClosePhase::SettlingActiveWork
+        );
+        assert!(matches!(
+            db.confirm_generic_close_stop_work(&target, &latest, &attempt_id)
+                .await,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("already left confirmation")
+        ));
+        let retained = db
+            .list_pending_generic_close_settlements(Some(&attempt_id))
+            .await
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].obligation(), settlement.obligation());
+        assert!(matches!(
+            db.finish_generic_close_settlement(&retained.into_iter().next().unwrap())
+                .await
+                .unwrap(),
+            GenericCloseSettlementAdvance::Interrupted(run)
+                if run == CloseRunRef::initial(attempt_id)
+        ));
+        assert!(matches!(
+            db.finish_generic_close_settlement(&settlement)
+                .await
+                .unwrap(),
+            GenericCloseSettlementAdvance::NoTransition
+        ));
+    }
+
+    #[tokio::test]
     async fn aggregate_latest_turn_remains_exact_settlement_target() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
@@ -9896,7 +11842,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn active_work_settlement_remains_fenced_until_creation_job_is_terminal() {
+    async fn retained_legacy_creation_blocks_retirement_but_not_close_cancellation() {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         sqlx::query(
@@ -9934,6 +11880,18 @@ mod tests {
             DbError::CloseFoundationPrecondition(_)
         ));
         sqlx::query(
+            "INSERT INTO conversation_creation_resource_reservations (
+                 id, job_id, generation, repository_identity, resource_identity,
+                 status, created_at, updated_at
+             ) VALUES (
+                 'reservation', 'creation-job', 1, '/repo', '/repo/staging',
+                 'reserved', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
             "UPDATE conversation_creation_jobs
              SET status = 'cancelled', cancelled_at = '2025-01-01T00:00:01Z'
              WHERE id = 'creation-job'",
@@ -9941,13 +11899,139 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        assert!(matches!(
+            db.advance_close_settlement_when_quiescent("attempt-creation")
+                .await
+                .unwrap_err(),
+            DbError::CloseFoundationPrecondition(message)
+                if message.contains("active durable member obligation")
+        ));
+        db.cancel_close_before_retirement("attempt-creation")
+            .await
+            .unwrap();
         assert_eq!(
             db.advance_close_settlement_when_quiescent("attempt-creation")
                 .await
                 .unwrap()
                 .phase(),
-            ClosePhase::AwaitingRetirementInspection
+            ClosePhase::Completed
         );
+        assert!(matches!(
+            db.begin_close_foundation(
+                &product_id("root"),
+                &transcript_id("root"),
+                "attempt-retained",
+            )
+            .await,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("operator review is required")
+        ));
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM conversation_creation_resource_reservations WHERE id = 'reservation'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "reserved");
+    }
+
+    #[tokio::test]
+    async fn resumed_legacy_close_cannot_retire_or_archive_with_pending_creation_cleanup() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let attempt_id = CloseAttemptId::parse("attempt-resumed").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(
+            &db,
+            attempt_id.as_str(),
+            ClosePhase::AwaitingRetirementInspection,
+        )
+        .await;
+        db.replace_close_inspection(ReplaceCloseInspectionRequest {
+            attempt_id: attempt_id.clone(),
+            scopes: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let obligation = db.get_close_obligation(attempt_id.as_str()).await.unwrap();
+        assert_eq!(obligation.phase(), ClosePhase::RetirementRequested);
+        let captured_scopes = db
+            .list_close_attempt_scopes(attempt_id.as_str())
+            .await
+            .unwrap();
+        let [captured] = captured_scopes.as_slice() else {
+            panic!("expected the single direct scope")
+        };
+        assert!(captured.captured_worktree.is_none());
+        let inventory = CaptureCloseRetirementInventoryRequest {
+            attempt_id: attempt_id.clone(),
+            snapshot: obligation.snapshot().unwrap().clone(),
+            scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
+                scope: captured.scope.clone(),
+                inventory: CloseOwnedResourceInventory {
+                    worktree: None,
+                    work_scopes: std::collections::BTreeSet::default(),
+                    bash_process_groups: std::collections::BTreeSet::default(),
+                    tmux_servers: std::collections::BTreeSet::default(),
+                    pty_sessions: std::collections::BTreeSet::default(),
+                    browser_sessions: std::collections::BTreeSet::default(),
+                    equivalent_live_resources: std::collections::BTreeSet::default(),
+                },
+            }],
+        };
+        let resources = db
+            .capture_close_retirement_inventory(inventory.clone())
+            .await
+            .unwrap();
+        let [resource] = resources.as_slice() else {
+            panic!("expected the single WorkScope retirement resource")
+        };
+        assert_eq!(resource.scope, captured.scope);
+        assert_eq!(resource.resource.kind(), RetiredResourceKind::WorkScope);
+
+        sqlx::query(
+            "INSERT INTO conversation_creation_jobs (
+                 id, conversation_id, status, stage, attempt, generation,
+                 intent_json, accepted_at, deletion_requested_at, created_at, updated_at
+             ) VALUES (
+                 'retired-delete', 'root', 'deletion_pending', 'validate_intent', 0, 1,
+                 '{}', '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z',
+                 '2025-01-01T00:00:00Z', '2025-01-01T00:00:00Z'
+             )",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            db.require_no_retained_legacy_creation_for_retirement(&attempt_id)
+                .await,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("operator review is required")
+        ));
+        assert!(matches!(
+            db.capture_close_retirement_inventory(inventory).await,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("operator review is required")
+        ));
+        assert!(matches!(
+            db.complete_close_retirement(&attempt_id).await,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("operator review is required")
+        ));
+        let lifecycle: String = sqlx::query_scalar(
+            "SELECT ordinary_lifecycle FROM product_conversations WHERE id = 'root'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(lifecycle, "open");
     }
 
     #[tokio::test]
@@ -10862,10 +12946,265 @@ mod tests {
 
         set_state(&db, "root", ConvState::Idle).await;
 
+        let prepared = db
+            .prepare_close_initial_settlement(obligation.attempt_id().as_str())
+            .await
+            .unwrap();
+        assert_eq!(prepared.phase(), ClosePhase::AwaitingStopWorkConfirmation);
+    }
+
+    #[tokio::test]
+    async fn existing_generic_close_admission_does_not_advance_legacy_blocker() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let product = product_id("root");
+        let latest = transcript_id("root");
+        let attempt = CloseAttemptId::parse("legacy-attempt").unwrap();
+        db.begin_close_foundation(&product, &latest, attempt.as_str())
+            .await
+            .unwrap();
+
+        let GenericCloseAdmission::Existing(existing) = db
+            .begin_generic_close_settlement(&product, &latest, &attempt)
+            .await
+            .unwrap()
+        else {
+            panic!("expected observation of the existing attempt");
+        };
+        assert_eq!(existing.phase(), ClosePhase::AwaitingBlockerResolution);
+        assert_eq!(
+            db.get_close_obligation(attempt.as_str()).await.unwrap(),
+            existing
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_settlement_advances_to_inspection_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settlement.sqlite");
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
+        create_root(&db, "root").await;
+        let attempt = CloseAttemptId::parse("fresh-attempt").unwrap();
+        let GenericCloseAdmission::InsertedSettling(settlement) = db
+            .begin_generic_close_settlement(&product_id("root"), &transcript_id("root"), &attempt)
+            .await
+            .unwrap()
+        else {
+            panic!("expected idle attempt to enter settlement");
+        };
+
+        let (first, second) = tokio::join!(
+            db.finish_generic_close_settlement(&settlement),
+            db.finish_generic_close_settlement(&settlement),
+        );
+        let inspection = match (first.unwrap(), second.unwrap()) {
+            (
+                GenericCloseSettlementAdvance::Inspect(inspection),
+                GenericCloseSettlementAdvance::NoTransition,
+            )
+            | (
+                GenericCloseSettlementAdvance::NoTransition,
+                GenericCloseSettlementAdvance::Inspect(inspection),
+            ) => inspection,
+            outcomes => panic!("expected exactly one inspection handoff, got {outcomes:?}"),
+        };
+        assert_eq!(inspection.attempt_id(), &attempt);
+        assert_eq!(
+            db.fail_generic_close_settlement(&settlement, "late settlement callback")
+                .await
+                .unwrap(),
+            GenericCloseSettlementFailure::NoTransition(CloseRunStatus::Running)
+        );
         assert!(db
-            .close_attempt_latest_was_busy(obligation.attempt_id().as_str())
+            .list_close_cleanup_failures(attempt.as_str())
+            .await
+            .unwrap()
+            .is_empty());
+        let fresh = db
+            .commit_fresh_generic_close_inspection(
+                inspection,
+                ReplaceCloseInspectionRequest {
+                    attempt_id: attempt.clone(),
+                    scopes: Vec::new(),
+                },
+            )
+            .await
+            .unwrap()
+            .expect("loss-free initial commit issues retirement authority");
+        let (admitted_attempt, snapshot) = fresh.into_parts();
+        assert_eq!(admitted_attempt, attempt);
+        let current = db.get_close_obligation(attempt.as_str()).await.unwrap();
+        assert_eq!(current.phase(), ClosePhase::RetirementRequested);
+        assert_eq!(current.snapshot(), Some(&snapshot));
+    }
+
+    #[tokio::test]
+    async fn interrupted_generic_handoffs_stop_without_retirement_authority() {
+        for commit_inspection in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            create_root(&db, "root").await;
+            let product = product_id("root");
+            let latest = transcript_id("root");
+            let attempt = CloseAttemptId::parse("interrupted-handoff").unwrap();
+            let GenericCloseAdmission::InsertedSettling(settlement) = db
+                .begin_generic_close_settlement(&product, &latest, &attempt)
+                .await
+                .unwrap()
+            else {
+                panic!("expected idle attempt to enter settlement");
+            };
+            let GenericCloseSettlementAdvance::Inspect(inspection) = db
+                .finish_generic_close_settlement(&settlement)
+                .await
+                .unwrap()
+            else {
+                panic!("expected initial inspection handoff");
+            };
+            if commit_inspection {
+                let retirement = db
+                    .commit_fresh_generic_close_inspection(
+                        inspection,
+                        ReplaceCloseInspectionRequest {
+                            attempt_id: attempt.clone(),
+                            scopes: Vec::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(retirement.is_some());
+            }
+            let before = db.get_close_obligation(attempt.as_str()).await.unwrap();
+            assert_eq!(
+                before.phase(),
+                if commit_inspection {
+                    ClosePhase::RetirementRequested
+                } else {
+                    ClosePhase::AwaitingRetirementInspection
+                }
+            );
+            let run = CloseRunRef::initial(attempt.clone());
+            let stopped = db.classify_interrupted_close_run(&run).await.unwrap();
+            assert_eq!(
+                db.get_close_run(&run).await.unwrap().status,
+                CloseRunStatus::Stopped
+            );
+            assert_eq!(stopped.phase(), ClosePhase::Completed);
+            assert!(matches!(
+                stopped.close_outcome(),
+                Some(
+                    CloseCompletionOutcome::CloseIncomplete
+                        | CloseCompletionOutcome::ArchivedCleanupAttention
+                )
+            ));
+            assert_eq!(stopped.snapshot(), before.snapshot());
+            assert_eq!(stopped.snapshot().is_some(), commit_inspection);
+            let expected_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM close_expected_retirement_resources WHERE attempt_id = ?1",
+            )
+            .bind(attempt.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(expected_count, 0);
+            assert!(db
+                .list_close_retirement_evidence(attempt.as_str())
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(db
+                .list_pending_generic_close_settlements(Some(&attempt))
+                .await
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                db.classify_interrupted_close_run(&run).await.unwrap(),
+                stopped
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_generic_close_admission_captures_direct_turns_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settlement.sqlite");
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
+        create_root(&db, "root").await;
+        let product = product_id("root");
+        let latest = transcript_id("root");
+        let attempt = CloseAttemptId::parse("attempt-idle").unwrap();
+        sqlx::query(
+            "INSERT INTO workflows (
+                 workflow_id, profile_kind, profile_version, runtime_acceptance_enabled,
+                 external_acceptance_enabled, version, generation, status,
+                 snapshot_codec_family, snapshot_codec_version, snapshot_payload, created_at, updated_at
+             ) VALUES (1, 'direct_turn', 1, 1, 0, 0, 0, 'Active', 'direct_turn', 1, X'00', 1, 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO durable_turns (
+                 turn_id, workflow_id, conversation_id, client_turn_key, prepared_fingerprint,
+                 prepared_payload, disposition, generation, terminal_kind, terminal_reason,
+                 owns_conversation, canonical_message_id
+             ) VALUES (1, 1, 'root', 'turn-key', 'prepared', X'00', 'Runtime', 0, NULL, NULL, 1, NULL)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let competing_attempt = CloseAttemptId::parse("competing-attempt").unwrap();
+        let (first, second) = tokio::join!(
+            db.begin_generic_close_settlement(&product, &latest, &attempt),
+            db.begin_generic_close_settlement(&product, &latest, &competing_attempt),
+        );
+        let (inserted, existing) = match (first.unwrap(), second.unwrap()) {
+            (
+                GenericCloseAdmission::InsertedSettling(inserted),
+                GenericCloseAdmission::Existing(existing),
+            )
+            | (
+                GenericCloseAdmission::Existing(existing),
+                GenericCloseAdmission::InsertedSettling(inserted),
+            ) => (inserted, existing),
+            outcomes => {
+                panic!("expected one inserted admission and one existing, got {outcomes:?}")
+            }
+        };
+        assert_eq!(inserted.obligation(), &existing);
+        assert_eq!(
+            inserted.obligation().phase(),
+            ClosePhase::SettlingActiveWork
+        );
+        assert!(db
+            .validate_generic_close_settlement(&inserted)
             .await
             .unwrap());
+        assert!(matches!(
+            db.finish_generic_close_settlement(&inserted).await.unwrap(),
+            GenericCloseSettlementAdvance::WaitingForQuiescence
+        ));
+        let attempt = inserted.obligation().attempt_id();
+        let targets = db
+            .list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
+            .await
+            .unwrap();
+        let [target] = targets.as_slice() else {
+            panic!("expected one captured direct-turn target");
+        };
+        assert_eq!(target.conversation_id, "root");
+        assert_eq!(target.turn_id, 1);
+        assert_eq!(target.expected_generation, 0);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_attempt_direct_turn_settlement_captures",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
     }
 
     #[tokio::test]
@@ -14010,7 +16349,10 @@ mod tests {
             "DELETE FROM native_close_initial_receipts",
             "INSERT OR REPLACE INTO native_close_initial_receipts SELECT * FROM native_close_initial_receipts",
         ] {
-            assert!(sqlx::query(statement).execute(db.pool()).await.is_err(), "{statement}");
+            assert!(
+                sqlx::query(statement).execute(db.pool()).await.is_err(),
+                "{statement}"
+            );
         }
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_receipts",)
@@ -14587,6 +16929,22 @@ mod tests {
         assert_eq!(promoted.phase(), ClosePhase::Completed);
         assert_eq!(promoted.snapshot(), incomplete.snapshot());
         assert_eq!(promoted.attempt_id(), incomplete.attempt_id());
+        let competing = CloseAttemptId::parse("competing-initial-after-attention").unwrap();
+        let observed = db
+            .begin_generic_close_settlement(
+                &product_id("root"),
+                &transcript_id("latest"),
+                &competing,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(observed, GenericCloseAdmission::Existing(obligation) if obligation == promoted)
+        );
+        assert!(matches!(
+            db.get_close_obligation(competing.as_str()).await,
+            Err(DbError::CloseFoundationNotFound(_))
+        ));
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT completed_at FROM close_obligations WHERE attempt_id = ?1"
@@ -18012,6 +20370,282 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn migration_197_preserves_existing_evidence_and_round_trips_tmux_replacement() {
+        const ORIGINAL: &str = "10000000-0000-4000-8000-000000000001";
+        const REPLACEMENT: &str = "10000000-0000-4000-8000-000000000002";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replacement.db");
+        let path = path.to_str().unwrap();
+        let db = Database::open_prefix_for_test(path, 196).await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt = CloseAttemptId::parse("tmux-replacement-upgrade").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(&db, attempt.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, attempt.as_str()).await;
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1",
+        )
+        .bind(attempt.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "running");
+        let identity = |kind, value: &str| {
+            RetiredResourceIdentity::parse(
+                kind,
+                LossItemIdentity::Opaque(OpaqueIdentity::parse(value).unwrap()),
+            )
+            .unwrap()
+        };
+        let tmux = identity(
+            RetiredResourceKind::TmuxServer,
+            &format!("tmux-v1:L3RtcC9jbG9zZQ:{ORIGINAL}"),
+        );
+        let pty = identity(RetiredResourceKind::PtySession, "old-pty");
+        capture_test_inventory(
+            &db,
+            attempt.as_str(),
+            &scope,
+            &snapshot,
+            vec![tmux.clone(), pty.clone()],
+        )
+        .await;
+        let request = |resource, outcome| RecordCloseRetirementEvidenceRequest {
+            attempt_id: attempt.clone(),
+            snapshot: snapshot.clone(),
+            scope: scope.clone(),
+            resource,
+            outcome,
+            detail: None,
+        };
+        for statement in [
+            "INSERT INTO close_retirement_resources (
+                attempt_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value, proof_kind,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 'pty_session', 'opaque', 'opaque_string_v1', 'old-pty', 'retired', ?5, ?5)",
+            "INSERT INTO close_retirement_resource_history (
+                attempt_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value, proof_kind, recorded_at
+             ) VALUES (?1, ?2, ?3, ?4, 'pty_session', 'opaque', 'opaque_string_v1', 'old-pty', 'retired', ?5)",
+        ] {
+            sqlx::query(statement)
+                .bind(attempt.as_str())
+                .bind(scope.as_str())
+                .bind(snapshot.generation())
+                .bind(snapshot.fingerprint())
+                .bind(Utc::now().to_rfc3339())
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        db.pool().close().await;
+        drop(db);
+
+        let db = Database::open(path).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let absence = |token: &str| RetirementOutcome::AbsenceAdopted {
+            absence_basis: AbsenceBasis::VerifiedTmuxReplacement {
+                replacement_token: uuid::Uuid::parse_str(token).unwrap(),
+            },
+        };
+        let other_target = identity(
+            RetiredResourceKind::TmuxServer,
+            "tmux-v1:L3RtcC9vdGhlcg:10000000-0000-4000-8000-000000000001",
+        );
+        let stale_snapshot = RecordCloseRetirementEvidenceRequest {
+            snapshot: CloseRetirementSnapshot::parse(
+                snapshot.generation(),
+                "different-fingerprint",
+            )
+            .unwrap(),
+            ..request(tmux.clone(), absence(REPLACEMENT))
+        };
+        for invalid in [
+            stale_snapshot,
+            request(other_target, absence(REPLACEMENT)),
+            request(tmux.clone(), absence(ORIGINAL)),
+            request(pty.clone(), absence(REPLACEMENT)),
+            request(
+                tmux.clone(),
+                RetirementOutcome::AbsenceAdopted {
+                    absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+                },
+            ),
+        ] {
+            assert!(matches!(
+                db.record_close_retirement_evidence(invalid).await,
+                Err(DbError::CloseFoundationPrecondition(_))
+            ));
+        }
+        for _ in 0..2 {
+            db.record_close_retirement_evidence(request(tmux.clone(), absence(REPLACEMENT)))
+                .await
+                .unwrap();
+        }
+        assert!(!db
+            .close_retirement_resource_was_dispatched(&attempt, &scope, &snapshot, &tmux)
+            .await
+            .unwrap());
+        db.pool().close().await;
+        drop(db);
+
+        let db = Database::open(path).await.unwrap();
+        crate::migrations::run_pending_migrations(db.pool())
+            .await
+            .unwrap();
+        let rows = db
+            .list_close_retirement_evidence(attempt.as_str())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows
+            .iter()
+            .any(|row| row.resource == pty && row.outcome == RetirementOutcome::Retired));
+        assert!(rows
+            .iter()
+            .any(|row| row.resource == tmux && row.outcome == absence(REPLACEMENT)));
+        let mutation_error = sqlx::query(
+            "UPDATE close_retirement_resources
+             SET tmux_replacement_token = '10000000-0000-4000-8000-000000000003'
+             WHERE attempt_id = ?1 AND resource_kind = 'tmux_server'",
+        )
+        .bind(attempt.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap_err();
+        let sqlx::Error::Database(mutation_error) = mutation_error else {
+            panic!("expected SQLite to reject the replacement-token rewrite: {mutation_error}");
+        };
+        assert!(matches!(
+            mutation_error.message(),
+            "tmux replacement proof is immutable"
+                | "retirement evidence may only resolve residual proof"
+        ));
+        let retained_token: String = sqlx::query_scalar(
+            "SELECT tmux_replacement_token FROM close_retirement_resources
+             WHERE attempt_id = ?1 AND resource_kind = 'tmux_server'",
+        )
+        .bind(attempt.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(retained_token, REPLACEMENT);
+        let applied: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM _migrations WHERE version = 197 AND name = 'close_verified_tmux_replacement'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(applied, 1);
+        let history: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT tmux_replacement_token FROM close_retirement_resource_history
+             WHERE attempt_id = ?1 ORDER BY resource_kind",
+        )
+        .bind(attempt.as_str())
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(history, vec![None, Some(REPLACEMENT.to_owned())]);
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    async fn generic_close_process_batch_replay_rolls_back_unclaimed_resources() {
+        use crate::workflow::LocalAuthorityResult::DurableFactEstablished;
+
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt_id = CloseAttemptId::parse("process-dispatch").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(&db, attempt_id.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, attempt_id.as_str()).await;
+        let request = |identity: &str| RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: RetiredResourceIdentity::parse(
+                RetiredResourceKind::PtySession,
+                LossItemIdentity::Opaque(OpaqueIdentity::parse(identity).unwrap()),
+            )
+            .unwrap(),
+        };
+        let first = request("process-first");
+        let second = request("process-second");
+        capture_test_inventory(
+            &db,
+            attempt_id.as_str(),
+            &scope,
+            &snapshot,
+            vec![first.resource.clone(), second.resource.clone()],
+        )
+        .await;
+
+        let mut wrong_snapshot = second.clone();
+        wrong_snapshot.snapshot =
+            CloseRetirementSnapshot::parse("other-generation", "other-fingerprint").unwrap();
+        assert!(matches!(
+            db.claim_generic_close_process_dispatches(&[first.clone(), wrong_snapshot])
+                .await,
+            DurableFactEstablished(Err(_))
+        ));
+        assert!(!db
+            .close_retirement_resource_was_dispatched(
+                &attempt_id,
+                &scope,
+                &snapshot,
+                &first.resource
+            )
+            .await
+            .unwrap());
+
+        // Drop the first committed claim without dispatching.
+        assert!(matches!(
+            db.claim_generic_close_process_dispatches(std::slice::from_ref(&first))
+                .await,
+            DurableFactEstablished(Ok(CloseRetirementBatchDispatch::First(_)))
+        ));
+        assert!(matches!(
+            db.claim_generic_close_process_dispatches(&[second.clone(), first])
+                .await,
+            DurableFactEstablished(Ok(CloseRetirementBatchDispatch::Replay))
+        ));
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(retained, 1);
+        assert!(matches!(
+            db.claim_generic_close_process_dispatches(&[second]).await,
+            DurableFactEstablished(Ok(CloseRetirementBatchDispatch::First(_)))
+        ));
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)] // Exercise both generic boundaries after the same Observe adoption.
     async fn generic_dispatch_and_failure_preserve_observe_adopted_legacy_initial() {
         let db = Database::open_in_memory().await.unwrap();
@@ -18068,9 +20702,98 @@ mod tests {
             snapshot,
             resource,
         };
-        db.record_close_retirement_dispatch(request.clone())
+        let plan = RecordCloseWorktreeCleanupPlanRequest {
+            attempt_id: request.attempt_id.clone(),
+            scope: request.scope.clone(),
+            snapshot: request.snapshot.clone(),
+            resource: request.resource.clone(),
+            administrative_dir: std::path::PathBuf::from("/example/git/worktrees/legacy"),
+            administrative_dir_incarnation: "legacy-admin".to_string(),
+        };
+        let mut invalid_plan = plan.clone();
+        invalid_plan.administrative_dir_incarnation.clear();
+        let error = db
+            .claim_generic_original_worktree_dispatch(invalid_plan)
             .await
+            .established()
+            .expect("invalid plan must release its transaction")
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("length(administrative_dir_incarnation)"));
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1),
+                    (SELECT COUNT(*) FROM close_worktree_cleanup_plans WHERE attempt_id = ?1)",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0));
+
+        let mut alternate = plan.clone();
+        alternate.administrative_dir = std::path::PathBuf::from("/example/git/worktrees/alternate");
+        alternate.administrative_dir_incarnation = "alternate-admin".to_string();
+        let (left, right) = tokio::join!(
+            db.claim_generic_original_worktree_dispatch(plan.clone()),
+            db.claim_generic_original_worktree_dispatch(alternate.clone()),
+        );
+        let (first, winning_plan) = match (
+            left.established().unwrap().unwrap(),
+            right.established().unwrap().unwrap(),
+        ) {
+            (CloseRetirementDispatch::First(first), CloseRetirementDispatch::Replay) => {
+                (first, plan)
+            }
+            (CloseRetirementDispatch::Replay, CloseRetirementDispatch::First(first)) => {
+                (first, alternate)
+            }
+            other => panic!("expected one first dispatch and one replay, got {other:?}"),
+        };
+        assert_eq!(first.request().resource, request.resource);
+        assert_eq!(first.request().scope, request.scope);
+        assert_eq!(first.request().snapshot, request.snapshot);
+        assert_eq!(first.request().attempt_id, request.attempt_id);
+        let persisted_plans: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT administrative_dir_codec, administrative_dir_value, administrative_dir_incarnation
+             FROM close_worktree_cleanup_plans WHERE attempt_id = ?1",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            persisted_plans,
+            vec![(
+                "hex_path_v1".to_string(),
+                encode_host_path(&winning_plan.administrative_dir),
+                winning_plan.administrative_dir_incarnation,
+            )],
+        );
+        let admission = AdmittedGenericLegacyCloseRetry(request.attempt_id.clone());
+        let exact_plan = db
+            .close_worktree_cleanup_plan(
+                &request.attempt_id,
+                &request.scope,
+                &request.snapshot,
+                &request.resource,
+            )
+            .await
+            .unwrap()
             .unwrap();
+        assert!(matches!(
+            db.claim_generic_legacy_retry_worktree(
+                &admission,
+                &request.scope,
+                &request.snapshot,
+                &request.resource,
+                &exact_plan,
+            )
+            .await
+            .established(),
+            Some(Err(DbError::CloseFoundationPrecondition(detail)))
+                if detail.contains("native-managed attempt")
+        ));
         let before: i64 = sqlx::query_scalar(
             "SELECT dispatched_at_us FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
         )
@@ -19251,20 +21974,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_reopens_reinspection_so_resources_admitted_during_repair_are_resealed() {
-        let db = Database::open_in_memory().await.unwrap();
-        create_root(&db, "root").await;
-        let scope = allocate_scope_worktree(&db, "root").await;
-        let attempt = CloseAttemptId::parse("attempt-reseal-after-repair").unwrap();
-        db.begin_close_foundation(
-            &product_id("root"),
-            &transcript_id("root"),
-            attempt.as_str(),
-        )
-        .await
-        .unwrap();
-        set_close_phase(&db, attempt.as_str(), ClosePhase::RetirementRequested).await;
-        let snapshot = current_test_snapshot(&db, attempt.as_str()).await;
+    async fn generic_legacy_close_retry_serializes_with_native_adoption() {
+        for observe in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            create_root(&db, "root").await;
+            let scope = allocate_scope_worktree(&db, "root").await;
+            let attempt = CloseAttemptId::parse("legacy-repair").unwrap();
+            db.begin_close_foundation(
+                &product_id("root"),
+                &transcript_id("root"),
+                attempt.as_str(),
+            )
+            .await
+            .unwrap();
+            record_test_worktree_residual(&db, &attempt, scope).await;
+            if observe {
+                observe_retained_run(&db, &CloseRunRef::initial(attempt.clone())).await;
+            }
+
+            let admission = db
+                .admit_generic_legacy_close_retry(&attempt)
+                .await
+                .established()
+                .expect("classified transaction release");
+            let expected_phase = if observe {
+                assert!(matches!(
+                    admission,
+                    Err(DbError::CloseFoundationPrecondition(detail))
+                        if detail.contains("requires native Retry admission")
+                ));
+                ClosePhase::NeedsRepair
+            } else {
+                assert_eq!(admission.unwrap().attempt_id(), &attempt);
+                observe_retained_run(&db, &CloseRunRef::initial(attempt.clone())).await;
+                let retained = db.read_generic_close_continuation(&attempt).await.unwrap();
+                assert_eq!(retained.phase(), ClosePhase::AwaitingRetirementInspection);
+                ClosePhase::AwaitingRetirementInspection
+            };
+            assert_eq!(
+                db.get_close_obligation(attempt.as_str())
+                    .await
+                    .unwrap()
+                    .phase(),
+                expected_phase,
+            );
+        }
+    }
+
+    async fn record_test_worktree_residual(
+        db: &Database,
+        attempt: &CloseAttemptId,
+        scope: WorkScopeId,
+    ) -> CloseRetirementSnapshot {
+        set_close_phase(db, attempt.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(db, attempt.as_str()).await;
         let resources = db
             .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
                 attempt_id: attempt.clone(),
@@ -19272,7 +22035,7 @@ mod tests {
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
                     scope: scope.clone(),
                     inventory: CloseOwnedResourceInventory {
-                        worktree: Some(current_test_worktree(&db, &scope).await),
+                        worktree: Some(current_test_worktree(db, &scope).await),
                         work_scopes: std::collections::BTreeSet::default(),
                         bash_process_groups: std::collections::BTreeSet::default(),
                         tmux_servers: std::collections::BTreeSet::default(),
@@ -19300,6 +22063,23 @@ mod tests {
         })
         .await
         .unwrap();
+        snapshot
+    }
+
+    #[tokio::test]
+    async fn retry_reopens_reinspection_so_resources_admitted_during_repair_are_resealed() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt = CloseAttemptId::parse("attempt-reseal-after-repair").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt.as_str(),
+        )
+        .await
+        .unwrap();
+        let snapshot = record_test_worktree_residual(&db, &attempt, scope).await;
 
         let retried = db.retry_close_retirement(&attempt).await.unwrap();
         assert_eq!(retried.phase(), ClosePhase::AwaitingRetirementInspection);
@@ -19377,7 +22157,12 @@ mod tests {
         })
         .await
         .unwrap();
-        db.retry_close_retirement(&attempt).await.unwrap();
+        let admission = db
+            .admit_generic_legacy_close_retry(&attempt)
+            .await
+            .established()
+            .unwrap()
+            .unwrap();
         let original_anchor: (String, String) = sqlx::query_as(
             "SELECT inspection_generation, inspection_fingerprint
              FROM close_original_retirement_anchors WHERE attempt_id = ?1",
@@ -19451,6 +22236,61 @@ mod tests {
             .list_close_retirement_inspections_for_snapshot(attempt.as_str(), &snapshot)
             .await
             .is_err());
+        let exact_plan = db
+            .close_worktree_cleanup_plan(&attempt, &scope, &replacement, &worktree.resource)
+            .await
+            .unwrap()
+            .unwrap();
+        let claim = |snapshot, plan| {
+            db.claim_generic_legacy_retry_worktree(
+                &admission,
+                &scope,
+                snapshot,
+                &worktree.resource,
+                plan,
+            )
+        };
+        let mut other_plan = exact_plan.clone();
+        other_plan.administrative_dir.push("different-registration");
+        assert!(matches!(
+            claim(&replacement, &other_plan).await.established(),
+            Some(Err(DbError::CloseFoundationPrecondition(detail)))
+                if detail.contains("cleanup plan changed")
+        ));
+        assert!(claim(&snapshot, &exact_plan)
+            .await
+            .established()
+            .unwrap()
+            .is_err());
+        let (left, right) = tokio::join!(
+            claim(&replacement, &exact_plan),
+            claim(&replacement, &exact_plan),
+        );
+        let first = match (
+            left.established().unwrap().unwrap(),
+            right.established().unwrap().unwrap(),
+        ) {
+            (
+                LegacyRetryWorktreeClaimRelease::First(first),
+                LegacyRetryWorktreeClaimRelease::Replay,
+            )
+            | (
+                LegacyRetryWorktreeClaimRelease::Replay,
+                LegacyRetryWorktreeClaimRelease::First(first),
+            ) => first,
+            pair => panic!("expected one retained cleanup claim, got {pair:?}"),
+        };
+        assert_eq!(first.attempt_id(), &attempt);
+        assert_eq!(first.scope(), &scope);
+        assert_eq!(first.snapshot(), &replacement);
+        assert_eq!(first.resource(), &worktree.resource);
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check(close_legacy_retry_worktree_claims)")
+                .fetch_optional(db.pool())
+                .await
+                .unwrap()
+                .is_none()
+        );
         // The later generation may succeed without rewriting the G1 residual.
         // Original-bound reads must not substitute this conflicting G2 receipt.
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
@@ -19463,6 +22303,11 @@ mod tests {
         })
         .await
         .unwrap();
+        assert!(matches!(
+            claim(&replacement, &exact_plan).await.established(),
+            Some(Err(DbError::CloseFoundationPrecondition(detail)))
+                if detail.contains("positive retirement evidence")
+        ));
         let initial_run = CloseRunRef::initial(attempt.clone());
         assert!(db
             .read_stopped_close_original_retirement_proof(&initial_run)

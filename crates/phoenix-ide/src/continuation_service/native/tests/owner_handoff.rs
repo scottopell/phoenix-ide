@@ -124,7 +124,6 @@ async fn settled(events: &mut tokio::sync::broadcast::Receiver<crate::runtime::S
                 | crate::runtime::SseEvent::AgentDone { .. }
                 | crate::runtime::SseEvent::ConversationBecameTerminal { .. }
                 | crate::runtime::SseEvent::ConversationUpdate { .. }
-                | crate::runtime::SseEvent::ConversationHardDeleted { .. }
                 | crate::runtime::SseEvent::BrowserSessionState { .. }
                 | crate::runtime::SseEvent::BashToolProgress { .. }
                 | crate::runtime::SseEvent::SteerMessageQueued { .. }

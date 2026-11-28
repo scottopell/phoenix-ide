@@ -136,21 +136,13 @@ async fn reconcile_startup_continuations(
     Ok(())
 }
 
-async fn observe_running_close_runs(
-    db: &Database,
-    mut after_commit: impl FnMut(),
+async fn recover_interrupted_close_runs(
+    runtime: &RuntimeManager,
+    after_commit: impl FnMut(),
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let running = db.list_running_close_runs().await?;
-    let mut classified = 0;
-    for run in running {
-        db.classify_interrupted_close_run(&run).await?;
-        classified += 1;
-        after_commit();
-    }
-    Ok(classified)
+    runtime.recover_interrupted_close_runs(after_commit).await
 }
 
-#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod close_startup_tests {
     use super::*;
@@ -172,15 +164,17 @@ mod close_startup_tests {
 
         let commits = Cell::new(0);
         assert_eq!(
-            observe_running_close_runs(&db, || commits.set(commits.get() + 1))
-                .await
-                .unwrap(),
+            crate::runtime::close_authority::observe_running_close_runs(&db, || commits
+                .set(commits.get() + 1))
+            .await
+            .unwrap(),
             1
         );
         assert_eq!(
-            observe_running_close_runs(&db, || commits.set(commits.get() + 1))
-                .await
-                .unwrap(),
+            crate::runtime::close_authority::observe_running_close_runs(&db, || commits
+                .set(commits.get() + 1))
+            .await
+            .unwrap(),
             0
         );
         assert_eq!(commits.get(), 1);
@@ -207,6 +201,10 @@ mod close_startup_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "api/close_startup_tests.rs"]
+mod close_startup_process_tests;
 
 impl AppState {
     /// Create new application state and start the sub-agent handler
@@ -269,14 +267,7 @@ impl AppState {
             credential_helper.clone(),
             &runtime_env,
         ));
-        runtime
-            .restore_close_admission_fences()
-            .await
-            .map_err(std::io::Error::other)?;
-        observe_running_close_runs(&db, || {
-            runtime.kick_direct_turn_worker();
-        })
-        .await?;
+        recover_interrupted_close_runs(&runtime, || runtime.kick_direct_turn_worker()).await?;
         // Close inspection and exact retirement must fence resources before any
         // resource-producing bridge or worker begins admitting new instances.
         reconcile_startup_continuations(&runtime).await?;
