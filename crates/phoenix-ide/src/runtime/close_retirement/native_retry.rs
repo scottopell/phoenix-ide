@@ -367,6 +367,7 @@ impl super::RuntimeManager {
                         effect,
                         expires,
                         NativeRetryTmuxEvidence::Replacement(observation),
+                        || Ok(()),
                     )
                     .await;
             }
@@ -382,6 +383,7 @@ impl super::RuntimeManager {
             effect,
             expires,
             NativeRetryTmuxEvidence::Dispatched,
+            || Ok(()),
         )
         .await
     }
@@ -567,24 +569,20 @@ impl super::RuntimeManager {
         evidence: NativeRetryTmuxEvidence,
     ) -> Result<(), NativeRetryExecutionError> {
         use crate::runtime::executor::WorkerEntryResult;
-        let lease = match source_entry.try_acquire_first_effect(command) {
-            WorkerEntryResult::Ran(lease) if std::time::Instant::now() < deadline => lease,
-            _ => {
-                return Err(NativeRetryExecutionError::ResourceFailure(
+        self.native_retry_record_tmux_success(
+            command,
+            admitted,
+            effect,
+            deadline.into(),
+            evidence,
+            || match source_entry.try_acquire_first_effect(command) {
+                WorkerEntryResult::Ran(lease) if std::time::Instant::now() < deadline => Ok(lease),
+                _ => Err(crate::db::DbError::CloseFoundationPrecondition(
                     "original native retry source unavailable at tmux evidence".into(),
-                ))
-            }
-        };
-        let result = self
-            .native_retry_record_tmux_success(command, admitted, effect, deadline.into(), evidence)
-            .await;
-        if matches!(result, Err(NativeRetryExecutionError::Unclassified)) {
-            self.fatal_local_authority_fence
-                .close("native_retry_tmux_success_release_unclassified");
-            std::mem::forget(lease);
-            std::mem::forget(source_entry.clone());
-        }
-        result
+                )),
+            },
+        )
+        .await
     }
 
     pub(crate) fn spawn_native_retry_scope_with_source_entry(
@@ -1070,13 +1068,14 @@ impl super::RuntimeManager {
         classify_native_scope_runtime_drain(has_live_other, inventory.tmux.map(|tmux| tmux.status))
     }
 
-    async fn native_retry_record_tmux_success(
+    async fn native_retry_record_tmux_success<L>(
         &self,
         command: &NativeCloseCommand,
         admitted: &NativeCloseRunRef,
         effect: &CloseSafeRetryEffect,
         expires: tokio::time::Instant,
         evidence: NativeRetryTmuxEvidence,
+        enter: impl FnOnce() -> crate::db::DbResult<L>,
     ) -> Result<(), NativeRetryExecutionError> {
         let sealed_identity =
             TmuxServerInstanceIdentity::parse_stable_identity(&effect.resource.identity().value())
@@ -1095,7 +1094,10 @@ impl super::RuntimeManager {
                 }
             }
         };
-        let verify = || async {
+        let mut lease = None;
+        let custody = &mut lease;
+        let verify = || async move {
+            *custody = Some(enter()?);
             let same = match evidence {
                 NativeRetryTmuxEvidence::Dispatched => self
                     .tmux_registry()
@@ -1126,6 +1128,9 @@ impl super::RuntimeManager {
                 Err(error.to_string().into())
             }
             LocalAuthorityResult::DurableFactUnclassified => {
+                self.fatal_local_authority_fence
+                    .close("native_retry_tmux_success_release_unclassified");
+                std::mem::forget(lease);
                 Err(NativeRetryExecutionError::Unclassified)
             }
         }

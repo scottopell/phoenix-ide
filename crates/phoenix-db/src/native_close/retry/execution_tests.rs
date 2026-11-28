@@ -676,6 +676,8 @@ async fn native_resource_failure_replay_refuses_a_stopped_predecessor_after_succ
 
 #[tokio::test]
 async fn native_resource_failure_requires_truthful_original_process_success() {
+    use crate::native_close::NativeRetryTmuxProof;
+
     let db = Database::open_in_memory().await.unwrap();
     let tmux = opaque_resource(RetiredResourceKind::TmuxServer, "native-failure-tmux");
     let initial = fixture(&db, vec![tmux.clone()], true).await;
@@ -694,7 +696,6 @@ async fn native_resource_failure_requires_truthful_original_process_success() {
     ).await);
     assert_eq!(migration_180_retained_state(&db).await, retained);
     let tmux_effect = pending.iter().find(|effect| effect.resource == tmux).unwrap();
-    use crate::native_close::NativeRetryTmuxProof;
     success_refused(db.record_native_close_retry_tmux_success(
         &assessment.command, &receipt.admitted, tmux_effect, NativeRetryTmuxProof::Dispatched, || async { Ok(()) },
     ).await);
@@ -763,9 +764,15 @@ async fn native_resource_failure_rolls_back_late_outbox_and_outcome_message_erro
 }
 
 async fn native_tmux_retry_fixture() -> (Database, Assessment, NativeCloseReceipt, CloseSafeRetryEffect) {
+    let db = Database::open_in_memory().await.unwrap();
+    native_tmux_retry_fixture_with_db(db).await
+}
+
+async fn native_tmux_retry_fixture_with_db(
+    db: Database,
+) -> (Database, Assessment, NativeCloseReceipt, CloseSafeRetryEffect) {
     // The generic failure fixture becomes native only after `assess` installs a
     // real executing source and native explicit-retry admission succeeds.
-    let db = Database::open_in_memory().await.unwrap();
     let tmux = opaque_resource(
         RetiredResourceKind::TmuxServer,
         "tmux-v1:L3RtcC9uYXRpdmUtcmV0cnk:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -783,12 +790,17 @@ async fn native_tmux_retry_fixture() -> (Database, Assessment, NativeCloseReceip
 async fn native_retry_tmux_replacement_settles_without_dispatch_and_replays_exactly() {
     use crate::native_close::NativeRetryTmuxProof;
 
-    let (db, assessment, receipt, effect) = native_tmux_retry_fixture().await;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("retry-tmux-replacement.sqlite");
+    let db = Database::open(path.to_str().unwrap()).await.unwrap();
+    crate::migrations::run_pending_migrations(db.pool()).await.unwrap();
+    let writer = Database::open(path.to_str().unwrap()).await.unwrap();
+    let (db, assessment, receipt, effect) = native_tmux_retry_fixture_with_db(db).await;
     let run = CloseRunRef {
         attempt_id: receipt.admitted.attempt_id.clone(),
         ordinal: receipt.admitted.run_ordinal,
     };
-    let sealed_identity = effect.resource.identity().value().to_string();
+    let sealed_identity = effect.resource.identity().value();
     let replacement = |sealed_identity: String, token: &str| NativeRetryTmuxProof::Replacement {
         sealed_identity,
         token: uuid::Uuid::parse_str(token).unwrap(),
@@ -805,21 +817,37 @@ async fn native_retry_tmux_replacement_settles_without_dispatch_and_replays_exac
     success_refused(record(replacement(wrong_identity, new)).await);
     assert_eq!(db.close_safe_retry_progress(&run).await.unwrap(), before);
 
+    let held_writer = writer.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let observed = std::cell::Cell::new(new);
     let rechecked = std::cell::Cell::new(false);
-    success_refused(
-        db.record_native_close_retry_tmux_success(
-            &assessment.command,
-            &receipt.admitted,
-            &effect,
-            replacement(sealed_identity.clone(), new),
-            || async {
-                rechecked.set(true);
+    let mut entry = Box::pin(db.record_native_close_retry_tmux_success(
+        &assessment.command,
+        &receipt.admitted,
+        &effect,
+        replacement(sealed_identity.clone(), new),
+        || async {
+            rechecked.set(true);
+            if observed.get() == new {
+                Ok(())
+            } else {
                 Err(crate::DbError::CloseFoundationPrecondition(
                     "replacement changed at writer entry".into(),
                 ))
-            },
-        )
-        .await,
+            }
+        },
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(entry.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert!(!rechecked.get());
+    observed.set("cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+    held_writer.commit().await.unwrap();
+    success_refused(
+        tokio::time::timeout(std::time::Duration::from_secs(5), entry)
+            .await
+            .unwrap(),
     );
     assert!(rechecked.get());
     assert_eq!(db.close_safe_retry_progress(&run).await.unwrap(), before);
