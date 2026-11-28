@@ -663,12 +663,14 @@ jobs:
             captured_loss_refuses_wrong_scope_dirty_and_stale_assessments_atomically \
             captured_loss_source_stop_refuses_before_admission \
             captured_loss_new_member_creation_work_refuses_without_adopting_source \
+            captured_loss_writer_observation_requires_exact_pending_dispatch \
             captured_loss_runtime_context_uses_accepted_clean_scope_snapshot_and_finite_effects; do
             grep -F "native_close::captured_loss_retry::tests::$test: test" evidence/inventory.log
             cargo test -p phoenix-db --lib "native_close::captured_loss_retry::tests::$test" -- --exact --nocapture --test-threads=1 2>&1 | tee "evidence/$test.log"
             grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "evidence/$test.log"
           done
           for test in \
+            real191_to192_replaces_only_writer_authority_and_is_idempotent \
             real187_to188_preserves_original_branches_and_is_idempotent \
             missing_or_changed_native_source_rolls_back188 \
             captured_authority_schema_is_immutable_but_cascades_with_its_obligation \
