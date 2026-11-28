@@ -20246,7 +20246,8 @@ mod tests {
         };
         assert!(matches!(
             mutation_error.message(),
-            "tmux replacement proof is immutable" | "retirement evidence may only resolve residual proof"
+            "tmux replacement proof is immutable"
+                | "retirement evidence may only resolve residual proof"
         ));
         let retained_token: String = sqlx::query_scalar(
             "SELECT tmux_replacement_token FROM close_retirement_resources
