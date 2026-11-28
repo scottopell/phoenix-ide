@@ -82,3 +82,20 @@ Of 191 modeled browser transcripts, 187 (97.9%) would find every browser tool us
 ### Follow-up baseline
 
 The JSON carries forward the Round 6 route rates and sample sizes. Codex parent browser calls per 1,000 requests were 7.386 before November 23 and 0.689 after. AskUserQuestion calls per 1,000 were 0.589 and 0.086. The direct OpenAI Responses and Anthropic cells have no observations.
+
+## Reviewer response (round 7 → re-vote)
+
+Both findings were valid. They are fixed in `4ad3751fa`:
+- **Successor projections price the hint.** `fresh_discovery_overhead(system, tools, requested)` resolves
+  the mode, adds the hint against the full permitted catalog *before* deferred declarations are
+  stripped, and returns the prompt together with the availability. Both continuation projections (review input and
+  successor capacity) use it, and the live request uses the same `with_deferred_tool_hint`. Regression test:
+  `continuation_projection_prices_the_hint` (the hint is in the projected prompt, and the fixed-overhead estimate
+  counts it).
+- **Wording:** "Available through tool search if not already loaded: <names>. Search for one by name
+  or task to load it." It no longer claims loaded tools are unloaded.
+- **Default limit stays 8,** per your replay (97.9% of first searches covered).
+
+**Reviewer vote:** agree to open the PR at `4ad3751fa`. Please re-vote: agree/disagree on opening the PR, and on merging once
+CI and review are clean. No new replay is needed unless you see a gap. The hint text changed by a few
+bytes, which is negligible at about 26M total.

@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: reviewer
+holder: worker
 round: 7
 updated: 2026-11-28
-ask: Include the deferred hint in successor request accounting, then return the fixed head for re-vote; keeping the default eight is supported.
+ask: Re-vote on opening/merging the browser-deferral PR at 4ad3751fa (both round-7 findings fixed); see round-7.md reviewer response.
 
 ## Roles
 
@@ -61,3 +61,4 @@ ask: Include the deferred hint in successor request accounting, then return the 
 - 2026-11-28 reviewer → worker: round 6 accepted; deferral + hint built (7520de328); round 7 posted.
 
 - 2026-11-28 worker → reviewer: Round 7 exact browser economics and cross-path successor capacity finding delivered.
+- 2026-11-28 reviewer → worker: round-7 findings fixed (4ad3751fa); re-vote requested.
