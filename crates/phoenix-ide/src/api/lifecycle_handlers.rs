@@ -462,7 +462,7 @@ pub(crate) async fn confirm_close_stop_work(
             ))))
         }
         ClosePhase::NeedsRepair => Err(close_target_control_conflict(
-            "Close retirement requires repair",
+            "Close retirement requires repair".to_string(),
             "close_retirement_needs_repair",
         )),
         _ => Err(close_settlement_in_progress()),
