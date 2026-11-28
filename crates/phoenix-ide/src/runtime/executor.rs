@@ -3394,8 +3394,9 @@ where
                 deferred_native_close_exit.is_none() && self.has_pending_cancellation();
             let acknowledged_control_ready =
                 queued_acknowledged_request.as_ref().is_some_and(|request| {
-                    matches!(request, AcknowledgedRuntimeRequest::Event(request)
-                    if matches!(&request.event, Event::UserCancel { .. } | Event::Shutdown))
+                    matches!(request, AcknowledgedRuntimeRequest::ControlNativeCloseInitial(_))
+                        || matches!(request, AcknowledgedRuntimeRequest::Event(request)
+                            if matches!(&request.event, Event::UserCancel { .. } | Event::Shutdown))
                 });
             let event_control_ready = deferred_native_close_exit.is_none()
                 && queued_event.as_ref().is_some_and(|event| {
@@ -3519,6 +3520,7 @@ where
                             native_close::NativeCloseInitialContinuationPhase::CollectingInspection
                             | native_close::NativeCloseInitialContinuationPhase::PreparingInventory
                             | native_close::NativeCloseInitialContinuationPhase::InspectionRequired
+                            | native_close::NativeCloseInitialContinuationPhase::DispatchConfirmedSettlement
                             | native_close::NativeCloseInitialContinuationPhase::WaitingForQuiescence
                             | native_close::NativeCloseInitialContinuationPhase::Prepare,
                         ) => {
@@ -3647,6 +3649,25 @@ where
                     }
                     let super::AcknowledgedEventRequest { event, acknowledgement, retirement } = match request {
                         AcknowledgedRuntimeRequest::Event(event) => *event,
+                        AcknowledgedRuntimeRequest::ControlNativeCloseInitial(request) => {
+                            use super::native_close_application::NativeCloseApplicationError;
+                            let result = match pending_native_close_initial.as_mut() {
+                                Some(owner) => Box::pin(owner.apply_target_control(
+                                    &self.state,
+                                    &request.route,
+                                    request.action,
+                                )).await,
+                                None => Err(NativeCloseApplicationError::SourceRefused),
+                            };
+                            let fatal = matches!(result, Err(NativeCloseApplicationError::FatalAuthority));
+                            let _ = request.response.send(result);
+                            if fatal {
+                                join_pending_native_close_before_fatal!();
+                                return self.fatal_local_authority_exit();
+                            }
+                            native_close_step_ready = pending_native_close_initial.is_some();
+                            continue;
+                        }
                         AcknowledgedRuntimeRequest::ExecuteNativeCloseInitial(request) => {
                             let super::native_close_application::NativeCloseInitialRequest {
                                 source, backend, target, admitted, target_gate, response,
@@ -5952,7 +5973,7 @@ where
             }
         }
 
-        if self.has_pending_cancellation() {
+        if self.has_pending_effective_cancellation() {
             self.steering_queue = drained_entries;
             drop(projection_guard);
             return Ok(());
@@ -7875,7 +7896,7 @@ where
         effect: AuthoritativeEffect,
         admitted: &mut crate::runtime::AdmittedOperation,
     ) -> Result<Option<Event>, String> {
-        if self.has_pending_cancellation()
+        if self.has_pending_effective_cancellation()
             && matches!(
                 effect,
                 AuthoritativeEffect::RequestLlm | AuthoritativeEffect::ExecuteTool { .. }

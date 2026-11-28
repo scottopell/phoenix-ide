@@ -402,6 +402,285 @@ fn initial_request_with_backend(
     }))
 }
 
+async fn wait_for_native_initial_phase(
+    db: &Database,
+    attempt_id: &phoenix_core::domain::close::CloseAttemptId,
+    expected: phoenix_core::domain::close::ClosePhase,
+) -> phoenix_core::domain::close::CloseObligation {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let obligation = db.get_close_obligation(attempt_id.as_str()).await.unwrap();
+            if obligation.phase() == expected {
+                return obligation;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("native Initial did not reach {expected:?}"))
+}
+
+async fn wait_for_target_mutation_gate_release(backend: &crate::runtime::RuntimeManager) {
+    let gate = backend.mutation_admission(TARGET_ID).await.unwrap();
+    let _guard = tokio::time::timeout(std::time::Duration::from_secs(10), gate.lock_owned())
+        .await
+        .expect("native Initial must release the target mutation gate after terminal evidence");
+}
+
+struct ParkedNativeInitial {
+    fixture: CloseFixture,
+    backend: Arc<crate::runtime::RuntimeManager>,
+    run: NativeCloseRunRef,
+    route: phoenix_db::native_close::NativeCloseInitialControlRoute,
+    observer: oneshot::Receiver<Result<NativeCloseInitialResult, NativeCloseApplicationError>>,
+    actor: tokio::task::JoinHandle<RuntimeExitDisposition>,
+    source_events: mpsc::Sender<Event>,
+}
+
+impl ParkedNativeInitial {
+    async fn new() -> Self {
+        let fixture = CloseFixture::new().await;
+        fixture.db.update_conversation_state(TARGET_ID, &fixture.state).await.unwrap();
+        let backend = CloseFixture::backend(fixture.db.clone());
+        Self::from_busy_target(fixture, backend).await
+    }
+
+    async fn from_busy_target(fixture: CloseFixture, backend: Arc<crate::runtime::RuntimeManager>) -> Self {
+        use native_close::NativeCloseInitialContinuationPhase as Phase;
+        use phoenix_core::domain::close::TranscriptConversationId;
+
+        let mut harness = fixture.runtime(true);
+        let (phase_tx, mut phases) = mpsc::unbounded_channel();
+        harness.runtime.native_close_phase_observer = Some(phase_tx);
+        let sender = setup_actor_queue(&mut harness);
+        let (state_tx, state_rx) = tokio::sync::watch::channel(fixture.state.clone());
+        harness.runtime = harness.runtime
+            .with_state_watcher(state_tx)
+            .with_fatal_local_authority_fence(Arc::clone(&backend.fatal_local_authority_fence));
+        backend.runtimes.write().await.insert(
+            fixture.source_transcript_id.clone(),
+            crate::runtime::ConversationHandle {
+                event_tx: crate::runtime::ConversationEventSender::for_test_receiver(harness.event_tx.clone()),
+                acknowledged_event_tx: crate::runtime::AcknowledgedEventSender::for_test_receiver(sender.clone()),
+                handoff_review_tx: None,
+                turn_trigger: crate::runtime::TurnTriggerSlot::default(),
+                broadcast_tx: crate::runtime::SseBroadcaster::new(128, 0),
+                identity: Arc::new(()),
+                state_rx,
+                startup_llm_recovery_ack: Arc::new(Mutex::new(None)),
+            },
+        );
+        let target_gate = backend.mutation_admission(TARGET_ID).await.unwrap();
+        let admitted = harness.runtime.admit_authoritative_effect().unwrap();
+        let (response, observer) = oneshot::channel();
+        sender.send(initial_request_with_backend(
+            admitted,
+            &fixture,
+            Arc::clone(&target_gate).lock_owned().await,
+            response,
+            Arc::clone(&backend),
+        )).await.unwrap();
+        let actor = spawn_actor(&mut harness);
+        await_native_close_phase(&mut phases, Phase::AwaitingStopWorkConfirmation).await;
+        assert!(target_gate.try_lock().is_err(), "parked source owns the target mutation gate");
+        let obligation = fixture.db.get_active_close_obligation_for_product(&fixture.target)
+            .await.unwrap().unwrap();
+        let run = NativeCloseRunRef {
+            target: fixture.target.clone(),
+            attempt_id: obligation.attempt_id().clone(),
+            run_ordinal: phoenix_core::domain::close::CloseRunOrdinal::INITIAL,
+        };
+        let latest = TranscriptConversationId::parse(TARGET_ID).unwrap();
+        let phoenix_db::native_close::CloseTargetControlResolution::ParkedNativeInitial(route) =
+            fixture
+                .db
+                .resolve_close_target_control(&fixture.target, &latest, &run.attempt_id)
+                .await
+                .unwrap()
+        else {
+            panic!("expected parked native Initial source route");
+        };
+        Self { fixture, backend, run, route, observer, actor, source_events: harness.event_tx }
+    }
+
+    async fn control(&self, action: phoenix_db::native_close::NativeCloseInitialControl) {
+        tokio::time::timeout(std::time::Duration::from_secs(10),
+            self.backend.control_native_close_initial(self.route.clone(), action))
+            .await.expect("source actor must not wait on its own target mutation gate")
+            .expect("source actor must accept the exact target control");
+    }
+
+    async fn finish(self) {
+        wait_for_target_mutation_gate_release(&self.backend).await;
+        assert!(matches!(self.observer.await.unwrap().unwrap(), NativeCloseInitialResult::NewlyAdmitted(_)));
+        self.source_events.send(Event::Shutdown).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), self.actor).await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn actor_cancel_of_parked_native_initial_releases_target_gate_without_source_write() {
+    use phoenix_core::domain::close::{CloseCompletionOutcome, ClosePhase};
+
+    let parked = ParkedNativeInitial::new().await;
+    parked.control(phoenix_db::native_close::NativeCloseInitialControl::Cancel).await;
+    let obligation = parked.fixture.db.get_close_obligation(parked.run.attempt_id.as_str()).await.unwrap();
+    assert_eq!(obligation.phase(), ClosePhase::Completed);
+    assert_eq!(obligation.close_outcome(), Some(CloseCompletionOutcome::Cancelled));
+    let source = parked.fixture.db.get_conversation(&parked.fixture.source_transcript_id).await.unwrap();
+    assert_eq!(source.state, parked.fixture.state, "target Cancel must not alter the source occurrence");
+    assert_eq!(count(&parked.fixture.db, "native_close_initial_receipts").await, 1);
+    assert_eq!(count(&parked.fixture.db, "close_runs").await, 1);
+    parked.finish().await;
+}
+
+async fn live_close_settlement_target(
+    backend: &Arc<crate::runtime::RuntimeManager>,
+    db: &Database,
+) -> (
+    phoenix_workflow::TurnAuthorityId,
+    mpsc::Sender<Event>,
+    ConversationRuntime<DatabaseStorage, MockLlmClient, MockToolExecutor>,
+) {
+    use phoenix_core::domain::sm_event::{
+        PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
+        SubmittedDirectTurnIdentity,
+    };
+    use phoenix_core::domain::db_schema::InputOrigin;
+    use phoenix_workflow::{
+        AcceptedDisposition, ClientTurnKey, ConversationAuthority, PreparedTurn, Timestamp,
+        TurnOutcome,
+    };
+
+    let payload = PreparedDirectTurnPayload::from_parts(
+        SubmittedDirectTurnIdentity {
+            message_id: "close-target-input".into(),
+            origin: InputOrigin::UserApi,
+            text: "target work".into(),
+            images: vec![], files: vec![], user_agent: None, skill_invocation: None,
+            expansion_policy: SubmittedDirectTurnExpansionPolicy::LiteralText,
+        },
+        PreparedDirectTurnDelivery {
+            text: "target work".into(), llm_text: None,
+            images: vec![], files: vec![], user_agent: None, skill_invocation: None,
+        },
+    );
+    let accepted = db.workflow_repository().accept_authoritative_turn(
+        &phoenix_db::workflow::AcceptAuthoritativeTurn {
+            client_key: ClientTurnKey::new("close-target-input").unwrap(),
+            prepared: PreparedTurn::from_exact_payload(
+                &ConversationAuthority(TARGET_ID.to_string()), payload.to_exact_bytes().unwrap(),
+            ),
+            disposition: AcceptedDisposition::Runtime,
+            accepted_at: Timestamp(1),
+        },
+    ).await.established().unwrap().unwrap();
+    let TurnOutcome::Created { turn_id, .. } = accepted.outcome else {
+        panic!("expected an authoritative target turn");
+    };
+    let state = ConvState::LlmRequesting { attempt: 1 };
+    db.update_conversation_state(TARGET_ID, &state).await.unwrap();
+    let (events, event_rx) = mpsc::channel(8);
+    let (ack, ack_rx) = mpsc::channel(8);
+    let (event_tx, acknowledged_event_tx, cancellation_rx) =
+        crate::runtime::cancellation_inbox::channel(events.clone(), ack);
+    let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
+    let (state_tx, state_rx) = tokio::sync::watch::channel(state.clone());
+    let runtime = ConversationRuntime::new(
+        ConvContext::new(TARGET_ID, std::path::PathBuf::from("/tmp"), "test-model", 200_000, 16_384),
+        state,
+        Arc::new(crate::runtime::traits::DatabaseStorage::new(db.clone())),
+        Arc::new(MockLlmClient::new("test-model")),
+        Arc::new(MockToolExecutor::new()),
+        Arc::new(BrowserSessionManager::default()),
+        Arc::new(crate::tools::BashHandleRegistry::new()),
+        Arc::new(crate::tools::TmuxRegistry::new()),
+        Arc::new(ModelRegistry::new_empty()),
+        crate::terminal::ActiveTerminals::new(),
+        event_rx, events.clone(), broadcast_tx.clone(),
+    )
+    .with_actor_database(db.clone())
+    .with_cancellation_input_receiver(cancellation_rx)
+    .with_acknowledged_event_receiver(ack_rx)
+    .with_state_watcher(state_tx)
+    .with_fatal_local_authority_fence(Arc::clone(&backend.fatal_local_authority_fence))
+    .with_active_direct_turn(Some(crate::runtime::traits::ActiveDirectTurn { turn_id, generation: 0 }));
+    backend.runtimes.write().await.insert(TARGET_ID.to_string(), crate::runtime::ConversationHandle {
+        event_tx, acknowledged_event_tx, broadcast_tx, state_rx,
+        handoff_review_tx: None,
+        turn_trigger: crate::runtime::TurnTriggerSlot::default(),
+        identity: Arc::new(()),
+        startup_llm_recovery_ack: Arc::new(Mutex::new(None)),
+    });
+    (turn_id, events, runtime)
+}
+
+#[tokio::test]
+async fn actor_stop_confirmation_of_parked_native_initial_releases_target_gate() {
+    use phoenix_core::domain::close::ClosePhase;
+
+    let fixture = CloseFixture::new().await;
+    let backend = CloseFixture::backend(fixture.db.clone());
+    let (turn, events, runtime) = live_close_settlement_target(&backend, &fixture.db).await;
+    let actor = tokio::spawn(runtime.run());
+    let parked = ParkedNativeInitial::from_busy_target(fixture, backend).await;
+    parked.control(phoenix_db::native_close::NativeCloseInitialControl::ConfirmStopWork).await;
+    wait_for_native_initial_phase(&parked.fixture.db, &parked.run.attempt_id, ClosePhase::Completed).await;
+    let row: (i64, String, bool) = sqlx::query_as(
+        "SELECT generation, terminal_kind, owns_conversation FROM durable_turns WHERE turn_id = ?1",
+    ).bind(i64::try_from(turn.0).unwrap()).fetch_one(parked.fixture.db.pool()).await.unwrap();
+    assert_eq!(row, (1, "Cancelled".into(), false));
+    let settled: bool = sqlx::query_scalar(
+        "SELECT settled_at IS NOT NULL FROM close_attempt_direct_turn_settlements WHERE attempt_id = ?1 AND turn_id = ?2",
+    ).bind(parked.run.attempt_id.as_str()).bind(i64::try_from(turn.0).unwrap())
+        .fetch_one(parked.fixture.db.pool()).await.unwrap();
+    assert!(settled, "mailbox delivery alone must not establish release");
+    parked.finish().await;
+    let _ = events.send(Event::Shutdown).await;
+    tokio::time::timeout(std::time::Duration::from_secs(10), actor).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn queued_native_close_settlement_stop_refuses_after_source_revocation() {
+    let fixture = CloseFixture::new().await;
+    let backend = CloseFixture::backend(fixture.db.clone());
+    let (turn, _events, mut target) = live_close_settlement_target(&backend, &fixture.db).await;
+    let parked = ParkedNativeInitial::from_busy_target(fixture, backend).await;
+    parked.control(phoenix_db::native_close::NativeCloseInitialControl::ConfirmStopWork).await;
+    let input = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        target.cancellation_input_rx.as_mut().unwrap().recv(),
+    ).await.unwrap().unwrap();
+    assert!(matches!(input, crate::runtime::cancellation_inbox::CancellationInput::DirectTurn(_)));
+    target.retain_cancellation_input(input);
+    assert!(!target.has_pending_effective_cancellation());
+    parked.source_events.send(Event::UserCancel {
+        reason: None,
+        cause: CancelCause::UserRequested,
+    }).await.unwrap();
+    wait_for_target_mutation_gate_release(&parked.backend).await;
+    assert!(target.settle_cancellation_input().await.is_none());
+    assert!(matches!(target.state, ConvState::LlmRequesting { .. }));
+    let retained: (i64, Option<String>, bool) = sqlx::query_as(
+        "SELECT generation, terminal_kind, owns_conversation FROM durable_turns WHERE turn_id = ?1",
+    ).bind(i64::try_from(turn.0).unwrap()).fetch_one(parked.fixture.db.pool()).await.unwrap();
+    assert_eq!(retained, (0, None, true));
+    assert_eq!(count(&parked.fixture.db, "native_close_initial_settlement_stop_claims").await, 0);
+    parked.finish().await;
+}
+
+#[tokio::test]
+async fn actor_refuses_stale_native_initial_target_control_route() {
+    let parked = ParkedNativeInitial::new().await;
+    parked.control(phoenix_db::native_close::NativeCloseInitialControl::Cancel).await;
+    assert_eq!(
+        parked.backend.control_native_close_initial(parked.route.clone(),
+            phoenix_db::native_close::NativeCloseInitialControl::Cancel).await,
+        Err(NativeCloseApplicationError::SourceRefused),
+    );
+    parked.finish().await;
+}
+
 #[tokio::test]
 async fn native_close_backend_requires_actor_database_authority_not_matching_path() {
     let fixture = CloseFixture::new().await;

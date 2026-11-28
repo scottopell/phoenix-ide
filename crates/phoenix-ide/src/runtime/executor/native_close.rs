@@ -6,7 +6,7 @@ mod process_retirement;
 pub(super) mod source_entry;
 
 use super::{
-    CancellationToken, ConversationRuntime, LlmClient, RuntimeSettlementAuthority, Storage,
+    CancellationToken, ConvState, ConversationRuntime, LlmClient, RuntimeSettlementAuthority, Storage,
     ToolExecutor,
 };
 use crate::db::CaptureCloseRetirementInventoryRequest;
@@ -61,6 +61,11 @@ pub(super) fn refuse_during_exit(request: crate::runtime::AcknowledgedRuntimeReq
                 .response
                 .send(Err(NativeCloseApplicationError::Unavailable));
         }
+        Request::ControlNativeCloseInitial(request) => {
+            let _ = request
+                .response
+                .send(Err(NativeCloseApplicationError::Unavailable));
+        }
     }
 }
 
@@ -81,6 +86,7 @@ pub(super) struct NativeCloseInitialContinuation {
     process_retirement: Option<process_retirement::ProcessRetirement>,
     post_retirement: Option<post_retirement::PostRetirement>,
     source_entry: Option<source_entry::SourceEntryWorker>,
+    settlement_source_entry: Option<(tokio::time::Instant, source_entry::SourceEntryWorker)>,
     original_entry_deadline: Option<std::time::Instant>,
     exit_custody_deadline: Option<std::time::Instant>,
     backend: std::sync::Arc<crate::runtime::RuntimeManager>,
@@ -90,6 +96,7 @@ pub(super) struct NativeCloseInitialContinuation {
     inspection_collection_test_barrier: Option<InspectionCollectionTestBarrier>,
     inspection_failure: Option<NativeInitialInspectionFailureIntent>,
     loss_terminalization: Option<NativeInitialLossTerminalizationIntent>,
+    confirmed_settlement_deliveries: std::collections::HashMap<u64, crate::runtime::NativeCloseSettlementDelivery>,
     pub(super) terminal_observation_retry: bool,
     pub(super) authority: RuntimeSettlementAuthority,
     pub(super) target_gate: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
@@ -101,6 +108,7 @@ pub(super) struct NativeCloseInitialContinuation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NativeCloseInitialContinuationPhase {
     Prepare,
+    DispatchConfirmedSettlement,
     Settle,
     WaitingForQuiescence,
     ReachedSettlementPhase(phoenix_core::domain::close::ClosePhase),
@@ -210,6 +218,18 @@ impl NativeCloseInitialContinuation {
         controller: &mut Option<source_entry::SourceEntryController>,
         live_state: &phoenix_core::domain::sm_state::ConvState,
     ) -> Result<(), NativeCloseApplicationError> {
+        if self.phase == NativeCloseInitialContinuationPhase::DispatchConfirmedSettlement
+            && self.settlement_source_entry.is_none()
+        {
+            let deadline = tokio::time::Instant::now() + super::CANCELLATION_DEADLINE;
+            let mut entry = source_entry::SourceEntryController::new(self.command.clone(), deadline);
+            if entry.revalidate(live_state, &self.command) != source_entry::ActorEntryResult::Updated {
+                self.begin_exit_interruption();
+                return Ok(());
+            }
+            self.settlement_source_entry = Some((deadline, entry.worker()));
+            *controller = Some(entry);
+        }
         if self.phase != NativeCloseInitialContinuationPhase::RetiringProcesses
             || self.source_entry.is_some()
             || !self
@@ -253,6 +273,40 @@ impl NativeCloseInitialContinuation {
         self.source_entry = Some(original.worker());
         *controller = Some(original);
         Ok(())
+    }
+
+    pub(super) async fn apply_target_control(
+        &mut self,
+        live_source: &ConvState,
+        route: &phoenix_db::native_close::NativeCloseInitialControlRoute,
+        action: phoenix_db::native_close::NativeCloseInitialControl,
+    ) -> Result<(), NativeCloseApplicationError> {
+        use phoenix_db::native_close::NativeCloseInitialControl;
+        if self.phase != NativeCloseInitialContinuationPhase::AwaitingStopWorkConfirmation {
+            return Err(NativeCloseApplicationError::SourceRefused);
+        }
+        match self
+            .db
+            .apply_native_initial_close_control(&self.command, &self.receipt, live_source, route, action)
+            .await
+        {
+            LocalAuthorityResult::DurableFactEstablished(Ok(_)) => {
+                self.phase = match action {
+                    NativeCloseInitialControl::ConfirmStopWork => {
+                        NativeCloseInitialContinuationPhase::DispatchConfirmedSettlement
+                    }
+                    NativeCloseInitialControl::Cancel => {
+                        NativeCloseInitialContinuationPhase::ObservingTerminal
+                    }
+                };
+                Ok(())
+            }
+            LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                tracing::debug!(%error, "native Close target control rejected");
+                Err(NativeCloseApplicationError::Storage)
+            }
+            LocalAuthorityResult::DurableFactUnclassified => Err(NativeCloseApplicationError::FatalAuthority),
+        }
     }
 
     /// Releases the source owner only after exact durable terminal evidence is observed.
@@ -406,6 +460,7 @@ impl NativeCloseInitialContinuation {
         matches!(
             self.phase,
             NativeCloseInitialContinuationPhase::CollectingInspection
+                | NativeCloseInitialContinuationPhase::DispatchConfirmedSettlement
                 | NativeCloseInitialContinuationPhase::WaitingForQuiescence
                 | NativeCloseInitialContinuationPhase::ReachedSettlementPhase(
                     phoenix_core::domain::close::ClosePhase::RetirementRequested
@@ -708,6 +763,32 @@ impl NativeCloseInitialContinuation {
                     Err(NativeCloseApplicationError::FatalAuthority)
                 }
             },
+            Phase::DispatchConfirmedSettlement => {
+                let (deadline, source_entry) = self.settlement_source_entry.as_ref()
+                    .expect("confirmed settlement source entry");
+                if tokio::time::Instant::now() >= *deadline {
+                    self.begin_exit_interruption();
+                    return Ok(self.phase);
+                }
+                match self.backend.dispatch_native_close_settlement_work(
+                    &self.command,
+                    &self.receipt,
+                    live_source,
+                    source_entry,
+                    &mut self.confirmed_settlement_deliveries,
+                ).await {
+                    LocalAuthorityResult::DurableFactEstablished(Ok(true)) => self.phase = Phase::Settle,
+                    LocalAuthorityResult::DurableFactEstablished(Ok(false)) => {}
+                    LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                        tracing::warn!(%error, "native Close settlement dispatch stopped; classifying exact run");
+                        self.begin_exit_interruption();
+                    }
+                    LocalAuthorityResult::DurableFactUnclassified => {
+                        return Err(NativeCloseApplicationError::FatalAuthority);
+                    }
+                }
+                Ok(self.phase)
+            }
             Phase::Settle | Phase::WaitingForQuiescence => match self
                 .db
                 .try_settle_native_close_initial(&self.command, &self.receipt, live_source)
@@ -1168,6 +1249,7 @@ where
                     process_retirement: None,
                     post_retirement: None,
                     source_entry: None,
+                    settlement_source_entry: None,
                     original_entry_deadline: None,
                     exit_custody_deadline: None,
                     backend: std::sync::Arc::clone(backend),
@@ -1177,6 +1259,7 @@ where
                     inspection_collection_test_barrier: None,
                     inspection_failure: None,
                     loss_terminalization: None,
+                    confirmed_settlement_deliveries: Default::default(),
                     terminal_observation_retry: false,
                     authority,
                     target_gate: std::sync::Arc::new(target_gate),

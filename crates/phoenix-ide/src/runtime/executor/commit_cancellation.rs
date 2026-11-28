@@ -1,9 +1,11 @@
 use super::{
-    AcknowledgedEventOutcome, ConvState, ConversationRuntime, CreationSettlementDisposition,
-    Effect, LlmClient, LocalTerminalAuthority, RuntimeExitDisposition, StepResult, Storage,
-    ToolExecutor, CANCELLATION_DEADLINE,
+    AcknowledgedEventOutcome, CANCELLATION_DEADLINE, ConvState, ConversationRuntime,
+    CreationSettlementDisposition, Effect, LlmClient, LocalTerminalAuthority,
+    RuntimeExitDisposition, StepResult, Storage, ToolExecutor,
 };
-use crate::runtime::cancellation_inbox::{CancellationInput, CancellationReceipt};
+use crate::runtime::cancellation_inbox::{
+    CancellationInput, CancellationReceipt, DirectTurnCancellation, ScopedStopHandling,
+};
 use phoenix_core::domain::sm_state::AssistantMessage;
 use std::{future::Future, sync::Arc};
 use tokio::sync::mpsc;
@@ -19,6 +21,7 @@ pub(super) fn refuse_during_exit(input: CancellationInput) {
         CancellationReceipt::Acknowledged {
             acknowledgement, ..
         },
+        _,
     ) = input.into_parts()
     {
         let _ = acknowledgement.send(Err("runtime is exiting".into()));
@@ -109,30 +112,44 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         self
     }
 
+    fn direct_turn_cancellation_is_current(&self, scoped: &DirectTurnCancellation) -> bool {
+        self.active_direct_turn.as_deref().is_some_and(|active| {
+            active.turn_id == scoped.turn_id && active.generation == scoped.generation
+        })
+    }
+
     pub(super) fn retain_cancellation_input(&mut self, input: CancellationInput) {
         debug_assert!(!self.has_pending_cancellation());
-        // Revoke closes admission even when an already-entered Close leaf holds
-        // the guard. Do not wait for that leaf while a batch write owns the actor.
+        let retained = self.cancellation_custody.take_closing();
+        let cutoff = if matches!(&input, CancellationInput::DirectTurn(_)) {
+            // The inbox may be drained during an outstanding commit. An unclaimed
+            // Close Stop must wait for the actor to finish that commit without effects.
+            retained
+        } else {
+            self.start_cancellation_cutoff(retained)
+        };
+        self.cancellation_custody =
+            CancellationCustody::Pending(ObservedCancellation { input, cutoff });
+    }
+
+    fn start_cancellation_cutoff(
+        &mut self,
+        retained: Option<CancellationCutoff>,
+    ) -> Option<CancellationCutoff> {
         self.try_revoke_native_close_source_entry();
-        let retained = self.cancellation_custody.take_closing().filter(|cutoff| {
+        let retained = retained.filter(|cutoff| {
             let current = self.foreground_dispatch.owns_batch_origin(&cutoff.origin);
             if !current {
                 tracing::error!("retained cancellation resource origin was replaced");
             }
             current
         });
-        let cutoff = retained.or_else(|| {
+        retained.or_else(|| {
             let origin = self.foreground_dispatch.open_batch_origin()?;
             let at = tokio::time::Instant::now() + CANCELLATION_DEADLINE;
             self.cancel_ordinary_batch();
-            Some(CancellationCutoff {
-                origin,
-                at,
-                phase: CutoffPhase::Pending,
-            })
-        });
-        self.cancellation_custody =
-            CancellationCustody::Pending(ObservedCancellation { input, cutoff });
+            Some(CancellationCutoff { origin, at, phase: CutoffPhase::Pending })
+        })
     }
 
     pub(super) fn service_cancellation_resource_cutoff(&mut self) {
@@ -204,7 +221,27 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             .cancellation_custody
             .take_pending()
             .expect("retained cancellation receipt");
-        let (event, receipt) = input.into_parts();
+        let (event, receipt, scoped, cutoff) = match input {
+            CancellationInput::DirectTurn(scoped) => {
+                if !self.direct_turn_cancellation_is_current(&scoped.scope)
+                    || !scoped.offer.claim(self.fatal_local_authority_fence.clone()).await
+                {
+                    self.cancellation_custody = cutoff.map_or(
+                        CancellationCustody::Idle, CancellationCustody::Closing,
+                    );
+                    let _ = scoped.applied.send(ScopedStopHandling::Refused);
+                    return self.fatal_local_authority_fence.fatal_authority_loss_is_latched()
+                        .then(|| self.fatal_local_authority_exit());
+                }
+                let cutoff = self.start_cancellation_cutoff(cutoff);
+                (scoped.cancellation.into_event(), CancellationReceipt::DirectTurn(scoped.applied),
+                    Some(scoped.scope), cutoff)
+            }
+            other => {
+                let (event, receipt, scope) = other.into_parts();
+                (event, receipt, scope, cutoff)
+            }
+        };
         self.cancellation_custody = CancellationCustody::Applying(cutoff);
         // The commit has returned, but a Close leaf may still hold source custody.
         // Keep the original cutoff serviceable until the leaf drains; only then
@@ -226,7 +263,19 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             }
             tokio::task::yield_now().await;
         }
-        let mut result = if self
+        let scope_is_current = scoped
+            .as_ref()
+            .is_none_or(|scoped| self.direct_turn_cancellation_is_current(scoped));
+        if !scope_is_current {
+            tracing::debug!(
+                turn_id = scoped.as_ref().expect("stale scope").turn_id.0,
+                generation = scoped.as_ref().expect("stale scope").generation,
+                "ignoring native direct-turn cancellation whose authority changed before apply"
+            );
+        }
+        let mut result = if !scope_is_current {
+            Ok(AcknowledgedEventOutcome::Settled)
+        } else if self
             .fatal_local_authority_fence
             .fatal_authority_loss_is_latched()
         {
@@ -278,6 +327,14 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                     tracing::error!(%error, "failed to settle addressed cancellation");
                 }
             }
+            CancellationReceipt::DirectTurn(reply) => {
+                let handling = if scope_is_current && result.is_ok() && !interrupted {
+                    ScopedStopHandling::Handled
+                } else {
+                    ScopedStopHandling::Refused
+                };
+                let _ = reply.send(handling);
+            }
             CancellationReceipt::Acknowledged {
                 acknowledgement,
                 retirement,
@@ -298,8 +355,16 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
     }
 
     pub(super) fn cancellation_defers_dispatch(&self, effect: &Effect) -> bool {
-        self.has_pending_cancellation()
+        self.has_pending_effective_cancellation()
             && matches!(effect, Effect::ExecuteTool { .. } | Effect::RequestLlm)
+    }
+
+    pub(super) fn has_pending_effective_cancellation(&self) -> bool {
+        matches!(
+            &self.cancellation_custody,
+            CancellationCustody::Pending(observed)
+                if !matches!(&observed.input, CancellationInput::DirectTurn(_))
+        )
     }
 
     pub(super) fn has_pending_cancellation(&self) -> bool {

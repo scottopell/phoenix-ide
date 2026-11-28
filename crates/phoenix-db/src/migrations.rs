@@ -1013,6 +1013,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "product_creation_repository_identity_pin",
         sql: MIGRATION_193,
     },
+    Migration {
+        version: 194,
+        name: "native_close_initial_settlement_stop_claims",
+        sql: include_str!("migrations/native_close_initial_settlement_stop_claims.sql"),
+    },
 ];
 
 const MIGRATION_175: &str = r"
@@ -17335,6 +17340,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (194, "native_close_initial_settlement_stop_claims"),
             (193, "product_creation_repository_identity_pin"),
             (192, "dismiss_pending_fork_proposals"),
             (191, "native_close_origin_owner_cleanup"),

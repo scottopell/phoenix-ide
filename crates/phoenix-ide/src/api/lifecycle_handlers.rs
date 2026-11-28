@@ -22,6 +22,7 @@ use axum::{
     Json,
 };
 use phoenix_core::domain::close::CloseCompletionOutcome;
+use phoenix_db::native_close::{CloseTargetControlResolution, NativeCloseInitialControl};
 
 // ============================================================
 // Terminal-action gate (REQ-BED-031)
@@ -286,17 +287,46 @@ pub(crate) async fn confirm_close_loss_retirement(
     ))))
 }
 
+fn close_target_control_conflict(detail: String, code: &str) -> AppError {
+    AppError::Conflict(Box::new(ConflictErrorResponse::new(detail, code)))
+}
+
+fn close_settlement_in_progress() -> AppError {
+    close_target_control_conflict(
+        "Close settlement remains in progress".into(),
+        "close_settlement_in_progress",
+    )
+}
+
+async fn require_close_target_latest(
+    state: &AppState,
+    product_id: &str,
+    transcript_id: &str,
+) -> Result<(), AppError> {
+    let aggregate = state
+        .db
+        .get_ordinary_product_conversation(product_id)
+        .await
+        .map_err(|error| AppError::NotFound(error.to_string()))?;
+    if aggregate
+        .segments
+        .last()
+        .map(|segment| segment.transcript_row.conversation.id.as_str())
+        != Some(transcript_id)
+    {
+        return Err(close_target_control_conflict(
+            "Close control is accepted only from the active aggregate transcript".into(),
+            "inactive_close_transcript",
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn confirm_close_stop_work(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(request): Json<ConfirmCloseStopWorkRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state
-        .runtime
-        .mutation_admission(&id)
-        .await
-        .map_err(super::handlers::map_admission_db_error)?;
-    let guard = admission.lock().await;
     let transcript = state
         .db
         .get_conversation(&id)
@@ -335,6 +365,43 @@ pub(crate) async fn confirm_close_stop_work(
             "stale_close_attempt",
         ))));
     }
+    let target_latest = phoenix_core::domain::close::TranscriptConversationId::parse(id.clone())
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let route = state
+        .db
+        .resolve_close_target_control(
+            obligation.product_conversation_id(),
+            &target_latest,
+            obligation.attempt_id(),
+        )
+        .await
+        .map_err(|error| close_target_control_conflict(error.to_string(), "close_stop_work_confirmation_failed"))?;
+    match route {
+        CloseTargetControlResolution::ParkedNativeInitial(route) => {
+            state
+                .runtime
+                .control_native_close_initial(route, NativeCloseInitialControl::ConfirmStopWork)
+                .await
+                .map_err(|error| {
+                    close_target_control_conflict(
+                        error.to_string(),
+                        "close_stop_work_confirmation_failed",
+                    )
+                })?;
+            return Err(close_settlement_in_progress());
+        }
+        CloseTargetControlResolution::NativeInitialSettlementInProgress => {
+            return Err(close_settlement_in_progress());
+        }
+        CloseTargetControlResolution::Generic => {}
+    }
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
+    let guard = admission.lock().await;
+    require_close_target_latest(&state, &transcript.product_conversation_id, &id).await?;
     state
         .db
         .begin_close_active_work_settlement(obligation.attempt_id().as_str())
@@ -373,10 +440,7 @@ pub(crate) async fn confirm_close_stop_work(
     match refreshed.phase() {
         phoenix_core::domain::close::ClosePhase::SettlingActiveWork
         | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement => {
-            Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                "Close settlement remains in progress",
-                "close_settlement_in_progress",
-            ))))
+            Err(close_settlement_in_progress())
         }
         phoenix_core::domain::close::ClosePhase::AwaitingLossConfirmation => {
             Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
@@ -394,12 +458,6 @@ pub(crate) async fn cancel_close_before_retirement(
     Path(id): Path<String>,
     Json(request): Json<CancelCloseBeforeRetirementRequest>,
 ) -> Result<Json<SuccessResponse>, AppError> {
-    let admission = state
-        .runtime
-        .mutation_admission(&id)
-        .await
-        .map_err(super::handlers::map_admission_db_error)?;
-    let guard = admission.lock().await;
     let transcript = state
         .db
         .get_conversation(&id)
@@ -438,6 +496,43 @@ pub(crate) async fn cancel_close_before_retirement(
             "stale_close_attempt",
         ))));
     }
+    let target_latest = phoenix_core::domain::close::TranscriptConversationId::parse(id.clone())
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    let route = state
+        .db
+        .resolve_close_target_control(
+            obligation.product_conversation_id(),
+            &target_latest,
+            obligation.attempt_id(),
+        )
+        .await
+        .map_err(|error| close_target_control_conflict(error.to_string(), "close_cancel_failed"))?;
+    match route {
+        CloseTargetControlResolution::ParkedNativeInitial(route) => {
+            state
+                .runtime
+                .control_native_close_initial(route, NativeCloseInitialControl::Cancel)
+                .await
+                .map_err(|error| {
+                    close_target_control_conflict(error.to_string(), "close_cancel_failed")
+                })?;
+            return Ok(Json(SuccessResponse { success: true }));
+        }
+        CloseTargetControlResolution::NativeInitialSettlementInProgress => {
+            return Err(close_target_control_conflict(
+                "Native Initial Close is already settling active work".into(),
+                "close_cancel_failed",
+            ));
+        }
+        CloseTargetControlResolution::Generic => {}
+    }
+    let admission = state
+        .runtime
+        .mutation_admission(&id)
+        .await
+        .map_err(super::handlers::map_admission_db_error)?;
+    let guard = admission.lock().await;
+    require_close_target_latest(&state, &transcript.product_conversation_id, &id).await?;
     state
         .runtime
         .cancel_close_before_retirement(obligation.attempt_id())

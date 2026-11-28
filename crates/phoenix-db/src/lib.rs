@@ -5998,8 +5998,18 @@ impl Database {
         conversation_id: &str,
         now: DateTime<Utc>,
     ) -> DbResult<bool> {
-        let now = now.to_rfc3339();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let cancelled = Self::cancel_conversation_creation_tx(&mut tx, conversation_id, now).await?;
+        tx.commit().await?;
+        Ok(cancelled)
+    }
+
+    pub(crate) async fn cancel_conversation_creation_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        conversation_id: &str,
+        now: DateTime<Utc>,
+    ) -> DbResult<bool> {
+        let now = now.to_rfc3339();
         let job: Option<(String, i64)> = sqlx::query_as(
             "SELECT j.id, j.generation FROM conversation_creation_jobs j
              JOIN conversations c ON c.id = j.conversation_id
@@ -6007,10 +6017,9 @@ impl Database {
                AND j.status IN ('accepted', 'claimed', 'retry_scheduled')",
         )
         .bind(conversation_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         let Some((job_id, generation)) = job else {
-            tx.rollback().await?;
             return Ok(false);
         };
         let result = sqlx::query(
@@ -6025,38 +6034,32 @@ impl Database {
         .bind(&now)
         .bind(&job_id)
         .bind(generation)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         if result.rows_affected() != 1 {
-            tx.rollback().await?;
             return Ok(false);
         }
         native_close::fence_native_retry_sources_tx(
-            &mut tx,
+            tx,
             conversation_id,
-            &ConvState::CreationCancelled {
-                job_id: job_id.clone(),
-            },
+            &ConvState::CreationCancelled { job_id: job_id.clone() },
         )
         .await?;
-        let state = serde_json::to_string(&ConvState::CreationCancelled {
-            job_id: job_id.clone(),
-        })
-        .map_err(|error| DbError::Serialization(error.to_string()))?;
+        let cancelled_state = ConvState::CreationCancelled { job_id: job_id.clone() };
+        let state = serde_json::to_string(&cancelled_state)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_kind = ?2, state_updated_at = ?3, updated_at = ?3
              WHERE id = ?4",
         )
         .bind(state)
-        .bind(conv_state_kind(&ConvState::CreationCancelled {
-            job_id: job_id.clone(),
-        }))
+        .bind(conv_state_kind(&cancelled_state))
         .bind(&now)
         .bind(conversation_id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         crate::coordinator_watches::record_creation_event_tx(
-            &mut tx,
+            tx,
             &job_id,
             u64::try_from(generation).map_err(|error| DbError::Serialization(error.to_string()))?,
             conversation_id,
@@ -6064,7 +6067,6 @@ impl Database {
             None,
         )
         .await?;
-        tx.commit().await?;
         Ok(true)
     }
 

@@ -302,6 +302,7 @@ pub(crate) enum AcknowledgedRuntimeRequest {
     ExecuteNativeCloseInitial(Box<native_close_application::NativeCloseInitialRequest>),
     ExecuteNativeCloseObserve(Box<native_close_application::NativeCloseObserveRequest>),
     ExecuteNativeCloseRetry(Box<native_close_application::NativeCloseRetryRequest>),
+    ControlNativeCloseInitial(Box<native_close_application::NativeCloseInitialControlRequest>),
 }
 
 mod native_close_application;
@@ -322,7 +323,8 @@ impl AcknowledgedRuntimeRequest {
             Self::Event(event) => *event,
             Self::ExecuteNativeCloseInitial(_)
             | Self::ExecuteNativeCloseObserve(_)
-            | Self::ExecuteNativeCloseRetry(_) => panic!("expected event request"),
+            | Self::ExecuteNativeCloseRetry(_)
+            | Self::ControlNativeCloseInitial(_) => panic!("expected event request"),
         }
     }
 }
@@ -949,6 +951,28 @@ impl ExecutionOccurrenceRecovery {
 
     fn restart_loop_detected(&self) -> bool {
         self.disposition == ExecutionOccurrenceDisposition::RestartLoopDetected
+    }
+}
+
+struct NativeCloseSettlementDelivery {
+    actor: Arc<()>,
+    application: Option<oneshot::Receiver<cancellation_inbox::ScopedStopHandling>>,
+}
+
+impl NativeCloseSettlementDelivery {
+    fn poll_handling(&mut self) -> bool {
+        let Some(application) = self.application.as_mut() else {
+            return true;
+        };
+        match application.try_recv() {
+            Ok(cancellation_inbox::ScopedStopHandling::Handled) => {
+                self.application = None;
+                true
+            }
+            Err(oneshot::error::TryRecvError::Empty) => true,
+            Ok(cancellation_inbox::ScopedStopHandling::Refused)
+            | Err(oneshot::error::TryRecvError::Closed) => false,
+        }
     }
 }
 
@@ -3677,6 +3701,96 @@ impl RuntimeManager {
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
+    }
+
+    async fn dispatch_native_close_settlement_work(
+        &self,
+        command: &phoenix_db::native_close::NativeCloseCommand,
+        receipt: &phoenix_db::native_close::NativeCloseReceipt,
+        live_source: &ConvState,
+        source_entry: &executor::SourceEntryWorker,
+        deliveries: &mut HashMap<u64, NativeCloseSettlementDelivery>,
+    ) -> phoenix_db::workflow::LocalAuthorityResult<crate::db::DbResult<bool>> {
+        use phoenix_db::native_close::{
+            NativeCloseInitialTurnDispatch as Offer, NativeCloseInitialTurnDispatchResult as Offered,
+        };
+        use phoenix_db::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+
+        let targets = match self.db.prepare_native_close_initial_settlement_dispatch(command, receipt, live_source).await {
+            DurableFactEstablished(Ok(targets)) => targets,
+            DurableFactEstablished(Err(error)) => return DurableFactEstablished(Err(error)),
+            DurableFactUnclassified => return DurableFactUnclassified,
+        };
+        self.kick_creation_worker();
+        let mut all_released = true;
+        for target in targets {
+            if let Some(delivery) = deliveries.get_mut(&target.turn_id) {
+                let retained = self.runtimes.read().await.get(&target.conversation_id)
+                    .is_some_and(|actor| {
+                        Arc::ptr_eq(&actor.identity, &delivery.actor) && !actor.event_tx.is_closed()
+                    });
+                if !retained || !delivery.poll_handling() {
+                    // The prior unsettled snapshot can race a normal terminal write and
+                    // actor exit. Reconcile again without offering a duplicate Stop.
+                    match self.db.dispatch_native_close_initial_settlement_turn(
+                        command, receipt, live_source, &target, || Offer::<()>::Backpressure,
+                    ).await {
+                        DurableFactEstablished(Ok(Offered::Released)) => continue,
+                        DurableFactEstablished(Ok(_)) => {
+                            return DurableFactEstablished(Err(crate::db::DbError::CloseFoundationPrecondition(
+                                "captured turn's Stop delivery was refused or lost before durable settlement".into(),
+                            )));
+                        }
+                        DurableFactEstablished(Err(error)) => return DurableFactEstablished(Err(error)),
+                        DurableFactUnclassified => return DurableFactUnclassified,
+                    }
+                }
+                all_released = false;
+                continue;
+            }
+            // Materialization reserves its slot before reading the durable turn. Hold
+            // admission across a no-actor fallback; an older slot must finish first.
+            let creations = self.runtime_creations.lock().await;
+            let runtimes = self.runtimes.read().await;
+            let actor = runtimes.get(&target.conversation_id);
+            let materializing = creations.contains_key(&target.conversation_id);
+            let actor = actor.filter(|actor| !actor.event_tx.is_closed());
+            if actor.is_none() && materializing {
+                all_released = false;
+                continue;
+            }
+            let result = self.db.dispatch_native_close_initial_settlement_turn(
+                command, receipt, live_source, &target, || {
+                    let Some(actor) = actor else {
+                        return Offer::NoLiveActor;
+                    };
+                    match actor.event_tx.try_reserve_direct_turn_cancellation() {
+                        Ok(reservation) => Offer::Reserved((Arc::clone(&actor.identity), reservation)),
+                        Err(mpsc::error::TrySendError::Full(())) => Offer::Backpressure,
+                        Err(mpsc::error::TrySendError::Closed(())) if materializing => Offer::Backpressure,
+                        Err(mpsc::error::TrySendError::Closed(())) => Offer::NoLiveActor,
+                    }
+                },
+            ).await;
+            match result {
+                DurableFactEstablished(Ok(Offered::Released)) => {}
+                DurableFactEstablished(Ok(Offered::Backpressure)) => all_released = false,
+                DurableFactEstablished(Ok(Offered::Reserved((actor, reservation)))) => {
+                    let application = reservation.send(cancellation_inbox::NativeCloseSettlementStopOffer::new(
+                        self.db.clone(), command.clone(), receipt.clone(), source_entry.clone(),
+                        live_source.clone(), target.clone(),
+                    ));
+                    deliveries.insert(target.turn_id, NativeCloseSettlementDelivery {
+                        actor,
+                        application: Some(application),
+                    });
+                    all_released = false;
+                }
+                DurableFactEstablished(Err(error)) => return DurableFactEstablished(Err(error)),
+                DurableFactUnclassified => return DurableFactUnclassified,
+            }
+        }
+        DurableFactEstablished(Ok(all_released))
     }
 
     pub async fn resume_pending_close_settlements(self: &Arc<Self>) -> Result<usize, String> {

@@ -2693,10 +2693,21 @@ impl Database {
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
+        Self::begin_close_active_work_settlement_tx(&mut tx, attempt_id, &obligation).await?;
+        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    pub(crate) async fn begin_close_active_work_settlement_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+        obligation: &CloseObligation,
+    ) -> DbResult<()> {
         match obligation.phase() {
             ClosePhase::AwaitingStopWorkConfirmation => {
-                set_close_phase_tx(&mut tx, attempt_id, ClosePhase::SettlingActiveWork).await?;
-                Self::capture_close_direct_turn_settlement_targets_tx(&mut tx, attempt_id).await?;
+                set_close_phase_tx(tx, attempt_id, ClosePhase::SettlingActiveWork).await?;
+                Self::capture_close_direct_turn_settlement_targets_tx(tx, attempt_id).await?;
             }
             ClosePhase::SettlingActiveWork => {}
             phase @ (ClosePhase::AwaitingBlockerResolution
@@ -2712,9 +2723,7 @@ impl Database {
                 )));
             }
         }
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
-        tx.commit().await?;
-        Ok(obligation)
+        Ok(())
     }
 
     /// Checks the exact owner and phase before the attempt's execution owner reopens leases.
@@ -2942,27 +2951,26 @@ impl Database {
         Ok(obligation)
     }
 
-    async fn require_generic_close_settlement_tx(
+    pub(crate) async fn require_generic_close_settlement_tx(
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,
         product_conversation_id: &str,
     ) -> DbResult<()> {
-        let native_initial: i64 = sqlx::query_scalar(
+        let native_execution: i64 = sqlx::query_scalar(
             "SELECT EXISTS (
                  SELECT 1 FROM native_close_initial_receipts receipt
                  WHERE receipt.attempt_id = ?1
                    AND receipt.product_conversation_id = ?2
-                   AND receipt.intent = 'initial'
-                   AND receipt.run_ordinal = 1
+                   AND receipt.intent IN ('initial', 'explicit_retry')
              )",
         )
         .bind(attempt_id)
         .bind(product_conversation_id)
         .fetch_one(&mut **tx)
         .await?;
-        if native_initial != 0 {
+        if native_execution != 0 {
             return Err(close_precondition(format!(
-                "attempt {attempt_id} is owned by native initial Close settlement"
+                "attempt {attempt_id} is owned by native Close execution"
             )));
         }
         Ok(())
@@ -3133,6 +3141,16 @@ impl Database {
         &self,
         attempt_id: &str,
     ) -> DbResult<Vec<CloseDirectTurnSettlementTarget>> {
+        let mut tx = self.pool.begin().await?;
+        let targets = Self::list_unsettled_close_direct_turn_settlement_targets_tx(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(targets)
+    }
+
+    pub(crate) async fn list_unsettled_close_direct_turn_settlement_targets_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+    ) -> DbResult<Vec<CloseDirectTurnSettlementTarget>> {
         let rows: Vec<(String, i64, i64)> = sqlx::query_as(
             "SELECT turn.conversation_id, target.turn_id, target.expected_generation
              FROM close_attempt_direct_turn_settlements target
@@ -3141,7 +3159,7 @@ impl Database {
              ORDER BY target.turn_id",
         )
         .bind(attempt_id)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **tx)
         .await?;
         rows.into_iter()
             .map(|(conversation_id, turn_id, expected_generation)| {

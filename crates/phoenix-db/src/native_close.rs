@@ -103,6 +103,37 @@ enum NativeCloseSourceShape {
     LegacyFlat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeCloseInitialControl {
+    ConfirmStopWork,
+    Cancel,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CloseTargetControlResolution {
+    Generic,
+    ParkedNativeInitial(NativeCloseInitialControlRoute),
+    NativeInitialSettlementInProgress,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeCloseInitialControlRoute {
+    target: ProductConversationId,
+    target_latest: phoenix_core::domain::close::TranscriptConversationId,
+    attempt_id: CloseAttemptId,
+    run_ordinal: CloseRunOrdinal,
+    source_transcript_id: phoenix_core::domain::close::TranscriptConversationId,
+    source_message_id: String,
+    source_tool_use_id: String,
+}
+
+impl NativeCloseInitialControlRoute {
+    #[must_use]
+    pub fn source_transcript_id(&self) -> &phoenix_core::domain::close::TranscriptConversationId {
+        &self.source_transcript_id
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeCloseCommand {
     source_transcript_id: String,
@@ -322,6 +353,7 @@ mod initial_exit;
 pub use initial::{
     NativeCloseInitialEntryRelease, NativeCloseInitialExecution,
     NativeCloseInitialFirstEffectError, NativeCloseInitialProcessAuthorization,
+    NativeCloseInitialTurnDispatch, NativeCloseInitialTurnDispatchResult,
     NativeCloseInitialResourceEntryDecision, NativeCloseInitialResourceEntryResult,
     NativeCloseInitialResult, NativeCloseInitialSettlement, NativeCloseReceipt, NativeCloseRunRef,
 };

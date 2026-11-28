@@ -490,12 +490,12 @@ impl<'a> WorkflowTx<'a> {
         Self { tx }
     }
 
-    async fn commit(self) -> DbResult<()> {
+    pub(crate) async fn commit(self) -> DbResult<()> {
         self.tx.commit().await?;
         Ok(())
     }
 
-    async fn rollback(self) -> DbResult<()> {
+    pub(crate) async fn rollback(self) -> DbResult<()> {
         self.tx.rollback().await?;
         Ok(())
     }
