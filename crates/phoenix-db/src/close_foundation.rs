@@ -115,7 +115,7 @@ impl LiveCloseSettlementTarget<'_, '_> {
             return Ok(false);
         }
         *lease = Some(enter()?);
-        sqlx::query(
+        let inserted = sqlx::query(
             "INSERT INTO close_settlement_stop_claims
              (attempt_id, run_ordinal, turn_id, expected_generation) VALUES (?1, ?2, ?3, ?4)",
         )
@@ -125,6 +125,9 @@ impl LiveCloseSettlementTarget<'_, '_> {
         .bind(generation)
         .execute(&mut *self.tx.tx)
         .await?;
+        if inserted.rows_affected() != 1 {
+            return Err(close_precondition("settlement Stop claim was not recorded"));
+        }
         Ok(true)
     }
 

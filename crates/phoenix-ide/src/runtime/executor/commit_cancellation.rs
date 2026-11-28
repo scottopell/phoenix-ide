@@ -244,8 +244,8 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
                     cutoff.map_or(CancellationCustody::Idle, CancellationCustody::Closing);
                 let fatal = self.fatal_local_authority_fence.clone();
                 if !self.direct_turn_cancellation_is_current(&scoped.scope)
-                    || !self.await_scoped_stop_claim(scoped.offer.claim(fatal.clone())).await
-                    || fatal.is_closed()
+                    || !self.await_scoped_stop_claim(scoped.offer.claim(fatal)).await
+                    || self.fatal_local_authority_fence.fatal_authority_loss_is_latched()
                 {
                     let _ = scoped.applied.send(ScopedStopHandling::Refused);
                     return self.fatal_local_authority_fence.fatal_authority_loss_is_latched()
