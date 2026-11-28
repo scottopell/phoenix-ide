@@ -1253,7 +1253,7 @@ impl Database {
         ) {
             Self::require_native_close_retry_members_quiescent_tx(tx, &run.attempt_id).await?;
         }
-        Self::insert_and_finish_close_resource_failure_tx(tx, &run, request, obligation).await
+        Self::persist_validated_close_failure_tx(tx, &run, request, obligation).await
     }
 
     async fn require_native_close_original_process_proof_tx(

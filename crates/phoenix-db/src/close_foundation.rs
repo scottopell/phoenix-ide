@@ -8603,10 +8603,10 @@ impl Database {
             .execute(&mut **tx)
             .await?;
         }
-        Self::insert_and_finish_close_resource_failure_tx(tx, run, request, obligation).await
+        Self::persist_validated_close_failure_tx(tx, run, request, obligation).await
     }
 
-    pub(crate) async fn insert_and_finish_close_resource_failure_tx(
+    pub(crate) async fn persist_validated_close_failure_tx(
         tx: &mut Transaction<'_, Sqlite>,
         run: &CloseRunRef,
         request: &TerminalizeInitialCloseCleanupFailureRequest,
@@ -8617,19 +8617,15 @@ impl Database {
                 scope,
                 resource,
                 snapshot,
-            } => (scope, resource, Some(snapshot)),
+            } => (Some(scope), Some(resource), Some(snapshot)),
             CloseCleanupFailureAuthority::CapturedScope { scope, resource }
             | CloseCleanupFailureAuthority::ObservedProcessResource { scope, resource } => {
-                (scope, resource, None)
+                (Some(scope), Some(resource), None)
             }
             CloseCleanupFailureAuthority::AttemptInterrupted
-            | CloseCleanupFailureAuthority::ExplicitlySuppressed => {
-                return Err(close_precondition(
-                    "resource occurrence requires resource authority",
-                ))
-            }
+            | CloseCleanupFailureAuthority::ExplicitlySuppressed => (None, None, None),
         };
-        let identity = resource.identity();
+        let identity = resource.map(RetiredResourceIdentity::identity);
         sqlx::query(
             "INSERT INTO close_cleanup_failures (
                 failure_occurrence_id, attempt_id, cleanup_run_ordinal,
@@ -8638,14 +8634,25 @@ impl Database {
                 stop_certainty, confirmed_at_us, occurred_at_us, authority_kind
              ) VALUES (?1, ?2, ?16, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?17)",
         )
-        .bind(&request.failure_occurrence_id).bind(request.attempt_id.as_str())
-        .bind(request.source_product_conversation_id.as_str()).bind(scope.as_str())
+        .bind(&request.failure_occurrence_id)
+        .bind(run.attempt_id.as_str())
+        .bind(request.source_product_conversation_id.as_str())
+        .bind(scope.map(WorkScopeId::as_str))
         .bind(snapshot.map(CloseRetirementSnapshot::generation))
         .bind(snapshot.map(CloseRetirementSnapshot::fingerprint))
-        .bind(resource.kind().as_str()).bind(identity.identity_kind())
-        .bind(identity.codec()).bind(identity.value()).bind(request.reason.as_str()).bind(&request.detail)
-        .bind(request.stop_certainty.as_str()).bind(request.stop_certainty.confirmed_at_us())
-        .bind(request.occurred_at_us).bind(run.ordinal.get()).bind(request.authority.as_str()).execute(&mut **tx).await?;
+        .bind(resource.map(|value| value.kind().as_str()))
+        .bind(identity.map(LossItemIdentity::identity_kind))
+        .bind(identity.map(LossItemIdentity::codec))
+        .bind(identity.map(LossItemIdentity::value))
+        .bind(request.reason.as_str())
+        .bind(&request.detail)
+        .bind(request.stop_certainty.as_str())
+        .bind(request.stop_certainty.confirmed_at_us())
+        .bind(request.occurred_at_us)
+        .bind(run.ordinal.get())
+        .bind(request.authority.as_str())
+        .execute(&mut **tx)
+        .await?;
         for (ordinal, remaining) in request.remaining_resources.iter().enumerate() {
             let identity = remaining.resource.identity();
             sqlx::query(
@@ -8788,23 +8795,7 @@ impl Database {
                 "resource-free retry failure requires a nonempty fully successful running plan",
             ));
         }
-        sqlx::query(
-            "INSERT INTO close_cleanup_failures
-            (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
-             authority_kind, reason, detail, stop_certainty, confirmed_at_us, occurred_at_us)
-            VALUES (?1, ?2, ?3, ?4, 'attempt_interrupted', 'interrupted', ?5, ?6, ?7, ?8)",
-        )
-        .bind(&request.failure_occurrence_id)
-        .bind(run.attempt_id.as_str())
-        .bind(run.ordinal.get())
-        .bind(request.source_product_conversation_id.as_str())
-        .bind(&request.detail)
-        .bind(request.stop_certainty.as_str())
-        .bind(request.stop_certainty.confirmed_at_us())
-        .bind(request.occurred_at_us)
-        .execute(&mut **tx)
-        .await?;
-        Self::finish_close_failure_tx(tx, run, request, obligation).await
+        Self::persist_validated_close_failure_tx(tx, run, request, obligation).await
     }
 
     // Keep the complete source-fence classification in one transaction boundary.
@@ -8973,24 +8964,9 @@ impl Database {
                         },
                         occurred_at_us,
                     };
-                    sqlx::query(
-                        "INSERT INTO close_cleanup_failures (
-                            failure_occurrence_id, attempt_id, cleanup_run_ordinal,
-                            source_product_conversation_id, authority_kind, reason, detail,
-                            stop_certainty, confirmed_at_us, occurred_at_us
-                         ) VALUES (?1, ?2, 1, ?3, ?4, 'interrupted', ?5,
-                                   'conversation_and_processes_stopped', ?6, ?6)",
-                    )
-                    .bind(&request.failure_occurrence_id)
-                    .bind(run.attempt_id.as_str())
-                    .bind(request.source_product_conversation_id.as_str())
-                    .bind(request.authority.as_str())
-                    .bind(&request.detail)
-                    .bind(occurred_at_us)
-                    .execute(&mut **tx)
-                    .await?;
                     let result =
-                        Self::finish_close_failure_tx(tx, &run, &request, obligation).await?;
+                        Self::persist_validated_close_failure_tx(tx, &run, &request, obligation)
+                            .await?;
                     if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
                         sqlx::query(
                             "UPDATE close_completion_retry_allowances SET suppressed = 1
@@ -9185,20 +9161,6 @@ impl Database {
             ));
         }
         let occurred_at_us = Utc::now().timestamp_micros();
-        sqlx::query(
-            "INSERT INTO close_cleanup_failures
-             (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
-              authority_kind, reason, detail, stop_certainty, occurred_at_us)
-             VALUES (?1, ?2, 1, ?3, ?4, 'interrupted', ?5, 'shutdown_uncertain', ?6)",
-        )
-        .bind(run.failure_occurrence_id())
-        .bind(run.attempt_id.as_str())
-        .bind(obligation.product_conversation_id().as_str())
-        .bind(authority.as_str())
-        .bind(detail)
-        .bind(occurred_at_us)
-        .execute(&mut **tx)
-        .await?;
         let request = TerminalizeInitialCloseCleanupFailureRequest {
             failure_occurrence_id: run.failure_occurrence_id(),
             attempt_id: run.attempt_id.clone(),
@@ -9210,7 +9172,7 @@ impl Database {
             stop_certainty: CloseStopCertainty::ShutdownUncertain,
             occurred_at_us,
         };
-        let result = Self::finish_close_failure_tx(tx, &run, &request, obligation).await?;
+        let result = Self::persist_validated_close_failure_tx(tx, &run, &request, obligation).await?;
         if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
             sqlx::query("UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1 AND suppressed = 0")
                 .bind(run.attempt_id.as_str()).execute(&mut **tx).await?;
@@ -9284,39 +9246,7 @@ impl Database {
             stop_certainty: CloseStopCertainty::ShutdownUncertain,
             occurred_at_us: Utc::now().timestamp_micros(),
         };
-        sqlx::query(
-            "INSERT INTO close_cleanup_failures
-             (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
-              authority_kind, reason, detail, stop_certainty, occurred_at_us)
-             VALUES (?1, ?2, ?3, ?4, ?7, 'interrupted', ?5, 'shutdown_uncertain', ?6)",
-        )
-        .bind(&request.failure_occurrence_id)
-        .bind(run.attempt_id.as_str())
-        .bind(run.ordinal.get())
-        .bind(request.source_product_conversation_id.as_str())
-        .bind(&request.detail)
-        .bind(request.occurred_at_us)
-        .bind(request.authority.as_str())
-        .execute(&mut **tx)
-        .await?;
-        for (ordinal, resource) in request.remaining_resources.iter().enumerate() {
-            let identity = resource.resource.identity();
-            sqlx::query(
-                "INSERT INTO close_cleanup_failure_resources
-                 (failure_occurrence_id, ordinal, scope, resource_kind, identity_kind, identity_codec, identity_value, disposition)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unattempted')",
-            )
-            .bind(&request.failure_occurrence_id)
-            .bind(i64::try_from(ordinal).map_err(|_| close_precondition("too many source fence resources"))?)
-            .bind(resource.scope.as_str())
-            .bind(resource.resource.kind().as_str())
-            .bind(identity.identity_kind())
-            .bind(identity.codec())
-            .bind(identity.value())
-            .execute(&mut **tx)
-            .await?;
-        }
-        let obligation = Self::finish_close_failure_tx(tx, run, &request, obligation).await?;
+        let obligation = Self::persist_validated_close_failure_tx(tx, run, &request, obligation).await?;
         if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
             sqlx::query(
                 "UPDATE close_completion_retry_allowances SET suppressed = 1
