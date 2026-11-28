@@ -949,6 +949,7 @@ WHEN a request's discovery mode withholds deferred tools from the model's view (
 AND the request may call at least one deferred tool
 THE SYSTEM SHALL name those deferred tools in the request's system prompt, in a stable order that depends only on the tool surface, with a bounded name count
 AND SHALL say that they load through tool search.
+AND SHALL include the list in every projection that prices that request, such as successor-capacity review.
 
 WHEN the discovery mode is eager, or is hosted OpenAI search that already declares each deferred tool's name and description
 THE SYSTEM SHALL NOT add the list.

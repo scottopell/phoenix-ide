@@ -2190,15 +2190,54 @@ fn deferred_tool_hint(
         format!(" and {unlisted} more")
     };
     Some(format!(
-        "\n\nNot yet loaded, available through tool search: {listed}{suffix}. Search for a tool by name or task before calling it."
+        "\n\nAvailable through tool search if not already loaded: {listed}{suffix}. Search for one by name or task to load it."
     ))
 }
 
+/// `system` with the deferred-tool hint for `mode`, if any (REQ-LLM-004o).
+/// Every request builder that renders or prices an ordinary request uses this,
+/// so capacity checks count the same prompt the request sends.
+fn with_deferred_tool_hint(
+    system: String,
+    mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
+    tools: &[phoenix_llm::ToolDefinition],
+    callable_names: &std::collections::BTreeSet<String>,
+) -> String {
+    match deferred_tool_hint(mode, tools, callable_names) {
+        Some(hint) => format!("{system}{hint}"),
+        None => system,
+    }
+}
+
+/// The system prompt and tool availability of a fresh ordinary request whose
+/// tools are all callable, as continuation projections price it.
+fn fresh_discovery_overhead(
+    system: String,
+    tools: Vec<phoenix_llm::ToolDefinition>,
+    requested: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
+) -> (
+    String,
+    phoenix_core::domain::tool_availability::ToolAvailability,
+) {
+    let mode = discovery_mode_for_tools(requested, &tools);
+    let callable = tools.iter().map(|tool| tool.name.clone()).collect();
+    let system = with_deferred_tool_hint(system, mode, &tools, &callable);
+    (system, fresh_discovery_availability_for_mode(tools, mode))
+}
+
+#[cfg(test)]
 fn fresh_discovery_availability(
-    mut tools: Vec<phoenix_llm::ToolDefinition>,
+    tools: Vec<phoenix_llm::ToolDefinition>,
     requested: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
 ) -> phoenix_core::domain::tool_availability::ToolAvailability {
     let mode = discovery_mode_for_tools(requested, &tools);
+    fresh_discovery_availability_for_mode(tools, mode)
+}
+
+fn fresh_discovery_availability_for_mode(
+    mut tools: Vec<phoenix_llm::ToolDefinition>,
+    mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
+) -> phoenix_core::domain::tool_availability::ToolAvailability {
     if mode.uses_local_search() {
         tools.retain(|tool| !tool.defer_loading);
     } else {
@@ -10323,11 +10362,12 @@ where
                 discovery_mode,
             )
             .await?;
-        let system_prompt =
-            match deferred_tool_hint(discovery_mode, &available_tools, &callable_names) {
-                Some(hint) => format!("{system_prompt}{hint}"),
-                None => system_prompt,
-            };
+        let system_prompt = with_deferred_tool_hint(
+            system_prompt,
+            discovery_mode,
+            &available_tools,
+            &callable_names,
+        );
         let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
         let responses_replay = self.storage.load_output_replay_state(&conv_id).await?;
         let fixed_tokens = estimate_fixed_request_tokens(&system_prompt, &tool_availability)
@@ -11989,7 +12029,8 @@ where
             .clone()
             .freeze_for_request()
             .map_err(|error| error.to_string())?;
-        let tool_availability = fresh_discovery_availability(
+        let (system, tool_availability) = fresh_discovery_overhead(
+            system,
             tools,
             client
                 .tool_discovery_mode()
@@ -12370,7 +12411,8 @@ where
             }
         };
         let (ordinary_system, ordinary_tools) = self.prepare_successor_overhead().await?;
-        let tool_availability = fresh_discovery_availability(
+        let (ordinary_system, tool_availability) = fresh_discovery_overhead(
+            ordinary_system,
             ordinary_tools,
             llm_client
                 .tool_discovery_mode()
@@ -34870,6 +34912,36 @@ mod deferred_tool_hint_tests {
             deferred_tool_hint(ToolDiscoveryMode::OpenAiClient, &tools, &BTreeSet::new()),
             None
         );
+    }
+
+    /// Continuation projections price the same prompt an ordinary request
+    /// sends: the hint is in the projected system prompt, and its tokens are in
+    /// the fixed-overhead estimate used for successor capacity.
+    #[test]
+    fn continuation_projection_prices_the_hint() {
+        let tools = vec![
+            tool("bash", false),
+            tool("browser_click", true),
+            phoenix_core::domain::tool_discovery::tool_search_definition(),
+        ];
+        let (system, availability) =
+            super::fresh_discovery_overhead("base".into(), tools.clone(), ToolDiscoveryMode::Local);
+        assert!(
+            system.starts_with("base") && system.contains("browser_click"),
+            "{system}"
+        );
+        assert!(availability
+            .declarations()
+            .iter()
+            .all(|tool| !tool.defer_loading));
+        assert!(
+            super::estimate_fixed_request_tokens(&system, &availability)
+                > super::estimate_fixed_request_tokens("base", &availability)
+        );
+
+        let (eager_system, _) =
+            super::fresh_discovery_overhead("base".into(), tools, ToolDiscoveryMode::Eager);
+        assert_eq!(eager_system, "base");
     }
 
     #[test]
