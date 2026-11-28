@@ -540,7 +540,7 @@ async fn live_close_settlement_target(
 ) -> (
     phoenix_workflow::TurnAuthorityId,
     mpsc::Sender<Event>,
-    ConversationRuntime<DatabaseStorage, MockLlmClient, MockToolExecutor>,
+    ConversationRuntime<Arc<DatabaseStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
 ) {
     use phoenix_core::domain::sm_event::{
         PreparedDirectTurnDelivery, PreparedDirectTurnPayload, SubmittedDirectTurnExpansionPolicy,
@@ -621,10 +621,20 @@ async fn actor_stop_confirmation_of_parked_native_initial_releases_target_gate()
 
     let fixture = CloseFixture::new().await;
     let backend = CloseFixture::backend(fixture.db.clone());
-    let (turn, events, runtime) = live_close_settlement_target(&backend, &fixture.db).await;
-    let actor = tokio::spawn(runtime.run());
+    let (turn, _events, mut target) = live_close_settlement_target(&backend, &fixture.db).await;
     let parked = ParkedNativeInitial::from_busy_target(fixture, backend).await;
     parked.control(phoenix_db::native_close::NativeCloseInitialControl::ConfirmStopWork).await;
+    let input = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        target.cancellation_input_rx.as_mut().unwrap().recv(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(input, crate::runtime::cancellation_inbox::CancellationInput::DirectTurn(_)));
+    target.retain_cancellation_input(input);
+    assert!(!target.has_pending_effective_cancellation());
+    let _ = target.settle_cancellation_input().await;
     wait_for_native_initial_phase(&parked.fixture.db, &parked.run.attempt_id, ClosePhase::Completed).await;
     let row: (i64, String, bool) = sqlx::query_as(
         "SELECT generation, terminal_kind, owns_conversation FROM durable_turns WHERE turn_id = ?1",
@@ -636,8 +646,6 @@ async fn actor_stop_confirmation_of_parked_native_initial_releases_target_gate()
         .fetch_one(parked.fixture.db.pool()).await.unwrap();
     assert!(settled, "mailbox delivery alone must not establish release");
     parked.finish().await;
-    let _ = events.send(Event::Shutdown).await;
-    tokio::time::timeout(std::time::Duration::from_secs(10), actor).await.unwrap().unwrap();
 }
 
 #[tokio::test]
@@ -665,7 +673,15 @@ async fn queued_native_close_settlement_stop_refuses_after_source_revocation() {
         "SELECT generation, terminal_kind, owns_conversation FROM durable_turns WHERE turn_id = ?1",
     ).bind(i64::try_from(turn.0).unwrap()).fetch_one(parked.fixture.db.pool()).await.unwrap();
     assert_eq!(retained, (0, None, true));
-    assert_eq!(count(&parked.fixture.db, "native_close_initial_settlement_stop_claims").await, 0);
+    let claims: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM native_close_initial_settlement_stop_claims WHERE attempt_id = ?1 AND turn_id = ?2",
+    )
+    .bind(parked.run.attempt_id.as_str())
+    .bind(i64::try_from(turn.0).unwrap())
+    .fetch_one(parked.fixture.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(claims, 0);
     parked.finish().await;
 }
 
