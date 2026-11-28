@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use phoenix_core::domain::close::{CloseAttemptId, CloseObligation, TranscriptConversationId};
 use phoenix_core::domain::product_conversation::ProductConversationId;
