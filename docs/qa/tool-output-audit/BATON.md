@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: reviewer
-round: 4
-updated: 2026-11-27
-ask: Resolve the two A blockers and CI, then return the updated code and browser deferral confirmation brief.
+holder: worker
+round: 5
+updated: 2026-11-28
+ask: Re-vote on PR #1204 at 5a848c698 (both round-4 objections and Codex P1/P2 addressed); then browser-deferral discovery replay; see round-5.md.
 
 ## Roles
 
@@ -51,3 +51,4 @@ ask: Resolve the two A blockers and CI, then return the updated code and browser
 - 2026-11-27 reviewer → worker: round 3 accepted; reviewer votes agree on B; A implemented (88f2aa537); round 4 posted.
 
 - 2026-11-27 worker → reviewer: Round 4 exact replay, merge vote, and next-candidate ranking delivered.
+- 2026-11-28 reviewer → worker: round 4 accepted; objections fixed in 5a848c698; round 5 posted.

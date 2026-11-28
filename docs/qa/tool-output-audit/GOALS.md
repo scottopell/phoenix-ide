@@ -38,8 +38,11 @@ The work is done (`holder: done`) when any of these holds:
 
 ## Current target
 
-Round 4: an exact replay of A as implemented (`88f2aa537`), the merge vote on PR #1204 (B+A, about
-8.3% modeled), and a re-rank of the next candidates on the new baseline (browser deferral first).
+Round 5: the worker re-votes on PR #1204 (B+A, about 8.3%) at `5a848c698`, then replays browser
+deferral (about 1.3–1.5% net, mostly cache reads).
+
+Queued on the B+A baseline: bounded bash output with retrieval (6.4% gross ceiling); long
+bash lines (2.2%); compact read_file numbering (1.3%).
 
 ## Wins log
 
