@@ -105,11 +105,12 @@ pub async fn close_product_conversation(
             .await
             .map_err(db_to_app)?
             .aggregate;
-        match crate::api::lifecycle_handlers::close_product_conversation_with_active_work(
-            &state,
-            &product_conversation.latest_transcript_row_id,
+        #[cfg(test)]
+        crate::close_service::pause_after_close_observation(
+            product_conversation.product_conversation.ordinary_lifecycle(),
         )
-        .await
+        .await;
+        match crate::close_service::run_observed_close(&state, &product_conversation).await
         {
             Ok(()) => break,
             Err(AppError::Conflict(conflict))

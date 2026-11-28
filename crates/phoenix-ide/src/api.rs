@@ -136,7 +136,7 @@ async fn reconcile_startup_continuations(
     Ok(())
 }
 
-async fn observe_running_close_runs(
+pub(crate) async fn observe_running_close_runs(
     db: &Database,
     mut after_commit: impl FnMut(),
 ) -> Result<usize, Box<dyn std::error::Error>> {

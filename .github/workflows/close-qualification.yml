@@ -80,6 +80,23 @@ jobs:
           grep -E "^\[e2e\] isolated server source=$GITHUB_SHA uid=[1-9][0-9]* pid=[1-9][0-9]*$" "$evidence/git-lifecycle-http.log"
           grep -E '^  ✓ git_lifecycle_public_http +[0-9.]+s$' "$evidence/git-lifecycle-http.log"
           grep -F '✓ all 1 e2e scenarios passed' "$evidence/git-lifecycle-http.log"
+      - name: Verify public Close on the ordinary Linux runner
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(id -u)" -ne 0
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain)"
+          evidence="$RUNNER_TEMP/close-http-evidence"
+          sha256sum --check "$evidence/input-sha256.txt"
+          timeout --kill-after=10s 6m uv run tests/e2e/run.py --ordinary-git-lifecycle "$evidence/source.sha" \
+            2>&1 | tee "$evidence/ordinary-linux-git-lifecycle-http.log"
+          sha256sum --check "$evidence/input-sha256.txt"
+          grep -E "^\[e2e\] ordinary Linux server source=$GITHUB_SHA uid=[1-9][0-9]* pid=[1-9][0-9]*$" "$evidence/ordinary-linux-git-lifecycle-http.log"
+          grep -E '^  ✓ git_lifecycle_public_http +[0-9.]+s$' "$evidence/ordinary-linux-git-lifecycle-http.log"
+          grep -F '✓ all 1 e2e scenarios passed' "$evidence/ordinary-linux-git-lifecycle-http.log"
       - name: Build and inventory exact Runtime controls
         id: controls
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
@@ -141,8 +158,16 @@ jobs:
             generic_cancel_rejects_native_initial_before_reopening_resource_fences \
             cancel_close_settles_only_the_requested_attempt_without_reclaiming_custody \
             shared_close_inspection_distinguishes_absence_from_quarantine_probe_failure \
+            external_writer_detector_gap_does_not_mask_independent_evidence_or_target_failure \
             stranded_generic_dispatch_cannot_reenter_original_worktree \
             generic_close_worker_survives_waiter_drop_and_serializes_reinspection \
+            public_close_observes_unprepared_attempt_without_advancing_it \
+            concurrent_initial_observes_winner_but_later_http_close_sees_history \
+            public_close_routes_keep_the_open_observation_across_winner_archival \
+            public_close_projects_committed_cleanup_attention_as_success \
+            public_close_does_not_report_fenced_settlement_as_in_progress \
+            initial_close_owner_survives_waiter_drop_before_admission \
+            generic_settlement_failure_is_classified_or_fences_authority \
             failed_pre_runtime_worktree_reinspection_persists_typed_residual \
             anchored_native_retry_assessment_preserves_writer_inspection_gap \
             registered_native_close_origin_only_fetched_pin_public_retry_preserves_owner_ref \
@@ -687,6 +712,7 @@ jobs:
           grep -F 'test close_foundation::tests::existing_generic_close_admission_does_not_advance_legacy_blocker ... ok' evidence/close-foundation.log
           grep -F 'test close_foundation::tests::generic_settlement_advances_to_inspection_once ... ok' evidence/close-foundation.log
           grep -F 'test close_foundation::tests::generic_stop_confirmation_hands_off_only_the_exact_target ... ok' evidence/close-foundation.log
+          grep -F 'test close_foundation::tests::interrupted_generic_handoffs_stop_without_retirement_authority ... ok' evidence/close-foundation.log
           for test in \
             initial_process_first_effect_preserves_nested_error_and_confirms_release \
             initial_pty_process_first_effect_preserves_nested_error_and_confirms_release \

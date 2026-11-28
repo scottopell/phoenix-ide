@@ -21,7 +21,10 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use phoenix_core::domain::close::CloseCompletionOutcome;
+use crate::runtime::close_retirement::{
+    GenericCloseIngress, GenericCloseIngressError, GenericCloseIngressOutcome,
+};
+use phoenix_core::domain::close::ClosePhase;
 use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::native_close::{CloseTargetControlResolution, NativeCloseInitialControl};
 
@@ -401,59 +404,68 @@ pub(crate) async fn confirm_close_stop_work(
         .mutation_admission(&id)
         .await
         .map_err(super::handlers::map_admission_db_error)?;
-    let guard = admission.lock().await;
-    let settlement = state
-        .db
-        .confirm_generic_close_stop_work(
-            &transcript.product_conversation_id,
-            &target_latest,
-            obligation.attempt_id(),
+    let worker = state
+        .runtime
+        .start_generic_close_ingress(
+            obligation.attempt_id().clone(),
+            transcript.product_conversation_id.clone(),
+            target_latest,
+            GenericCloseIngress::ConfirmStop(admission),
         )
-        .await
-        .map_err(|error| {
+        .map_err(|error| close_target_control_conflict(error, "close_settlement_in_progress"))?;
+    match worker.await {
+        Ok(Ok(GenericCloseIngressOutcome::Continued)) => {}
+        Ok(Ok(GenericCloseIngressOutcome::Observed(_))) => {
+            return Err(AppError::Internal("expected committed Close stop-work".into()));
+        }
+        Ok(Err(GenericCloseIngressError::Admission(error))) => {
             let error_type = if matches!(error, crate::db::DbError::CloseFoundationStaleLatest { .. }) {
                 "inactive_close_transcript"
             } else {
                 "close_stop_work_confirmation_failed"
             };
-            close_target_control_conflict(error.to_string(), error_type)
-        })?;
-    drop(guard);
-    let worker = state
-        .runtime
-        .start_generic_close_settlement(settlement)
-        .await
-        .map_err(|error| close_target_control_conflict(error, "close_settlement_in_progress"))?;
-    worker
-        .await
-        .unwrap_or_else(|error| Err(format!("Close settlement worker failed: {error}")))
-        .map_err(|error| close_target_control_conflict(error, "close_settlement_in_progress"))?;
+            return Err(close_target_control_conflict(error.to_string(), error_type));
+        }
+        Ok(Err(GenericCloseIngressError::Worker(error))) => {
+            crate::close_service::project_close_worker_failure(&state, obligation.attempt_id(), error)
+                .await?;
+            return Ok(Json(SuccessResponse { success: true }));
+        }
+        Err(error) => {
+            crate::close_service::project_close_worker_failure(
+                &state,
+                obligation.attempt_id(),
+                format!("Close settlement worker failed: {error}"),
+            )
+            .await?;
+            return Ok(Json(SuccessResponse { success: true }));
+        }
+    }
     let refreshed = state
         .db
         .get_close_obligation(obligation.attempt_id().as_str())
         .await
         .map_err(|error| AppError::Internal(error.to_string()))?;
-    if refreshed.phase() == phoenix_core::domain::close::ClosePhase::SettlingActiveWork {
-        require_close_settlement_without_retained_custody(&state, refreshed.attempt_id()).await?;
-    }
-    if refreshed.close_outcome() == Some(CloseCompletionOutcome::Cancelled) {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Close was cancelled before retirement",
-            "close_cancelled",
-        ))));
-    }
     match refreshed.phase() {
-        phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-        | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement => {
+        ClosePhase::Completed => {
+            crate::close_service::project_completed_close(refreshed.close_outcome(), None)?;
+            Ok(Json(SuccessResponse { success: true }))
+        }
+        ClosePhase::SettlingActiveWork => {
+            require_close_settlement_without_retained_custody(&state, refreshed.attempt_id()).await?;
             Err(close_settlement_in_progress())
         }
-        phoenix_core::domain::close::ClosePhase::AwaitingLossConfirmation => {
+        ClosePhase::AwaitingLossConfirmation => {
             Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
                 "Close requires confirmation of the freshly inspected loss inventory",
                 "close_loss_confirmation_required",
             ))))
         }
-        _ => Ok(Json(SuccessResponse { success: true })),
+        ClosePhase::NeedsRepair => Err(close_target_control_conflict(
+            "Close retirement requires repair",
+            "close_retirement_needs_repair",
+        )),
+        _ => Err(close_settlement_in_progress()),
     }
 }
 
@@ -640,13 +652,6 @@ pub(crate) async fn close_legacy_compat(
     action: &str,
 ) -> Result<(), AppError> {
     run_legacy_close_compat(state, id, action).await
-}
-
-pub(crate) async fn close_product_conversation_with_active_work(
-    state: &AppState,
-    id: &str,
-) -> Result<(), AppError> {
-    run_legacy_close_compat(state, id, "archive").await
 }
 
 pub(crate) async fn abandon_task(

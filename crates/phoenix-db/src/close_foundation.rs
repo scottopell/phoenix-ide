@@ -28,15 +28,27 @@ use crate::{
 /// Initial-origin receipts are immutable: observation adoption does not transfer
 /// a generic operation to the source-owned initial driver. The private field
 /// prevents callers from passing arbitrary native obligations to that worker.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct GenericCloseSettlement {
     obligation: CloseObligation,
+    provenance: GenericSettlementProvenance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenericSettlementProvenance {
+    CommittedIngress,
+    RetainedSettlement,
 }
 
 impl GenericCloseSettlement {
     #[must_use]
     pub fn obligation(&self) -> &CloseObligation {
         &self.obligation
+    }
+
+    #[must_use]
+    pub fn is_committed_ingress(&self) -> bool {
+        self.provenance == GenericSettlementProvenance::CommittedIngress
     }
 }
 
@@ -52,14 +64,43 @@ pub enum GenericCloseAdmission {
 #[derive(Debug)]
 pub enum GenericCloseSettlementAdvance {
     Inspect(GenericCloseInspection),
+    Interrupted(CloseRunRef),
+    WaitingForQuiescence,
     Cancelled,
     NoTransition,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum GenericCloseSettlementFailure {
+    Classified,
+    NoTransition(CloseRunStatus),
+}
+
+struct PendingCloseQuiescence(String);
+
 #[derive(Debug)]
 pub struct GenericCloseInspection(CloseAttemptId);
 
+/// Authority from a fresh, loss-free Initial inspection commit, not a phase read.
+#[derive(Debug)]
+pub struct FreshGenericCloseRetirement {
+    attempt_id: CloseAttemptId,
+    snapshot: CloseRetirementSnapshot,
+}
+
+impl FreshGenericCloseRetirement {
+    #[must_use]
+    pub fn into_parts(self) -> (CloseAttemptId, CloseRetirementSnapshot) {
+        (self.attempt_id, self.snapshot)
+    }
+}
+
 impl GenericCloseInspection {
+    #[must_use]
+    pub fn attempt_id(&self) -> &CloseAttemptId {
+        &self.0
+    }
+
     #[must_use]
     pub fn into_attempt_id(self) -> CloseAttemptId {
         self.0
@@ -2316,6 +2357,8 @@ impl Database {
 
     /// Admit and capture the first settlement phase in the same writer
     /// transaction. This is a generic ingress: it creates no native receipt.
+    /// An Initial submitted from an Open observation can observe the exact
+    /// attempt that moved that product to History before this transaction.
     pub async fn begin_generic_close_settlement(
         &self,
         product_conversation_id: &ProductConversationId,
@@ -2323,11 +2366,37 @@ impl Database {
         attempt_id: &CloseAttemptId,
     ) -> DbResult<GenericCloseAdmission> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        // Preserve exact-ID replay (including conflicts) ahead of observing another attempt.
+        let candidates: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT o.attempt_id,
+                    (o.phase <> 'completed' OR o.close_outcome = 'close_incomplete') AS active
+             FROM close_obligations o
+             JOIN product_conversations p ON p.id = o.product_conversation_id
+             WHERE o.product_conversation_id = ?1
+               AND (o.phase <> 'completed' OR o.close_outcome = 'close_incomplete'
+                    OR (p.ordinary_lifecycle = 'history'
+                        AND o.close_outcome IN ('archived', 'archived_cleanup_attention')))
+               AND NOT EXISTS (SELECT 1 FROM close_obligations WHERE attempt_id = ?2)
+             ORDER BY active DESC LIMIT 2",
+        )
+        .bind(product_conversation_id.as_str())
+        .bind(attempt_id.as_str())
+        .fetch_all(&mut *tx)
+        .await?;
+        let observed_attempt_id = match candidates.as_slice() {
+            [(_, first), (_, second)] if first == second => {
+                return Err(DbError::CloseFoundationConflict(format!(
+                    "ProductConversation {product_conversation_id} has ambiguous Close ownership"
+                )));
+            }
+            [(winner, _), ..] => Some(winner.as_str()),
+            [] => None,
+        };
         let admission = Self::begin_close_foundation_inner(
             &mut tx,
             product_conversation_id,
             expected_latest_transcript_id,
-            attempt_id.as_str(),
+            observed_attempt_id.unwrap_or(attempt_id.as_str()),
             false,
         )
         .await?;
@@ -2337,7 +2406,10 @@ impl Database {
                     Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?;
                 match obligation.phase() {
                     ClosePhase::SettlingActiveWork => {
-                        GenericCloseAdmission::InsertedSettling(GenericCloseSettlement { obligation })
+                        GenericCloseAdmission::InsertedSettling(GenericCloseSettlement {
+                            obligation,
+                            provenance: GenericSettlementProvenance::CommittedIngress,
+                        })
                     }
                     ClosePhase::AwaitingStopWorkConfirmation => {
                         GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
@@ -2777,7 +2849,10 @@ impl Database {
         Self::begin_close_active_work_settlement_tx(&mut tx, attempt_id.as_str(), &current).await?;
         let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
         tx.commit().await?;
-        Ok(GenericCloseSettlement { obligation })
+        Ok(GenericCloseSettlement {
+            obligation,
+            provenance: GenericSettlementProvenance::CommittedIngress,
+        })
     }
 
     pub async fn begin_close_active_work_settlement(
@@ -3104,8 +3179,10 @@ impl Database {
         .await?;
         rows.into_iter()
             .map(|row| {
-                parse_close_obligation_row(row)
-                    .map(|obligation| GenericCloseSettlement { obligation })
+                parse_close_obligation_row(row).map(|obligation| GenericCloseSettlement {
+                    obligation,
+                    provenance: GenericSettlementProvenance::RetainedSettlement,
+                })
             })
             .collect()
     }
@@ -3137,7 +3214,7 @@ impl Database {
 
     pub async fn finish_generic_close_settlement(
         &self,
-        settlement: GenericCloseSettlement,
+        settlement: &GenericCloseSettlement,
     ) -> DbResult<GenericCloseSettlementAdvance> {
         let attempt_id = settlement.obligation.attempt_id();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -3146,17 +3223,31 @@ impl Database {
         if current.product_conversation_id() != settlement.obligation.product_conversation_id() {
             return Err(close_precondition("generic Close settlement target changed"));
         }
-        let outcome = match current.phase() {
+        let phase = current.phase();
+        if matches!(phase, ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement)
+            && Self::try_advance_close_settlement_when_quiescent_tx(&mut tx, attempt_id.as_str())
+                .await?
+                .is_err()
+        {
+            tx.rollback().await?;
+            return Ok(GenericCloseSettlementAdvance::WaitingForQuiescence);
+        }
+        let outcome = match phase {
             ClosePhase::SettlingActiveWork => {
-                Self::advance_close_settlement_when_quiescent_tx(&mut tx, attempt_id.as_str())
-                    .await?;
-                GenericCloseSettlementAdvance::Inspect(GenericCloseInspection(attempt_id.clone()))
+                match settlement.provenance {
+                    GenericSettlementProvenance::CommittedIngress => {
+                        GenericCloseSettlementAdvance::Inspect(GenericCloseInspection(
+                            attempt_id.clone(),
+                        ))
+                    }
+                    GenericSettlementProvenance::RetainedSettlement => {
+                        GenericCloseSettlementAdvance::Interrupted(CloseRunRef::initial(
+                            attempt_id.clone(),
+                        ))
+                    }
+                }
             }
-            ClosePhase::CancelRequestedDuringSettlement => {
-                Self::advance_close_settlement_when_quiescent_tx(&mut tx, attempt_id.as_str())
-                    .await?;
-                GenericCloseSettlementAdvance::Cancelled
-            }
+            ClosePhase::CancelRequestedDuringSettlement => GenericCloseSettlementAdvance::Cancelled,
             _ => GenericCloseSettlementAdvance::NoTransition,
         };
         tx.commit().await?;
@@ -3185,10 +3276,19 @@ impl Database {
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
+        Self::try_advance_close_settlement_when_quiescent_tx(tx, attempt_id)
+            .await?
+            .map_err(|PendingCloseQuiescence(detail)| close_precondition(detail))
+    }
+
+    async fn try_advance_close_settlement_when_quiescent_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+    ) -> DbResult<Result<CloseObligation, PendingCloseQuiescence>> {
         let obligation = close_obligation_for_update(tx, attempt_id).await?;
         match obligation.phase() {
             ClosePhase::AwaitingRetirementInspection | ClosePhase::Completed => {
-                return Ok(obligation);
+                return Ok(Ok(obligation));
             }
             ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement => {}
             phase @ (ClosePhase::AwaitingBlockerResolution
@@ -3205,16 +3305,16 @@ impl Database {
         let unsettled =
             Self::reconcile_close_direct_turn_settlement_receipts_tx(tx, attempt_id).await?;
         if unsettled != 0 {
-            return Err(close_precondition(format!(
+            return Ok(Err(PendingCloseQuiescence(format!(
                 "attempt {attempt_id} still has {unsettled} unsettled direct-turn receipt(s)"
-            )));
+            ))));
         }
         let active_members =
             Self::count_close_settlement_active_participants_tx(tx, attempt_id).await?;
         if active_members != 0 {
-            return Err(close_precondition(format!(
+            return Ok(Err(PendingCloseQuiescence(format!(
                 "attempt {attempt_id} still has {active_members} active durable member obligation(s)"
-            )));
+            ))));
         }
         if obligation.phase() == ClosePhase::CancelRequestedDuringSettlement {
             sqlx::query(
@@ -3229,7 +3329,7 @@ impl Database {
         } else {
             set_close_phase_tx(tx, attempt_id, ClosePhase::AwaitingRetirementInspection).await?;
         }
-        close_obligation_for_update(tx, attempt_id).await
+        close_obligation_for_update(tx, attempt_id).await.map(Ok)
     }
 
     pub async fn list_close_settlement_conversation_ids(
@@ -3502,6 +3602,63 @@ impl Database {
             WorkScopeId::parse(scope).map_err(|error| DbError::Serialization(error.to_string()))
         })
         .collect()
+    }
+
+    pub async fn commit_fresh_generic_close_inspection(
+        &self,
+        inspection: GenericCloseInspection,
+        request: ReplaceCloseInspectionRequest,
+    ) -> DbResult<Option<FreshGenericCloseRetirement>> {
+        let attempt_id = inspection.into_attempt_id();
+        if request.attempt_id != attempt_id {
+            return Err(close_precondition("Initial inspection names a different Close attempt"));
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current = Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+        if current.phase() != ClosePhase::AwaitingRetirementInspection || current.snapshot().is_some() {
+            return Err(close_precondition("Initial inspection no longer owns the fresh transition"));
+        }
+        let captured_latest: String = sqlx::query_scalar(
+            "SELECT conversation_id FROM close_attempt_members
+             WHERE attempt_id = ?1 AND member_role IN ('latest', 'root_latest')",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        let captured_latest = TranscriptConversationId::parse(captured_latest)
+            .map_err(|error| DbError::Serialization(error.to_string()))?;
+        require_control_target_latest_tx(
+            &mut tx,
+            current.product_conversation_id(),
+            &captured_latest,
+        )
+        .await?;
+        let admitted: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_runs run
+             WHERE run.attempt_id = ?1 AND run.run_ordinal = 1 AND run.status = 'running'
+               AND NOT EXISTS (SELECT 1 FROM close_runs later
+                   WHERE later.attempt_id = run.attempt_id AND later.run_ordinal > run.run_ordinal))",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        if !admitted {
+            return Err(close_precondition("Initial inspection requires the running Initial Close"));
+        }
+        self.replace_close_inspection_tx(&mut tx, &request, None).await?;
+        let committed = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        let retirement = match committed.phase() {
+            ClosePhase::RetirementRequested => Some(FreshGenericCloseRetirement {
+                attempt_id,
+                snapshot: committed.snapshot().cloned().ok_or_else(|| {
+                    close_precondition("Initial retirement requires its committed inspection snapshot")
+                })?,
+            }),
+            ClosePhase::AwaitingLossConfirmation => None,
+            _ => return Err(close_precondition("Unexpected Initial inspection outcome")),
+        };
+        tx.commit().await?;
+        Ok(retirement)
     }
 
     pub async fn replace_close_inspection(
@@ -6756,24 +6913,83 @@ impl Database {
     ///
     /// # Errors
     /// Rejects absent runs, unavailable captured scope authority, and persistence failures.
-    #[allow(clippy::too_many_lines)]
     pub async fn classify_interrupted_close_run(
         &self,
         run: &CloseRunRef,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let row = sqlx::query("SELECT attempt_id, run_ordinal, status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2")
-            .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut *tx).await?;
-        let retained = parse_close_run_row(row)?;
-        let obligation = close_obligation_for_update(&mut tx, run.attempt_id.as_str()).await?;
-        if retained.status != CloseRunStatus::Running {
-            tx.commit().await?;
-            return Ok(obligation);
+        let (status, obligation) = Self::interrupted_close_run_for_update(&mut tx, run).await?;
+        let result = if status == CloseRunStatus::Running {
+            let detail = format!(
+                "Close run {} interrupted in {}; startup observed retained authority only",
+                run.ordinal.get(),
+                obligation.phase().as_str()
+            );
+            Self::classify_running_close_run_tx(&mut tx, run, &obligation, detail).await?
+        } else {
+            obligation
+        };
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// Classify failure before the generic settlement owner can hand off to inspection.
+    ///
+    /// # Errors
+    /// Rejects absent or inconsistent retained authority and persistence failures.
+    pub async fn fail_generic_close_settlement(
+        &self,
+        settlement: &GenericCloseSettlement,
+        detail: &str,
+    ) -> DbResult<GenericCloseSettlementFailure> {
+        let run = CloseRunRef::initial(settlement.obligation().attempt_id().clone());
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let (status, obligation) = Self::interrupted_close_run_for_update(&mut tx, &run).await?;
+        let product = settlement.obligation().product_conversation_id();
+        if obligation.product_conversation_id() != product {
+            return Err(close_precondition("generic Close settlement target changed"));
         }
-        if let Some(interrupted) =
-            crate::native_close::interrupt_native_retry_tx(&mut tx, run).await?
+        if status != CloseRunStatus::Running
+            || !matches!(
+                obligation.phase(),
+                ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+            )
         {
-            tx.commit().await?;
+            tx.rollback().await?;
+            return Ok(GenericCloseSettlementFailure::NoTransition(status));
+        }
+        Self::require_generic_close_settlement_tx(&mut tx, run.attempt_id.as_str(), product.as_str())
+            .await?;
+        Self::classify_running_close_run_tx(
+            &mut tx,
+            &run,
+            &obligation,
+            format!("Close settlement failed: {detail}"),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(GenericCloseSettlementFailure::Classified)
+    }
+
+    async fn interrupted_close_run_for_update(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+    ) -> DbResult<(CloseRunStatus, CloseObligation)> {
+        let row = sqlx::query("SELECT attempt_id, run_ordinal, status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = ?2")
+            .bind(run.attempt_id.as_str()).bind(run.ordinal.get()).fetch_one(&mut **tx).await?;
+        let retained = parse_close_run_row(row)?;
+        let obligation = close_obligation_for_update(tx, run.attempt_id.as_str()).await?;
+        Ok((retained.status, obligation))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn classify_running_close_run_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        run: &CloseRunRef,
+        obligation: &CloseObligation,
+        detail: String,
+    ) -> DbResult<CloseObligation> {
+        if let Some(interrupted) = crate::native_close::interrupt_native_retry_tx(tx, run).await? {
             return Ok(interrupted);
         }
         let completion_only_running: bool = if run.ordinal == CloseRunOrdinal::INITIAL {
@@ -6785,12 +7001,12 @@ impl Database {
             )
             .bind(run.attempt_id.as_str())
             .bind(run.ordinal.get())
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?
         };
         let authority = if run.ordinal == CloseRunOrdinal::INITIAL {
             let unresolved =
-                unresolved_expected_close_cleanup_resources_tx(&mut tx, run.attempt_id.as_str())
+                unresolved_expected_close_cleanup_resources_tx(tx, run.attempt_id.as_str())
                     .await?;
             if let Some(first) = unresolved.first() {
                 CloseCleanupFailureAuthority::ExpectedResource {
@@ -6804,7 +7020,7 @@ impl Database {
                 }
             } else {
                 let scope: Option<String> = sqlx::query_scalar("SELECT scope FROM close_attempt_scopes WHERE attempt_id = ?1 ORDER BY scope LIMIT 1")
-                    .bind(run.attempt_id.as_str()).fetch_optional(&mut *tx).await?;
+                    .bind(run.attempt_id.as_str()).fetch_optional(&mut **tx).await?;
                 if let Some(scope) = scope {
                     let resource = RetiredResourceIdentity::parse(
                         RetiredResourceKind::WorkScope,
@@ -6826,7 +7042,7 @@ impl Database {
         } else if completion_only_running {
             CloseCleanupFailureAuthority::AttemptInterrupted
         } else {
-            let progress = close_safe_retry_progress_tx(&mut tx, run).await?;
+            let progress = close_safe_retry_progress_tx(tx, run).await?;
             match progress.pending.first() {
                 Some(first) => CloseCleanupFailureAuthority::ExpectedResource {
                     scope: first.scope.clone(),
@@ -6841,28 +7057,23 @@ impl Database {
         let remaining_resources = if completion_only_running {
             Vec::new()
         } else if run.ordinal != CloseRunOrdinal::INITIAL {
-            let progress = close_safe_retry_progress_tx(&mut tx, run).await?;
+            let progress = close_safe_retry_progress_tx(tx, run).await?;
             match progress.pending.first() {
-                Some(first) => retry_failure_resources_tx(&mut tx, run, &progress, first).await?,
+                Some(first) => retry_failure_resources_tx(tx, run, &progress, first).await?,
                 None => Vec::new(),
             }
         } else if let CloseCleanupFailureAuthority::ExpectedResource {
             scope, resource, ..
         } = &authority
         {
-            expected_close_cleanup_failure_resources_tx(
-                &mut tx,
-                run.attempt_id.as_str(),
-                scope,
-                resource,
-            )
-            .await?
+            expected_close_cleanup_failure_resources_tx(tx, run.attempt_id.as_str(), scope, resource)
+                .await?
         } else {
             sqlx::query_scalar::<_, String>(
                 "SELECT scope FROM close_attempt_scopes WHERE attempt_id = ?1 ORDER BY scope",
             )
             .bind(run.attempt_id.as_str())
-            .fetch_all(&mut *tx)
+            .fetch_all(&mut **tx)
             .await?
             .into_iter()
             .map(|captured| {
@@ -6894,17 +7105,11 @@ impl Database {
             authority,
             remaining_resources,
             reason: RetirementFailureReason::Interrupted,
-            detail: format!(
-                "Close run {} interrupted in {}; startup observed retained authority only",
-                run.ordinal.get(),
-                obligation.phase().as_str()
-            ),
-            stop_certainty: retained_interrupted_stop_certainty_tx(&mut tx, run).await?,
+            detail,
+            stop_certainty: retained_interrupted_stop_certainty_tx(tx, run).await?,
             occurred_at_us: Utc::now().timestamp_micros(),
         };
-        let result = Self::terminalize_close_run_cleanup_failure_tx(&mut tx, run, &request).await?;
-        tx.commit().await?;
-        Ok(result)
+        Self::terminalize_close_run_cleanup_failure_tx(tx, run, &request).await
     }
 
     /// Derives every unresolved target from retained sealed inventory and exact proofs.
@@ -10052,12 +10257,23 @@ mod tests {
             settlement.obligation().phase(),
             ClosePhase::SettlingActiveWork
         );
-        assert_eq!(
-            db.list_pending_generic_close_settlements(Some(&attempt_id))
+        let retained = db
+            .list_pending_generic_close_settlements(Some(&attempt_id))
+            .await
+            .unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].obligation(), settlement.obligation());
+        assert!(matches!(
+            db.finish_generic_close_settlement(&retained.into_iter().next().unwrap())
                 .await
                 .unwrap(),
-            vec![settlement]
-        );
+            GenericCloseSettlementAdvance::Interrupted(run)
+                if run == CloseRunRef::initial(attempt_id)
+        ));
+        assert!(matches!(
+            db.finish_generic_close_settlement(&settlement).await.unwrap(),
+            GenericCloseSettlementAdvance::NoTransition
+        ));
     }
 
     #[tokio::test]
@@ -11599,8 +11815,8 @@ mod tests {
         };
 
         let (first, second) = tokio::join!(
-            db.finish_generic_close_settlement(settlement.clone()),
-            db.finish_generic_close_settlement(settlement),
+            db.finish_generic_close_settlement(&settlement),
+            db.finish_generic_close_settlement(&settlement),
         );
         let inspection = match (first.unwrap(), second.unwrap()) {
             (
@@ -11613,14 +11829,85 @@ mod tests {
             ) => inspection,
             outcomes => panic!("expected exactly one inspection handoff, got {outcomes:?}"),
         };
-        assert_eq!(inspection.into_attempt_id(), attempt);
+        assert_eq!(inspection.attempt_id(), &attempt);
         assert_eq!(
-            db.get_close_obligation(attempt.as_str())
+            db.fail_generic_close_settlement(&settlement, "late settlement callback")
+                .await
+                .unwrap(),
+            GenericCloseSettlementFailure::NoTransition(CloseRunStatus::Running)
+        );
+        assert!(db.list_close_cleanup_failures(attempt.as_str()).await.unwrap().is_empty());
+        let fresh = db
+            .commit_fresh_generic_close_inspection(
+                inspection,
+                ReplaceCloseInspectionRequest { attempt_id: attempt.clone(), scopes: Vec::new() },
+            )
+            .await
+            .unwrap()
+            .expect("loss-free initial commit issues retirement authority");
+        let (admitted_attempt, snapshot) = fresh.into_parts();
+        assert_eq!(admitted_attempt, attempt);
+        let current = db.get_close_obligation(attempt.as_str()).await.unwrap();
+        assert_eq!(current.phase(), ClosePhase::RetirementRequested);
+        assert_eq!(current.snapshot(), Some(&snapshot));
+    }
+
+    #[tokio::test]
+    async fn interrupted_generic_handoffs_stop_without_retirement_authority() {
+        for commit_inspection in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            create_root(&db, "root").await;
+            let product = product_id("root");
+            let latest = transcript_id("root");
+            let attempt = CloseAttemptId::parse("interrupted-handoff").unwrap();
+            let GenericCloseAdmission::InsertedSettling(settlement) = db
+                .begin_generic_close_settlement(&product, &latest, &attempt)
                 .await
                 .unwrap()
-                .phase(),
-            ClosePhase::AwaitingRetirementInspection
-        );
+            else {
+                panic!("expected idle attempt to enter settlement");
+            };
+            let GenericCloseSettlementAdvance::Inspect(inspection) =
+                db.finish_generic_close_settlement(&settlement).await.unwrap()
+            else {
+                panic!("expected initial inspection handoff");
+            };
+            if commit_inspection {
+                let retirement = db
+                    .commit_fresh_generic_close_inspection(
+                        inspection,
+                        ReplaceCloseInspectionRequest {
+                            attempt_id: attempt.clone(),
+                            scopes: Vec::new(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert!(retirement.is_some());
+            }
+            let before = db.get_close_obligation(attempt.as_str()).await.unwrap();
+            assert_eq!(
+                before.phase(),
+                if commit_inspection {
+                    ClosePhase::RetirementRequested
+                } else {
+                    ClosePhase::AwaitingRetirementInspection
+                }
+            );
+            let run = CloseRunRef::initial(attempt.clone());
+            let stopped = db.classify_interrupted_close_run(&run).await.unwrap();
+            assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+            assert_eq!(stopped.phase(), ClosePhase::Completed);
+            assert!(matches!(
+                stopped.close_outcome(),
+                Some(CloseCompletionOutcome::CloseIncomplete | CloseCompletionOutcome::ArchivedCleanupAttention)
+            ));
+            assert_eq!(stopped.snapshot(), before.snapshot());
+            assert!(db.list_close_expected_retirement_resources(attempt.as_str()).await.unwrap().is_empty());
+            assert!(db.list_close_retirement_evidence(attempt.as_str()).await.unwrap().is_empty());
+            assert!(db.list_pending_generic_close_settlements(Some(&attempt)).await.unwrap().is_empty());
+            assert_eq!(db.classify_interrupted_close_run(&run).await.unwrap(), stopped);
+        }
     }
 
     #[tokio::test]
@@ -11654,9 +11941,10 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
+        let competing_attempt = CloseAttemptId::parse("competing-attempt").unwrap();
         let (first, second) = tokio::join!(
             db.begin_generic_close_settlement(&product, &latest, &attempt),
-            db.begin_generic_close_settlement(&product, &latest, &attempt),
+            db.begin_generic_close_settlement(&product, &latest, &competing_attempt),
         );
         let (inserted, existing) = match (first.unwrap(), second.unwrap()) {
             (
@@ -11672,6 +11960,11 @@ mod tests {
         assert_eq!(inserted.obligation(), &existing);
         assert_eq!(inserted.obligation().phase(), ClosePhase::SettlingActiveWork);
         assert!(db.validate_generic_close_settlement(&inserted).await.unwrap());
+        assert!(matches!(
+            db.finish_generic_close_settlement(&inserted).await.unwrap(),
+            GenericCloseSettlementAdvance::WaitingForQuiescence
+        ));
+        let attempt = inserted.obligation().attempt_id();
         let targets = db
             .list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
             .await
@@ -11683,8 +11976,7 @@ mod tests {
         assert_eq!(target.turn_id, 1);
         assert_eq!(target.expected_generation, 0);
         let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM close_attempt_direct_turn_settlement_captures
-             WHERE attempt_id = 'attempt-idle'",
+            "SELECT COUNT(*) FROM close_attempt_direct_turn_settlement_captures",
         )
         .fetch_one(db.pool())
         .await
@@ -15393,6 +15685,16 @@ mod tests {
         assert_eq!(promoted.phase(), ClosePhase::Completed);
         assert_eq!(promoted.snapshot(), incomplete.snapshot());
         assert_eq!(promoted.attempt_id(), incomplete.attempt_id());
+        let competing = CloseAttemptId::parse("competing-initial-after-attention").unwrap();
+        let observed = db
+            .begin_generic_close_settlement(&product_id("root"), &transcript_id("latest"), &competing)
+            .await
+            .unwrap();
+        assert!(matches!(observed, GenericCloseAdmission::Existing(obligation) if obligation == promoted));
+        assert!(matches!(
+            db.get_close_obligation(competing.as_str()).await,
+            Err(DbError::CloseFoundationNotFound(_))
+        ));
         assert_eq!(
             sqlx::query_scalar::<_, String>(
                 "SELECT completed_at FROM close_obligations WHERE attempt_id = ?1"

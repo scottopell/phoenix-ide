@@ -777,6 +777,9 @@ pub struct RuntimeManager {
     #[cfg(test)]
     clean_close_writer_fixture: bool,
     close_retirement_execution: ConversationMutexGates,
+    waiting_generic_close_owners: AsyncMutex<
+        HashMap<phoenix_core::domain::close::CloseAttemptId, crate::db::GenericCloseSettlement>,
+    >,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
     /// Per-conversation single-flight results for slow runtime materialization.
     /// The mutex protects only map admission/removal; unrelated conversations
@@ -2668,6 +2671,7 @@ impl RuntimeManager {
             #[cfg(test)]
             clean_close_writer_fixture: false,
             close_retirement_execution: ConversationMutexGates::default(),
+            waiting_generic_close_owners: AsyncMutex::new(HashMap::new()),
             runtimes: RwLock::new(HashMap::new()),
             runtime_creations: AsyncMutex::new(HashMap::new()),
             conversation_admissions: AsyncMutex::new(HashMap::new()),
@@ -3809,7 +3813,7 @@ impl RuntimeManager {
         let mut completed = 0;
         let mut first_error = None;
         for settlement in obligations {
-            let worker = self.start_generic_close_settlement(settlement).await?;
+            let worker = self.start_generic_close_settlement(settlement)?;
             match worker.await {
                 Ok(Ok(true)) => completed += 1,
                 Ok(Ok(false)) => {}
@@ -3828,54 +3832,82 @@ impl RuntimeManager {
         self: &Arc<Self>,
         settlement: crate::db::GenericCloseSettlement,
     ) -> Result<bool, String> {
-        let obligation = settlement.obligation();
-        if !matches!(
-            obligation.phase(),
-            phoenix_core::domain::close::ClosePhase::SettlingActiveWork
-                | phoenix_core::domain::close::ClosePhase::CancelRequestedDuringSettlement
-        ) {
-            return Ok(false);
-        }
-        if !self
-            .db
-            .validate_generic_close_settlement(&settlement)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            return Ok(false);
-        }
-        let conversation_ids = self
-            .db
-            .list_close_settlement_conversation_ids(obligation.attempt_id().as_str())
-            .await
-            .map_err(|error| error.to_string())?;
-        for conversation_id in &conversation_ids {
-            match self
-                .db
-                .cancel_conversation_creation(conversation_id, Utc::now())
-                .await
-            {
-                Ok(_) => {}
-                Err(error) => return Err(error.to_string()),
-            }
-        }
-        self.kick_creation_worker();
-        self.settle_close_direct_turn_targets(obligation.attempt_id().as_str())
-            .await?;
-        match self
-            .db
-            .finish_generic_close_settlement(settlement)
-            .await
-        {
+        match self.apply_generic_close_settlement(&settlement).await {
             Ok(crate::db::GenericCloseSettlementAdvance::Inspect(inspection)) => {
                 self.continue_settled_generic_close(inspection).await?;
                 Ok(true)
             }
+            Ok(crate::db::GenericCloseSettlementAdvance::Interrupted(run)) => {
+                self.classify_generic_close_interruption(&run).await?;
+                Ok(true)
+            }
             Ok(crate::db::GenericCloseSettlementAdvance::Cancelled) => Ok(true),
-            Ok(crate::db::GenericCloseSettlementAdvance::NoTransition)
-            | Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
-            Err(error) => Err(error.to_string()),
+            Ok(crate::db::GenericCloseSettlementAdvance::NoTransition) => Ok(false),
+            Ok(crate::db::GenericCloseSettlementAdvance::WaitingForQuiescence) => {
+                if settlement.is_committed_ingress() {
+                    self.waiting_generic_close_owners
+                        .lock()
+                        .await
+                        .insert(settlement.obligation().attempt_id().clone(), settlement);
+                }
+                Ok(false)
+            }
+            Err(error) => {
+                use crate::db::GenericCloseSettlementFailure::{Classified, NoTransition};
+                use phoenix_core::domain::close::CloseRunStatus::{Completed, Running, Stopped};
+
+                match self.db.fail_generic_close_settlement(&settlement, &error).await {
+                    Ok(Classified) => {
+                        self.kick_direct_turn_worker();
+                        Err(error)
+                    }
+                    Ok(NoTransition(Stopped | Completed)) => Err(error),
+                    Ok(NoTransition(Running)) => {
+                        // The failed handoff did not deliver an inspection witness to this owner.
+                        self.signal_fatal_local_authority("generic_close_settlement_unclassified");
+                        Err(format!("{error}; Close run is still running outside settlement"))
+                    }
+                    Err(storage_error) => {
+                        self.signal_fatal_local_authority("generic_close_settlement_unclassified");
+                        Err(format!("{error}; Close settlement failure could not be recorded: {storage_error}"))
+                    }
+                }
+            }
         }
+    }
+
+    async fn apply_generic_close_settlement(
+        &self,
+        settlement: &crate::db::GenericCloseSettlement,
+    ) -> Result<crate::db::GenericCloseSettlementAdvance, String> {
+        use crate::db::GenericCloseSettlementAdvance;
+
+        if !self
+            .db
+            .validate_generic_close_settlement(settlement)
+            .await
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(GenericCloseSettlementAdvance::NoTransition);
+        }
+        let attempt_id = settlement.obligation().attempt_id().as_str();
+        let conversation_ids = self
+            .db
+            .list_close_settlement_conversation_ids(attempt_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        for conversation_id in &conversation_ids {
+            self.db
+                .cancel_conversation_creation(conversation_id, Utc::now())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        self.kick_creation_worker();
+        self.settle_close_direct_turn_targets(attempt_id).await?;
+        self.db
+            .finish_generic_close_settlement(settlement)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     /// Materialize persisted continuation operations so restart recovery does
@@ -9464,7 +9496,10 @@ mod scope_liveness_tests {
     }
 
     pub(super) async fn test_manager() -> RuntimeManager {
-        let db = crate::db::Database::open_in_memory().await.expect("db");
+        test_manager_with_db(crate::db::Database::open_in_memory().await.expect("db"))
+    }
+
+    fn test_manager_with_db(db: crate::db::Database) -> RuntimeManager {
         RuntimeManager::new(
             db,
             Arc::new(ModelRegistry::new_empty()),
@@ -10204,6 +10239,194 @@ mod scope_liveness_tests {
     }
 
     #[tokio::test]
+    async fn initial_close_owner_survives_waiter_drop_before_admission() {
+        use phoenix_core::domain::close::{CloseCompletionOutcome, TranscriptConversationId};
+
+        let manager = Arc::new(test_manager().await);
+        let id = "initial-close-detached-ingress";
+        manager
+            .db()
+            .create_conversation(id, id, "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let target = manager.db().get_conversation(id).await.unwrap().product_conversation_id;
+        let latest = TranscriptConversationId::parse(id).unwrap();
+        let attempt = CloseAttemptId::parse(id).unwrap();
+        let gate = manager.close_retirement_execution.lock(id).await;
+        let worker = manager
+            .start_generic_close_ingress(
+                attempt.clone(),
+                target,
+                latest,
+                close_retirement::GenericCloseIngress::Initial,
+            )
+            .unwrap();
+        drop(worker);
+        assert!(matches!(
+            manager.db().get_close_obligation(id).await,
+            Err(crate::db::DbError::CloseFoundationNotFound(_))
+        ));
+        assert_eq!(manager.fatal_authority_owner_count(), 1);
+        drop(gate);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            manager.fatal_local_authority_fence.wait_for_owners(),
+        )
+        .await
+        .expect("the detached ingress owner must settle and release authority");
+        let obligation = manager.db().get_close_obligation(attempt.as_str()).await.unwrap();
+        assert_eq!(obligation.close_outcome(), Some(CloseCompletionOutcome::Archived));
+    }
+
+    #[tokio::test]
+    async fn generic_settlement_failure_is_classified_or_fences_authority() {
+        use crate::db::{CloseCleanupFailureAuthority, CloseCleanupResourceDisposition};
+        use phoenix_core::domain::close::{
+            CloseCompletionOutcome, ClosePhase, CloseRunRef, CloseRunStatus, RetiredResourceKind,
+            RetirementFailureReason, TranscriptConversationId,
+        };
+        use phoenix_core::domain::product_conversation::OrdinaryProductConversationLifecycle;
+
+        for (terminalization_available, capture_scope) in [(true, false), (true, true), (false, true)] {
+            let manager = Arc::new(test_manager().await);
+            let id = "generic-settlement-write-failure";
+            let db = manager.db().clone();
+            let checkout = tempfile::tempdir().unwrap();
+            let scope = if capture_scope {
+                let ResourceScopeKey::Work(scope) =
+                    create_handleless_work_conv(&manager, id, checkout.path().to_str().unwrap(), None)
+                        .await
+                else {
+                    panic!("Work conversation must have a WorkScope");
+                };
+                sqlx::query("UPDATE conversations SET user_initiated = 1 WHERE id = ?1")
+                    .bind(id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                Some(scope)
+            } else {
+                db.create_conversation(id, id, "/tmp", true, None, None)
+                    .await
+                    .unwrap();
+                None
+            };
+            let target = db.get_conversation(id).await.unwrap().product_conversation_id;
+            let attempt = CloseAttemptId::parse(id).unwrap();
+            let run = CloseRunRef::initial(attempt.clone());
+            sqlx::query(
+                "CREATE TRIGGER fail_settlement_handoff BEFORE UPDATE OF phase ON close_obligations
+                 WHEN OLD.phase = 'settling_active_work' AND NEW.phase = 'awaiting_retirement_inspection'
+                 BEGIN SELECT RAISE(ABORT, 'injected settlement handoff failure'); END",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            if !terminalization_available {
+                sqlx::query(
+                    "CREATE TRIGGER fail_settlement_terminalization BEFORE INSERT ON close_cleanup_failures
+                     BEGIN SELECT RAISE(ABORT, 'injected terminalization failure'); END",
+                )
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+
+            let result = manager
+                .start_generic_close_ingress(
+                    attempt.clone(),
+                    target,
+                    TranscriptConversationId::parse(id).unwrap(),
+                    close_retirement::GenericCloseIngress::Initial,
+                )
+                .unwrap()
+                .await
+                .unwrap();
+            assert!(matches!(result, Err(close_retirement::GenericCloseIngressError::Worker(detail))
+                if detail.contains("injected settlement handoff failure")
+                    && (terminalization_available || detail.contains("injected terminalization failure"))));
+            let obligation = db.get_close_obligation(id).await.unwrap();
+            assert!(!manager.waiting_generic_close_owners.lock().await.contains_key(&attempt));
+            if terminalization_available {
+                assert!(!manager.fatal_local_authority_is_latched());
+            } else {
+                assert_eq!(obligation.phase(), ClosePhase::SettlingActiveWork);
+                assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Running);
+                assert_eq!(manager.observed_local_authority_failure_boundary(), Some("generic_close_settlement_unclassified"));
+                assert!(manager.start_generic_close_settlement(
+                    db.list_pending_generic_close_settlements(Some(&attempt)).await.unwrap().pop().unwrap(),
+                ).is_err());
+                sqlx::query("DROP TRIGGER fail_settlement_terminalization")
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+                assert_eq!(manager.fatal_authority_owner_count(), 0);
+                drop(manager);
+                let restarted = test_manager_with_db(db.clone());
+                restarted.restore_close_admission_fences().await.unwrap();
+                assert_eq!(
+                    crate::api::observe_running_close_runs(&db, || restarted.kick_direct_turn_worker())
+                        .await
+                        .unwrap(),
+                    1
+                );
+                assert!(!restarted.fatal_local_authority_is_latched());
+                assert!(restarted.waiting_generic_close_owners.lock().await.is_empty());
+            }
+            let obligation = db.get_close_obligation(id).await.unwrap();
+            assert_eq!(obligation.close_outcome(), Some(CloseCompletionOutcome::CloseIncomplete));
+            assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Stopped);
+            assert!(obligation.snapshot().is_none());
+            let conversation = db.get_conversation(id).await.unwrap();
+            assert!(!conversation.archived);
+            let aggregate = db.get_ordinary_product_conversation(&conversation.product_conversation_id)
+                .await.unwrap();
+            assert_eq!(aggregate.product_conversation.ordinary_lifecycle(),
+                Some(OrdinaryProductConversationLifecycle::Open));
+            let dispatches: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
+            )
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(dispatches, 0);
+            let failures = db.list_close_cleanup_failures(id).await.unwrap();
+            let [failure] = failures.as_slice() else {
+                panic!("expected exactly one failure, got {failures:?}");
+            };
+            assert_eq!(failure.run_ordinal, run.ordinal);
+            assert_eq!(failure.occurrence.reason, RetirementFailureReason::Interrupted);
+            let events: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM coordinator_watch_events WHERE event_id = ?1",
+            )
+            .bind(&failure.occurrence.failure_occurrence_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(events, 1);
+            if let Some(scope) = scope {
+                let CloseCleanupFailureAuthority::CapturedScope { scope: failed_scope, resource } =
+                    &failure.occurrence.authority
+                else {
+                    panic!("expected captured WorkScope authority");
+                };
+                assert_eq!(failed_scope, &scope);
+                assert_eq!(resource.kind(), RetiredResourceKind::WorkScope);
+                let [child] = failure.occurrence.remaining_resources.as_slice() else {
+                    panic!("expected the exact captured WorkScope child");
+                };
+                assert_eq!(child.scope, scope);
+                assert_eq!(&child.resource, resource);
+                assert_eq!(child.disposition, CloseCleanupResourceDisposition::Failed);
+            } else {
+                assert_eq!(failure.occurrence.authority, CloseCleanupFailureAuthority::AttemptInterrupted);
+                assert!(failure.occurrence.remaining_resources.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn generic_close_worker_survives_waiter_drop_and_serializes_reinspection() {
         use phoenix_core::domain::close::{CloseCompletionOutcome, RetiredResourceKind, RetirementOutcome};
 
@@ -10220,13 +10443,12 @@ mod scope_liveness_tests {
             .try_lock(attempt_id.as_str())
             .await
             .is_none());
-        let mut competing_inspection = Box::pin(manager.continue_legacy_close(attempt_id.clone()));
+        let mut competing_inspection = Box::pin(manager.wait_for_close_owner(&attempt_id));
         assert!(futures::poll!(&mut competing_inspection).is_pending());
         resume.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(60), competing_inspection)
             .await
-            .expect("the admitted worker must persist its outcome and release ownership")
-            .unwrap();
+            .expect("the admitted worker must persist its outcome and release ownership");
         let obligation = manager.db().get_close_obligation(attempt_id.as_str()).await.unwrap();
         assert_eq!(obligation.close_outcome(), Some(CloseCompletionOutcome::Archived));
         let evidence = manager.db().list_close_retirement_evidence(attempt_id.as_str()).await.unwrap();

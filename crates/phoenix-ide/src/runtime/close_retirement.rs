@@ -100,10 +100,55 @@ pub(crate) use lease_custody::CloseResourceLeaseStore;
 
 use lease_custody::LeaseRegistries;
 
+pub(crate) enum GenericCloseIngress {
+    Initial,
+    ConfirmStop(Arc<tokio::sync::Mutex<()>>),
+}
+
+pub(crate) enum GenericCloseIngressOutcome {
+    Continued,
+    Observed(Box<phoenix_core::domain::close::CloseObligation>),
+}
+
+pub(crate) enum GenericCloseIngressError {
+    Admission(crate::db::DbError),
+    Worker(String),
+}
+
+impl From<String> for GenericCloseIngressError {
+    fn from(error: String) -> Self {
+        Self::Worker(error)
+    }
+}
+
+pub(crate) type GenericCloseIngressWorker =
+    tokio::task::JoinHandle<Result<GenericCloseIngressOutcome, GenericCloseIngressError>>;
+
 pub(crate) enum GenericCloseRetryError {
     Admission(String),
     Continuation(String),
     Internal(String),
+}
+
+enum GenericRetirementAuthority {
+    Fresh(crate::db::FreshGenericCloseRetirement),
+    Retry { attempt_id: CloseAttemptId, snapshot: CloseRetirementSnapshot },
+    #[cfg(test)]
+    Fixture(CloseAttemptId),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum GenericRemovalPolicy {
+    Initial,
+    RetainedOnly,
+}
+
+enum CollectedCloseInspection {
+    Present {
+        request: ReplaceCloseInspectionRequest,
+        replacement_generation: Option<String>,
+    },
+    DispatchedAbsence(DispatchedWorktreeAbsence),
 }
 
 struct DispatchedWorktreeAbsence {
@@ -1171,35 +1216,75 @@ impl RuntimeManager {
         Ok(())
     }
 
-    pub(crate) async fn continue_legacy_close(
-        self: &Arc<Self>,
-        attempt_id: CloseAttemptId,
-    ) -> Result<(), String> {
-        self.start_generic_close_worker(attempt_id, |manager, attempt_id| async move {
-            manager.run_close_inspection(attempt_id).await
-        })
-        .await?
-        .await
-        .map_err(|error| format!("Close continuation worker failed: {error}"))?
+    pub(crate) async fn wait_for_close_owner(&self, attempt_id: &CloseAttemptId) {
+        let _execution = self.close_retirement_execution.lock(attempt_id.as_str()).await;
     }
 
     pub(super) async fn continue_settled_generic_close(
         &self,
         inspection: crate::db::GenericCloseInspection,
     ) -> Result<(), String> {
-        self.run_close_inspection(inspection.into_attempt_id()).await
+        let run = CloseRunRef::initial(inspection.attempt_id().clone());
+        let result = match self.commit_settled_generic_inspection(inspection).await {
+            Ok(Some(retirement)) => {
+                self.run_close_runtime_retirement(GenericRetirementAuthority::Fresh(retirement))
+                    .await
+            }
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => Err(self.record_interrupted_generic_handoff(&run, error).await),
+        }
     }
 
-    async fn run_close_inspection(&self, attempt_id: CloseAttemptId) -> Result<(), String> {
+    async fn commit_settled_generic_inspection(
+        &self,
+        inspection: crate::db::GenericCloseInspection,
+    ) -> Result<Option<crate::db::FreshGenericCloseRetirement>, String> {
+        let CollectedCloseInspection::Present { request, .. } = self
+            .collect_close_retirement_inspection(inspection.attempt_id())
+            .await?
+        else {
+            return Err("Initial Close cannot resume a dispatched absence".into());
+        };
+        self.db()
+            .commit_fresh_generic_close_inspection(inspection, request)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn record_interrupted_generic_handoff(&self, run: &CloseRunRef, cause: String) -> String {
+        match self.classify_generic_close_interruption(run).await {
+            Ok(()) => cause,
+            Err(error) => format!("{cause}; {error}"),
+        }
+    }
+
+    pub(super) async fn classify_generic_close_interruption(
+        &self,
+        run: &CloseRunRef,
+    ) -> Result<(), String> {
+        match self.db().classify_interrupted_close_run(run).await {
+            Ok(_) => {
+                self.kick_direct_turn_worker();
+                Ok(())
+            }
+            Err(error) => {
+                self.signal_fatal_local_authority("generic Close handoff interruption");
+                Err(format!("Close interruption could not be recorded: {error}"))
+            }
+        }
+    }
+
+    async fn run_admitted_generic_retry_inspection(&self, attempt_id: CloseAttemptId) -> Result<(), String> {
         let current = self
             .db()
             .read_generic_close_continuation(&attempt_id)
             .await
             .map_err(|error| error.to_string())?;
         match current.phase() {
-            ClosePhase::RetirementRequested => {
-                return self.run_close_runtime_retirement(attempt_id).await;
-            }
             ClosePhase::AwaitingRetirementInspection => {}
             _ => return Ok(()),
         }
@@ -1223,7 +1308,9 @@ impl RuntimeManager {
             .await
             .map_err(|error| error.to_string())?;
         if current.phase() == ClosePhase::RetirementRequested {
-            self.run_close_runtime_retirement(attempt_id).await?;
+            let snapshot = current.snapshot().cloned()
+                .ok_or_else(|| "Close Retry has no committed inspection snapshot".to_string())?;
+            self.run_close_runtime_retirement(GenericRetirementAuthority::Retry { attempt_id, snapshot }).await?;
         }
         Ok(())
     }
@@ -1243,11 +1330,27 @@ impl RuntimeManager {
             .ok_or_else(|| "server inspection did not persist aggregate snapshot".to_string())
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn persist_close_retirement_inspection(
         &self,
         attempt_id: &CloseAttemptId,
     ) -> Result<Option<DispatchedWorktreeAbsence>, String> {
+        match self.collect_close_retirement_inspection(attempt_id).await? {
+            CollectedCloseInspection::Present { request, replacement_generation } => {
+                self.db()
+                    .replace_close_inspection_with_empty_generation(request, replacement_generation.as_deref())
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok(None)
+            }
+            CollectedCloseInspection::DispatchedAbsence(absence) => Ok(Some(absence)),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn collect_close_retirement_inspection(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> Result<CollectedCloseInspection, String> {
         let prior_obligation = self
             .db()
             .get_close_obligation(attempt_id.as_str())
@@ -1337,7 +1440,7 @@ impl RuntimeManager {
                     } else {
                         None
                     };
-                    return Ok(Some(DispatchedWorktreeAbsence {
+                    return Ok(CollectedCloseInspection::DispatchedAbsence(DispatchedWorktreeAbsence {
                         snapshot: prior_snapshot,
                         replacement_generation,
                     }));
@@ -1352,17 +1455,13 @@ impl RuntimeManager {
                 )
                 .await;
         }
-        self.db()
-            .replace_close_inspection_with_empty_generation(
-                ReplaceCloseInspectionRequest {
-                    attempt_id: attempt_id.clone(),
-                    scopes: requests,
-                },
-                reinspection_generation.as_deref(),
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        Ok(None)
+        Ok(CollectedCloseInspection::Present {
+            request: ReplaceCloseInspectionRequest {
+                attempt_id: attempt_id.clone(),
+                scopes: requests,
+            },
+            replacement_generation: reinspection_generation,
+        })
     }
 
     /// Acquires every registry admission fence before Close seals inventory.
@@ -1640,7 +1739,7 @@ impl RuntimeManager {
         attempt_id: CloseAttemptId,
     ) -> Result<(), String> {
         self.start_generic_close_worker(attempt_id, |manager, attempt_id| async move {
-            manager.run_close_runtime_retirement(attempt_id).await
+            manager.run_close_runtime_retirement(GenericRetirementAuthority::Fixture(attempt_id)).await
         })
             .await?
             .await
@@ -1668,7 +1767,7 @@ impl RuntimeManager {
             .retry_close_retirement(&attempt_id)
             .await
             .map_err(|error| GenericCloseRetryError::Admission(error.to_string()))?;
-        let Err(error) = self.run_close_inspection(attempt_id.clone()).await else {
+        let Err(error) = self.run_admitted_generic_retry_inspection(attempt_id.clone()).await else {
             return Ok(());
         };
         let current = self.db().get_close_obligation(attempt_id.as_str()).await
@@ -1697,20 +1796,110 @@ impl RuntimeManager {
     ) -> Result<tokio::task::JoinHandle<Result<(), String>>, String> {
         self.start_generic_close_worker(attempt_id, |manager, attempt_id| async move {
             resume.await.map_err(|error| error.to_string())?;
-            manager.run_close_runtime_retirement(attempt_id).await
+            manager.run_close_runtime_retirement(GenericRetirementAuthority::Fixture(attempt_id)).await
         })
         .await
     }
 
-    pub(crate) async fn start_generic_close_settlement(
+    pub(crate) fn start_generic_close_ingress(
+        self: &Arc<Self>,
+        attempt_id: CloseAttemptId,
+        target: phoenix_core::domain::product_conversation::ProductConversationId,
+        latest: phoenix_core::domain::close::TranscriptConversationId,
+        ingress: GenericCloseIngress,
+    ) -> Result<GenericCloseIngressWorker, String> {
+        let stop_admission = match ingress {
+            GenericCloseIngress::Initial => None,
+            GenericCloseIngress::ConfirmStop(admission) => Some(admission),
+        };
+        self.spawn_generic_close_owner(
+            attempt_id.clone(),
+            stop_admission,
+            move |manager, stop_guard| async move {
+                use crate::db::GenericCloseAdmission;
+
+                let admission = if let Some(stop_guard) = stop_guard {
+                    let confirmed = manager
+                        .db()
+                        .confirm_generic_close_stop_work(&target, &latest, &attempt_id)
+                        .await;
+                    drop(stop_guard);
+                    GenericCloseAdmission::InsertedSettling(
+                        confirmed.map_err(GenericCloseIngressError::Admission)?,
+                    )
+                } else {
+                    manager
+                        .db()
+                        .begin_generic_close_settlement(&target, &latest, &attempt_id)
+                        .await
+                        .map_err(GenericCloseIngressError::Admission)?
+                };
+                Ok(match admission {
+                    GenericCloseAdmission::InsertedSettling(settlement) => {
+                        manager.settle_close_obligation(settlement).await?;
+                        GenericCloseIngressOutcome::Continued
+                    }
+                    GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
+                    | GenericCloseAdmission::Existing(obligation) => {
+                        GenericCloseIngressOutcome::Observed(Box::new(obligation))
+                    }
+                })
+            },
+        )
+    }
+
+    pub(super) fn start_generic_close_settlement(
         self: &Arc<Self>,
         settlement: crate::db::GenericCloseSettlement,
     ) -> Result<tokio::task::JoinHandle<Result<bool, String>>, String> {
         let attempt_id = settlement.obligation().attempt_id().clone();
-        self.start_generic_close_worker(attempt_id, |manager, _| async move {
+        self.spawn_generic_close_owner(attempt_id.clone(), None, move |manager, _| async move {
+            let settlement = manager
+                .waiting_generic_close_owners
+                .lock()
+                .await
+                .remove(&attempt_id)
+                .unwrap_or(settlement);
             manager.settle_close_obligation(settlement).await
         })
-        .await
+    }
+
+    fn spawn_generic_close_owner<F, Fut, T, E>(
+        self: &Arc<Self>,
+        attempt_id: CloseAttemptId,
+        stop_admission: Option<Arc<tokio::sync::Mutex<()>>>,
+        operation: F,
+    ) -> Result<tokio::task::JoinHandle<Result<T, E>>, String>
+    where
+        F: FnOnce(Arc<Self>, Option<tokio::sync::OwnedMutexGuard<()>>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = Result<T, E>> + Send,
+        T: Send + 'static,
+        E: From<String> + Send + 'static,
+    {
+        let owner = self
+            .acquire_local_authority_pass()
+            .map_err(|()| "local authority closed before Close settlement".to_string())?;
+        let manager = Arc::clone(self);
+        Ok(tokio::spawn(async move {
+            let _owner = owner;
+            let stop_guard = match stop_admission {
+                Some(admission) => Some(admission.lock_owned().await),
+                None => None,
+            };
+            let _execution = manager.close_retirement_execution.lock(attempt_id.as_str()).await;
+            use futures::FutureExt as _;
+            manager.require_local_authority_admission().map_err(E::from)?;
+            match std::panic::AssertUnwindSafe(operation(Arc::clone(&manager), stop_guard))
+                .catch_unwind()
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => {
+                    manager.signal_fatal_local_authority("generic Close settlement panic");
+                    Err(E::from("Close settlement worker panicked; recovery must use retained facts".to_string()))
+                }
+            }
+        }))
     }
 
     async fn start_generic_close_worker<F, Fut, T>(
@@ -1739,13 +1928,35 @@ impl RuntimeManager {
     }
 
     #[allow(clippy::too_many_lines)]
-    async fn run_close_runtime_retirement(&self, attempt_id: CloseAttemptId) -> Result<(), String> {
+    async fn run_close_runtime_retirement(
+        &self,
+        authority: GenericRetirementAuthority,
+    ) -> Result<(), String> {
+        let (attempt_id, expected_snapshot, policy) = match authority {
+            GenericRetirementAuthority::Fresh(fresh) => {
+                let (attempt_id, snapshot) = fresh.into_parts();
+                (attempt_id, Some(snapshot), GenericRemovalPolicy::Initial)
+            }
+            GenericRetirementAuthority::Retry { attempt_id, snapshot } => {
+                (attempt_id, Some(snapshot), GenericRemovalPolicy::RetainedOnly)
+            }
+            #[cfg(test)]
+            GenericRetirementAuthority::Fixture(attempt_id) => {
+                (attempt_id, None, GenericRemovalPolicy::Initial)
+            }
+        };
         let run = CloseRunRef::initial(attempt_id.clone());
         let obligation = self
             .db()
             .get_close_obligation(attempt_id.as_str())
             .await
             .map_err(|error| error.to_string())?;
+        if expected_snapshot.as_ref().is_some_and(|expected| {
+            obligation.phase() != ClosePhase::RetirementRequested
+                || obligation.snapshot() != Some(expected)
+        }) {
+            return Err("Close retirement no longer owns its inspection snapshot".into());
+        }
         if obligation.phase() != ClosePhase::RetirementRequested {
             return Ok(());
         }
@@ -1757,6 +1968,12 @@ impl RuntimeManager {
             .snapshot()
             .cloned()
             .ok_or_else(|| "retirement requested without an inspection snapshot".to_string())?;
+        if policy == GenericRemovalPolicy::RetainedOnly
+            && !self.db().close_retirement_inventory_is_complete(attempt_id.as_str())
+                .await.map_err(|error| error.to_string())?
+        {
+            return Err("Close Retry cannot create a new retirement inventory".into());
+        }
         let targets = self
             .prepare_close_retirement_targets(&attempt_id, &snapshot)
             .await?;
@@ -2011,7 +2228,7 @@ impl RuntimeManager {
                 }
             };
         }
-        self.retire_close_worktrees_and_scopes(&run, &snapshot, None)
+        self.retire_close_worktrees_and_scopes(&run, &snapshot, None, policy)
             .await?;
         self.complete_close_retirement_and_publish(&attempt_id)
             .await?;
@@ -2498,12 +2715,23 @@ impl RuntimeManager {
         Ok(())
     }
 
+    async fn fence_unclassified_generic_worktree_effect(
+        &self,
+        persistence_uncertain: &std::sync::atomic::AtomicBool,
+    ) {
+        if persistence_uncertain.load(std::sync::atomic::Ordering::SeqCst) {
+            self.signal_fatal_local_authority("generic_close_worktree_physical_unclassified");
+            std::future::pending::<()>().await;
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn retire_close_worktrees_and_scopes(
         &self,
         run: &CloseRunRef,
         snapshot: &CloseRetirementSnapshot,
         plan: Option<&[CloseSafeRetryEffect]>,
+        policy: GenericRemovalPolicy,
     ) -> Result<(), String> {
         let attempt_id = &run.attempt_id;
         let targets = self
@@ -2652,8 +2880,9 @@ impl RuntimeManager {
                             let confirmed_snapshot = confirmed.snapshot;
                             let identity = identity.clone();
                             let cleanup_plan = cleanup_plan.clone();
+                            let persistence_uncertain = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let writer_probe = CloseWriterProbe {
-                                persistence_uncertain: None,
+                                persistence_uncertain: Some(Arc::clone(&persistence_uncertain)),
                                 #[cfg(test)]
                                 clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
@@ -2683,6 +2912,7 @@ impl RuntimeManager {
                                 )
                             })
                             .await;
+                            self.fence_unclassified_generic_worktree_effect(&persistence_uncertain).await;
                             let recovery = match recovery {
                                 Ok(recovery) => recovery,
                                 Err(error) => {
@@ -2794,8 +3024,9 @@ impl RuntimeManager {
                                 })?;
                             let confirmed_snapshot = confirmed.snapshot;
                             let identity = identity.clone();
+                            let persistence_uncertain = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let writer_probe = CloseWriterProbe {
-                                persistence_uncertain: None,
+                                persistence_uncertain: Some(Arc::clone(&persistence_uncertain)),
                                 #[cfg(test)]
                                 clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
@@ -2826,6 +3057,7 @@ impl RuntimeManager {
                                 )
                             })
                             .await;
+                            self.fence_unclassified_generic_worktree_effect(&persistence_uncertain).await;
                             let recovery = match recovery {
                                 Ok(recovery) => recovery,
                                 Err(error) => {
@@ -2905,6 +3137,13 @@ impl RuntimeManager {
                                 }
                             };
                             let is_original = prepared.inspection_path == worktree_path(identity);
+                            if is_original && policy == GenericRemovalPolicy::RetainedOnly {
+                                return self.record_close_cleanup_failure(
+                                    run, snapshot, &scope, target.resource.clone(),
+                                    RetirementFailureReason::IdentityNotProven,
+                                    "Close Retry cannot take fresh custody of an original worktree",
+                                ).await;
+                            }
                             if is_original {
                                 let (fresh, _) = match inspect_worktree_at_until(
                                     identity,
@@ -3019,8 +3258,9 @@ impl RuntimeManager {
                             let snapshot_for_tombstone = snapshot.clone();
                             let runtime = tokio::runtime::Handle::current();
                             let persistence_runtime = runtime.clone();
+                            let persistence_uncertain = Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let writer_probe = CloseWriterProbe {
-                                persistence_uncertain: None,
+                                persistence_uncertain: Some(Arc::clone(&persistence_uncertain)),
                                 #[cfg(test)]
                                 clean_writer_fixture: self.clean_close_writer_fixture,
                                 db: self.db().clone(),
@@ -3073,10 +3313,11 @@ impl RuntimeManager {
                                         }
                                     },
                                     |_| {},
-                                    CloseWorktreeEffects::production(writer_probe, removal_entry)?,
+                                    CloseWorktreeEffects::production(writer_probe, removal_entry, policy)?,
                                 )
                             })
                             .await;
+                            self.fence_unclassified_generic_worktree_effect(&persistence_uncertain).await;
                             let final_removal = match final_removal {
                                 Ok(final_removal) => final_removal,
                                 Err(error) => {
@@ -6728,7 +6969,7 @@ impl<F, B, A, O, E> WorktreeDeletionDriver for CallbackWorktreeDeletionDriver<'_
 where
     F: FnOnce(&Path),
     B: FnMut(&Path, (u64, u64), Option<(u64, u64)>) -> Result<(), String>,
-    A: FnOnce(&Path, &Path) -> Result<(), String>,
+    A: FnOnce(&Path, &Path, Option<&SelfDeletionDescriptorBorrow<'_>>) -> Result<(), String>,
     O: Fn(&Path) -> Result<String, String>,
     E: WorktreeMutationExecutor,
 {
@@ -6754,9 +6995,9 @@ where
         &mut self,
         root: &Path,
         object: &Path,
-        _self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
+        self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
     ) -> Result<(), String> {
-        self.after.take().expect("one final move")(root, object)
+        self.after.take().expect("one final move")(root, object, self_descriptor)
     }
 }
 
@@ -6789,7 +7030,11 @@ where
         &mut CallbackWorktreeDeletionDriver {
             before: Some(before_final_move),
             bind: bind_root,
-            after: Some(after_identity_observation),
+            after: Some(
+                move |root: &Path, object: &Path, _: Option<&SelfDeletionDescriptorBorrow<'_>>| {
+                    after_identity_observation(root, object)
+                },
+            ),
             observe: observe_identity,
             executor,
         },
@@ -7676,15 +7921,22 @@ impl ExternalWriterEvidence {
         )
     }
 
-    // Preserve one representative unknown unless verified authority supersedes it.
-    // Only the final observation is persisted, so it cannot conflict with the
-    // immutable per-detector evidence key for this run.
+    fn blocks_initial_removal(&self) -> bool {
+        match self {
+            Self::NoPositiveEvidence => false,
+            Self::Observed(CloseWriterObservation::InspectionGap {
+                pid: Some(_),
+                reason,
+                ..
+            }) => !is_residual_process_gap(*reason),
+            Self::Observed(_) => true,
+        }
+    }
+
     fn remember_gap(&mut self, evidence: Self) {
-        if matches!(self, Self::NoPositiveEvidence)
-            && matches!(
-                evidence,
-                Self::Observed(CloseWriterObservation::InspectionGap { .. })
-            )
+        if matches!(evidence, Self::Observed(CloseWriterObservation::InspectionGap { .. }))
+            && (matches!(self, Self::NoPositiveEvidence)
+                || (!self.blocks_initial_removal() && evidence.blocks_initial_removal()))
         {
             *self = evidence;
         }
@@ -7701,6 +7953,10 @@ impl From<CloseWriterGap> for WriterScanError {
     fn from(gap: CloseWriterGap) -> Self {
         Self::Gap(gap)
     }
+}
+
+fn is_residual_process_gap(reason: CloseWriterGap) -> bool {
+    matches!(reason, CloseWriterGap::Unavailable)
 }
 
 fn writer_scan_check(deadline: std::time::Instant) -> Result<(), WriterScanError> {
@@ -7730,7 +7986,9 @@ fn scan_writer_entries<T, M>(
             Ok(Some(authority)) => return Ok(Some(authority)),
             Ok(None) => {}
             Err(WriterScanError::Gap(reason)) => {
-                gap.get_or_insert(reason);
+                if gap.is_none_or(|prior| is_residual_process_gap(prior) && !is_residual_process_gap(reason)) {
+                    gap = Some(reason);
+                }
             }
             Err(error @ WriterScanError::Stopped(_)) => return Err(error),
         }
@@ -7758,8 +8016,6 @@ fn writer_gap(
 
 #[derive(Clone)]
 pub(crate) struct CloseWriterProbe {
-    // Native execution must not classify an untyped writer-observation commit
-    // error as a proven terminal failure.
     persistence_uncertain: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     #[cfg(test)]
     clean_writer_fixture: bool,
@@ -7793,6 +8049,22 @@ impl CloseWriterProbe {
             ));
         }
         Ok(evidence)
+    }
+
+    fn observe_for_removal<F>(
+        &self,
+        path: &Path,
+        deadline: std::time::Instant,
+        policy: GenericRemovalPolicy,
+        production: F,
+    ) -> Result<ExternalWriterEvidence, String>
+    where
+        F: FnOnce(&Path, std::time::Instant) -> Result<ExternalWriterEvidence, String>,
+    {
+        match policy {
+            GenericRemovalPolicy::Initial => self.observe_and_retain_until(path, deadline, production),
+            GenericRemovalPolicy::RetainedOnly => self.observe_until(path, deadline, production),
+        }
     }
 
     fn observe_and_retain_until<F>(
@@ -8728,6 +9000,20 @@ fn linux_writer_scan_until(
             Err(WriterScanError::Stopped(message)) => return Err(message),
             Err(WriterScanError::Gap(reason)) => {
                 incomplete.remember_gap(writer_gap(detector, Some(pid), reason));
+                let observed = inspect(&process.path(), &canonical);
+                check_directory_deletion_deadline(Some(deadline))?;
+                match observed {
+                    Ok(Some(_)) => incomplete.remember_gap(writer_gap(
+                        detector,
+                        Some(pid),
+                        CloseWriterGap::ProcessChanged,
+                    )),
+                    Ok(None) => {}
+                    Err(WriterScanError::Stopped(message)) => return Err(message),
+                    Err(WriterScanError::Gap(reason)) => {
+                        incomplete.remember_gap(writer_gap(detector, Some(pid), reason));
+                    }
+                }
                 continue;
             }
         };
@@ -9824,8 +10110,18 @@ pub(super) struct CloseWorktreeEffects {
     removal_entry: WorktreeRemovalEntry,
     stop_fsmonitor: StopFsmonitorEffect,
     first_submodule_spawn_admission: Option<SubmoduleSpawnAdmissionEffect>,
-    observe_open_descriptors: OpenDescriptorsEffect,
-    observe_external_writer: ExternalWriterEffect,
+    writers: WorktreeRemovalWriterChecks,
+}
+
+enum WorktreeRemovalWriterChecks {
+    Quarantine {
+        descriptors: OpenDescriptorsEffect,
+        external: ExternalWriterEffect,
+    },
+    MovedObject {
+        probe: CloseWriterProbe,
+        policy: GenericRemovalPolicy,
+    },
 }
 
 enum WorktreeRemovalEntry {
@@ -9838,12 +10134,25 @@ enum WorktreeRemovalEntry {
 
 impl CloseWorktreeEffects {
     fn for_admitted_native_retry(probe: CloseWriterProbe) -> Self {
-        Self::writer_probes(probe, WorktreeRemovalEntry::AdmittedNativeRetry)
+        let descriptor_probe = probe.clone();
+        Self::with_writer_checks(
+            WorktreeRemovalEntry::AdmittedNativeRetry,
+            WorktreeRemovalWriterChecks::Quarantine {
+                descriptors: Box::new(move |path, deadline| {
+                    descriptor_probe.observe_until(path, deadline, quarantine_has_open_descriptors_until)
+                }),
+                external: Box::new(move |path, deadline| {
+                    Ok(probe.observe_until(path, deadline, quarantine_has_external_writer_until)?
+                        .blocks_retirement())
+                }),
+            },
+        )
     }
 
     fn production(
         probe: CloseWriterProbe,
         removal_entry: WorktreeRemovalEntry,
+        policy: GenericRemovalPolicy,
     ) -> Result<Self, String> {
         if let WorktreeRemovalEntry::GenericOriginal(first) = &removal_entry {
             let request = first.request();
@@ -9856,30 +10165,32 @@ impl CloseWorktreeEffects {
                 return Err("first dispatch does not match the worktree writer evidence target".to_string());
             }
         }
-        Ok(Self::writer_probes(probe, removal_entry))
+        Ok(Self::with_writer_checks(
+            removal_entry,
+            WorktreeRemovalWriterChecks::MovedObject { probe, policy },
+        ))
     }
 
-    fn writer_probes(probe: CloseWriterProbe, removal_entry: WorktreeRemovalEntry) -> Self {
-        let descriptor_probe = probe.clone();
+    fn with_writer_checks(
+        removal_entry: WorktreeRemovalEntry,
+        writers: WorktreeRemovalWriterChecks,
+    ) -> Self {
         Self {
             removal_entry,
             stop_fsmonitor: Box::new(|path, deadline, admission| {
                 stop_bound_fsmonitor_daemons_with_admission_until(path, deadline, admission)
             }),
             first_submodule_spawn_admission: None,
-            observe_open_descriptors: Box::new(move |path, deadline| {
-                descriptor_probe.observe_until(
-                    path,
-                    deadline,
-                    quarantine_has_open_descriptors_until,
-                )
-            }),
-            observe_external_writer: Box::new(move |path, deadline| {
-                Ok(probe
-                    .observe_until(path, deadline, quarantine_has_external_writer_until)?
-                    .blocks_retirement())
-            }),
+            writers,
         }
+    }
+
+    #[cfg(test)]
+    fn writer_checks_for_test(&mut self) -> (&mut OpenDescriptorsEffect, &mut ExternalWriterEffect) {
+        let WorktreeRemovalWriterChecks::Quarantine { descriptors, external } = &mut self.writers else {
+            panic!("expected quarantine writer fixture");
+        };
+        (descriptors, external)
     }
 }
 
@@ -10001,8 +10312,7 @@ where
         removal_entry,
         stop_fsmonitor,
         first_submodule_spawn_admission,
-        observe_open_descriptors,
-        observe_external_writer,
+        writers,
     } = effects;
     let path = worktree_path(identity);
     let quarantine = worktree_quarantine_path(identity)?;
@@ -10128,16 +10438,6 @@ where
         check_directory_deletion_deadline(Some(deadline))?;
         after_quarantine(&path);
         check_directory_deletion_deadline(Some(deadline))?;
-        let open_descriptors = observe_open_descriptors(&quarantine, deadline)?;
-        check_directory_deletion_deadline(Some(deadline))?;
-        if open_descriptors.blocks_retirement() {
-            return Ok(ExactWorktreeRemoval::Residual {
-                detail: format!(
-                    "open descriptors can still modify the confirmed worktree; retained at {}",
-                    quarantine.display()
-                ),
-            });
-        }
         if path
             .try_exists()
             .map_err(|error| format!("cannot inspect original worktree path: {error}"))?
@@ -10151,16 +10451,32 @@ where
             });
         }
         check_directory_deletion_deadline(Some(deadline))?;
-        let external_writer = observe_external_writer(&quarantine, deadline)?;
-        check_directory_deletion_deadline(Some(deadline))?;
-        if external_writer {
-            return Ok(ExactWorktreeRemoval::Residual {
-                detail: format!(
-                    "an external process can still write the confirmed worktree; retained at {}",
-                    quarantine.display()
-                ),
-            });
-        }
+        let moved_writer = match writers {
+            WorktreeRemovalWriterChecks::Quarantine { descriptors, external } => {
+                let open_descriptors = descriptors(&quarantine, deadline)?;
+                check_directory_deletion_deadline(Some(deadline))?;
+                if open_descriptors.blocks_retirement() {
+                    return Ok(ExactWorktreeRemoval::Residual {
+                        detail: format!(
+                            "open descriptors can still modify the confirmed worktree; retained at {}",
+                            quarantine.display()
+                        ),
+                    });
+                }
+                let external_writer = external(&quarantine, deadline)?;
+                check_directory_deletion_deadline(Some(deadline))?;
+                if external_writer {
+                    return Ok(ExactWorktreeRemoval::Residual {
+                        detail: format!(
+                            "an external process can still write the confirmed worktree; retained at {}",
+                            quarantine.display()
+                        ),
+                    });
+                }
+                None
+            }
+            WorktreeRemovalWriterChecks::MovedObject { probe, policy } => Some((probe, policy)),
+        };
         if let Err(detail) =
             verify_confirmed_snapshot(&quarantine, Some(&verified_git_bindings))
         {
@@ -10176,22 +10492,49 @@ where
         let expected = observe_worktree_fingerprint(&quarantine).ok_or_else(|| {
             "cannot observe quarantined worktree identity before final deletion".to_string()
         })?;
-        remove_identity_bound_directory_with_deadline(
+        remove_identity_bound_directory_with_driver(
             &quarantine,
-            final_tombstone
-                .as_ref()
-                .map(|binding| binding.root.as_path()),
+            final_tombstone.as_ref().map(|binding| binding.root.as_path()),
             &expected,
-            |path| {
-                observe_worktree_fingerprint(path).ok_or_else(|| {
-                    "cannot observe worktree identity in final tombstone".to_string()
-                })
-            },
-            |_| {},
-            bind_tombstone,
-            |_, object| verify_confirmed_snapshot(object, Some(&verified_git_bindings)),
             "quarantined worktree",
             Some(deadline),
+            &mut CallbackWorktreeDeletionDriver {
+                before: Some(|_: &Path| {}),
+                bind: bind_tombstone,
+                observe: |object: &Path| {
+                    observe_worktree_fingerprint(object).ok_or_else(|| {
+                        "cannot observe worktree identity in final tombstone".to_string()
+                    })
+                },
+                after: Some(
+                    |_: &Path, object: &Path, self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>| {
+                        if let Some((probe, policy)) = moved_writer {
+                            let evidence = probe.observe_for_removal(
+                                object,
+                                deadline,
+                                policy,
+                                |path, deadline| {
+                                    quarantine_has_external_writer_until_with_self_descriptor(
+                                        path, deadline, self_descriptor,
+                                    )
+                                },
+                            )?;
+                            let blocked = match policy {
+                                GenericRemovalPolicy::Initial => evidence.blocks_initial_removal(),
+                                GenericRemovalPolicy::RetainedOnly => evidence.blocks_retirement(),
+                            };
+                            if blocked {
+                                return Err(format!(
+                                    "Close writer evidence prevents unlink; worktree retained at {}",
+                                    object.display(),
+                                ));
+                            }
+                        }
+                        verify_confirmed_snapshot(object, Some(&verified_git_bindings))
+                    },
+                ),
+                executor: &mut DirectWorktreeMutationExecutor,
+            },
         )?;
         remove_exact_worktree_administrative_dir_until(
             &administrative_dir,
@@ -14583,8 +14926,8 @@ mod tests {
         let mut effects = injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning));
         // Keep persistence and fsmonitor fixture-local; use the actual host
         // descriptor, cwd, and mapping probes at the normal removal boundary.
-        effects.observe_open_descriptors = Box::new(super::quarantine_has_open_descriptors_until);
-        effects.observe_external_writer = Box::new(|path, deadline| {
+        *effects.writer_checks_for_test().0 = Box::new(super::quarantine_has_open_descriptors_until);
+        *effects.writer_checks_for_test().1 = Box::new(|path, deadline| {
             Ok(super::quarantine_has_external_writer_until(path, deadline)?.blocks_retirement())
         });
         let outcome = super::quarantine_and_remove_exact_worktree_with_effects(
@@ -17712,6 +18055,13 @@ mod tests {
         assert_eq!(unknown, gap().unwrap());
         assert!(!unknown.is_positive());
         assert!(unknown.blocks_retirement(), "strict paths still block");
+        assert!(!unknown.blocks_initial_removal(), "per-process opacity is residual");
+        let global_gap = || Ok(super::writer_gap(
+            CloseWriterDetector::MacDescriptor, None, CloseWriterGap::Unavailable,
+        ));
+        let blocked = super::scan_writer_detectors(deadline, gap, global_gap, no_evidence).unwrap();
+        assert_eq!(blocked, global_gap().unwrap());
+        assert!(blocked.blocks_initial_removal());
 
         let positive = super::scan_writer_detectors(deadline, gap, no_evidence, || {
             Ok(injected_writer_evidence())
@@ -17719,6 +18069,7 @@ mod tests {
         .unwrap();
         assert_eq!(positive, injected_writer_evidence());
         assert!(positive.is_positive());
+        assert!(positive.blocks_initial_removal());
 
         let failure = super::scan_writer_detectors(
             deadline,
@@ -17776,10 +18127,12 @@ mod tests {
             removal_entry: super::WorktreeRemovalEntry::Test,
             stop_fsmonitor: Box::new(move |path, _deadline, _admission| stop_fsmonitor(path)),
             first_submodule_spawn_admission: None,
-            observe_open_descriptors: Box::new(|_, _| {
-                Ok(super::ExternalWriterEvidence::NoPositiveEvidence)
-            }),
-            observe_external_writer: Box::new(|_, _| Ok(false)),
+            writers: super::WorktreeRemovalWriterChecks::Quarantine {
+                descriptors: Box::new(|_, _| {
+                    Ok(super::ExternalWriterEvidence::NoPositiveEvidence)
+                }),
+                external: Box::new(|_, _| Ok(false)),
+            },
         }
     }
 
@@ -17792,12 +18145,14 @@ mod tests {
             removal_entry: super::WorktreeRemovalEntry::Test,
             stop_fsmonitor: Box::new(move |path, _deadline, _admission| stop_fsmonitor(path)),
             first_submodule_spawn_admission: None,
-            observe_open_descriptors: Box::new(|_, _| {
-                panic!("must not scan for open descriptors before quarantine commits")
-            }),
-            observe_external_writer: Box::new(|_, _| {
-                panic!("must not scan for an external writer before quarantine commits")
-            }),
+            writers: super::WorktreeRemovalWriterChecks::Quarantine {
+                descriptors: Box::new(|_, _| {
+                    panic!("must not scan for open descriptors before quarantine commits")
+                }),
+                external: Box::new(|_, _| {
+                    panic!("must not scan for an external writer before quarantine commits")
+                }),
+            },
         }
     }
 
@@ -17857,7 +18212,7 @@ mod tests {
         let writer_pid = std::process::id();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         let mut effects = injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning));
-        effects.observe_open_descriptors = Box::new(move |quarantine, deadline| {
+        *effects.writer_checks_for_test().0 = Box::new(move |quarantine, deadline| {
             let evidence = super::quarantine_has_open_descriptors_until(quarantine, deadline)?;
             assert!(
                 matches!(
@@ -17879,7 +18234,7 @@ mod tests {
             );
             Ok(evidence)
         });
-        effects.observe_external_writer = Box::new(|_, _| {
+        *effects.writer_checks_for_test().1 = Box::new(|_, _| {
             panic!("descriptor evidence must refuse retirement before the next writer scan")
         });
 
@@ -17921,12 +18276,12 @@ mod tests {
             let incarnation = observe_administrative_dir_incarnation(&admin).unwrap();
             let mut effects =
                 injected_close_worktree_effects(|_| Ok(super::FsmonitorStop::NotRunning));
-            effects.observe_open_descriptors = Box::new(move |_, _| match observation {
+            *effects.writer_checks_for_test().0 = Box::new(move |_, _| match observation {
                 0 => Ok(injected_writer_evidence()),
                 1 => Err("injected descriptor observation failure".into()),
                 _ => Ok(super::ExternalWriterEvidence::NoPositiveEvidence),
             });
-            effects.observe_external_writer = Box::new(move |_, _| match observation {
+            *effects.writer_checks_for_test().1 = Box::new(move |_, _| match observation {
                 2 => Ok(true),
                 3 => Err("injected writer observation failure".into()),
                 _ => panic!("later writer observation must not run after descriptor rejection"),

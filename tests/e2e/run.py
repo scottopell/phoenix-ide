@@ -2288,7 +2288,9 @@ SCENARIO_MAP = dict(SCENARIOS)
 def _parse_args(argv: list[str]):
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true")
-    parser.add_argument("--isolated-git-lifecycle", action="store_true")
+    qualification = parser.add_mutually_exclusive_group()
+    qualification.add_argument("--isolated-git-lifecycle", action="store_true")
+    qualification.add_argument("--ordinary-git-lifecycle", type=Path, metavar="SOURCE_SHA_FILE")
     parser.add_argument(
         "--scenario",
         action="append",
@@ -2299,8 +2301,8 @@ def _parse_args(argv: list[str]):
     args = parser.parse_args(argv)
     if args.positional:
         parser.error(f"unrecognized arguments: {' '.join(args.positional)}")
-    if args.isolated_git_lifecycle and (args.self_test or args.scenario):
-        parser.error("--isolated-git-lifecycle is a fixed standalone selector")
+    if (args.isolated_git_lifecycle or args.ordinary_git_lifecycle) and (args.self_test or args.scenario):
+        parser.error("Git lifecycle qualification is a fixed standalone selector")
     return args
 
 
@@ -2826,6 +2828,13 @@ class ScenarioSelectorTests(unittest.TestCase):
             with self.subTest(other=other), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
                 _parse_args([flag, *other])
 
+    def test_ordinary_git_lifecycle_uses_a_prepared_sha_and_cannot_select_other_work(self):
+        flag = ["--ordinary-git-lifecycle", "source.sha"]
+        self.assertEqual(_parse_args(flag).ordinary_git_lifecycle, Path("source.sha"))
+        for other in (["--scenario", "git_lifecycle_public_http"], ["--self-test"], ["--isolated-git-lifecycle"]):
+            with self.subTest(other=other), mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                _parse_args([*flag, *other])
+
     def test_parse_args_rejects_positional_arguments(self):
         with self.assertRaises(SystemExit):
             _parse_args(["product_conversation_context_continuation"])
@@ -3020,7 +3029,9 @@ def _run_self_tests() -> int:
     return 0 if result.wasSuccessful() else 1
 
 
-def _verify_isolated_server(base_url: str, pid: int, binary: Path, expected_sha: str) -> None:
+def _verify_qualified_linux_server(
+    base_url: str, pid: int, binary: Path, expected_sha: str, *, isolated: bool
+) -> None:
     version = httpx.get(f"{base_url}/api/version", timeout=10.0)
     version.raise_for_status()
     assert version.json()["git_sha"] == expected_sha, version.text
@@ -3033,10 +3044,13 @@ def _verify_isolated_server(base_url: str, pid: int, binary: Path, expected_sha:
     credentials = dict(line.split(":", 1) for line in (server_proc / "status").read_text().splitlines())
     uid = os.getuid()
     assert uid != 0 and credentials["Uid"].split() == [str(uid)] * 4
-    assert not credentials["Groups"].split()
-    assert credentials["NoNewPrivs"].strip() == "1"
-    assert all(int(credentials[f"Cap{kind}"], 16) == 0 for kind in ("Inh", "Prm", "Eff", "Bnd", "Amb"))
-    print(f"[e2e] isolated server source={expected_sha} uid={uid} pid={pid}", flush=True)
+    assert all(int(credentials[f"Cap{kind}"], 16) == 0 for kind in ("Inh", "Prm", "Eff", "Amb"))
+    if isolated:
+        assert not credentials["Groups"].split()
+        assert credentials["NoNewPrivs"].strip() == "1"
+        assert int(credentials["CapBnd"], 16) == 0
+    context = "isolated" if isolated else "ordinary Linux"
+    print(f"[e2e] {context} server source={expected_sha} uid={uid} pid={pid}", flush=True)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3044,10 +3058,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return _run_self_tests()
     binary = BINARY
+    expected_sha = None
     if args.isolated_git_lifecycle:
         selected_scenarios = _select_scenarios(["git_lifecycle_public_http"])
         binary = Path.cwd() / "runtime-test"
         expected_sha = (Path(__file__).parent / "source.sha").read_text().strip()
+    elif args.ordinary_git_lifecycle:
+        selected_scenarios = _select_scenarios(["git_lifecycle_public_http"])
+        expected_sha = args.ordinary_git_lifecycle.read_text().strip()
     else:
         if _run_self_tests() != 0:
             return 1
@@ -3058,9 +3076,11 @@ def main(argv: list[str] | None = None) -> int:
     workers = _e2e_worker_budget()
     with _server(binary) as (base_url, log_path, server_pid, profile_dir):
         print(f"[e2e] server up at {base_url}", flush=True)
-        if args.isolated_git_lifecycle:
+        if expected_sha is not None:
             try:
-                _verify_isolated_server(base_url, server_pid, binary, expected_sha)
+                _verify_qualified_linux_server(
+                    base_url, server_pid, binary, expected_sha, isolated=args.isolated_git_lifecycle
+                )
             except Exception:
                 print("\n".join(log_path.read_text().splitlines()[-80:]), file=sys.stderr)
                 raise
