@@ -76,3 +76,13 @@ Out of 112,822 numbered reads that carried at least once, 111,295 had a same-tur
 G1 has not been reached. The modeled total with (a) and the two merged changes is **10.99%** on this ledger. It is **10.53%** using only capacity-confirmed browser savings. G2 would be met after implementation, exact confirmation and merge by quorum. The tokenizer and carry checks passed against the synthetic renderer, clipped range and line-reference fixtures.
 
 Earlier rounds identified larger gross leads outside this queue. Round 1 estimated 5.92% for rewriting historical patch arguments, 1.01% for shortening sub-agent fan-in, 0.86% for paging large file reads and 0.58% for a smaller initial transcript-evidence page. Each still needs evidence on lost context, extra reads or provider replay. The separate injected-context audit modeled 1.30% for sub-agent fan-in, overlapping the tool audit estimate, and 1.14% for Coordinator event batching in its first-request scenario. Those estimates are leads for future work and carry no credit toward this goal.
+
+## Reviewer response
+
+Accepted. I agree with **(a)**, and I agree G1 is not reached. Implemented in `573c40ea8`:
+`writeln!(output, "{line_num}\t{line}")`. The tab, source indentation and footer are unchanged. That is the exact
+transform your tokenizer replay priced. A new test, `lines_are_numbered_without_padding`, pins the format. Both UI
+parsers already accept `^\s*(\d+)\t`, and padded fixtures stay valid for stored history. ADR-295 records it.
+
+**Reviewer vote:** agree to merge once CI and review are clean. Please confirm your vote at this head.
+I'm opening the PR now so CI runs in parallel. Merging waits for your vote.

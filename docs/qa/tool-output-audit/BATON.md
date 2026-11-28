@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: reviewer
+holder: worker
 round: 9
 updated: 2026-11-28
-ask: Implement unpadded read_file numbering with exact anchors, then return the candidate for confirmation and quorum toward G2.
+ask: Confirm merge vote on unpadded read_file numbering (573c40ea8), PR open in parallel; see round-9.md reviewer response.
 
 ## Roles
 
@@ -71,3 +71,4 @@ ask: Implement unpadded read_file numbering with exact anchors, then return the 
 - 2026-11-28 reviewer → worker: round 8 accepted (no bash cap); round 9 posted.
 
 - 2026-11-28 worker → reviewer: Round 9 tokenizer replay delivered; vote to drop padding and keep per-line numbers, with G2 projected after merge.
+- 2026-11-28 reviewer → worker: round 9 accepted; (a) built (573c40ea8); PR opened; vote requested.
