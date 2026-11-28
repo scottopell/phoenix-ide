@@ -2,7 +2,10 @@
 
 use crate::api::handlers::AppError;
 use crate::api::{AppState, ConflictErrorResponse};
-use phoenix_core::domain::close::TranscriptConversationId;
+use phoenix_core::domain::close::{
+    CloseAttemptId, CloseObligation, ClosePhase, TranscriptConversationId,
+};
+use phoenix_db::GenericCloseAdmission;
 
 pub(crate) async fn require_close_settlement_without_retained_custody(
     state: &AppState,
@@ -23,14 +26,43 @@ pub(crate) async fn require_close_settlement_without_retained_custody(
         })
 }
 
+fn close_settlement_conflict(detail: String) -> AppError {
+    AppError::Conflict(Box::new(ConflictErrorResponse::new(
+        detail,
+        "close_settlement_in_progress",
+    )))
+}
+
+async fn observe_close_settlement(
+    state: &AppState,
+    attempt_id: &CloseAttemptId,
+) -> Result<CloseObligation, AppError> {
+    let advanced = state
+        .db
+        .get_close_obligation(attempt_id.as_str())
+        .await
+        .map_err(|error| AppError::Internal(error.to_string()))?;
+    if advanced.phase() == ClosePhase::SettlingActiveWork {
+        require_close_settlement_without_retained_custody(state, advanced.attempt_id()).await?;
+    }
+    if matches!(
+        advanced.phase(),
+        ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+    ) {
+        return Err(close_settlement_conflict(
+            "Close settlement remains in progress".into(),
+        ));
+    }
+    Ok(advanced)
+}
+
 #[allow(clippy::too_many_lines, clippy::single_match_else)]
 pub(crate) async fn run_legacy_close_compat(
     state: &AppState,
     id: &str,
     action: &str,
-    require_idle_latest: bool,
 ) -> Result<(), AppError> {
-    use phoenix_core::domain::close::{CloseAttemptId, CloseCompletionOutcome, ClosePhase};
+    use phoenix_core::domain::close::CloseCompletionOutcome;
 
     let transcript = state
         .db
@@ -85,38 +117,44 @@ pub(crate) async fn run_legacy_close_compat(
             }
             let attempt_id = CloseAttemptId::parse(uuid::Uuid::new_v4().to_string())
                 .expect("UUID is a valid Close attempt id");
-            let begin = if require_idle_latest {
-                state
-                    .db
-                    .begin_direct_close_foundation(
-                        &transcript.product_conversation_id,
-                        &expected_latest_transcript,
-                        attempt_id.as_str(),
-                    )
-                    .await
-            } else {
-                state
-                    .db
-                    .begin_generic_close_settlement(
-                        &transcript.product_conversation_id,
-                        &expected_latest_transcript,
-                        &attempt_id,
-                    )
-                    .await
-                    .map(phoenix_db::CloseFoundationAdmission::into_obligation)
-            };
-            begin.map_err(|error| {
-                let error_type =
-                    if matches!(error, crate::db::DbError::CloseFoundationStaleLatest { .. }) {
-                        "stale_latest_close_transcript"
-                    } else {
-                        "close_start_failed"
-                    };
-                AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                    error.to_string(),
-                    error_type,
-                )))
-            })?
+            let admission = state
+                .db
+                .begin_generic_close_settlement(
+                    &transcript.product_conversation_id,
+                    &expected_latest_transcript,
+                    &attempt_id,
+                )
+                .await
+                .map_err(|error| {
+                    let error_type =
+                        if matches!(error, crate::db::DbError::CloseFoundationStaleLatest { .. }) {
+                            "stale_latest_close_transcript"
+                        } else {
+                            "close_start_failed"
+                        };
+                    AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        error.to_string(),
+                        error_type,
+                    )))
+                })?;
+            match admission {
+                GenericCloseAdmission::InsertedSettling(settlement) => {
+                    let attempt_id = settlement.obligation().attempt_id().clone();
+                    state
+                        .runtime
+                        .start_generic_close_settlement(settlement)
+                        .await
+                        .map_err(close_settlement_conflict)?
+                        .await
+                        .map_err(|error| {
+                            close_settlement_conflict(format!("Close settlement worker failed: {error}"))
+                        })?
+                        .map_err(close_settlement_conflict)?;
+                    observe_close_settlement(state, &attempt_id).await?
+                }
+                GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
+                | GenericCloseAdmission::Existing(obligation) => obligation,
+            }
         }
     };
     loop {
@@ -145,31 +183,8 @@ pub(crate) async fn run_legacy_close_compat(
                     .runtime
                     .resume_close_settlements(Some(obligation.attempt_id()))
                     .await
-                    .map_err(|error| {
-                        AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                            error,
-                            "close_settlement_in_progress",
-                        )))
-                    })?;
-                let advanced = state
-                    .db
-                    .get_close_obligation(obligation.attempt_id().as_str())
-                    .await
-                    .map_err(|error| AppError::Internal(error.to_string()))?;
-                if advanced.phase() == ClosePhase::SettlingActiveWork {
-                    require_close_settlement_without_retained_custody(state, advanced.attempt_id())
-                        .await?;
-                }
-                if matches!(
-                    advanced.phase(),
-                    ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
-                ) {
-                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        "Close settlement remains in progress",
-                        "close_settlement_in_progress",
-                    ))));
-                }
-                advanced
+                    .map_err(close_settlement_conflict)?;
+                observe_close_settlement(state, obligation.attempt_id()).await?
             }
             ClosePhase::AwaitingRetirementInspection => {
                 if let Err(error) = state

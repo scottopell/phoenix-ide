@@ -1695,7 +1695,7 @@ impl RuntimeManager {
         .await
     }
 
-    pub(super) async fn start_generic_close_settlement(
+    pub(crate) async fn start_generic_close_settlement(
         self: &Arc<Self>,
         settlement: crate::db::GenericCloseSettlement,
     ) -> Result<tokio::task::JoinHandle<Result<bool, String>>, String> {

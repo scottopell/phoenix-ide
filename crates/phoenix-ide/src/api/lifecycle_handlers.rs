@@ -635,14 +635,14 @@ pub(crate) async fn close_legacy_compat(
     id: &str,
     action: &str,
 ) -> Result<(), AppError> {
-    run_legacy_close_compat(state, id, action, false).await
+    run_legacy_close_compat(state, id, action).await
 }
 
 pub(crate) async fn close_product_conversation_with_active_work(
     state: &AppState,
     id: &str,
 ) -> Result<(), AppError> {
-    run_legacy_close_compat(state, id, "archive", false).await
+    run_legacy_close_compat(state, id, "archive").await
 }
 
 pub(crate) async fn abandon_task(
@@ -655,7 +655,7 @@ pub(crate) async fn abandon_task(
         .await
         .map_err(super::handlers::map_admission_db_error)?;
     let _admission = admission.lock().await;
-    run_legacy_close_compat(&state, &id, "abandon", false).await?;
+    run_legacy_close_compat(&state, &id, "abandon").await?;
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -676,7 +676,7 @@ pub(crate) async fn mark_merged(
         .await
         .map_err(super::handlers::map_admission_db_error)?;
     let _admission = admission.lock().await;
-    run_legacy_close_compat(&state, &id, "mark as merged", false).await?;
+    run_legacy_close_compat(&state, &id, "mark as merged").await?;
     Ok(Json(SuccessResponse { success: true }))
 }
 
@@ -847,11 +847,11 @@ mod tests {
             require_task_lifecycle_admission(&state, &child).await,
             Err(AppError::BadRequest(message)) if message == "Sub-agents cannot own task lifecycle decisions"
         ));
-        assert!(run_legacy_close_compat(&state, &child.id, "abandon", false)
+        assert!(run_legacy_close_compat(&state, &child.id, "abandon")
             .await
             .is_err());
         assert!(
-            run_legacy_close_compat(&state, &child.id, "mark as merged", false)
+            run_legacy_close_compat(&state, &child.id, "mark as merged")
                 .await
                 .is_err()
         );

@@ -23,7 +23,7 @@ use crate::{
     Database, DbError, DbResult,
 };
 
-/// Database-admitted input for the generic background settlement worker.
+/// Database-admitted input for the generic Close settlement worker.
 ///
 /// Initial-origin receipts are immutable: observation adoption does not transfer
 /// a generic operation to the source-owned initial driver. The private field
@@ -38,6 +38,13 @@ impl GenericCloseSettlement {
     pub fn obligation(&self) -> &CloseObligation {
         &self.obligation
     }
+}
+
+#[derive(Debug)]
+pub enum GenericCloseAdmission {
+    InsertedSettling(GenericCloseSettlement),
+    InsertedAwaitingStopWork(CloseObligation),
+    Existing(CloseObligation),
 }
 
 /// Exact generic attempt accepted for pre-retirement cancellation.
@@ -2278,7 +2285,7 @@ impl Database {
         product_conversation_id: &ProductConversationId,
         expected_latest_transcript_id: &TranscriptConversationId,
         attempt_id: &CloseAttemptId,
-    ) -> DbResult<CloseFoundationAdmission> {
+    ) -> DbResult<GenericCloseAdmission> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let admission = Self::begin_close_foundation_inner(
             &mut tx,
@@ -2289,10 +2296,25 @@ impl Database {
         )
         .await?;
         let admission = match admission {
-            CloseFoundationAdmission::Inserted(obligation) => CloseFoundationAdmission::Inserted(
-                Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?,
-            ),
-            CloseFoundationAdmission::Existing(obligation) => CloseFoundationAdmission::Existing(
+            CloseFoundationAdmission::Inserted(obligation) => {
+                let obligation =
+                    Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?;
+                match obligation.phase() {
+                    ClosePhase::SettlingActiveWork => {
+                        GenericCloseAdmission::InsertedSettling(GenericCloseSettlement { obligation })
+                    }
+                    ClosePhase::AwaitingStopWorkConfirmation => {
+                        GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
+                    }
+                    phase => {
+                        return Err(close_precondition(format!(
+                            "new generic Close cannot start in phase {}",
+                            phase.as_str(),
+                        )));
+                    }
+                }
+            }
+            CloseFoundationAdmission::Existing(obligation) => GenericCloseAdmission::Existing(
                 Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?,
             ),
         };
@@ -11410,17 +11432,18 @@ mod tests {
         );
         let (inserted, existing) = match (first.unwrap(), second.unwrap()) {
             (
-                CloseFoundationAdmission::Inserted(inserted),
-                CloseFoundationAdmission::Existing(existing),
+                GenericCloseAdmission::InsertedSettling(inserted),
+                GenericCloseAdmission::Existing(existing),
             )
             | (
-                CloseFoundationAdmission::Existing(existing),
-                CloseFoundationAdmission::Inserted(inserted),
+                GenericCloseAdmission::Existing(existing),
+                GenericCloseAdmission::InsertedSettling(inserted),
             ) => (inserted, existing),
             outcomes => panic!("expected one inserted admission and one existing, got {outcomes:?}"),
         };
-        assert_eq!(inserted, existing);
-        assert_eq!(inserted.phase(), ClosePhase::SettlingActiveWork);
+        assert_eq!(inserted.obligation(), &existing);
+        assert_eq!(inserted.obligation().phase(), ClosePhase::SettlingActiveWork);
+        assert!(db.validate_generic_close_settlement(&inserted).await.unwrap());
         let targets = db
             .list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
             .await
