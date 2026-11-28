@@ -3695,12 +3695,7 @@ impl RuntimeManager {
         let mut completed = 0;
         let mut first_error = None;
         for settlement in obligations {
-            let attempt_id = settlement.obligation().attempt_id().clone();
-            let worker = self
-                .start_generic_close_worker(attempt_id, |manager, _| async move {
-                    manager.settle_close_obligation(settlement).await
-                })
-                .await?;
+            let worker = self.start_generic_close_settlement(settlement).await?;
             match worker.await {
                 Ok(Ok(true)) => completed += 1,
                 Ok(Ok(false)) => {}

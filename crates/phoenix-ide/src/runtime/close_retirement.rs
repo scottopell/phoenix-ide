@@ -1681,7 +1681,18 @@ impl RuntimeManager {
         .await
     }
 
-    pub(super) async fn start_generic_close_worker<F, Fut, T>(
+    pub(super) async fn start_generic_close_settlement(
+        self: &Arc<Self>,
+        settlement: crate::db::GenericCloseSettlement,
+    ) -> Result<tokio::task::JoinHandle<Result<bool, String>>, String> {
+        let attempt_id = settlement.obligation().attempt_id().clone();
+        self.start_generic_close_worker(attempt_id, |manager, _| async move {
+            manager.settle_close_obligation(settlement).await
+        })
+        .await
+    }
+
+    async fn start_generic_close_worker<F, Fut, T>(
         self: &Arc<Self>,
         attempt_id: CloseAttemptId,
         operation: F,

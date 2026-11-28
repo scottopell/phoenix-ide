@@ -296,7 +296,7 @@ pub(crate) async fn confirm_close_stop_work(
         .mutation_admission(&id)
         .await
         .map_err(super::handlers::map_admission_db_error)?;
-    let _guard = admission.lock().await;
+    let guard = admission.lock().await;
     let transcript = state
         .db
         .get_conversation(&id)
@@ -345,6 +345,7 @@ pub(crate) async fn confirm_close_stop_work(
                 "close_stop_work_confirmation_failed",
             )))
         })?;
+    drop(guard);
     state
         .runtime
         .resume_close_settlements(Some(obligation.attempt_id()))
