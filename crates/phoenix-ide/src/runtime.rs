@@ -15989,12 +15989,12 @@ mod scope_liveness_tests {
             .add_message(
                 "cancelled-tool-result",
                 conversation_id,
-                &crate::db::MessageContent::Tool(ToolContent {
-                    tool_use_id: "cancelled-tool".to_string(),
-                    content: "interrupted".to_string(),
-                    is_error: true,
-                    images: Vec::new(),
-                }),
+                &crate::db::MessageContent::Tool(ToolContent::with_images(
+                    "cancelled-tool".to_string(),
+                    "interrupted".to_string(),
+                    true,
+                    Vec::new(),
+                )),
                 None,
                 None,
             )
@@ -16132,12 +16132,12 @@ mod scope_liveness_tests {
             ),
             (
                 "exhausted-tool-result",
-                crate::db::MessageContent::Tool(ToolContent {
-                    tool_use_id: "exhausted-tool".to_string(),
-                    content: "interrupted".to_string(),
-                    is_error: true,
-                    images: Vec::new(),
-                }),
+                crate::db::MessageContent::Tool(ToolContent::with_images(
+                    "exhausted-tool".to_string(),
+                    "interrupted".to_string(),
+                    true,
+                    Vec::new(),
+                )),
             ),
             (
                 "exhausted-restart-1",
@@ -16257,12 +16257,12 @@ mod scope_liveness_tests {
             ),
             (
                 "loop-tool-result-1",
-                crate::db::MessageContent::Tool(ToolContent {
-                    tool_use_id: "loop-tool-1".to_string(),
-                    content: "interrupted".to_string(),
-                    is_error: true,
-                    images: Vec::new(),
-                }),
+                crate::db::MessageContent::Tool(ToolContent::with_images(
+                    "loop-tool-1".to_string(),
+                    "interrupted".to_string(),
+                    true,
+                    Vec::new(),
+                )),
             ),
             (
                 "loop-restart-1",
@@ -16280,12 +16280,12 @@ mod scope_liveness_tests {
             ),
             (
                 "loop-tool-result-2",
-                crate::db::MessageContent::Tool(ToolContent {
-                    tool_use_id: "loop-tool-2".to_string(),
-                    content: "interrupted".to_string(),
-                    is_error: true,
-                    images: Vec::new(),
-                }),
+                crate::db::MessageContent::Tool(ToolContent::with_images(
+                    "loop-tool-2".to_string(),
+                    "interrupted".to_string(),
+                    true,
+                    Vec::new(),
+                )),
             ),
             (
                 "loop-restart-2",
@@ -16303,12 +16303,12 @@ mod scope_liveness_tests {
             ),
             (
                 "loop-tool-result-3",
-                crate::db::MessageContent::Tool(ToolContent {
-                    tool_use_id: "loop-tool-3".to_string(),
-                    content: "interrupted".to_string(),
-                    is_error: true,
-                    images: Vec::new(),
-                }),
+                crate::db::MessageContent::Tool(ToolContent::with_images(
+                    "loop-tool-3".to_string(),
+                    "interrupted".to_string(),
+                    true,
+                    Vec::new(),
+                )),
             ),
         ] {
             manager
@@ -16475,12 +16475,12 @@ mod scope_liveness_tests {
             .add_message(
                 "nonresumable-tool-result",
                 conversation_id,
-                &crate::db::MessageContent::Tool(ToolContent {
-                    tool_use_id: "nonresumable-tool".to_string(),
-                    content: "done".to_string(),
-                    is_error: false,
-                    images: Vec::new(),
-                }),
+                &crate::db::MessageContent::Tool(ToolContent::with_images(
+                    "nonresumable-tool".to_string(),
+                    "done".to_string(),
+                    false,
+                    Vec::new(),
+                )),
                 None,
                 None,
             )
@@ -17756,12 +17756,14 @@ mod scope_liveness_tests {
             .add_message(
                 "exhausted-tool-result",
                 conversation_id,
-                &crate::db::MessageContent::Tool(phoenix_core::domain::db_schema::ToolContent {
-                    tool_use_id: "exhausted-tool".to_string(),
-                    content: "done".to_string(),
-                    is_error: false,
-                    images: Vec::new(),
-                }),
+                &crate::db::MessageContent::Tool(
+                    phoenix_core::domain::db_schema::ToolContent::with_images(
+                        "exhausted-tool".to_string(),
+                        "done".to_string(),
+                        false,
+                        Vec::new(),
+                    ),
+                ),
                 None,
                 None,
             )
@@ -18166,12 +18168,14 @@ mod scope_liveness_tests {
             .add_message(
                 "marker-failure-tool-result",
                 conversation_id,
-                &crate::db::MessageContent::Tool(phoenix_core::domain::db_schema::ToolContent {
-                    tool_use_id: "marker-failure-tool".to_string(),
-                    content: "interrupted".to_string(),
-                    is_error: true,
-                    images: Vec::new(),
-                }),
+                &crate::db::MessageContent::Tool(
+                    phoenix_core::domain::db_schema::ToolContent::with_images(
+                        "marker-failure-tool".to_string(),
+                        "interrupted".to_string(),
+                        true,
+                        Vec::new(),
+                    ),
+                ),
                 None,
                 None,
             )

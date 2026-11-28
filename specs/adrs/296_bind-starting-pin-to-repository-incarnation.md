@@ -1,4 +1,4 @@
-# ADR-292: Bind creation pins to the supplying Git common-directory incarnation
+# ADR-296: Bind creation pins to the supplying Git common-directory incarnation
 
 - **Status:** Accepted
 - **Date:** 2026-11-27

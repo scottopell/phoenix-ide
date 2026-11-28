@@ -1,0 +1,603 @@
+{
+  "params": {
+    "since": null,
+    "top": 10,
+    "burst_seconds": 60.0,
+    "large_bytes": 4096,
+    "cache_read_mult": 0.1,
+    "cache_write_mult": 1.25,
+    "default_tokens_per_byte": 0.27,
+    "consistent_read_transaction": true
+  },
+  "corpus": {
+    "transcripts": 12691,
+    "transcripts_with_usage": 12541,
+    "model_visible_messages": 1211263,
+    "hidden_messages": 573,
+    "requests_with_message_usage": 561193,
+    "fresh": 9194827462,
+    "cache_write": 0,
+    "cache_read": 51010188928,
+    "created_min": "2026-05-03T19:52:05.716679+00:00",
+    "created_max": "2026-11-27T18:12:46.928518+00:00",
+    "turn_usage": {
+      "rows": 566077,
+      "fresh": 9300493810,
+      "cache_write": 0,
+      "cache_read": 51456346112
+    }
+  },
+  "calibration": {
+    "tokens_per_byte": 0.2550579009516665,
+    "fits": 11577,
+    "fixed_overhead_median": 18664.777558180227,
+    "slope_p10": 0.09693313666916474,
+    "slope_p90": 0.2830189434469438,
+    "negative_intercepts": 2,
+    "eligible_transcripts": 12379,
+    "by_transcript_model": {
+      "gpt-5.3-codex": {
+        "fits": 1,
+        "slope_median": 0.15077643336193278,
+        "fixed_median": 7243.966862752028
+      },
+      "gpt-5.4": {
+        "fits": 1584,
+        "slope_median": 0.25708601917688806,
+        "fixed_median": 17722.97679270547
+      },
+      "gpt-5.4-mini": {
+        "fits": 1547,
+        "slope_median": 0.2593187624417257,
+        "fixed_median": 17262.093359346458
+      },
+      "gpt-5.5": {
+        "fits": 262,
+        "slope_median": 0.2679516296153273,
+        "fixed_median": 16450.82482911287
+      },
+      "gpt-5.6-luna": {
+        "fits": 123,
+        "slope_median": 0.24062950014854112,
+        "fixed_median": 31465.876703201
+      },
+      "gpt-5.6-sol": {
+        "fits": 1404,
+        "slope_median": 0.24838996758421225,
+        "fixed_median": 32568.06751149271
+      },
+      "gpt-5.6-terra": {
+        "fits": 129,
+        "slope_median": 0.2544801328409647,
+        "fixed_median": 18573.748075967742
+      },
+      "gpt-6-astra": {
+        "fits": 600,
+        "slope_median": 0.2567302625062299,
+        "fixed_median": 25623.65141799476
+      },
+      "gpt-6-luna": {
+        "fits": 1114,
+        "slope_median": 0.264978105940026,
+        "fixed_median": 18581.510022992396
+      },
+      "gpt-6-sol": {
+        "fits": 1001,
+        "slope_median": 0.25319545354345346,
+        "fixed_median": 26238.677303318902
+      },
+      "gpt-6.1-sol": {
+        "fits": 3552,
+        "slope_median": 0.24967856631190105,
+        "fixed_median": 25287.428763092812
+      },
+      "gpt-6.1-terra": {
+        "fits": 24,
+        "slope_median": 0.28961556829903823,
+        "fixed_median": 3736.2879102152183
+      },
+      "gpt-6.2-astra": {
+        "fits": 4,
+        "slope_median": 0.25419595710986564,
+        "fixed_median": 17863.546234590176
+      },
+      "gpt-6.2-sol": {
+        "fits": 231,
+        "slope_median": 0.2439886372941552,
+        "fixed_median": 26788.54903792845
+      }
+    },
+    "slope_extremes": [
+      {
+        "transcript": "9779cd52",
+        "slope": 0.05002184375611309,
+        "fixed": 83967.37235327408,
+        "requests": 425
+      },
+      {
+        "transcript": "67b1ab0e",
+        "slope": 0.050025813385460444,
+        "fixed": 57870.52094985376,
+        "requests": 21
+      },
+      {
+        "transcript": "05ce56bb",
+        "slope": 0.050032893797765564,
+        "fixed": 52975.2729971596,
+        "requests": 74
+      },
+      {
+        "transcript": "193d5036",
+        "slope": 0.5192796241370129,
+        "fixed": 31417.783843515237,
+        "requests": 13
+      },
+      {
+        "transcript": "7a50b369",
+        "slope": 0.5681433523462378,
+        "fixed": 23678.217535055555,
+        "requests": 19
+      },
+      {
+        "transcript": "1256f0bb",
+        "slope": 0.5810940105482463,
+        "fixed": 3830.264690256663,
+        "requests": 21
+      }
+    ]
+  },
+  "categories": [
+    {
+      "category": "tool_result",
+      "msgs": 590389,
+      "tokens": 887789605.6972448,
+      "token_turns": 72719025514.16937,
+      "cache_weighted": 8289024200.921148,
+      "p50": 452.9828320901598,
+      "p95": 6288.916606182328
+    },
+    {
+      "category": "assistant",
+      "msgs": 561193,
+      "tokens": 96369987.15935607,
+      "token_turns": 9674944692.752941,
+      "cache_weighted": 1063935556.7855625,
+      "p50": 79.64547299432007,
+      "p95": 582.5522457736064
+    },
+    {
+      "category": "user_typed",
+      "msgs": 16076,
+      "tokens": 3335632.3283748925,
+      "token_turns": 661830092.8434732,
+      "cache_weighted": 69975662.51121478,
+      "p50": 98.84230032236047,
+      "p95": 504.24947018144474
+    },
+    {
+      "category": "continuation",
+      "msgs": 2131,
+      "tokens": 10990313.197199732,
+      "token_turns": 519708928.34958726,
+      "cache_weighted": 56969343.19386492,
+      "p50": 3701.2292403924553,
+      "p95": 11015.950742102477
+    },
+    {
+      "category": "cross_conversation",
+      "msgs": 19235,
+      "tokens": 2547285.725403787,
+      "token_turns": 388475667.7777691,
+      "cache_weighted": 41770543.967448905,
+      "p50": 95.40066387939687,
+      "p95": 332.0853870390698
+    },
+    {
+      "category": "subscription_event",
+      "msgs": 9989,
+      "tokens": 422999.9801310027,
+      "token_turns": 133728183.15510216,
+      "cache_weighted": 13859111.456301922,
+      "p50": 29.397031859134167,
+      "p95": 101.25798667781162
+    },
+    {
+      "category": "system_other",
+      "msgs": 11773,
+      "tokens": 2832039.8729515513,
+      "token_turns": 123673286.44087844,
+      "cache_weighted": 15280726.287762994,
+      "p50": 133.17503524758737,
+      "p95": 592.3686684174531
+    },
+    {
+      "category": "skill",
+      "msgs": 193,
+      "tokens": 296108.6620078399,
+      "token_turns": 36576084.9184561,
+      "cache_weighted": 3998133.453154626,
+      "p50": 1677.0056987572075,
+      "p95": 2479.7996255722583
+    },
+    {
+      "category": "subagent_summary",
+      "msgs": 12,
+      "tokens": 16219.316066642,
+      "token_turns": 5899065.620171263,
+      "cache_weighted": 608558.7754937646,
+      "p50": 956.9772443706528,
+      "p95": 2696.1275977831287
+    },
+    {
+      "category": "followup_approval",
+      "msgs": 6,
+      "tokens": 9894.767294672607,
+      "token_turns": 4013576.565313431,
+      "cache_weighted": 412736.6389202166,
+      "p50": 1242.3263679459849,
+      "p95": 3338.707923457315
+    },
+    {
+      "category": "scheduled_reminder",
+      "msgs": 260,
+      "tokens": 29974.265320554066,
+      "token_turns": 2415291.7498207972,
+      "cache_weighted": 275885.8290359803,
+      "p50": 101.7693604002734,
+      "p95": 256.0781325554732
+    },
+    {
+      "category": "close_failure",
+      "msgs": 6,
+      "tokens": 967.9370859602077,
+      "token_turns": 111540.27641303182,
+      "cache_weighted": 12267.155290157421,
+      "p50": 138.8296301112855,
+      "p95": 262.905324121585
+    }
+  ],
+  "injected_categories": [
+    "close_failure",
+    "continuation",
+    "cross_conversation",
+    "followup_approval",
+    "remote_api",
+    "scheduled_reminder",
+    "skill",
+    "slack_gateway",
+    "subagent_summary",
+    "subscription_event",
+    "system_other"
+  ],
+  "historical": {
+    "unknown_origin_typed": 14134,
+    "p95": 492.893712529526,
+    "token_turns": 505058684.039195,
+    "system_other_unknown": 1772
+  },
+  "cap_sensitivity": {
+    "subagent_summary": {
+      "messages": 7549,
+      "injected_messages": 12,
+      "token_turns": 1468517553.736934,
+      "cap_savings": {
+        "512": 1023929886.7193271,
+        "1024": 791264839.8620987,
+        "2048": 542750253.294201
+      }
+    },
+    "close_failure": {
+      "messages": 6,
+      "injected_messages": 6,
+      "token_turns": 111540.27641303182,
+      "cap_savings": {
+        "512": 0,
+        "1024": 0,
+        "2048": 0
+      }
+    }
+  },
+  "by_kind_totals": {
+    "coordinator": {
+      "token_turns": 6558286186.328505,
+      "cache_weighted": 677593527.5313307,
+      "injected_share": 0.04267235422646203,
+      "injected_cache_weighted_share": 0.04273700971659234
+    },
+    "ordinary + sub-agent": {
+      "token_turns": 77712115738.29079,
+      "cache_weighted": 8878529199.443869,
+      "injected_share": 0.012028293203853877,
+      "injected_cache_weighted_share": 0.011739442788992078
+    }
+  },
+  "by_kind": {
+    "coordinator": {
+      "continuation": 0.020771665047583994,
+      "assistant": 0.14590103612582925,
+      "tool_result": 0.8022542093959505,
+      "user_typed": 0.009172400251764518,
+      "subscription_event": 0.020390720891972396,
+      "scheduled_reminder": 0.0002528639969814101,
+      "system_other": 0.0012400967557538668,
+      "close_failure": 1.7007534170367595e-05
+    },
+    "ordinary + sub-agent": {
+      "system_other": 0.0014867743069434602,
+      "assistant": 0.11218435967330341,
+      "tool_result": 0.8680449911045813,
+      "user_typed": 0.007742356018244284,
+      "continuation": 0.004934654020904786,
+      "cross_conversation": 0.0049989073658221915,
+      "skill": 0.0004706612935572682,
+      "subagent_summary": 7.590921395110903e-05,
+      "scheduled_reminder": 9.74027388402243e-06,
+      "followup_approval": 5.16467287910402e-05
+    }
+  },
+  "final_request_share": {
+    "system_other": 0.0063745923523789196,
+    "assistant": 0.07345981107639536,
+    "tool_result": 0.9076973026158401,
+    "user_typed": 0.0074434849278882985,
+    "continuation": 0.0033680284220778873,
+    "cross_conversation": 0.0012435647284714066,
+    "subscription_event": 0.00017623004050482108,
+    "skill": 0.000204790104774446,
+    "subagent_summary": 6.58792584525377e-06,
+    "scheduled_reminder": 2.24099701023765e-05,
+    "close_failure": 8.146488658023442e-07,
+    "followup_approval": 2.3831868552125665e-06
+  },
+  "top": [
+    {
+      "conv": "9bc3b72d",
+      "seq": 1,
+      "category": "continuation",
+      "detail": "",
+      "tokens": 10220.170091133277,
+      "carries": 867
+    },
+    {
+      "conv": "61591d1d",
+      "seq": 1,
+      "category": "continuation",
+      "detail": "",
+      "tokens": 11015.950742102477,
+      "carries": 755
+    },
+    {
+      "conv": "82e73b48",
+      "seq": 1,
+      "category": "continuation",
+      "detail": "",
+      "tokens": 10960.603177595965,
+      "carries": 723
+    },
+    {
+      "conv": "24ce75b7",
+      "seq": 1,
+      "category": "continuation",
+      "detail": "",
+      "tokens": 8703.595812074669,
+      "carries": 862
+    },
+    {
+      "conv": "67952f7b",
+      "seq": 1,
+      "category": "continuation",
+      "detail": "",
+      "tokens": 10175.534958466736,
+      "carries": 735
+    },
+    {
+      "conv": "dcba54e9",
+      "seq": 1,
+      "category": "continuation",
+      "detail": "",
+      "tokens": 7810.893158743836,
+      "carries": 925
+    },
+    {
+      "conv": "8521dc04",
+      "seq": 1,
+      "category": "continuation",
+      "detail": "",
+      "tokens": 9289.718868461598,
+      "carries": 713
+    },
+    {
+      "conv": "cd59fa81",
+      "seq": 1,
+      "category": "continuation",
+      "detail": "",
+      "tokens": 11415.626472893739,
+      "carries": 446
+    },
+    {
+      "conv": "e1033f6f",
+      "seq": 1,
+      "category": "continuation",
+      "detail": "",
+      "tokens": 10418.860195974627,
+      "carries": 436
+    },
+    {
+      "conv": "63a7cdd3",
+      "seq": 1,
+      "category": "continuation",
+      "detail": "",
+      "tokens": 9330.018016811962,
+      "carries": 482
+    }
+  ],
+  "redundant": {
+    "same_watch_same_source_same_terminal_event": 116053551.94158107,
+    "followup_plan_copy": 3914386.484070727,
+    "followup_plan_pointer_100": 3690286.484070727,
+    "duplicate_skill": 76619.81005936822,
+    "event_overlap": 0.0
+  },
+  "duplicate_skills_by_name": {
+    "phoenix-release": 50193.150483123776,
+    "prs-for-busy-folks": 26426.65957624444
+  },
+  "wakes": {
+    "turns": {
+      "system_other": 11464,
+      "continuation": 733,
+      "cross_conversation": 17715,
+      "subscription_event": 9271,
+      "subagent_summary": 12,
+      "scheduled_reminder": 160,
+      "close_failure": 5,
+      "followup_approval": 6
+    },
+    "input_tokens": {
+      "system_other": 546528011,
+      "continuation": 28824011,
+      "cross_conversation": 2403046107,
+      "subscription_event": 1296422017,
+      "subagent_summary": 1577430,
+      "scheduled_reminder": 16065340,
+      "close_failure": 594130,
+      "followup_approval": 863387
+    },
+    "burst_events": 5598,
+    "burst_tokens": 1330393710,
+    "burst_pairs_with_requests": 5039,
+    "burst_candidate_first_requests": 4946,
+    "burst_candidate_first_request_tokens": 695073188
+  },
+  "continuation": {
+    "count": 1368,
+    "median": 0.028986533865341002,
+    "p90": 0.11611695463828683,
+    "mean": 0.04473629974641478,
+    "median_tokens": 3315.173747787768,
+    "coordinator": 69
+  },
+  "cache": {
+    "after_large_injection": {
+      "requests": 1252,
+      "read_pct": 35.3288246156883,
+      "write_pct": 0.0
+    },
+    "other": {
+      "requests": 559941,
+      "read_pct": 84.7922689880873,
+      "write_pct": 0.0
+    },
+    "other_in_exposed_transcripts": {
+      "requests": 172273,
+      "read_pct": 82.7351884018295,
+      "write_pct": 0.0
+    },
+    "by_inter_response_gap": {
+      "0–60s": {
+        "after": {
+          "requests": 104,
+          "read_pct": 73.21754803438165,
+          "write_pct": 0.0
+        },
+        "other": {
+          "requests": 289036,
+          "read_pct": 90.16124440484026,
+          "write_pct": 0.0
+        }
+      },
+      "61–300s": {
+        "after": {
+          "requests": 139,
+          "read_pct": 34.63763662701374,
+          "write_pct": 0.0
+        },
+        "other": {
+          "requests": 24657,
+          "read_pct": 53.557294054612036,
+          "write_pct": 0.0
+        }
+      },
+      "over 300s": {
+        "after": {
+          "requests": 191,
+          "read_pct": 24.014473086943028,
+          "write_pct": 0.0
+        },
+        "other": {
+          "requests": 15316,
+          "read_pct": 35.94097694843799,
+          "write_pct": 0.0
+        }
+      }
+    }
+  },
+  "supplemental_read_only_checks": {
+    "system_generated_prefix_breakdown": {
+      "coordinator_tracking_observation": {
+        "byte_turns": 71658184,
+        "messages": 261
+      },
+      "initial_approval_plan": {
+        "byte_turns": 40221041,
+        "messages": 33
+      },
+      "subagent_terminal_guidance": {
+        "byte_turns": 989292,
+        "messages": 2905
+      },
+      "unmapped_system_generated": {
+        "byte_turns": 134861571,
+        "messages": 6803
+      }
+    },
+    "skill_tool": {
+      "user": {
+        "successes": 3444,
+        "exact_repeats": 17,
+        "repeat_byte_turns": 19342233,
+        "fully_after_final_watermark_repeat_byte_turns": 19342233
+      },
+      "coordinator": {
+        "successes": 428,
+        "exact_repeats": 374,
+        "repeat_byte_turns": 8566128,
+        "fully_after_final_watermark_repeat_byte_turns": 14457
+      }
+    },
+    "skill_tool_top_exact_repeats_by_name": {
+      "phoenix-development": 15524652,
+      "phoenix-api": 8566128,
+      "devmbp-phoenix": 3633693,
+      "phoenix-release": 183888
+    },
+    "system_residual_by_role": {
+      "subagent_terminal_guidance / sub_agent / later": {
+        "messages": 4375,
+        "byte_turns": 1428085
+      },
+      "other_unknown_historical / user / later": {
+        "messages": 91,
+        "byte_turns": 28804128
+      },
+      "other_unknown_historical / sub_agent / later": {
+        "messages": 13,
+        "byte_turns": 0
+      },
+      "other_system_generated / sub_agent / opening": {
+        "messages": 6803,
+        "byte_turns": 134864170
+      }
+    },
+    "continuation_cap_sensitivity": {
+      "rows": 2131,
+      "total_token_turns_at_global_fit": 901542950.2305596,
+      "payload_cap_savings_at_global_fit": {
+        "2048": 671833151.6150191,
+        "4096": 477267953.1696574,
+        "8192": 119241820.78100255
+      }
+    },
+    "cache_write_observed_rows": 185257
+  }
+}

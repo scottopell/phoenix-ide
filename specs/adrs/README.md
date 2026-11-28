@@ -27,7 +27,7 @@ Codex reset-credit visibility and manual redemption, including resuming the stop
 
 Strict local-only selection of Kache v1.2.2 on macOS arm64 and Linux x86_64 is governed by [ADR-225](225_kache-v1-2-2-strict-local-only-selection.md) and [ADR-289](289_extend-kache-v1-2-2-local-only-qualification-to-linux-x86-64.md), superseding only ADR-224's selection conclusion; ADR-223 and ADR-224 retain their historical v1.0.0 evidence. Remote caching remains deferred.
 
-Conversation creation and task approval use one detached worktree and same-conversation checkpoint, with no approval Git writes, fork/handoff, permanent Delete, or startup resource reclamation, under [ADR-291](291_single-detached-conversation-workflow.md). Creation-pin binding to the supplying common-directory incarnation is governed by [ADR-292](292_bind-starting-pin-to-repository-incarnation.md); it is distinct from hidden `GitRepository` identity.
+Conversation creation and task approval use one detached worktree and same-conversation checkpoint, with no approval Git writes, fork/handoff, permanent Delete, or startup resource reclamation, under [ADR-295](295_single-detached-conversation-workflow.md). Creation-pin binding to the supplying common-directory incarnation is governed by [ADR-292](292_bind-starting-pin-to-repository-incarnation.md); it is distinct from hidden `GitRepository` identity.
 
 [ADR-293](293_native-close-requires-positive-external-writer-evidence.md) narrows only the external process-inspection blocker for admitted native physical Close; ADR-241's exact-run evidence and ADR-286's remaining safeguards still apply.
 
@@ -53,10 +53,13 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
+| [296](296_bind-starting-pin-to-repository-incarnation.md) | Bind creation pins to the supplying Git common-directory incarnation | Accepted | REQ-CCR-005A; Git aggregate staging |
+| [295](295_single-detached-conversation-workflow.md) | One detached conversation worktree with in-place task approval | Accepted | REQ-CCR-005, REQ-PROJ-005, REQ-TAT-001, REQ-BED-028 |
+| [294](294_defer-browser-tools-with-a-discoverable-names-hint.md) | Defer browser tools, and name deferred tools where the model cannot see them | Accepted | REQ-LLM-004n, REQ-LLM-004o, REQ-AUQ-008 |
 | [293](293_native-close-requires-positive-external-writer-evidence.md) | Require positive external writer evidence to block admitted native physical Close on a process | Accepted | REQ-WL-002e |
-| [292](292_bind-starting-pin-to-repository-incarnation.md) | Bind creation pins to the supplying Git common-directory incarnation | Accepted | REQ-CCR-005A; Git aggregate staging |
-| [291](291_single-detached-conversation-workflow.md) | One detached conversation worktree with in-place task approval | Accepted | REQ-CCR-005, REQ-PROJ-005, REQ-TAT-001, REQ-BED-028 |
 | [290](290_compact-model-visible-tool-output.md) | Compact model-visible tool output, separate from typed displays | Accepted | REQ-BASH-002, REQ-BASH-004, REQ-BASH-017, REQ-RQD-010 |
+| [291](291_clearable-previews-in-state-changing-results.md) | Clearable previews inside state-changing tool results | Accepted | REQ-STR-002, REQ-STR-004, REQ-STR-013, REQ-PATCH-007 |
+| [292](292_caller-relative-cleared-result-locator.md) | Cleared-result markers name their source relative to the caller | Accepted | REQ-STR-004, REQ-STR-012 |
 | [288](288_unified-close-idempotence-and-bounded-completion-retry.md) | Unified Close is idempotent with one bounded completion-only retry | Proposed; branch-local proposal; automatic completion policy superseded by ADR-286 | REQ-WL-002f; REQ-BED-029; `close_conversation`, retained Close operation and run identity |
 | [287](287_native-task-approval-source-snapshot-and-receipt.md) | Bind native task approval to canonical source, snapshot and receipt | Proposed | REQ-TAT-001–008; REQ-PROJ-003; REQ-BED-028/046; REQ-COMP-001/002; REQ-DWF-043 |
 | [286](286_close-uses-exact-blockers-and-explicit-retry-only.md) | Close uses exact blockers and explicit retry only | Accepted; supersedes branch-local ADR-288's automatic completion policy and ADR-088's in-Close discard/disposable alternative | REQ-WL-002/002a/002b/002c/002d/002e/002f/004; REQ-BED-029 |

@@ -22,6 +22,7 @@ PREFIX = (
 TEST_NAMES = [PREFIX + suffix for suffix in (
     "registered_native_close_with_production_detector_retires_worktree_and_replays",
     "registered_native_close_captured_loss_public_retry_with_production_detector_reclaims_and_replays",
+    "registered_native_close_captured_loss_retry_final_writer_gap_preserves_checkout",
     "registered_native_close_captured_loss_retry_stop_during_assessment_preserves_worktree_and_history",
     "registered_native_close_captured_loss_retry_stop_while_prepared_preserves_worktree",
     "registered_native_close_captured_loss_retry_stop_before_writer_refuses_dispatch",
@@ -75,12 +76,18 @@ class CloseNextestWrapperTests(unittest.TestCase):
                 self.assertEqual(args, result.stdout.decode().split("\0")[:-1])
                 self.assertEqual(b"original fixture stderr\n", result.stderr)
 
-    def test_allowlist_is_exactly_the_existing_harness_eight(self):
-        pattern = re.escape(PREFIX) + r"[a-z0-9_]+"
-        expected = set(TEST_NAMES)
-        self.assertEqual(8, len(expected))
-        for path in (DISPATCHER, QUALIFICATION):
-            self.assertEqual(expected, set(re.findall(pattern, path.read_text())))
+    def test_each_gate_allows_exactly_the_named_disposable_journeys(self):
+        selector = re.escape(PREFIX) + r"[a-z0-9_]+"
+        for path, case, gate_count in (
+            (DISPATCHER, 'case "$expected_test" in', 1),
+            (QUALIFICATION, 'case ${1-} in', 2),
+        ):
+            with self.subTest(path=path.name):
+                gates = re.findall(r"^" + re.escape(case) + r"\n(.*?)^esac$",
+                                   path.read_text(), flags=re.MULTILINE | re.DOTALL)
+                self.assertEqual(gate_count, len(gates))
+                for gate in gates:
+                    self.assertCountEqual(TEST_NAMES, re.findall(selector, gate))
 
     def test_each_allowed_test_delegates_original_binary_and_fixed_exact_options(self):
         for name in TEST_NAMES:

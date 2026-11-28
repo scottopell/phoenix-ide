@@ -109,14 +109,14 @@ async fn restart_acknowledges_only_matching_durable_child_terminal_calls() {
             assert_eq!(receipt.tool_use_id, "call");
             if let Some(text) = expected {
                 assert!(!receipt.is_error, "{child}");
-                assert_eq!(receipt.content, *text);
+                assert_eq!(receipt.content(), *text);
                 assert_eq!(
                     rows[1].message_id,
                     tool_result_message_id(&format!("{child}-assistant"), "call")
                 );
             } else {
                 assert!(receipt.is_error, "{child}");
-                assert!(receipt.content.contains("interrupted"));
+                assert!(receipt.content().contains("interrupted"));
             }
         }
     }
@@ -134,6 +134,7 @@ fn restart_orders_out_of_order_sibling_results_by_source_identity() {
                 media_type: "image/png".into(),
                 data: "image".into(),
             }],
+            clearable_preview: None,
         },
         duration_ms: Some(17),
     };
@@ -170,7 +171,7 @@ fn restart_orders_out_of_order_sibling_results_by_source_identity() {
         ["unfinished", "finished"]
     );
     assert!(contents[0].is_error);
-    assert_eq!(contents[1].content, "authentic completed sibling");
+    assert_eq!(contents[1].content(), "authentic completed sibling");
     assert!(!contents[1].is_error);
     assert_eq!(contents[1].images[0].data, "image");
     assert_eq!(
@@ -254,12 +255,7 @@ fn restart_preserves_completed_metadata_and_source_order() {
         assert!(row.usage_data.is_none());
         assert_eq!(
             row.content,
-            MessageContent::Tool(ToolContent {
-                tool_use_id: id.into(),
-                content: output.into(),
-                is_error,
-                images
-            })
+            MessageContent::Tool(ToolContent::with_images(id, output, is_error, images))
         );
         assert_eq!(row.display_data, display);
     }
@@ -279,6 +275,7 @@ fn restart_spawn_fan_in_replaces_display_and_duration_but_preserves_images() {
             output: "Spawning 1 sub-agent(s): child".into(),
             display_data: Some(serde_json::json!({"old": "placeholder", "duration_ms": 999})),
             images: vec![image.clone()],
+            clearable_preview: None,
         },
         duration_ms: Some(17),
     };
@@ -307,13 +304,12 @@ fn restart_spawn_fan_in_replaces_display_and_duration_but_preserves_images() {
     .unwrap();
     assert_eq!(
         rows[0].content,
-        MessageContent::Tool(ToolContent {
-            tool_use_id: "spawn".into(),
-            content: "Sub-agent results (1 completed):\n\nTask: \"investigate\"\nResult: answer"
-                .into(),
-            is_error: false,
-            images: vec![image],
-        })
+        MessageContent::Tool(ToolContent::with_images(
+            "spawn",
+            "Sub-agent results (1 completed):\n\nTask: \"investigate\"\nResult: answer",
+            false,
+            vec![image]
+        ))
     );
     assert_eq!(
         rows[0].display_data,
@@ -327,12 +323,11 @@ fn restart_spawn_fan_in_replaces_display_and_duration_but_preserves_images() {
     assert_eq!(rows[0].message_id, "tool-result:5:round:spawn");
     assert_eq!(
         rows[1].content,
-        MessageContent::Tool(ToolContent {
-            tool_use_id: "unfinished".into(),
-            content: "[Tool execution interrupted by server restart]".into(),
-            is_error: true,
-            images: vec![],
-        })
+        MessageContent::Tool(ToolContent::new(
+            "unfinished",
+            "[Tool execution interrupted by server restart]",
+            true
+        ))
     );
     assert!(rows[1].display_data.is_none());
 }
@@ -783,12 +778,9 @@ fn assert_recovered_trusted_round(
                 conversation_id: conversation_id.to_owned(),
                 sequence_id: start_seq + 1 + i64::try_from(ordinal).unwrap(),
                 message_type: MessageType::Tool,
-                content: MessageContent::Tool(ToolContent {
-                    tool_use_id: id.into(),
-                    content: content.into(),
-                    is_error,
-                    images
-                }),
+                content: MessageContent::Tool(ToolContent::with_images(
+                    id, content, is_error, images
+                )),
                 created_at: result_time,
                 display_data,
                 usage_data: None,
@@ -818,7 +810,7 @@ fn restart_preserves_ordinary_skill_body() {
     let MessageContent::Tool(content) = &rows[0].content else {
         panic!("tool result row");
     };
-    assert_eq!(content.content, "ordinary skill body");
+    assert_eq!(content.content(), "ordinary skill body");
     assert!(!content.is_error);
 }
 

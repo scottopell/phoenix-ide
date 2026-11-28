@@ -626,3 +626,118 @@ async fn captured_loss_runtime_context_uses_accepted_clean_scope_snapshot_and_fi
     assert_eq!(db.list_close_safe_retry_effects(&captured_successor(&assessment.context)).await.unwrap(), expected_effects);
     assert_captured_origin_preserved(&db, &assessment.context).await;
 }
+
+#[tokio::test]
+async fn captured_loss_writer_observation_requires_exact_pending_dispatch() {
+    use crate::close_foundation::{
+        CloseWriterDetector, CloseWriterGap, CloseWriterObservation,
+        RecordCloseWriterObservationRequest,
+    };
+
+    let (db, assessment) = captured_loss_assessment().await;
+    let NativeCloseRetryResult::NewlyAdmitted(receipt) =
+        established(db.apply_native_close_captured_loss_retry(&assessment).await)
+    else {
+        panic!("expected captured-loss successor");
+    };
+    let execution = db
+        .read_native_close_retry_execution_context(&assessment.command, &receipt.admitted)
+        .await
+        .unwrap();
+    let worktree = &execution.effects[0];
+    assert_eq!(worktree.resource.kind(), RetiredResourceKind::Worktree);
+    assert_ne!(execution.snapshot, *assessment.context.snapshot());
+    assert_captured_origin_preserved(&db, &assessment.context).await;
+    let request = RecordCloseWriterObservationRequest {
+        run: captured_successor(&assessment.context),
+        scope: worktree.scope.clone(),
+        snapshot: execution.snapshot.clone(),
+        resource: worktree.resource.clone(),
+        observation: CloseWriterObservation::InspectionGap {
+            detector: CloseWriterDetector::LinuxDescriptor,
+            pid: None,
+            reason: CloseWriterGap::Unavailable,
+        },
+    };
+    assert_writer_observation_refused(&db, &request).await;
+    established(
+        db.record_native_close_retry_retirement_dispatch(
+            &assessment.command,
+            &receipt.admitted,
+            worktree,
+        )
+        .await,
+    );
+    let original = assessment.context.snapshot();
+    for snapshot in [
+        CloseRetirementSnapshot::parse(original.generation(), request.snapshot.fingerprint())
+            .unwrap(),
+        CloseRetirementSnapshot::parse(request.snapshot.generation(), "wrong-fingerprint")
+            .unwrap(),
+    ] {
+        let wrong_snapshot = RecordCloseWriterObservationRequest {
+            snapshot,
+            ..request.clone()
+        };
+        assert_writer_observation_refused(&db, &wrong_snapshot).await;
+    }
+    let wrong_run = RecordCloseWriterObservationRequest {
+        run: assessment.context.failed_run().clone(),
+        ..request.clone()
+    };
+    assert_writer_observation_refused(&db, &wrong_run).await;
+
+    db.record_close_writer_observation(&request).await.unwrap();
+    db.update_conversation_state(assessment.command.source_transcript_id(), &ConvState::Idle)
+        .await
+        .unwrap();
+    assert_eq!(
+        db.get_close_run(&request.run).await.unwrap().status,
+        CloseRunStatus::Stopped
+    );
+    let new_detector = RecordCloseWriterObservationRequest {
+        observation: CloseWriterObservation::InspectionGap {
+            detector: CloseWriterDetector::LinuxCwd,
+            pid: None,
+            reason: CloseWriterGap::Unavailable,
+        },
+        ..request.clone()
+    };
+    assert_writer_observation_refused(&db, &new_detector).await;
+    db.record_close_writer_observation(&request).await.unwrap();
+    let failures = db
+        .list_close_cleanup_failures(request.run.attempt_id.as_str())
+        .await
+        .unwrap();
+    assert_eq!(failures.len(), 2);
+    assert!(failures.iter().any(|failure| {
+        failure.run_ordinal == CloseRunOrdinal::INITIAL
+            && &failure.occurrence == assessment.context.failure()
+    }));
+    assert!(failures.iter().any(|failure| {
+        failure.run_ordinal == request.run.ordinal
+            && failure.occurrence.reason == RetirementFailureReason::Interrupted
+    }));
+    assert_eq!(
+        db.list_close_writer_observations(&request.run, &request.scope)
+            .await
+            .unwrap(),
+        vec![request]
+    );
+}
+
+async fn assert_writer_observation_refused(
+    db: &Database,
+    request: &crate::close_foundation::RecordCloseWriterObservationRequest,
+) {
+    let error = db
+        .record_close_writer_observation(request)
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("writer observation lacks exact active Close authority"),
+        "{error}"
+    );
+}

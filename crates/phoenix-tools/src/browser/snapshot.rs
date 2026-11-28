@@ -16,6 +16,11 @@ pub struct BrowserSnapshotTool;
 
 #[async_trait]
 impl Tool for BrowserSnapshotTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }

@@ -22,9 +22,17 @@ struct Checkpoint {
     resume: oneshot::Receiver<()>,
 }
 
+#[cfg(target_os = "linux")]
+type FinalWriterGap = (
+    phoenix_db::CloseWriterObservation,
+    oneshot::Sender<std::path::PathBuf>,
+);
+
 #[derive(Clone, Default)]
 pub(crate) struct Hooks {
     checkpoint: Arc<Mutex<Option<Checkpoint>>>,
+    #[cfg(target_os = "linux")]
+    final_writer_gap: Arc<Mutex<Option<FinalWriterGap>>>,
     revalidations: Arc<std::sync::atomic::AtomicUsize>,
     pending_ticks: Arc<std::sync::atomic::AtomicUsize>,
     pending_tick: Arc<tokio::sync::Notify>,
@@ -38,6 +46,23 @@ impl Hooks {
     #[cfg(target_os = "linux")]
     pub(crate) async fn scope<F: Future>(&self, future: F) -> F::Output {
         ACTOR_HOOKS.scope(self.clone(), future).await
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn inject_final_writer_gap(
+        &self,
+        observation: phoenix_db::CloseWriterObservation,
+    ) -> oneshot::Receiver<std::path::PathBuf> {
+        let (scanned_path, observed) = oneshot::channel();
+        let mut slot = self.final_writer_gap.lock().unwrap();
+        assert!(slot.is_none());
+        *slot = Some((observation, scanned_path));
+        observed
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn take_final_writer_gap(&self) -> Option<FinalWriterGap> {
+        self.final_writer_gap.lock().unwrap().take()
     }
 
     // Capture before spawning: task-local values do not propagate to workers.

@@ -327,6 +327,11 @@ pub const PROFILE_ACTIONS: &[&str] = &[
 
 #[async_trait]
 impl Tool for BrowserProfileTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }

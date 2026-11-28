@@ -1005,16 +1005,21 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 192,
+        name: "native_close_captured_retry_writer_observations",
+        sql: include_str!("migrations/native_close_captured_retry_writer_observations.sql"),
+    },
+    Migration {
+        version: 193,
         name: "dismiss_pending_fork_proposals",
         sql: "UPDATE fork_proposals SET status = 'dismissed', resolved_at = COALESCE(resolved_at, CURRENT_TIMESTAMP) WHERE status = 'pending';",
     },
     Migration {
-        version: 193,
+        version: 194,
         name: "product_creation_repository_identity_pin",
-        sql: MIGRATION_193,
+        sql: MIGRATION_194,
     },
     Migration {
-        version: 194,
+        version: 195,
         name: "native_close_initial_settlement_stop_claims",
         sql: include_str!("migrations/native_close_initial_settlement_stop_claims.sql"),
     },
@@ -17340,9 +17345,10 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
-            (194, "native_close_initial_settlement_stop_claims"),
-            (193, "product_creation_repository_identity_pin"),
-            (192, "dismiss_pending_fork_proposals"),
+            (195, "native_close_initial_settlement_stop_claims"),
+            (194, "product_creation_repository_identity_pin"),
+            (193, "dismiss_pending_fork_proposals"),
+            (192, "native_close_captured_retry_writer_observations"),
             (191, "native_close_origin_owner_cleanup"),
             (190, "native_close_retry_origin_gate"),
             (189, "native_close_retry_tmux_dispatch"),
@@ -17688,12 +17694,6 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         for prefix in [171, 172] {
-            let pending = u32::try_from(
-                migration_identities()
-                    .filter(|(version, _)| *version > prefix)
-                    .count(),
-            )
-            .unwrap();
             let path = dir.path().join(format!("prefix-{prefix}.db"));
             let path = path.to_str().unwrap();
             let db = crate::Database::open(path).await.unwrap();
@@ -17703,7 +17703,10 @@ mod tests {
                 sqlx::query_as(ledger_query).fetch_all(pool).await.unwrap();
             assert_eq!(before.last().unwrap().0, prefix);
 
-            assert_eq!(run_pending_migrations(pool).await.unwrap(), pending);
+            assert_eq!(
+                run_pending_migrations(pool).await.unwrap(),
+                registered_after(prefix)
+            );
             let installed: Vec<(u32, String, String)> =
                 sqlx::query_as(ledger_query).fetch_all(pool).await.unwrap();
             assert!(installed.starts_with(&before));
@@ -25642,7 +25645,7 @@ mod native_close_initial_receipt_tests {
     }
 }
 
-const MIGRATION_193: &str = r"
+const MIGRATION_194: &str = r"
 ALTER TABLE product_creation_jobs
     ADD COLUMN pin_repository_identity TEXT
     CHECK (pin_repository_identity IS NULL OR
@@ -25690,7 +25693,7 @@ END;
 mod product_creation_repository_identity_pin_tests {
     use sqlx::sqlite::SqlitePoolOptions;
 
-    use super::MIGRATION_193;
+    use super::MIGRATION_194;
 
     #[tokio::test]
     async fn migration_preserves_legacy_pins_and_guards_new_identity_bindings() {
@@ -25719,7 +25722,7 @@ mod product_creation_repository_identity_pin_tests {
         .await
         .unwrap();
 
-        sqlx::raw_sql(MIGRATION_193).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_194).execute(&pool).await.unwrap();
 
         let identity: Option<String> = sqlx::query_scalar(
             "SELECT pin_repository_identity FROM product_creation_jobs WHERE request_id = 'legacy'",

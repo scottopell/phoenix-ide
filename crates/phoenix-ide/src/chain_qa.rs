@@ -1075,7 +1075,7 @@ fn render_message_line(m: &Message) -> String {
         // than silently stranding the images.
         MessageContent::Tool(c) => {
             if c.images.is_empty() {
-                c.content.clone()
+                c.content().to_owned()
             } else {
                 tracing::debug!(
                     tool_use_id = %c.tool_use_id,
@@ -1084,7 +1084,7 @@ fn render_message_line(m: &Message) -> String {
                 );
                 format!(
                         "{}\n[{} image(s) in this tool result are not shown — chain Q&A reads text only]",
-                        c.content,
+                        c.content(),
                         c.images.len()
                     )
             }

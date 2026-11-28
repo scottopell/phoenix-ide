@@ -2285,7 +2285,7 @@ impl MessageStore for InMemoryStorage {
             for msg in msgs.iter_mut() {
                 if msg.message_id == message_id {
                     if let crate::db::MessageContent::Tool(ref mut tool) = msg.content {
-                        tool.content = content.to_string();
+                        tool.replace_content(content.to_string());
                         let mut generations = self.transcript_generations.lock().unwrap();
                         let generation =
                             generations.entry(msg.conversation_id.clone()).or_insert(1);
@@ -4148,7 +4148,7 @@ mod tests {
             .find(|message| matches!(&message.content, MessageContent::Tool(tool) if tool.tool_use_id == "spawn-1"))
             .expect("durable spawn result");
         assert!(
-            matches!(&result.content, MessageContent::Tool(tool) if tool.content.starts_with("Sub-agent results"))
+            matches!(&result.content, MessageContent::Tool(tool) if tool.content().starts_with("Sub-agent results"))
         );
         assert_eq!(
             result

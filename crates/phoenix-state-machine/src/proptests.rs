@@ -1468,6 +1468,7 @@ fn test_cancel_mid_tool_chain() {
                 media_type: "image/png".into(),
                 data: "retained".into(),
             }],
+            clearable_preview: None,
         },
         duration_ms: Some(17),
     };

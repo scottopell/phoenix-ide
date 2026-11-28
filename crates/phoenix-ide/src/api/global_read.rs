@@ -294,6 +294,9 @@ pub(crate) struct GlobalReadService {
     stable_resolution_test_hook: Option<Arc<StableResolutionTestHook>>,
 }
 
+/// Prefix of the caller-relative reference written by cleared tool-result markers.
+pub(crate) const SELF_SEQUENCE_PREFIX: &str = "@self#seq-";
+
 const PREVIOUS_RESULT_BYTES: usize = 16 * 1024;
 const PREVIOUS_PAGE_BYTES: usize = 2 * 1024;
 
@@ -1211,6 +1214,37 @@ impl GlobalReadService {
         })
     }
 
+    /// Resolve a caller-relative `@self#seq-<n>` reference, as written by a
+    /// cleared tool-result marker, to the exact `@transcript:<id>#message-<id>`
+    /// reference for that row of `caller_conversation_id`. Any other reference
+    /// is returned unchanged.
+    pub(crate) async fn resolve_self_reference(
+        &self,
+        caller_conversation_id: &str,
+        reference: &str,
+    ) -> Result<String, String> {
+        let Some(sequence) = reference.strip_prefix(SELF_SEQUENCE_PREFIX) else {
+            return Ok(reference.to_owned());
+        };
+        let sequence = sequence
+            .parse::<i64>()
+            .ok()
+            .filter(|sequence| *sequence > 0)
+            .ok_or_else(|| format!("{SELF_SEQUENCE_PREFIX}<n> needs a positive sequence number"))?;
+        let message = self
+            .db
+            .get_messages_after_limited(caller_conversation_id, sequence - 1, 1)
+            .await
+            .map_err(|error| format!("failed to read this transcript: {error}"))?
+            .into_iter()
+            .find(|message| message.sequence_id == sequence)
+            .ok_or_else(|| format!("this transcript has no message at sequence {sequence}"))?;
+        Ok(format!(
+            "@transcript:{caller_conversation_id}#message-{}",
+            message.message_id
+        ))
+    }
+
     pub(crate) async fn read_conversation(
         &self,
         conversation: &str,
@@ -1868,7 +1902,7 @@ fn render_bounded_message_text(message: &BoundedReadMessage) -> String {
                 .map(ContentBlock::render_text)
                 .collect::<Vec<_>>()
                 .join("\n"),
-            MessageContent::Tool(content) => content.content.clone(),
+            MessageContent::Tool(content) => content.content().to_owned(),
             MessageContent::System(content) => content.text.clone(),
             MessageContent::Error(content) => content.message.clone(),
             MessageContent::Continuation(content) => content.summary.clone(),
@@ -2125,7 +2159,7 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
             .join("\n"),
         MessageContent::Tool(c) => {
             if c.images.is_empty() {
-                c.content.clone()
+                c.content().to_owned()
             } else {
                 tracing::debug!(
                     tool_use_id = %c.tool_use_id,
@@ -2134,7 +2168,7 @@ fn render_full_message_text(message: &crate::db::Message) -> String {
                 );
                 format!(
                     "{}\n[{} image(s) in this tool result are not shown — read_conversation returns text only]",
-                    c.content,
+                    c.content(),
                     c.images.len()
                 )
             }
@@ -4339,6 +4373,74 @@ mod tests {
         assert_eq!(
             error,
             format!("cursor exceeds maximum {MAX_CONVERSATION_READ_CURSOR}")
+        );
+    }
+
+    /// REQ-STR-012: a cleared result's `@self#seq-<n>` marker resolves to the
+    /// exact row of the caller's own transcript, and only of that transcript.
+    #[tokio::test]
+    async fn self_sequence_reference_resolves_within_the_caller_transcript() {
+        let db = crate::db::Database::open_in_memory().await.unwrap();
+        let service = GlobalReadService::new(db.clone(), Arc::new(db.fts_retriever()));
+        let conv = db
+            .create_conversation("self-ref", "self-ref", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let first = db
+            .add_message(
+                "self-ref-1",
+                &conv.id,
+                &crate::db::MessageContent::user("one"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let second = db
+            .add_message(
+                "self-ref-2",
+                &conv.id,
+                &crate::db::MessageContent::user("two"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let resolved = service
+            .resolve_self_reference(&conv.id, &format!("@self#seq-{}", second.sequence_id))
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved,
+            format!("@transcript:{}#message-self-ref-2", conv.id)
+        );
+        let page = service.read_conversation(&resolved, 0).await.unwrap();
+        assert!(page.contains("two"), "{page}");
+        assert_ne!(first.sequence_id, second.sequence_id);
+
+        let other = db
+            .create_conversation("self-ref-other", "self-ref-other", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let missing = service
+            .resolve_self_reference(&other.id, &format!("@self#seq-{}", second.sequence_id))
+            .await
+            .unwrap_err();
+        assert!(missing.contains("no message at sequence"), "{missing}");
+
+        for bad in ["@self#seq-0", "@self#seq--1", "@self#seq-x"] {
+            assert!(
+                service.resolve_self_reference(&conv.id, bad).await.is_err(),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            service
+                .resolve_self_reference(&conv.id, "@conv:abc")
+                .await
+                .unwrap(),
+            "@conv:abc"
         );
     }
 

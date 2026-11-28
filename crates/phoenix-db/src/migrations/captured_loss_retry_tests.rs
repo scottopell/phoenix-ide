@@ -36,6 +36,37 @@ async fn trigger(db: &Database, name: &str) -> String {
         .unwrap()
 }
 
+#[tokio::test]
+async fn real191_to192_replaces_only_writer_authority_and_is_idempotent() {
+    let db = predecessor().await;
+    run_through_for_test(&db.pool, 191).await.unwrap();
+    let name = "close_writer_observations_require_active_authority";
+    let before = trigger(&db, name).await;
+    assert!(before.contains("JOIN close_retirement_inventories"));
+    assert!(!before.contains("native_close_retry_snapshot_authorities"));
+    let other_schema = "SELECT name, sql FROM sqlite_schema
+        WHERE name <> ?1 AND sql IS NOT NULL ORDER BY name";
+    let unchanged: Vec<(String, String)> = sqlx::query_as(other_schema)
+        .bind(name)
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+
+    assert_eq!(run_through_for_test(&db.pool, 192).await.unwrap(), 1);
+    let after = trigger(&db, name).await;
+    assert!(after.contains("native_close_retry_snapshot_authorities"));
+    assert_eq!(
+        sqlx::query_as::<_, (String, String)>(other_schema)
+            .bind(name)
+            .fetch_all(&db.pool)
+            .await
+            .unwrap(),
+        unchanged
+    );
+    assert_eq!(run_through_for_test(&db.pool, 192).await.unwrap(), 0);
+    assert_eq!(trigger(&db, name).await, after);
+}
+
 fn assert_only_native_union_added(before: &str, after: &str, native: &str) {
     assert_eq!(before.matches(native).count(), 1);
     let (prefix, suffix) = before.split_once(native).unwrap();
