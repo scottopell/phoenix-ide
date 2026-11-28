@@ -3864,19 +3864,16 @@ impl RuntimeManager {
             .await?;
         match self
             .db
-            .advance_close_settlement_when_quiescent(obligation.attempt_id().as_str())
+            .finish_generic_close_settlement(settlement)
             .await
         {
-            Ok(advanced) => {
-                if advanced.phase()
-                    == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
-                {
-                    self.run_close_inspection(advanced.attempt_id().clone())
-                        .await?;
-                }
+            Ok(crate::db::GenericCloseSettlementAdvance::Inspect(inspection)) => {
+                self.run_close_inspection(inspection.into_attempt_id()).await?;
                 Ok(true)
             }
-            Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
+            Ok(crate::db::GenericCloseSettlementAdvance::Cancelled) => Ok(true),
+            Ok(crate::db::GenericCloseSettlementAdvance::NoTransition)
+            | Err(crate::db::DbError::CloseFoundationPrecondition(_)) => Ok(false),
             Err(error) => Err(error.to_string()),
         }
     }

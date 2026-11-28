@@ -47,6 +47,25 @@ pub enum GenericCloseAdmission {
     Existing(CloseObligation),
 }
 
+/// The transaction that finishes settlement is the only one that can return
+/// `Inspect`. Observing the resulting phase does not reproduce this handoff.
+#[derive(Debug)]
+pub enum GenericCloseSettlementAdvance {
+    Inspect(GenericCloseInspection),
+    Cancelled,
+    NoTransition,
+}
+
+#[derive(Debug)]
+pub struct GenericCloseInspection(CloseAttemptId);
+
+impl GenericCloseInspection {
+    #[must_use]
+    pub fn into_attempt_id(self) -> CloseAttemptId {
+        self.0
+    }
+}
+
 /// Exact generic attempt accepted for pre-retirement cancellation.
 #[derive(Debug)]
 pub struct GenericCloseCancellation {
@@ -2314,9 +2333,9 @@ impl Database {
                     }
                 }
             }
-            CloseFoundationAdmission::Existing(obligation) => GenericCloseAdmission::Existing(
-                Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation).await?,
-            ),
+            CloseFoundationAdmission::Existing(obligation) => {
+                GenericCloseAdmission::Existing(obligation)
+            }
         };
         tx.commit().await?;
         Ok(admission)
@@ -3052,6 +3071,34 @@ impl Database {
                     ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
                 ),
         )
+    }
+
+    pub async fn finish_generic_close_settlement(
+        &self,
+        settlement: GenericCloseSettlement,
+    ) -> DbResult<GenericCloseSettlementAdvance> {
+        let attempt_id = settlement.obligation.attempt_id();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let current =
+            Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+        if current.product_conversation_id() != settlement.obligation.product_conversation_id() {
+            return Err(close_precondition("generic Close settlement target changed"));
+        }
+        let outcome = match current.phase() {
+            ClosePhase::SettlingActiveWork => {
+                Self::advance_close_settlement_when_quiescent_tx(&mut tx, attempt_id.as_str())
+                    .await?;
+                GenericCloseSettlementAdvance::Inspect(GenericCloseInspection(attempt_id.clone()))
+            }
+            ClosePhase::CancelRequestedDuringSettlement => {
+                Self::advance_close_settlement_when_quiescent_tx(&mut tx, attempt_id.as_str())
+                    .await?;
+                GenericCloseSettlementAdvance::Cancelled
+            }
+            _ => GenericCloseSettlementAdvance::NoTransition,
+        };
+        tx.commit().await?;
+        Ok(outcome)
     }
 
     pub async fn advance_close_settlement_when_quiescent(
@@ -11393,6 +11440,73 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(prepared.phase(), ClosePhase::AwaitingStopWorkConfirmation);
+    }
+
+    #[tokio::test]
+    async fn existing_generic_close_admission_does_not_advance_legacy_blocker() {
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let product = product_id("root");
+        let latest = transcript_id("root");
+        let attempt = CloseAttemptId::parse("legacy-attempt").unwrap();
+        db.begin_close_foundation(&product, &latest, attempt.as_str())
+            .await
+            .unwrap();
+
+        let GenericCloseAdmission::Existing(existing) = db
+            .begin_generic_close_settlement(&product, &latest, &attempt)
+            .await
+            .unwrap()
+        else {
+            panic!("expected observation of the existing attempt");
+        };
+        assert_eq!(existing.phase(), ClosePhase::AwaitingBlockerResolution);
+        assert_eq!(
+            db.get_close_obligation(attempt.as_str()).await.unwrap(),
+            existing
+        );
+    }
+
+    #[tokio::test]
+    async fn generic_settlement_advances_to_inspection_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settlement.sqlite");
+        let db = Database::open_migrated_for_test(path.to_str().unwrap())
+            .await
+            .unwrap();
+        create_root(&db, "root").await;
+        let attempt = CloseAttemptId::parse("fresh-attempt").unwrap();
+        let GenericCloseAdmission::InsertedSettling(settlement) = db
+            .begin_generic_close_settlement(&product_id("root"), &transcript_id("root"), &attempt)
+            .await
+            .unwrap()
+        else {
+            panic!("expected idle attempt to enter settlement");
+        };
+
+        let (first, second) = tokio::join!(
+            db.finish_generic_close_settlement(settlement.clone()),
+            db.finish_generic_close_settlement(settlement),
+        );
+        let inspection = match (first.unwrap(), second.unwrap()) {
+            (
+                GenericCloseSettlementAdvance::Inspect(inspection),
+                GenericCloseSettlementAdvance::NoTransition,
+            )
+            | (
+                GenericCloseSettlementAdvance::NoTransition,
+                GenericCloseSettlementAdvance::Inspect(inspection),
+            ) => inspection,
+            outcomes => panic!("expected exactly one inspection handoff, got {outcomes:?}"),
+        };
+        assert_eq!(inspection.into_attempt_id(), attempt);
+        assert_eq!(
+            db.get_close_obligation(attempt.as_str())
+                .await
+                .unwrap()
+                .phase(),
+            ClosePhase::AwaitingRetirementInspection
+        );
     }
 
     #[tokio::test]

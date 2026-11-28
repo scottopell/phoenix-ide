@@ -33,6 +33,28 @@ fn close_settlement_conflict(detail: String) -> AppError {
     )))
 }
 
+async fn project_close_worker_failure(
+    state: &AppState,
+    attempt_id: &CloseAttemptId,
+    detail: String,
+) -> AppError {
+    use phoenix_core::domain::close::CloseCompletionOutcome;
+
+    let current = match state.db.get_close_obligation(attempt_id.as_str()).await {
+        Ok(current) => current,
+        Err(error) => return AppError::Internal(error.to_string()),
+    };
+    let error_type = match (current.phase(), current.close_outcome()) {
+        (_, Some(CloseCompletionOutcome::CloseIncomplete)) => "close_incomplete",
+        (ClosePhase::NeedsRepair | ClosePhase::RetirementRequested, _) => {
+            "close_retirement_needs_repair"
+        }
+        (ClosePhase::AwaitingRetirementInspection, _) => "close_inspection_failed",
+        _ => "close_settlement_in_progress",
+    };
+    AppError::Conflict(Box::new(ConflictErrorResponse::new(detail, error_type)))
+}
+
 async fn observe_close_settlement(
     state: &AppState,
     attempt_id: &CloseAttemptId,
@@ -140,16 +162,17 @@ pub(crate) async fn run_legacy_close_compat(
             match admission {
                 GenericCloseAdmission::InsertedSettling(settlement) => {
                     let attempt_id = settlement.obligation().attempt_id().clone();
-                    state
+                    let worker = state
                         .runtime
                         .start_generic_close_settlement(settlement)
                         .await
-                        .map_err(close_settlement_conflict)?
-                        .await
-                        .map_err(|error| {
-                            close_settlement_conflict(format!("Close settlement worker failed: {error}"))
-                        })?
                         .map_err(close_settlement_conflict)?;
+                    let result = worker.await.unwrap_or_else(|error| {
+                        Err(format!("Close settlement worker failed: {error}"))
+                    });
+                    if let Err(error) = result {
+                        return Err(project_close_worker_failure(state, &attempt_id, error).await);
+                    }
                     observe_close_settlement(state, &attempt_id).await?
                 }
                 GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
@@ -179,11 +202,15 @@ pub(crate) async fn run_legacy_close_compat(
                 ))));
             }
             ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement => {
-                state
+                if let Err(error) = state
                     .runtime
                     .resume_close_settlements(Some(obligation.attempt_id()))
                     .await
-                    .map_err(close_settlement_conflict)?;
+                {
+                    return Err(
+                        project_close_worker_failure(state, obligation.attempt_id(), error).await,
+                    );
+                }
                 observe_close_settlement(state, obligation.attempt_id()).await?
             }
             ClosePhase::AwaitingRetirementInspection => {
