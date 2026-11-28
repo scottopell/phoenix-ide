@@ -3002,8 +3002,10 @@ impl TmuxRegistry {
                         },
                     }
                 }
-                Ok(TmuxRetirementRehydration::EndpointAbsent
-                | TmuxRetirementRehydration::ReplacementLive(_)) => {
+                Ok(
+                    TmuxRetirementRehydration::EndpointAbsent
+                    | TmuxRetirementRehydration::ReplacementLive(_),
+                ) => {
                     return CascadeReport {
                         socket_path: identity.socket_path,
                         kill_server_error: None,
@@ -5149,13 +5151,19 @@ mod tests {
         fake.set_global_env(&spelling.socket_path, SERVER_TOKEN_VAR, &alternate)
             .await;
         assert_eq!(
-            bootstrap.exact_identity_state(&spelling, close_deadline()).await.unwrap(),
+            bootstrap
+                .exact_identity_state(&spelling, close_deadline())
+                .await
+                .unwrap(),
             ExactTmuxIdentityState::Live,
         );
         fake.set_global_env(&spelling.socket_path, SERVER_TOKEN_VAR, "not-a-uuid")
             .await;
         assert!(matches!(
-            bootstrap.exact_identity_state(&spelling, close_deadline()).await.unwrap(),
+            bootstrap
+                .exact_identity_state(&spelling, close_deadline())
+                .await
+                .unwrap(),
             ExactTmuxIdentityState::Ambiguous { .. },
         ));
         assert_eq!(fake.kill_server_count(&spelling.socket_path), 0);

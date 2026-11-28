@@ -1793,7 +1793,9 @@ impl RuntimeManager {
         attempt_id: CloseAttemptId,
     ) -> Result<(), String> {
         self.start_generic_close_worker(attempt_id, |manager, attempt_id| async move {
-            manager.run_close_runtime_retirement(GenericRetirementAuthority::Fixture(attempt_id)).await
+            manager
+                .run_close_runtime_retirement(GenericRetirementAuthority::Fixture(attempt_id))
+                .await
         })
         .await?
         .await
@@ -1884,7 +1886,9 @@ impl RuntimeManager {
     ) -> Result<tokio::task::JoinHandle<Result<(), String>>, String> {
         self.start_generic_close_worker(attempt_id, |manager, attempt_id| async move {
             resume.await.map_err(|error| error.to_string())?;
-            manager.run_close_runtime_retirement(GenericRetirementAuthority::Fixture(attempt_id)).await
+            manager
+                .run_close_runtime_retirement(GenericRetirementAuthority::Fixture(attempt_id))
+                .await
         })
         .await
     }
@@ -2280,8 +2284,11 @@ impl RuntimeManager {
                         GenericRemovalPolicy::RetainedOnly => None,
                     };
                     let rehydration = match prepared {
-                        None | Some(Ok(TmuxRetirementRehydration::EndpointAbsent
-                            | TmuxRetirementRehydration::ReplacementLive(_))) => {
+                        None
+                        | Some(Ok(
+                            TmuxRetirementRehydration::EndpointAbsent
+                            | TmuxRetirementRehydration::ReplacementLive(_),
+                        )) => {
                             if tokio::time::timeout_at(
                                 tmux_expires,
                                 tmux.fence_retirement_admission(&key),
@@ -2376,8 +2383,10 @@ impl RuntimeManager {
                             )
                             .await?;
                         }
-                        Ok(TmuxRetirementRehydration::EndpointAbsent
-                            | TmuxRetirementRehydration::ReplacementLive(_)) => {
+                        Ok(
+                            TmuxRetirementRehydration::EndpointAbsent
+                            | TmuxRetirementRehydration::ReplacementLive(_),
+                        ) => {
                             let dispatched = self
                                 .db()
                                 .close_retirement_resource_was_dispatched(
@@ -3152,7 +3161,8 @@ impl RuntimeManager {
                             let confirmed_snapshot = confirmed.snapshot;
                             let identity = identity.clone();
                             let cleanup_plan = cleanup_plan.clone();
-                            let persistence_uncertain = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let persistence_uncertain =
+                                Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let writer_probe = CloseWriterProbe {
                                 persistence_uncertain: Some(Arc::clone(&persistence_uncertain)),
                                 #[cfg(test)]
@@ -3184,7 +3194,8 @@ impl RuntimeManager {
                                 )
                             })
                             .await;
-                            self.fence_unclassified_generic_worktree_effect(&persistence_uncertain).await;
+                            self.fence_unclassified_generic_worktree_effect(&persistence_uncertain)
+                                .await;
                             let recovery = match recovery {
                                 Ok(recovery) => recovery,
                                 Err(error) => {
@@ -3296,7 +3307,8 @@ impl RuntimeManager {
                                 })?;
                             let confirmed_snapshot = confirmed.snapshot;
                             let identity = identity.clone();
-                            let persistence_uncertain = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let persistence_uncertain =
+                                Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let writer_probe = CloseWriterProbe {
                                 persistence_uncertain: Some(Arc::clone(&persistence_uncertain)),
                                 #[cfg(test)]
@@ -3329,7 +3341,8 @@ impl RuntimeManager {
                                 )
                             })
                             .await;
-                            self.fence_unclassified_generic_worktree_effect(&persistence_uncertain).await;
+                            self.fence_unclassified_generic_worktree_effect(&persistence_uncertain)
+                                .await;
                             let recovery = match recovery {
                                 Ok(recovery) => recovery,
                                 Err(error) => {
@@ -3532,7 +3545,8 @@ impl RuntimeManager {
                             let snapshot_for_tombstone = snapshot.clone();
                             let runtime = tokio::runtime::Handle::current();
                             let persistence_runtime = runtime.clone();
-                            let persistence_uncertain = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                            let persistence_uncertain =
+                                Arc::new(std::sync::atomic::AtomicBool::new(false));
                             let writer_probe = CloseWriterProbe {
                                 persistence_uncertain: Some(Arc::clone(&persistence_uncertain)),
                                 #[cfg(test)]
@@ -3595,7 +3609,8 @@ impl RuntimeManager {
                                 )
                             })
                             .await;
-                            self.fence_unclassified_generic_worktree_effect(&persistence_uncertain).await;
+                            self.fence_unclassified_generic_worktree_effect(&persistence_uncertain)
+                                .await;
                             let final_removal = match final_removal {
                                 Ok(final_removal) => final_removal,
                                 Err(error) => {
@@ -3817,8 +3832,8 @@ impl RuntimeManager {
         observation: phoenix_tools::tmux::registry::TmuxReplacementObservation,
     ) -> Result<(), String> {
         let (sealed, replacement_token) = observation.into_parts();
-        let identity = OpaqueIdentity::parse(sealed.stable_identity())
-            .map_err(|error| error.to_string())?;
+        let identity =
+            OpaqueIdentity::parse(sealed.stable_identity()).map_err(|error| error.to_string())?;
         let resource = RetiredResourceIdentity::parse(
             RetiredResourceKind::TmuxServer,
             LossItemIdentity::Opaque(identity),
@@ -21393,16 +21408,14 @@ mod tests {
     #[test]
     fn linux_first_descriptor_link_distinguishes_denial_from_identity_loss() {
         for errno in [libc::EACCES, libc::EPERM] {
-            let reason = super::initial_linux_descriptor_link_gap(
-                &std::io::Error::from_raw_os_error(errno),
-            );
+            let reason =
+                super::initial_linux_descriptor_link_gap(&std::io::Error::from_raw_os_error(errno));
             assert_eq!(reason, super::CloseWriterGap::Unavailable);
             assert!(super::is_residual_process_gap(reason));
         }
         for errno in [libc::ENOENT, libc::EIO] {
-            let reason = super::initial_linux_descriptor_link_gap(
-                &std::io::Error::from_raw_os_error(errno),
-            );
+            let reason =
+                super::initial_linux_descriptor_link_gap(&std::io::Error::from_raw_os_error(errno));
             assert_eq!(reason, super::CloseWriterGap::DescriptorChanged);
             assert!(!super::is_residual_process_gap(reason));
         }

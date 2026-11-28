@@ -578,8 +578,10 @@ impl LeaseRegistries {
                     .await
                 {
                     Ok(TmuxRetirementRehydration::Permit(permit)) => *permit,
-                    Ok(TmuxRetirementRehydration::EndpointAbsent
-                    | TmuxRetirementRehydration::ReplacementLive(_)) => {
+                    Ok(
+                        TmuxRetirementRehydration::EndpointAbsent
+                        | TmuxRetirementRehydration::ReplacementLive(_),
+                    ) => {
                         self.tmux.fence_retirement_admission(key).await;
                         return Err("tmux identity changed during Close lease acquisition".into());
                     }
