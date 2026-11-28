@@ -1,0 +1,689 @@
+{
+  "recorded_input": 60994769767,
+  "provider_coverage": {
+    "unlinked": {
+      "ordinary_or_legacy_usage_attempts": 380825
+    },
+    "codex_auth": {
+      "ordinary_or_legacy_usage_attempts": 187767
+    }
+  },
+  "call_id_bytes": 37,
+  "diagnostics": {
+    "subagent_explore": {
+      "codex_context_proxy": 19484,
+      "hint_anchors": 58141,
+      "hint_without_browser_anchors": 0,
+      "omitted_hint_names": 0,
+      "hints_missing_browser_names": 0,
+      "matched_codex": 38657,
+      "terminal_anchors": 1923,
+      "browser_transcripts": 122,
+      "first_request_missing_from_default_browser_results": 0,
+      "targeted_one_search": 122,
+      "targeted_two_searches": 0,
+      "targeted_three_or_more": 0,
+      "without_callable_search_evidence": 2871
+    },
+    "subagent_legacy_mode": {
+      "matched_codex": 20854,
+      "hint_anchors": 29098,
+      "hint_without_browser_anchors": 0,
+      "omitted_hint_names": 0,
+      "hints_missing_browser_names": 0,
+      "codex_context_proxy": 8244,
+      "terminal_anchors": 452
+    },
+    "subagent_work": {
+      "matched_codex": 16371,
+      "hint_anchors": 24507,
+      "hint_without_browser_anchors": 0,
+      "omitted_hint_names": 0,
+      "hints_missing_browser_names": 0,
+      "terminal_anchors": 431,
+      "codex_context_proxy": 8136,
+      "browser_transcripts": 5,
+      "first_request_missing_from_default_browser_results": 1,
+      "targeted_one_search": 1,
+      "targeted_two_searches": 4,
+      "targeted_three_or_more": 0
+    },
+    "ordinary_parent": {
+      "matched_codex": 89811,
+      "hint_anchors": 159744,
+      "hint_without_browser_anchors": 0,
+      "omitted_hint_names": 0,
+      "hints_missing_browser_names": 0,
+      "unclassified_or_eager_anchors": 1447,
+      "codex_context_proxy": 69933,
+      "browser_transcripts": 64,
+      "first_request_missing_from_default_browser_results": 3,
+      "targeted_one_search": 50,
+      "targeted_two_searches": 7,
+      "targeted_three_or_more": 7
+    },
+    "coordinator": {
+      "without_callable_search_evidence": 27601
+    }
+  },
+  "scenarios": {
+    "default_with_targeted_followups": {
+      "codex_context_proxy": {
+        "ordinary_parent": {
+          "missing_needed_tools": 0,
+          "requests": 69933,
+          "schema_removed": 222950562.39725628,
+          "hint_input": 7078466.568034253,
+          "search_replayed": 25520435.20342801,
+          "schema_removed_cache": 188989559.67441073,
+          "hint_cache": 5997161.446408415,
+          "search_replayed_cache": 21834664.642872084,
+          "extra_search_requests": 44,
+          "extra_search_input": 5919932.30001444,
+          "extra_search_cache": 4806175.445182288,
+          "net_input": 184431728.3257796,
+          "net_cache_read": 156351558.13994792
+        },
+        "subagent_explore": {
+          "missing_needed_tools": 0,
+          "requests": 19484,
+          "schema_removed": 54438515.145674296,
+          "hint_input": 1649795.615533312,
+          "search_replayed": 616320.8082927422,
+          "schema_removed_cache": 46124945.4763861,
+          "hint_cache": 1398130.7769470895,
+          "search_replayed_cache": 573630.3831076366,
+          "extra_search_requests": 22,
+          "extra_search_input": 882416.6522627737,
+          "extra_search_cache": 767093.6802145253,
+          "net_input": 51289982.069585465,
+          "net_cache_read": 43386090.63611685
+        },
+        "subagent_legacy_mode": {
+          "missing_needed_tools": 0,
+          "requests": 8244,
+          "schema_removed": 23766062.139027193,
+          "hint_input": 721348.8081378441,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 21585680.771154787,
+          "hint_cache": 655131.888525317,
+          "search_replayed_cache": 0.0,
+          "net_input": 23044713.330889348,
+          "net_cache_read": 20930548.88262947
+        },
+        "subagent_work": {
+          "missing_needed_tools": 0,
+          "requests": 8136,
+          "schema_removed": 23857761.708351213,
+          "hint_input": 724514.6354721818,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 21812800.104673192,
+          "hint_cache": 662354.3168049362,
+          "search_replayed_cache": 0.0,
+          "net_input": 23133247.07287903,
+          "net_cache_read": 21150445.787868254
+        }
+      },
+      "matched_codex": {
+        "ordinary_parent": {
+          "missing_needed_tools": 0,
+          "requests": 89811,
+          "schema_removed": 301692016.6389474,
+          "hint_input": 9147368.304389546,
+          "search_replayed": 6194272.019643507,
+          "schema_removed_cache": 252392875.05359074,
+          "hint_cache": 7652739.86803206,
+          "search_replayed_cache": 5237688.081505313,
+          "extra_search_requests": 41,
+          "extra_search_input": 3104210.1180789587,
+          "extra_search_cache": 2567602.196281962,
+          "net_input": 283246166.19683546,
+          "net_cache_read": 236934844.9077714
+        },
+        "subagent_explore": {
+          "missing_needed_tools": 0,
+          "requests": 38657,
+          "schema_removed": 118403973.97039004,
+          "hint_input": 3373987.027877618,
+          "search_replayed": 2393072.518198597,
+          "schema_removed_cache": 99567648.85369761,
+          "hint_cache": 2836901.089541541,
+          "search_replayed_cache": 2259547.5682533733,
+          "extra_search_requests": 100,
+          "extra_search_input": 5104036.824768537,
+          "extra_search_cache": 4563510.548907118,
+          "net_input": 107532877.59954529,
+          "net_cache_read": 89907689.64699559
+        },
+        "subagent_legacy_mode": {
+          "missing_needed_tools": 0,
+          "requests": 20854,
+          "schema_removed": 66759768.94584144,
+          "hint_input": 1901715.9115658645,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 59237667.27702139,
+          "hint_cache": 1687362.3327278092,
+          "search_replayed_cache": 0.0,
+          "net_input": 64858053.03427558,
+          "net_cache_read": 57550304.94429358
+        },
+        "subagent_work": {
+          "missing_needed_tools": 0,
+          "requests": 16371,
+          "schema_removed": 52266236.58582033,
+          "hint_input": 1495263.5819312055,
+          "search_replayed": 566811.7748173379,
+          "schema_removed_cache": 48150959.38610587,
+          "hint_cache": 1377442.071845004,
+          "search_replayed_cache": 555117.2896998953,
+          "extra_search_requests": 9,
+          "extra_search_input": 412223.28550125065,
+          "extra_search_cache": 400573.6195649462,
+          "net_input": 49791937.94357054,
+          "net_cache_read": 45817826.40499603
+        }
+      },
+      "route_or_context": {
+        "ordinary_parent": {
+          "missing_needed_tools": 0,
+          "requests": 159744,
+          "schema_removed": 524642579.03620684,
+          "hint_input": 16225834.872428434,
+          "search_replayed": 31714707.223070912,
+          "schema_removed_cache": 441382434.72800565,
+          "hint_cache": 13649901.314440504,
+          "search_replayed_cache": 27072352.724377345,
+          "extra_search_requests": 85,
+          "extra_search_input": 9024142.418093398,
+          "extra_search_cache": 7373777.641464251,
+          "net_input": 467677894.5226141,
+          "net_cache_read": 393286403.0477236
+        },
+        "subagent_explore": {
+          "missing_needed_tools": 0,
+          "requests": 58141,
+          "schema_removed": 172842489.11606106,
+          "hint_input": 5023782.643410934,
+          "search_replayed": 3009393.326491318,
+          "schema_removed_cache": 145692594.33008358,
+          "hint_cache": 4235031.866488638,
+          "search_replayed_cache": 2833177.9513610085,
+          "extra_search_requests": 122,
+          "extra_search_input": 5986453.477031309,
+          "extra_search_cache": 5330604.229121644,
+          "net_input": 158822859.6691275,
+          "net_cache_read": 133293780.2831123
+        },
+        "subagent_legacy_mode": {
+          "missing_needed_tools": 0,
+          "requests": 29098,
+          "schema_removed": 90525831.08486985,
+          "hint_input": 2623064.7197037465,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 80823348.04817618,
+          "hint_cache": 2342494.2212531203,
+          "search_replayed_cache": 0.0,
+          "net_input": 87902766.3651661,
+          "net_cache_read": 78480853.82692306
+        },
+        "subagent_work": {
+          "missing_needed_tools": 0,
+          "requests": 24507,
+          "schema_removed": 76123998.29417142,
+          "hint_input": 2219778.2174033765,
+          "search_replayed": 566811.7748173379,
+          "schema_removed_cache": 69963759.49077919,
+          "hint_cache": 2039796.3886499382,
+          "search_replayed_cache": 555117.2896998953,
+          "extra_search_requests": 9,
+          "extra_search_input": 412223.28550125065,
+          "extra_search_cache": 400573.6195649462,
+          "net_input": 72925185.01644945,
+          "net_cache_read": 66968272.19286441
+        }
+      }
+    },
+    "one_explicit_limit_20": {
+      "codex_context_proxy": {
+        "ordinary_parent": {
+          "missing_needed_tools": 0,
+          "requests": 69933,
+          "schema_removed": 222950562.39725628,
+          "hint_input": 7078466.568034253,
+          "search_replayed": 27698803.667736985,
+          "schema_removed_cache": 188989559.67441073,
+          "hint_cache": 5997161.446408415,
+          "search_replayed_cache": 23667049.316342015,
+          "extra_search_requests": 28,
+          "extra_search_input": 3781146.441144712,
+          "extra_search_cache": 2900848.7368939267,
+          "net_input": 184392145.72034034,
+          "net_cache_read": 156424500.17476636
+        },
+        "subagent_explore": {
+          "missing_needed_tools": 0,
+          "requests": 19484,
+          "schema_removed": 54438515.145674296,
+          "hint_input": 1649795.615533312,
+          "search_replayed": 1055875.0158941285,
+          "schema_removed_cache": 46124945.4763861,
+          "hint_cache": 1398130.7769470895,
+          "search_replayed_cache": 982324.001317753,
+          "extra_search_requests": 22,
+          "extra_search_input": 882416.6522627737,
+          "extra_search_cache": 767093.6802145253,
+          "net_input": 50850427.861984074,
+          "net_cache_read": 42977397.01790673
+        },
+        "subagent_legacy_mode": {
+          "missing_needed_tools": 0,
+          "requests": 8244,
+          "schema_removed": 23766062.139027193,
+          "hint_input": 721348.8081378441,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 21585680.771154787,
+          "hint_cache": 655131.888525317,
+          "search_replayed_cache": 0.0,
+          "net_input": 23044713.330889348,
+          "net_cache_read": 20930548.88262947
+        },
+        "subagent_work": {
+          "missing_needed_tools": 0,
+          "requests": 8136,
+          "schema_removed": 23857761.708351213,
+          "hint_input": 724514.6354721818,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 21812800.104673192,
+          "hint_cache": 662354.3168049362,
+          "search_replayed_cache": 0.0,
+          "net_input": 23133247.07287903,
+          "net_cache_read": 21150445.787868254
+        }
+      },
+      "matched_codex": {
+        "ordinary_parent": {
+          "missing_needed_tools": 0,
+          "requests": 89811,
+          "schema_removed": 301692016.6389474,
+          "hint_input": 9147368.304389546,
+          "search_replayed": 9667861.903259693,
+          "schema_removed_cache": 252392875.05359074,
+          "hint_cache": 7652739.86803206,
+          "search_replayed_cache": 8120026.548250725,
+          "extra_search_requests": 36,
+          "extra_search_input": 2676905.7027610517,
+          "extra_search_cache": 2225853.0205265684,
+          "net_input": 280199880.72853714,
+          "net_cache_read": 234394255.61678138
+        },
+        "subagent_explore": {
+          "missing_needed_tools": 0,
+          "requests": 38657,
+          "schema_removed": 118403973.97039004,
+          "hint_input": 3373987.027877618,
+          "search_replayed": 4368495.365863883,
+          "schema_removed_cache": 99567648.85369761,
+          "hint_cache": 2836901.089541541,
+          "search_replayed_cache": 4124966.238268352,
+          "extra_search_requests": 100,
+          "extra_search_input": 5104036.824768537,
+          "extra_search_cache": 4563510.548907118,
+          "net_input": 105557454.75187999,
+          "net_cache_read": 88042270.97698061
+        },
+        "subagent_legacy_mode": {
+          "missing_needed_tools": 0,
+          "requests": 20854,
+          "schema_removed": 66759768.94584144,
+          "hint_input": 1901715.9115658645,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 59237667.27702139,
+          "hint_cache": 1687362.3327278092,
+          "search_replayed_cache": 0.0,
+          "net_input": 64858053.03427558,
+          "net_cache_read": 57550304.94429358
+        },
+        "subagent_work": {
+          "missing_needed_tools": 0,
+          "requests": 16371,
+          "schema_removed": 52266236.58582033,
+          "hint_input": 1495263.5819312055,
+          "search_replayed": 547877.8177508438,
+          "schema_removed_cache": 48150959.38610587,
+          "hint_cache": 1377442.071845004,
+          "search_replayed_cache": 536611.0929943426,
+          "extra_search_requests": 5,
+          "extra_search_input": 214189.02352519514,
+          "extra_search_cache": 207539.50231604374,
+          "net_input": 50008906.162613094,
+          "net_cache_read": 46029366.71895049
+        }
+      },
+      "route_or_context": {
+        "ordinary_parent": {
+          "missing_needed_tools": 0,
+          "requests": 159744,
+          "schema_removed": 524642579.03620684,
+          "hint_input": 16225834.872428434,
+          "search_replayed": 37366665.57099534,
+          "schema_removed_cache": 441382434.72800565,
+          "hint_cache": 13649901.314440504,
+          "search_replayed_cache": 31787075.86459257,
+          "extra_search_requests": 64,
+          "extra_search_input": 6458052.143905765,
+          "extra_search_cache": 5126701.757420497,
+          "net_input": 464592026.44887733,
+          "net_cache_read": 390818755.7915521
+        },
+        "subagent_explore": {
+          "missing_needed_tools": 0,
+          "requests": 58141,
+          "schema_removed": 172842489.11606106,
+          "hint_input": 5023782.643410934,
+          "search_replayed": 5424370.381757993,
+          "schema_removed_cache": 145692594.33008358,
+          "hint_cache": 4235031.866488638,
+          "search_replayed_cache": 5107290.239586112,
+          "extra_search_requests": 122,
+          "extra_search_input": 5986453.477031309,
+          "extra_search_cache": 5330604.229121644,
+          "net_input": 156407882.61386082,
+          "net_cache_read": 131019667.99488719
+        },
+        "subagent_legacy_mode": {
+          "missing_needed_tools": 0,
+          "requests": 29098,
+          "schema_removed": 90525831.08486985,
+          "hint_input": 2623064.7197037465,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 80823348.04817618,
+          "hint_cache": 2342494.2212531203,
+          "search_replayed_cache": 0.0,
+          "net_input": 87902766.3651661,
+          "net_cache_read": 78480853.82692306
+        },
+        "subagent_work": {
+          "missing_needed_tools": 0,
+          "requests": 24507,
+          "schema_removed": 76123998.29417142,
+          "hint_input": 2219778.2174033765,
+          "search_replayed": 547877.8177508438,
+          "schema_removed_cache": 69963759.49077919,
+          "hint_cache": 2039796.3886499382,
+          "search_replayed_cache": 536611.0929943426,
+          "extra_search_requests": 5,
+          "extra_search_input": 214189.02352519514,
+          "extra_search_cache": 207539.50231604374,
+          "net_input": 73142153.235492,
+          "net_cache_read": 67179812.50681886
+        }
+      }
+    },
+    "two_bundle_searches": {
+      "codex_context_proxy": {
+        "ordinary_parent": {
+          "missing_needed_tools": 0,
+          "requests": 69933,
+          "schema_removed": 222950562.39725628,
+          "hint_input": 7078466.568034253,
+          "search_replayed": 43873003.48563087,
+          "schema_removed_cache": 188989559.67441073,
+          "hint_cache": 5997161.446408415,
+          "search_replayed_cache": 37475065.05476024,
+          "extra_search_requests": 56,
+          "extra_search_input": 7617212.104954121,
+          "extra_search_cache": 5841729.78694959,
+          "net_input": 164381880.23863703,
+          "net_cache_read": 139675603.38629246
+        },
+        "subagent_explore": {
+          "missing_needed_tools": 0,
+          "requests": 19484,
+          "schema_removed": 54438515.145674296,
+          "hint_input": 1649795.615533312,
+          "search_replayed": 1672195.824186874,
+          "schema_removed_cache": 46124945.4763861,
+          "hint_cache": 1398130.7769470895,
+          "search_replayed_cache": 1555954.3844253893,
+          "extra_search_requests": 44,
+          "extra_search_input": 1803774.4647787884,
+          "extra_search_cache": 1565697.910174245,
+          "net_input": 49312749.241175316,
+          "net_cache_read": 41605162.40483938
+        },
+        "subagent_legacy_mode": {
+          "missing_needed_tools": 0,
+          "requests": 8244,
+          "schema_removed": 23766062.139027193,
+          "hint_input": 721348.8081378441,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 21585680.771154787,
+          "hint_cache": 655131.888525317,
+          "search_replayed_cache": 0.0,
+          "net_input": 23044713.330889348,
+          "net_cache_read": 20930548.88262947
+        },
+        "subagent_work": {
+          "missing_needed_tools": 0,
+          "requests": 8136,
+          "schema_removed": 23857761.708351213,
+          "hint_input": 724514.6354721818,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 21812800.104673192,
+          "hint_cache": 662354.3168049362,
+          "search_replayed_cache": 0.0,
+          "net_input": 23133247.07287903,
+          "net_cache_read": 21150445.787868254
+        }
+      },
+      "matched_codex": {
+        "ordinary_parent": {
+          "missing_needed_tools": 0,
+          "requests": 89811,
+          "schema_removed": 301692016.6389474,
+          "hint_input": 9147368.304389546,
+          "search_replayed": 14993376.465961082,
+          "schema_removed_cache": 252392875.05359074,
+          "hint_cache": 7652739.86803206,
+          "search_replayed_cache": 12588194.953463353,
+          "extra_search_requests": 72,
+          "extra_search_input": 5424114.299121817,
+          "extra_search_cache": 4510344.054866918,
+          "net_input": 272127157.569475,
+          "net_cache_read": 227641596.17722842
+        },
+        "subagent_explore": {
+          "missing_needed_tools": 0,
+          "requests": 38657,
+          "schema_removed": 118403973.97039004,
+          "hint_input": 3373987.027877618,
+          "search_replayed": 6761567.884062488,
+          "schema_removed_cache": 99567648.85369761,
+          "hint_cache": 2836901.089541541,
+          "search_replayed_cache": 6384513.806521734,
+          "extra_search_requests": 200,
+          "extra_search_input": 10393620.75060159,
+          "extra_search_cache": 9296620.070402358,
+          "net_input": 97874798.30784835,
+          "net_cache_read": 81049613.88723199
+        },
+        "subagent_legacy_mode": {
+          "missing_needed_tools": 0,
+          "requests": 20854,
+          "schema_removed": 66759768.94584144,
+          "hint_input": 1901715.9115658645,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 59237667.27702139,
+          "hint_cache": 1687362.3327278092,
+          "search_replayed_cache": 0.0,
+          "net_input": 64858053.03427558,
+          "net_cache_read": 57550304.94429358
+        },
+        "subagent_work": {
+          "missing_needed_tools": 0,
+          "requests": 16371,
+          "schema_removed": 52266236.58582033,
+          "hint_input": 1495263.5819312055,
+          "search_replayed": 847240.9506325007,
+          "schema_removed_cache": 48150959.38610587,
+          "hint_cache": 1377442.071845004,
+          "search_replayed_cache": 829818.0320839814,
+          "extra_search_requests": 10,
+          "extra_search_input": 437819.66115558485,
+          "extra_search_cache": 424215.6743544853,
+          "net_input": 49485912.39210105,
+          "net_cache_read": 45519483.6078224
+        }
+      },
+      "route_or_context": {
+        "ordinary_parent": {
+          "missing_needed_tools": 0,
+          "requests": 159744,
+          "schema_removed": 524642579.03620684,
+          "hint_input": 16225834.872428434,
+          "search_replayed": 58866379.95159567,
+          "schema_removed_cache": 441382434.72800565,
+          "hint_cache": 13649901.314440504,
+          "search_replayed_cache": 50063260.008223735,
+          "extra_search_requests": 128,
+          "extra_search_input": 13041326.40407594,
+          "extra_search_cache": 10352073.841816505,
+          "net_input": 436509037.80810684,
+          "net_cache_read": 367317199.56352496
+        },
+        "subagent_explore": {
+          "missing_needed_tools": 0,
+          "requests": 58141,
+          "schema_removed": 172842489.11606106,
+          "hint_input": 5023782.643410934,
+          "search_replayed": 8433763.70824936,
+          "schema_removed_cache": 145692594.33008358,
+          "hint_cache": 4235031.866488638,
+          "search_replayed_cache": 7940468.190947129,
+          "extra_search_requests": 244,
+          "extra_search_input": 12197395.215380376,
+          "extra_search_cache": 10862317.980576603,
+          "net_input": 147187547.5490204,
+          "net_cache_read": 122654776.29207121
+        },
+        "subagent_legacy_mode": {
+          "missing_needed_tools": 0,
+          "requests": 29098,
+          "schema_removed": 90525831.08486985,
+          "hint_input": 2623064.7197037465,
+          "search_replayed": 0.0,
+          "schema_removed_cache": 80823348.04817618,
+          "hint_cache": 2342494.2212531203,
+          "search_replayed_cache": 0.0,
+          "net_input": 87902766.3651661,
+          "net_cache_read": 78480853.82692306
+        },
+        "subagent_work": {
+          "missing_needed_tools": 0,
+          "requests": 24507,
+          "schema_removed": 76123998.29417142,
+          "hint_input": 2219778.2174033765,
+          "search_replayed": 847240.9506325007,
+          "schema_removed_cache": 69963759.49077919,
+          "hint_cache": 2039796.3886499382,
+          "search_replayed_cache": 829818.0320839814,
+          "extra_search_requests": 10,
+          "extra_search_input": 437819.66115558485,
+          "extra_search_cache": 424215.6743544853,
+          "net_input": 72619159.46497996,
+          "net_cache_read": 66669929.395690784
+        }
+      }
+    }
+  },
+  "baseline": {
+    "codex": {
+      "before": {
+        "requests": 22069,
+        "transcripts": 282,
+        "ask_user_question_calls": 13,
+        "ask_user_question_transcripts": 12,
+        "browser_calls": 163,
+        "browser_transcripts": 17,
+        "browser_calls_per_1000": 7.385925959490688,
+        "ask_user_question_calls_per_1000": 0.5890615795912819
+      },
+      "after": {
+        "requests": 11618,
+        "transcripts": 138,
+        "ask_user_question_calls": 1,
+        "ask_user_question_transcripts": 1,
+        "browser_calls": 8,
+        "browser_transcripts": 7,
+        "browser_calls_per_1000": 0.6885866758478223,
+        "ask_user_question_calls_per_1000": 0.08607333448097779
+      }
+    },
+    "openai_responses": {
+      "before": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0,
+        "browser_calls_per_1000": null,
+        "ask_user_question_calls_per_1000": null
+      },
+      "after": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0,
+        "browser_calls_per_1000": null,
+        "ask_user_question_calls_per_1000": null
+      }
+    },
+    "anthropic": {
+      "before": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0,
+        "browser_calls_per_1000": null,
+        "ask_user_question_calls_per_1000": null
+      },
+      "after": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0,
+        "browser_calls_per_1000": null,
+        "ask_user_question_calls_per_1000": null
+      }
+    },
+    "other": {
+      "before": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0,
+        "browser_calls_per_1000": null,
+        "ask_user_question_calls_per_1000": null
+      },
+      "after": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0,
+        "browser_calls_per_1000": null,
+        "ask_user_question_calls_per_1000": null
+      }
+    }
+  }
+}

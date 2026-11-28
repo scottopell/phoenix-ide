@@ -96,6 +96,11 @@ pub struct BrowserNavigateTool;
 
 #[async_trait]
 impl Tool for BrowserNavigateTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }
@@ -216,6 +221,11 @@ pub struct BrowserEvalTool;
 
 #[async_trait]
 impl Tool for BrowserEvalTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }
@@ -555,6 +565,11 @@ pub struct BrowserTakeScreenshotTool;
 
 #[async_trait]
 impl Tool for BrowserTakeScreenshotTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }
@@ -722,6 +737,11 @@ pub struct BrowserRecentConsoleLogsTool;
 
 #[async_trait]
 impl Tool for BrowserRecentConsoleLogsTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }
@@ -825,6 +845,11 @@ pub struct BrowserClearConsoleLogsTool;
 
 #[async_trait]
 impl Tool for BrowserClearConsoleLogsTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }
@@ -888,6 +913,11 @@ pub struct BrowserResizeTool;
 
 #[async_trait]
 impl Tool for BrowserResizeTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }
@@ -990,6 +1020,11 @@ pub struct BrowserWaitForSelectorTool;
 
 #[async_trait]
 impl Tool for BrowserWaitForSelectorTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }
@@ -1155,6 +1190,11 @@ pub struct BrowserClickTool;
 
 #[async_trait]
 impl Tool for BrowserClickTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }
@@ -1346,6 +1386,11 @@ async fn focus_element_until(
 
 #[async_trait]
 impl Tool for BrowserTypeTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }
@@ -1635,6 +1680,11 @@ pub struct BrowserKeyPressTool;
 
 #[async_trait::async_trait]
 impl Tool for BrowserKeyPressTool {
+    fn defer_loading(&self) -> bool {
+        // deferred on discovery-capable routes: most transcripts never use the browser
+        true
+    }
+
     fn foreground_execution(&self) -> crate::ForegroundExecution {
         crate::ForegroundExecution::Concurrent
     }

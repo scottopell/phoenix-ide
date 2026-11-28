@@ -1,0 +1,375 @@
+{
+  "windows_utc": {
+    "start": "2026-11-09",
+    "cutover": "2026-11-23",
+    "latest_observed_request_day": "2026-11-28"
+  },
+  "parent_by_route": {
+    "codex": {
+      "before": {
+        "requests": 22069,
+        "transcripts": 282,
+        "ask_user_question_calls": 13,
+        "ask_user_question_transcripts": 12,
+        "browser_calls": 163,
+        "browser_transcripts": 17
+      },
+      "after": {
+        "requests": 11618,
+        "transcripts": 138,
+        "ask_user_question_calls": 1,
+        "ask_user_question_transcripts": 1,
+        "browser_calls": 8,
+        "browser_transcripts": 7
+      }
+    },
+    "openai_responses": {
+      "before": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      },
+      "after": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      }
+    },
+    "anthropic": {
+      "before": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      },
+      "after": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      }
+    },
+    "other": {
+      "before": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      },
+      "after": {
+        "requests": 0,
+        "transcripts": 0,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      }
+    }
+  },
+  "parent_by_day": {
+    "codex": {
+      "2026-11-09": {
+        "requests": 5948,
+        "transcripts": 77,
+        "ask_user_question_calls": 5,
+        "ask_user_question_transcripts": 5,
+        "browser_calls": 75,
+        "browser_transcripts": 6
+      },
+      "2026-11-10": {
+        "requests": 1179,
+        "transcripts": 17,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      },
+      "2026-11-14": {
+        "requests": 3566,
+        "transcripts": 41,
+        "ask_user_question_calls": 1,
+        "ask_user_question_transcripts": 1,
+        "browser_calls": 16,
+        "browser_transcripts": 5
+      },
+      "2026-11-15": {
+        "requests": 1478,
+        "transcripts": 23,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 6,
+        "browser_transcripts": 2
+      },
+      "2026-11-16": {
+        "requests": 3582,
+        "transcripts": 60,
+        "ask_user_question_calls": 2,
+        "ask_user_question_transcripts": 2,
+        "browser_calls": 65,
+        "browser_transcripts": 3
+      },
+      "2026-11-17": {
+        "requests": 613,
+        "transcripts": 11,
+        "ask_user_question_calls": 2,
+        "ask_user_question_transcripts": 2,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      },
+      "2026-11-21": {
+        "requests": 1543,
+        "transcripts": 23,
+        "ask_user_question_calls": 3,
+        "ask_user_question_transcripts": 2,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      },
+      "2026-11-22": {
+        "requests": 4160,
+        "transcripts": 66,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 1,
+        "browser_transcripts": 1
+      },
+      "2026-11-23": {
+        "requests": 1492,
+        "transcripts": 17,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      },
+      "2026-11-24": {
+        "requests": 2395,
+        "transcripts": 36,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 5,
+        "browser_transcripts": 4
+      },
+      "2026-11-25": {
+        "requests": 1308,
+        "transcripts": 22,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 1,
+        "browser_transcripts": 1
+      },
+      "2026-11-26": {
+        "requests": 2375,
+        "transcripts": 31,
+        "ask_user_question_calls": 1,
+        "ask_user_question_transcripts": 1,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      },
+      "2026-11-27": {
+        "requests": 3375,
+        "transcripts": 36,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 1,
+        "browser_transcripts": 1
+      },
+      "2026-11-28": {
+        "requests": 673,
+        "transcripts": 10,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 1,
+        "browser_transcripts": 1
+      }
+    },
+    "openai_responses": {},
+    "anthropic": {},
+    "other": {}
+  },
+  "codex_parent_by_model": {
+    "before": {
+      "gpt_5": {
+        "requests": 2737,
+        "transcripts": 49,
+        "ask_user_question_calls": 1,
+        "ask_user_question_transcripts": 1,
+        "browser_calls": 8,
+        "browser_transcripts": 1
+      },
+      "gpt_6_1_sol": {
+        "requests": 16884,
+        "transcripts": 210,
+        "ask_user_question_calls": 10,
+        "ask_user_question_transcripts": 9,
+        "browser_calls": 96,
+        "browser_transcripts": 11
+      },
+      "gpt_6_astra": {
+        "requests": 356,
+        "transcripts": 4,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 48,
+        "browser_transcripts": 2
+      },
+      "gpt_6_sol": {
+        "requests": 2092,
+        "transcripts": 19,
+        "ask_user_question_calls": 2,
+        "ask_user_question_transcripts": 2,
+        "browser_calls": 11,
+        "browser_transcripts": 3
+      }
+    },
+    "after": {
+      "gpt_5": {
+        "requests": 146,
+        "transcripts": 4,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      },
+      "gpt_6_1_sol": {
+        "requests": 6584,
+        "transcripts": 79,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 6,
+        "browser_transcripts": 5
+      },
+      "gpt_6_1_terra": {
+        "requests": 75,
+        "transcripts": 1,
+        "ask_user_question_calls": 0,
+        "ask_user_question_transcripts": 0,
+        "browser_calls": 0,
+        "browser_transcripts": 0
+      },
+      "gpt_6_2_sol": {
+        "requests": 4813,
+        "transcripts": 55,
+        "ask_user_question_calls": 1,
+        "ask_user_question_transcripts": 1,
+        "browser_calls": 2,
+        "browser_transcripts": 2
+      }
+    }
+  },
+  "codex_parent_latest_policy_after": {
+    "other": {
+      "requests": 1905,
+      "transcripts": 21,
+      "ask_user_question_calls": 0,
+      "ask_user_question_transcripts": 0,
+      "browser_calls": 2,
+      "browser_transcripts": 1
+    },
+    "search_and_advertised": {
+      "requests": 1057,
+      "transcripts": 11,
+      "ask_user_question_calls": 1,
+      "ask_user_question_transcripts": 1,
+      "browser_calls": 1,
+      "browser_transcripts": 1
+    },
+    "search_only": {
+      "requests": 8656,
+      "transcripts": 106,
+      "ask_user_question_calls": 0,
+      "ask_user_question_transcripts": 0,
+      "browser_calls": 5,
+      "browser_transcripts": 5
+    }
+  },
+  "parent_usage_ledger_coverage": {
+    "after": {
+      "other_kind": 125,
+      "ordinary": 11618,
+      "codex": 11618
+    },
+    "before": {
+      "other_kind": 254,
+      "ordinary": 22070,
+      "codex": 22070
+    }
+  },
+  "attribution_coverage": {
+    "before": {
+      "coordinator": {
+        "response_anchors_with_usage": 2411,
+        "matched_response_anchors": 2411
+      },
+      "sub_agent": {
+        "response_anchors_with_usage": 31627,
+        "matched_response_anchors": 31627
+      },
+      "user": {
+        "response_anchors_with_usage": 22070,
+        "matched_response_anchors": 22069,
+        "unmatched_ask_user_question_calls": 0,
+        "unmatched_browser_calls": 0
+      }
+    },
+    "after": {
+      "coordinator": {
+        "response_anchors_with_usage": 3141,
+        "matched_response_anchors": 3141
+      },
+      "sub_agent": {
+        "response_anchors_with_usage": 18128,
+        "matched_response_anchors": 18128
+      },
+      "user": {
+        "response_anchors_with_usage": 11616,
+        "matched_response_anchors": 11616
+      }
+    }
+  },
+  "search_by_route": {
+    "codex": {
+      "before": {},
+      "after": {
+        "sub_agent": {
+          "calls": 422,
+          "named_tool": 391,
+          "queries_naming_ask_user_question": 0,
+          "provider_server_calls": 0,
+          "durable_results": 422,
+          "results_with_deferred_tools": 0,
+          "results_with_ask_user_question": 0,
+          "task_or_keyword": 31
+        },
+        "user": {
+          "calls": 23,
+          "task_or_keyword": 13,
+          "queries_naming_ask_user_question": 1,
+          "provider_server_calls": 0,
+          "durable_results": 23,
+          "results_with_deferred_tools": 11,
+          "results_with_ask_user_question": 11,
+          "question_or_clarification_terms": 4,
+          "question_results_from_question_or_clarification_terms": 4,
+          "question_results_from_task_or_keyword": 3,
+          "named_tool": 5,
+          "question_results_from_named_tool": 3,
+          "named_ask_user_question": 1,
+          "question_results_from_named_ask_user_question": 1,
+          "question_results_followed_by_question_call": 1,
+          "followed_question_results_from_task_or_keyword": 1
+        }
+      }
+    }
+  }
+}

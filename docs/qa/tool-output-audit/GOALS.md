@@ -38,13 +38,15 @@ The work is done (`holder: done`) when any of these holds:
 
 ## Current target
 
-Round 5: the worker re-votes on PR #1204 (B+A, about 8.3%) at `5a848c698`, then replays browser
-deferral (about 1.3–1.5% net, mostly cache reads).
+Round 7: the worker replays browser deferral plus the deferred-names hint as built (`7520de328`).
+If confirmed, a PR follows. Replay: about 1.3% net before the hint's cost; the hint should also
+restore `ask_user_question` use.
 
-Queued on the B+A baseline: bounded bash output with retrieval (6.4% gross ceiling); long
-bash lines (2.2%); compact read_file numbering (1.3%).
+Queued: bounded bash output with retrieval (6.4% gross ceiling); long bash lines (2.2%);
+compact read_file numbering (1.3%).
 
 ## Wins log
 
-- PR #1204 (open): B, patch diff previews, 5.19% replayed, both agents agree; A, short
-  resolvable marker, 3.09% replayed, implementation replay pending.
+- **PR #1204, merged 2026-11-28 (`415ddf399`):** patch diff previews (5.18%) and the short
+  resolvable cleared-result marker (3.34%), **about 8.5% of recorded input** by offline replay.
+  Running total: 8.5% of the 10% goal (G2).

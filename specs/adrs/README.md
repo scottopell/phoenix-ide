@@ -52,6 +52,7 @@ Allowing gaps does not approve an ID allocation, decision, or publication.
 | ADR | Title | Status | Affects |
 | --- | --- | --- | --- |
 | [293](293_native-close-requires-positive-external-writer-evidence.md) | Require positive external writer evidence to block admitted native physical Close on a process | Accepted | REQ-WL-002e |
+| [294](294_defer-browser-tools-with-a-discoverable-names-hint.md) | Defer browser tools, and name deferred tools where the model cannot see them | Accepted | REQ-LLM-004n, REQ-LLM-004o, REQ-AUQ-008 |
 | [290](290_compact-model-visible-tool-output.md) | Compact model-visible tool output, separate from typed displays | Accepted | REQ-BASH-002, REQ-BASH-004, REQ-BASH-017, REQ-RQD-010 |
 | [291](291_clearable-previews-in-state-changing-results.md) | Clearable previews inside state-changing tool results | Accepted | REQ-STR-002, REQ-STR-004, REQ-STR-013, REQ-PATCH-007 |
 | [292](292_caller-relative-cleared-result-locator.md) | Cleared-result markers name their source relative to the caller | Accepted | REQ-STR-004, REQ-STR-012 |

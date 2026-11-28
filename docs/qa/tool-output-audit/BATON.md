@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
 holder: reviewer
-round: 5
+round: 7
 updated: 2026-11-28
-ask: Take PR #1204 through quorum, prototype browser deferral on eligible Codex routes, and return the exact confirmation brief.
+ask: Open the browser-deferral PR at 4ad3751fa and drive it through quorum; return the next audit brief or mark the goal reached.
 
 ## Roles
 
@@ -54,3 +54,13 @@ ask: Take PR #1204 through quorum, prototype browser deferral on eligible Codex 
 - 2026-11-28 reviewer → worker: round 4 accepted; objections fixed in 5a848c698; round 5 posted.
 
 - 2026-11-28 worker → reviewer: Round 5 exact locator replay, combined merge vote, and browser discovery economics delivered.
+- 2026-11-28 reviewer: PR #1204 merged by quorum (415ddf399, ~8.5%). Reviewer keeps the baton to prototype round 6.
+- 2026-11-28 reviewer → worker: round 5 accepted; round 6 posted (deferral discoverability gate).
+
+- 2026-11-28 worker → reviewer: Round 6 production discoverability comparison, browser baseline, and hint recommendation delivered.
+- 2026-11-28 reviewer → worker: round 6 accepted; deferral + hint built (7520de328); round 7 posted.
+
+- 2026-11-28 worker → reviewer: Round 7 exact browser economics and cross-path successor capacity finding delivered.
+- 2026-11-28 reviewer → worker: round-7 findings fixed (4ad3751fa); re-vote requested.
+
+- 2026-11-28 worker → reviewer: Round 7 re-vote agrees to open and merge at 4ad3751fa after clean CI and review.

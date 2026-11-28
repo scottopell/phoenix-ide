@@ -2149,11 +2149,95 @@ fn discovery_mode_for_tools(
     }
 }
 
+/// Most deferred tool names a hint lists; the rest are counted.
+const DEFERRED_HINT_MAX_NAMES: usize = 40;
+
+/// A short system-prompt note naming the permitted deferred tools, for discovery
+/// modes where the model otherwise cannot see that they exist (REQ-LLM-004o).
+/// Hosted `OpenAI` search already declares each deferred tool's name and
+/// description, and eager loading defers nothing, so both return `None`. The
+/// list depends only on the tool surface, so it stays stable across turns.
+fn deferred_tool_hint(
+    mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
+    tools: &[phoenix_llm::ToolDefinition],
+    callable_names: &std::collections::BTreeSet<String>,
+) -> Option<String> {
+    use phoenix_core::domain::tool_discovery::ToolDiscoveryMode;
+    match mode {
+        ToolDiscoveryMode::Eager | ToolDiscoveryMode::OpenAiHosted => return None,
+        ToolDiscoveryMode::Anthropic
+        | ToolDiscoveryMode::OpenAiClient
+        | ToolDiscoveryMode::Local => {}
+    }
+    let names = tools
+        .iter()
+        .filter(|tool| tool.defer_loading && callable_names.contains(&tool.name))
+        .map(|tool| tool.name.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    if names.is_empty() {
+        return None;
+    }
+    let listed = names
+        .iter()
+        .take(DEFERRED_HINT_MAX_NAMES)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let unlisted = names.len().saturating_sub(DEFERRED_HINT_MAX_NAMES);
+    let suffix = if unlisted == 0 {
+        String::new()
+    } else {
+        format!(" and {unlisted} more")
+    };
+    Some(format!(
+        "\n\nAvailable through tool search if not already loaded: {listed}{suffix}. Search for one by name or task to load it."
+    ))
+}
+
+/// `system` with the deferred-tool hint for `mode`, if any (REQ-LLM-004o).
+/// Every request builder that renders or prices an ordinary request uses this,
+/// so capacity checks count the same prompt the request sends.
+fn with_deferred_tool_hint(
+    system: String,
+    mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
+    tools: &[phoenix_llm::ToolDefinition],
+    callable_names: &std::collections::BTreeSet<String>,
+) -> String {
+    match deferred_tool_hint(mode, tools, callable_names) {
+        Some(hint) => format!("{system}{hint}"),
+        None => system,
+    }
+}
+
+/// The system prompt and tool availability of a fresh ordinary request whose
+/// tools are all callable, as continuation projections price it.
+fn fresh_discovery_overhead(
+    system: String,
+    tools: Vec<phoenix_llm::ToolDefinition>,
+    requested: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
+) -> (
+    String,
+    phoenix_core::domain::tool_availability::ToolAvailability,
+) {
+    let mode = discovery_mode_for_tools(requested, &tools);
+    let callable = tools.iter().map(|tool| tool.name.clone()).collect();
+    let system = with_deferred_tool_hint(system, mode, &tools, &callable);
+    (system, fresh_discovery_availability_for_mode(tools, mode))
+}
+
+#[cfg(test)]
 fn fresh_discovery_availability(
-    mut tools: Vec<phoenix_llm::ToolDefinition>,
+    tools: Vec<phoenix_llm::ToolDefinition>,
     requested: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
 ) -> phoenix_core::domain::tool_availability::ToolAvailability {
     let mode = discovery_mode_for_tools(requested, &tools);
+    fresh_discovery_availability_for_mode(tools, mode)
+}
+
+fn fresh_discovery_availability_for_mode(
+    mut tools: Vec<phoenix_llm::ToolDefinition>,
+    mode: phoenix_core::domain::tool_discovery::ToolDiscoveryMode,
+) -> phoenix_core::domain::tool_availability::ToolAvailability {
     if mode.uses_local_search() {
         tools.retain(|tool| !tool.defer_loading);
     } else {
@@ -10278,6 +10362,12 @@ where
                 discovery_mode,
             )
             .await?;
+        let system_prompt = with_deferred_tool_hint(
+            system_prompt,
+            discovery_mode,
+            &available_tools,
+            &callable_names,
+        );
         let provider_replay = self.storage.load_provider_replay_state(&conv_id).await?;
         let responses_replay = self.storage.load_output_replay_state(&conv_id).await?;
         let fixed_tokens = estimate_fixed_request_tokens(&system_prompt, &tool_availability)
@@ -11939,7 +12029,8 @@ where
             .clone()
             .freeze_for_request()
             .map_err(|error| error.to_string())?;
-        let tool_availability = fresh_discovery_availability(
+        let (system, tool_availability) = fresh_discovery_overhead(
+            system,
             tools,
             client
                 .tool_discovery_mode()
@@ -12320,7 +12411,8 @@ where
             }
         };
         let (ordinary_system, ordinary_tools) = self.prepare_successor_overhead().await?;
-        let tool_availability = fresh_discovery_availability(
+        let (ordinary_system, tool_availability) = fresh_discovery_overhead(
+            ordinary_system,
             ordinary_tools,
             llm_client
                 .tool_discovery_mode()
@@ -34760,6 +34852,119 @@ mod tool_output_cap_tests {
 /// monotonic watermark under context pressure, never into the recency floor and
 /// only for re-queryable (clearable) results; the renderer placeholders cleared
 /// results and preserves kept ones with their images.
+#[cfg(test)]
+mod deferred_tool_hint_tests {
+    use super::deferred_tool_hint;
+    use phoenix_core::domain::tool_discovery::ToolDiscoveryMode;
+    use std::collections::BTreeSet;
+
+    fn tool(name: &str, defer: bool) -> phoenix_llm::ToolDefinition {
+        phoenix_llm::ToolDefinition {
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type":"object"}),
+            defer_loading: defer,
+        }
+    }
+
+    fn all_callable(tools: &[phoenix_llm::ToolDefinition]) -> BTreeSet<String> {
+        tools.iter().map(|tool| tool.name.clone()).collect()
+    }
+
+    /// REQ-LLM-004o: the hint names permitted deferred tools only where the
+    /// model cannot otherwise see them.
+    #[test]
+    fn hint_appears_only_where_deferred_tools_are_invisible() {
+        let tools = [
+            tool("bash", false),
+            tool("browser_click", true),
+            tool("ask_user_question", true),
+        ];
+        let callable = all_callable(&tools);
+        for mode in [ToolDiscoveryMode::Eager, ToolDiscoveryMode::OpenAiHosted] {
+            assert_eq!(
+                deferred_tool_hint(mode, &tools, &callable),
+                None,
+                "{mode:?}"
+            );
+        }
+        for mode in [
+            ToolDiscoveryMode::Anthropic,
+            ToolDiscoveryMode::OpenAiClient,
+            ToolDiscoveryMode::Local,
+        ] {
+            let hint = deferred_tool_hint(mode, &tools, &callable).unwrap();
+            assert!(hint.contains("ask_user_question, browser_click"), "{hint}");
+            assert!(!hint.contains("bash"), "{hint}");
+        }
+    }
+
+    #[test]
+    fn hint_omits_tools_the_request_may_not_call() {
+        let tools = [tool("browser_click", true), tool("ask_user_question", true)];
+        let callable: BTreeSet<String> = ["browser_click".to_string()].into();
+        let hint = deferred_tool_hint(ToolDiscoveryMode::OpenAiClient, &tools, &callable).unwrap();
+        assert!(
+            hint.contains("browser_click") && !hint.contains("ask_user_question"),
+            "{hint}"
+        );
+        assert_eq!(
+            deferred_tool_hint(ToolDiscoveryMode::OpenAiClient, &tools, &BTreeSet::new()),
+            None
+        );
+    }
+
+    /// Continuation projections price the same prompt an ordinary request
+    /// sends: the hint is in the projected system prompt, and its tokens are in
+    /// the fixed-overhead estimate used for successor capacity.
+    #[test]
+    fn continuation_projection_prices_the_hint() {
+        let tools = vec![
+            tool("bash", false),
+            tool("browser_click", true),
+            phoenix_core::domain::tool_discovery::tool_search_definition(),
+        ];
+        let (system, availability) =
+            super::fresh_discovery_overhead("base".into(), tools.clone(), ToolDiscoveryMode::Local);
+        assert!(
+            system.starts_with("base") && system.contains("browser_click"),
+            "{system}"
+        );
+        assert!(availability
+            .declarations()
+            .iter()
+            .all(|tool| !tool.defer_loading));
+        assert!(
+            super::estimate_fixed_request_tokens(&system, &availability)
+                > super::estimate_fixed_request_tokens("base", &availability)
+        );
+
+        let (eager_system, _) =
+            super::fresh_discovery_overhead("base".into(), tools, ToolDiscoveryMode::Eager);
+        assert_eq!(eager_system, "base");
+    }
+
+    #[test]
+    fn hint_caps_long_catalogs_and_is_stable() {
+        let tools = (0..55)
+            .map(|i| tool(&format!("mcp_tool_{i:02}"), true))
+            .collect::<Vec<_>>();
+        let callable = all_callable(&tools);
+        let hint = deferred_tool_hint(ToolDiscoveryMode::Local, &tools, &callable).unwrap();
+        assert!(
+            hint.contains("mcp_tool_39") && !hint.contains("mcp_tool_40"),
+            "{hint}"
+        );
+        assert!(hint.contains("and 15 more"), "{hint}");
+        let mut reversed = tools.clone();
+        reversed.reverse();
+        assert_eq!(
+            deferred_tool_hint(ToolDiscoveryMode::Local, &reversed, &callable).unwrap(),
+            hint
+        );
+    }
+}
+
 #[cfg(test)]
 mod stale_tool_result_clearing_tests {
     use super::*;
