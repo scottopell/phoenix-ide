@@ -505,12 +505,16 @@ rule AmbiguousPrivateDirectoryIdentityPreservesSafeLeftover {
         -- checks can still find a positive match after a gap. Persist the positive
         -- match, or a representative gap if no match is verified, as immutable
         -- evidence of the exact run, scope, inspection snapshot and resource.
-        -- Once Phoenix-owned shutdown is proven, admitted native physical removal
-        -- blocks on positive writer evidence, not on a process gap alone. Failure
-        -- to persist, target uncertainty, losses and deadlines still stop removal.
-        -- An undetected concurrent save may be lost. Logical removal is not proof
-        -- that open handles released disk space (REQ-WL-002e). Pre-admission retry
-        -- remains strict and cannot write evidence under a hypothetical ordinal.
+        -- Once Phoenix-owned shutdown is proven, admitted native Initial removal
+        -- blocks on positive writer evidence, not on an external process gap alone.
+        -- Initial public Close can continue only on a retained candidate-specific
+        -- unavailability gap; unbound, malformed or changed evidence still blocks.
+        -- Explicit Retry blocks on gaps, including at the final moved-object scan,
+        -- and retains the bound object without unlinking it. Pre-admission Retry
+        -- cannot write evidence under a hypothetical ordinal. Failure to persist,
+        -- target uncertainty, losses and deadlines still stop removal. An undetected
+        -- concurrent save may be lost; logical removal does not prove open handles
+        -- released disk space (REQ-WL-002e).
 }
 
 rule RetirementStepSuccessRecordsTypedEvidence {

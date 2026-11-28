@@ -24115,11 +24115,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migration_192_dismisses_pending_forks_without_deleting_history_or_children() {
+    async fn migration_193_dismisses_pending_forks_without_deleting_history_or_children() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("fork-retirement.db");
         let path = path.to_str().unwrap();
-        let db = crate::Database::open_prefix_for_test(path, 191)
+        let db = crate::Database::open_prefix_for_test(path, 192)
             .await
             .unwrap();
         let origin = db
@@ -24151,12 +24151,12 @@ mod tests {
         drop(db);
 
         let db = crate::Database::open(path).await.unwrap();
-        assert_eq!(run_through_for_test(db.pool(), 192).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(db.pool(), 193).await.unwrap(), 1);
         db.pool().close().await;
         drop(db);
 
         let db = crate::Database::open(path).await.unwrap();
-        assert_eq!(run_through_for_test(db.pool(), 192).await.unwrap(), 0);
+        assert_eq!(run_through_for_test(db.pool(), 193).await.unwrap(), 0);
         let retained_relationships: Vec<(String, String, Option<String>, Option<String>)> =
             sqlx::query_as(
                 "SELECT id, origin_conv_id, fork_conv_id, refinement_conv_id
