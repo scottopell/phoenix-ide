@@ -22,6 +22,7 @@ use axum::{
     Json,
 };
 use phoenix_core::domain::close::CloseCompletionOutcome;
+use phoenix_core::domain::product_conversation::ProductConversationId;
 use phoenix_db::native_close::{CloseTargetControlResolution, NativeCloseInitialControl};
 
 // ============================================================
@@ -300,7 +301,7 @@ fn close_settlement_in_progress() -> AppError {
 
 async fn require_close_target_latest(
     state: &AppState,
-    product_id: &str,
+    product_id: &ProductConversationId,
     transcript_id: &str,
 ) -> Result<(), AppError> {
     let aggregate = state
