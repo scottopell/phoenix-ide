@@ -3,6 +3,7 @@ use crate::runtime::native_close_application::{
     NativeCloseApplicationError, NativeCloseInitialRequest, NativeCloseObserveRequest,
 };
 use crate::runtime::testing::InMemoryStorage;
+use crate::runtime::traits::DatabaseStorage;
 use crate::state_machine::event::CancelCause;
 use crate::state_machine::Event;
 use phoenix_core::domain::db_schema::SourceToolCall;
