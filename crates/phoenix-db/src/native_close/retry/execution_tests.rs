@@ -787,6 +787,7 @@ async fn native_tmux_retry_fixture_with_db(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn native_retry_tmux_replacement_settles_without_dispatch_and_replays_exactly() {
     use crate::native_close::NativeRetryTmuxProof;
 

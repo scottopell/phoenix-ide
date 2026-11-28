@@ -3813,6 +3813,7 @@ async fn initial_worktree_metadata_requires_exact_original_dispatched_authority_
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn initial_work_scope_retirement_rejects_unresolved_originals_then_commits_proof_atomically()
 {
     let f = Fixture::new().await;
@@ -3961,10 +3962,14 @@ async fn native_initial_control_route_confirms_stop_and_captures_settlement_targ
         .resolve_close_target_control(&f.target, &wrong_transcript, &receipt.admitted.attempt_id)
         .await
         .is_err());
-    let captures: i64 = sqlx::query_scalar(
+    let capture_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM close_attempt_direct_turn_settlement_captures WHERE attempt_id = ?1",
-    ).bind(receipt.admitted.attempt_id.as_str()).fetch_one(f.db.pool()).await.unwrap();
-    assert_eq!(captures, 1);
+    )
+    .bind(receipt.admitted.attempt_id.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(capture_count, 1);
     let captured = f.db.list_unsettled_close_direct_turn_settlement_targets(receipt.admitted.attempt_id.as_str())
         .await.unwrap();
     assert_eq!(captured.len(), 1);

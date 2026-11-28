@@ -424,6 +424,10 @@ async fn validate_initial_worktree_entry_tx(
 }
 
 impl Database {
+    /// Resolves control routing for the exact Close attempt and latest target transcript.
+    ///
+    /// # Errors
+    /// Returns an error for a stale target or if the retained routing state cannot be read.
     pub async fn resolve_close_target_control(
         &self,
         target: &ProductConversationId,
@@ -2463,6 +2467,9 @@ impl Database {
     /// An unclassified commit/rollback is NOT a refusal or a successful receipt:
     /// the source owner must enter its existing fatal-authority path. A cancelled
     /// caller must not release transferred actor/admission ownership prematurely.
+    ///
+    /// # Panics
+    /// Panics if a freshly generated UUID is not a valid Close attempt identifier.
     pub async fn apply_native_close_initial(
         &self,
         command: &NativeCloseCommand,

@@ -428,6 +428,10 @@ impl Database {
 
     /// Authorizes the process-bound approval sink for the exact durable plan.
     /// Entering approval does not establish that the original command ran.
+    ///
+    /// # Errors
+    /// Refuses stale source authority or a mismatched or settled effect, and reports
+    /// database errors with the transaction release classification when available.
     #[allow(clippy::too_many_arguments)]
     pub async fn with_native_close_retry_tmux_approval<F, T>(
         &self,

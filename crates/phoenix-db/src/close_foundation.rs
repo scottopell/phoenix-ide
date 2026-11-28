@@ -1113,28 +1113,7 @@ pub(crate) async fn validate_adopted_absence_evidence(
 ) -> DbResult<()> {
     let evidence_matches_basis = match absence_basis {
         AbsenceBasis::VerifiedTmuxReplacement { replacement_token } => {
-            Database::generic_close_settlement_for_update(tx, request.attempt_id.as_str()).await?;
-            let identity = request.resource.identity().value();
-            let running: bool = sqlx::query_scalar(
-                "SELECT EXISTS (
-                    SELECT 1 FROM close_runs run
-                    JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
-                    WHERE run.attempt_id = ?1 AND run.run_ordinal = 1 AND run.status = 'running'
-                      AND obligation.phase = 'retirement_requested'
-                 )",
-            )
-            .bind(request.attempt_id.as_str())
-            .fetch_one(&mut **tx)
-            .await?;
-            running
-                && request.resource.kind() == RetiredResourceKind::TmuxServer
-                && matches!(request.resource.identity(), LossItemIdentity::Opaque(_))
-                && identity
-                    .strip_prefix("tmux-v1:")
-                    .and_then(|value| value.rsplit_once(':'))
-                    .filter(|(socket, _)| !socket.is_empty())
-                    .and_then(|(_, token)| uuid::Uuid::parse_str(token).ok())
-                    .is_some_and(|target| target != replacement_token)
+            verified_generic_tmux_replacement(tx, request, replacement_token).await?
         }
         AbsenceBasis::SameAttemptPriorRetirement => {
             sqlx::query_scalar::<_, bool>(
@@ -1214,6 +1193,35 @@ pub(crate) async fn validate_adopted_absence_evidence(
             request.attempt_id
         )))
     }
+}
+
+async fn verified_generic_tmux_replacement(
+    tx: &mut Transaction<'_, Sqlite>,
+    request: &RecordCloseRetirementEvidenceRequest,
+    replacement_token: uuid::Uuid,
+) -> DbResult<bool> {
+    Database::generic_close_settlement_for_update(tx, request.attempt_id.as_str()).await?;
+    let identity = request.resource.identity().value();
+    let running: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM close_runs run
+            JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
+            WHERE run.attempt_id = ?1 AND run.run_ordinal = 1 AND run.status = 'running'
+              AND obligation.phase = 'retirement_requested'
+         )",
+    )
+    .bind(request.attempt_id.as_str())
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(running
+        && request.resource.kind() == RetiredResourceKind::TmuxServer
+        && matches!(request.resource.identity(), LossItemIdentity::Opaque(_))
+        && identity
+            .strip_prefix("tmux-v1:")
+            .and_then(|value| value.rsplit_once(':'))
+            .filter(|(socket, _)| !socket.is_empty())
+            .and_then(|(_, token)| uuid::Uuid::parse_str(token).ok())
+            .is_some_and(|target| target != replacement_token))
 }
 
 fn parse_close_inspection_row(row: SqliteRow) -> DbResult<CloseInspection> {
@@ -2003,10 +2011,12 @@ pub struct RecordCloseRetirementDispatchRequest {
 pub struct FirstCloseRetirementDispatch(RecordCloseRetirementDispatchRequest);
 
 impl FirstCloseRetirementDispatch {
+    #[must_use]
     pub fn request(&self) -> &RecordCloseRetirementDispatchRequest {
         &self.0
     }
 
+    #[must_use]
     pub fn into_request(self) -> RecordCloseRetirementDispatchRequest {
         self.0
     }
@@ -2709,7 +2719,8 @@ impl Database {
                     let obligation =
                         Self::prepare_generic_close_initial_settlement_tx(&mut tx, obligation)
                             .await?;
-                    match obligation.phase() {
+                    let phase = obligation.phase();
+                    match phase {
                         ClosePhase::SettlingActiveWork => {
                             GenericCloseAdmission::InsertedSettling(GenericCloseSettlement {
                                 obligation,
@@ -2719,7 +2730,13 @@ impl Database {
                         ClosePhase::AwaitingStopWorkConfirmation => {
                             GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
                         }
-                        phase => {
+                        ClosePhase::AwaitingBlockerResolution
+                        | ClosePhase::CancelRequestedDuringSettlement
+                        | ClosePhase::AwaitingRetirementInspection
+                        | ClosePhase::AwaitingLossConfirmation
+                        | ClosePhase::RetirementRequested
+                        | ClosePhase::NeedsRepair
+                        | ClosePhase::Completed => {
                             return Err(close_precondition(format!(
                                 "new generic Close cannot start in phase {}",
                                 phase.as_str(),
@@ -3668,7 +3685,13 @@ impl Database {
                 ClosePhase::CancelRequestedDuringSettlement => {
                     GenericCloseSettlementAdvance::Cancelled
                 }
-                _ => GenericCloseSettlementAdvance::NoTransition,
+                ClosePhase::AwaitingBlockerResolution
+                | ClosePhase::AwaitingStopWorkConfirmation
+                | ClosePhase::AwaitingRetirementInspection
+                | ClosePhase::AwaitingLossConfirmation
+                | ClosePhase::RetirementRequested
+                | ClosePhase::NeedsRepair
+                | ClosePhase::Completed => GenericCloseSettlementAdvance::NoTransition,
             };
             Ok((outcome, true))
         }
@@ -4317,7 +4340,15 @@ impl Database {
                     })?,
                 }),
                 ClosePhase::AwaitingLossConfirmation => None,
-                _ => return Err(close_precondition("Unexpected Initial inspection outcome")),
+                ClosePhase::AwaitingBlockerResolution
+                | ClosePhase::AwaitingStopWorkConfirmation
+                | ClosePhase::SettlingActiveWork
+                | ClosePhase::CancelRequestedDuringSettlement
+                | ClosePhase::AwaitingRetirementInspection
+                | ClosePhase::NeedsRepair
+                | ClosePhase::Completed => {
+                    return Err(close_precondition("Unexpected Initial inspection outcome"));
+                }
             };
             Ok(retirement)
         }.await;
@@ -6098,58 +6129,12 @@ impl Database {
                 ));
             }
         }
-        if matches!(kind, GenericCloseDispatchKind::OriginalWorktree(_))
-            && (current.phase() != ClosePhase::RetirementRequested
-                || request.resource.kind() != RetiredResourceKind::Worktree)
-        {
-            return Err(close_precondition(
-                "original worktree claim requires requested worktree retirement",
-            ));
-        }
         if matches!(kind, GenericCloseDispatchKind::OriginalWorktree(_)) {
-            let initial_run_active: bool = sqlx::query_scalar(
-                "SELECT EXISTS (
-                     SELECT 1 FROM close_runs
-                     WHERE attempt_id = ?1 AND run_ordinal = 1 AND status = 'running'
-                 )",
-            )
-            .bind(request.attempt_id.as_str())
-            .fetch_one(&mut **tx)
-            .await?;
-            if !initial_run_active {
-                return Err(close_precondition(
-                    "original worktree claim requires a running initial Close run",
-                ));
-            }
+            Self::require_original_worktree_dispatch_authority_tx(tx, &request, &current).await?;
         }
         let identity = request.resource.identity();
-        let retry_authorized = if current.phase() == ClosePhase::Completed
-            && matches!(
-                current.close_outcome(),
-                Some(
-                    CloseCompletionOutcome::CloseIncomplete
-                        | CloseCompletionOutcome::ArchivedCleanupAttention
-                )
-            )
-            && request.resource.kind() == RetiredResourceKind::Worktree
-        {
-            sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
-                   ON effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
-                 WHERE run.attempt_id = ?1 AND run.status = 'running' AND run.retry_evidence_kind = 'resource_plan'
-                   AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
-                   AND effect.scope = ?2 AND effect.resource_kind = ?3 AND effect.identity_kind = ?4
-                   AND effect.identity_codec = ?5 AND effect.identity_value = ?6
-                   AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
-                     WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
-                       AND success.ordinal = effect.ordinal))",
-            )
-            .bind(request.attempt_id.as_str()).bind(request.scope.as_str())
-            .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
-            .bind(identity.codec()).bind(identity.value()).fetch_one(&mut **tx).await?
-        } else {
-            false
-        };
+        let retry_authorized =
+            Self::generic_worktree_retry_authorizes_dispatch_tx(tx, &request, &current).await?;
         if !(matches!(
             current.phase(),
             ClosePhase::RetirementRequested | ClosePhase::NeedsRepair
@@ -6199,6 +6184,75 @@ impl Database {
             Self::record_close_worktree_cleanup_plan_tx(tx, *plan).await?;
         }
         Ok(dispatch)
+    }
+
+    async fn require_original_worktree_dispatch_authority_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        request: &RecordCloseRetirementDispatchRequest,
+        current: &CloseObligation,
+    ) -> DbResult<()> {
+        if current.phase() != ClosePhase::RetirementRequested
+            || request.resource.kind() != RetiredResourceKind::Worktree
+        {
+            return Err(close_precondition(
+                "original worktree claim requires requested worktree retirement",
+            ));
+        }
+        let initial_run_active: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM close_runs
+                 WHERE attempt_id = ?1 AND run_ordinal = 1 AND status = 'running'
+             )",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_one(&mut **tx)
+        .await?;
+        if !initial_run_active {
+            return Err(close_precondition(
+                "original worktree claim requires a running initial Close run",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn generic_worktree_retry_authorizes_dispatch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        request: &RecordCloseRetirementDispatchRequest,
+        current: &CloseObligation,
+    ) -> DbResult<bool> {
+        let identity = request.resource.identity();
+        if current.phase() == ClosePhase::Completed
+            && matches!(
+                current.close_outcome(),
+                Some(
+                    CloseCompletionOutcome::CloseIncomplete
+                        | CloseCompletionOutcome::ArchivedCleanupAttention
+                )
+            )
+            && request.resource.kind() == RetiredResourceKind::Worktree
+        {
+            Ok(sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM close_runs run JOIN close_run_retry_effects effect
+                   ON effect.attempt_id = run.attempt_id AND effect.run_ordinal = run.run_ordinal
+                 WHERE run.attempt_id = ?1 AND run.status = 'running' AND run.retry_evidence_kind = 'resource_plan'
+                   AND run.run_ordinal = (SELECT MAX(run_ordinal) FROM close_runs WHERE attempt_id = run.attempt_id)
+                   AND effect.scope = ?2 AND effect.resource_kind = ?3 AND effect.identity_kind = ?4
+                   AND effect.identity_codec = ?5 AND effect.identity_value = ?6
+                   AND NOT EXISTS (SELECT 1 FROM close_run_retry_successes success
+                     WHERE success.attempt_id = effect.attempt_id AND success.run_ordinal = effect.run_ordinal
+                       AND success.ordinal = effect.ordinal))",
+            )
+            .bind(request.attempt_id.as_str())
+            .bind(request.scope.as_str())
+            .bind(request.resource.kind().as_str())
+            .bind(identity.identity_kind())
+            .bind(identity.codec())
+            .bind(identity.value())
+            .fetch_one(&mut **tx)
+            .await?)
+        } else {
+            Ok(false)
+        }
     }
 
     pub(crate) async fn insert_close_retirement_dispatch_tx(

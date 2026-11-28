@@ -177,6 +177,7 @@ enum TmuxRetirementAuthority {
 pub struct StrictTmuxDispatchConfirmation<'a>(&'a TmuxServerInstanceIdentity);
 
 impl StrictTmuxDispatchConfirmation<'_> {
+    #[must_use]
     pub fn instance(&self) -> &TmuxServerInstanceIdentity {
         self.0
     }

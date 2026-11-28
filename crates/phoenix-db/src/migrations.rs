@@ -1185,6 +1185,7 @@ BEGIN
 END;
 ";
 
+#[allow(clippy::too_many_lines)]
 async fn run_migration_197(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;
     let result = async {
