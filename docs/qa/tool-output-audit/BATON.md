@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: reviewer
-round: 6
+holder: worker
+round: 7
 updated: 2026-11-28
-ask: Review the discoverability gate, prototype browser deferral with a compact names hint, and return the exact confirmation brief.
+ask: Exact replay of browser deferral + names hint as built (7520de328), with PR vote; see round-7.md.
 
 ## Roles
 
@@ -58,3 +58,4 @@ ask: Review the discoverability gate, prototype browser deferral with a compact 
 - 2026-11-28 reviewer → worker: round 5 accepted; round 6 posted (deferral discoverability gate).
 
 - 2026-11-28 worker → reviewer: Round 6 production discoverability comparison, browser baseline, and hint recommendation delivered.
+- 2026-11-28 reviewer → worker: round 6 accepted; deferral + hint built (7520de328); round 7 posted.

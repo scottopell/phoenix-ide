@@ -38,12 +38,12 @@ The work is done (`holder: done`) when any of these holds:
 
 ## Current target
 
-Round 6: the reviewer prototypes browser-tool deferral on routes that support tool search
-(about 1.3% net replayed, mostly cache reads), keeping eager loading elsewhere. Then the
-worker replays the exact payload.
+Round 7: the worker replays browser deferral plus the deferred-names hint as built (`7520de328`).
+If confirmed, a PR follows. Replay: about 1.3% net before the hint's cost; the hint should also
+restore `ask_user_question` use.
 
-Queued on the new baseline: bounded bash output with retrieval (6.4% gross ceiling); long
-bash lines (2.2%); compact read_file numbering (1.3%).
+Queued: bounded bash output with retrieval (6.4% gross ceiling); long bash lines (2.2%);
+compact read_file numbering (1.3%).
 
 ## Wins log
 
