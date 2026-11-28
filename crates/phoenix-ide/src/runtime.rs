@@ -3692,12 +3692,27 @@ impl RuntimeManager {
             .list_pending_generic_close_settlements(attempt_id)
             .await
             .map_err(|error| error.to_string())?;
-        let manager = Arc::clone(self);
-        self.run_authority_units(obligations, move |obligation| {
-            let manager = Arc::clone(&manager);
-            async move { manager.settle_close_obligation(obligation).await }
-        })
-        .await
+        let mut completed = 0;
+        let mut first_error = None;
+        for settlement in obligations {
+            let attempt_id = settlement.obligation().attempt_id().clone();
+            let worker = self
+                .start_generic_close_worker(attempt_id, |manager, _| async move {
+                    manager.settle_close_obligation(settlement).await
+                })
+                .await?;
+            match worker.await {
+                Ok(Ok(true)) => completed += 1,
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(error) => {
+                    first_error.get_or_insert_with(|| format!("Close settlement worker failed: {error}"));
+                }
+            }
+        }
+        first_error.map_or(Ok(completed), Err)
     }
 
     async fn settle_close_obligation(
@@ -3747,7 +3762,7 @@ impl RuntimeManager {
                 if advanced.phase()
                     == phoenix_core::domain::close::ClosePhase::AwaitingRetirementInspection
                 {
-                    self.inspect_close_retirement(advanced.attempt_id().clone())
+                    self.run_close_inspection(advanced.attempt_id().clone())
                         .await?;
                 }
                 Ok(true)
@@ -10036,7 +10051,6 @@ mod scope_liveness_tests {
             )
             .await
             .unwrap();
-
         let error = manager
             .retire_close_runtime_resources(attempt_id.clone())
             .await
@@ -10050,7 +10064,7 @@ mod scope_liveness_tests {
             .unwrap();
         assert_eq!(
             obligation.close_outcome(),
-            Some(CloseCompletionOutcome::CloseIncomplete)
+            Some(CloseCompletionOutcome::ArchivedCleanupAttention)
         );
         let evidence = manager
             .db()

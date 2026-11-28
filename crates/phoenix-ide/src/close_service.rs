@@ -229,7 +229,18 @@ pub(crate) async fn run_legacy_close_compat(
                         error, error_type,
                     ))));
                 }
-                return Ok(());
+                let current = state
+                    .db
+                    .get_close_obligation(obligation.attempt_id().as_str())
+                    .await
+                    .map_err(|error| AppError::Internal(error.to_string()))?;
+                if current.phase() == ClosePhase::RetirementRequested {
+                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                        "Close retirement has not reached a durable outcome",
+                        "close_retirement_needs_repair",
+                    ))));
+                }
+                current
             }
             ClosePhase::NeedsRepair => {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(

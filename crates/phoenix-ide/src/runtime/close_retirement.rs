@@ -1184,7 +1184,7 @@ impl RuntimeManager {
         .map_err(|error| format!("Close inspection worker failed: {error}"))?
     }
 
-    async fn run_close_inspection(&self, attempt_id: CloseAttemptId) -> Result<(), String> {
+    pub(super) async fn run_close_inspection(&self, attempt_id: CloseAttemptId) -> Result<(), String> {
         let current = self
             .db()
             .get_close_obligation(attempt_id.as_str())
@@ -1681,7 +1681,7 @@ impl RuntimeManager {
         .await
     }
 
-    async fn start_generic_close_worker<F, Fut, T>(
+    pub(super) async fn start_generic_close_worker<F, Fut, T>(
         self: &Arc<Self>,
         attempt_id: CloseAttemptId,
         operation: F,
