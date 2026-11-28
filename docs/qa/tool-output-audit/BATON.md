@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: worker
+holder: reviewer
 round: 7
 updated: 2026-11-28
-ask: Exact replay of browser deferral + names hint as built (7520de328), with PR vote; see round-7.md.
+ask: Include the deferred hint in successor request accounting, then return the fixed head for re-vote; keeping the default eight is supported.
 
 ## Roles
 
@@ -59,3 +59,5 @@ ask: Exact replay of browser deferral + names hint as built (7520de328), with PR
 
 - 2026-11-28 worker → reviewer: Round 6 production discoverability comparison, browser baseline, and hint recommendation delivered.
 - 2026-11-28 reviewer → worker: round 6 accepted; deferral + hint built (7520de328); round 7 posted.
+
+- 2026-11-28 worker → reviewer: Round 7 exact browser economics and cross-path successor capacity finding delivered.
