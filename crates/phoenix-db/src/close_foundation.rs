@@ -303,6 +303,22 @@ impl GenericCloseInspection {
     }
 }
 
+/// Authority released only by a committed legacy API Retry admission.
+#[derive(Debug)]
+pub struct AdmittedGenericLegacyCloseRetry(CloseAttemptId);
+
+impl AdmittedGenericLegacyCloseRetry {
+    #[must_use]
+    pub fn attempt_id(&self) -> &CloseAttemptId {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_attempt_id(self) -> CloseAttemptId {
+        self.0
+    }
+}
+
 /// Exact generic attempt accepted for pre-retirement cancellation.
 #[derive(Debug)]
 pub struct GenericCloseCancellation {
@@ -910,10 +926,17 @@ fn parse_retired_resource_kind(value: &str) -> DbResult<RetiredResourceKind> {
     }
 }
 
-fn parse_absence_basis(value: &str) -> DbResult<AbsenceBasis> {
+fn parse_absence_basis(value: &str, replacement_token: Option<String>) -> DbResult<AbsenceBasis> {
     match value {
         "same_attempt_prior_retirement" => Ok(AbsenceBasis::SameAttemptPriorRetirement),
         "preexisting_exact_identity_evidence" => Ok(AbsenceBasis::PreexistingExactIdentityEvidence),
+        "verified_tmux_replacement" => {
+            let replacement_token = replacement_token
+                .as_deref()
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .ok_or_else(|| DbError::Serialization("invalid tmux replacement token".into()))?;
+            Ok(AbsenceBasis::VerifiedTmuxReplacement { replacement_token })
+        }
         other => Err(DbError::Serialization(format!(
             "unknown absence basis {other}"
         ))),
@@ -1046,6 +1069,30 @@ pub(crate) async fn validate_adopted_absence_evidence(
     absence_basis: AbsenceBasis,
 ) -> DbResult<()> {
     let evidence_matches_basis = match absence_basis {
+        AbsenceBasis::VerifiedTmuxReplacement { replacement_token } => {
+            Database::generic_close_settlement_for_update(tx, request.attempt_id.as_str()).await?;
+            let identity = request.resource.identity().value();
+            let running: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM close_runs run
+                    JOIN close_obligations obligation ON obligation.attempt_id = run.attempt_id
+                    WHERE run.attempt_id = ?1 AND run.run_ordinal = 1 AND run.status = 'running'
+                      AND obligation.phase = 'retirement_requested'
+                 )",
+            )
+            .bind(request.attempt_id.as_str())
+            .fetch_one(&mut **tx)
+            .await?;
+            running
+                && request.resource.kind() == RetiredResourceKind::TmuxServer
+                && matches!(request.resource.identity(), LossItemIdentity::Opaque(_))
+                && identity
+                    .strip_prefix("tmux-v1:")
+                    .and_then(|value| value.rsplit_once(':'))
+                    .filter(|(socket, _)| !socket.is_empty())
+                    .and_then(|(_, token)| uuid::Uuid::parse_str(token).ok())
+                    .is_some_and(|target| target != replacement_token)
+        }
         AbsenceBasis::SameAttemptPriorRetirement => {
             sqlx::query_scalar::<_, bool>(
                 "SELECT EXISTS(
@@ -1165,13 +1212,17 @@ fn parse_retirement_outcome(
     proof_kind: &str,
     absence_basis: Option<String>,
     residual_reason: Option<String>,
+    replacement_token: Option<String>,
 ) -> DbResult<RetirementOutcome> {
     match proof_kind {
         "retired" => Ok(RetirementOutcome::Retired),
         "absence_adopted" => Ok(RetirementOutcome::AbsenceAdopted {
-            absence_basis: parse_absence_basis(&absence_basis.ok_or_else(|| {
-                DbError::Serialization("absence_adopted missing absence_basis".to_string())
-            })?)?,
+            absence_basis: parse_absence_basis(
+                &absence_basis.ok_or_else(|| {
+                    DbError::Serialization("absence_adopted missing absence_basis".to_string())
+                })?,
+                replacement_token,
+            )?,
         }),
         "residual" => Ok(RetirementOutcome::Residual {
             residual_reason: parse_retirement_failure_reason(&residual_reason.ok_or_else(
@@ -1212,6 +1263,7 @@ fn parse_close_retired_resource_row(row: SqliteRow) -> DbResult<CloseRetiredReso
             &proof_kind,
             row.try_get("absence_basis")?,
             row.try_get("residual_reason")?,
+            row.try_get("tmux_replacement_token")?,
         )?,
         detail: row.try_get("detail")?,
         created_at: parse_rfc3339_utc(row.try_get("created_at")?, "created_at")?,
@@ -4379,7 +4431,7 @@ impl Database {
                     resource.inspection_fingerprint, resource.resource_kind, resource.identity_kind,
                     resource.identity_codec, resource.identity_value, resource.proof_kind,
                     resource.absence_basis, resource.residual_reason, resource.detail,
-                    resource.created_at, resource.updated_at,
+                    resource.created_at, resource.updated_at, resource.tmux_replacement_token,
                     captured.captured_worktree_fingerprint, captured.captured_worktree_locator
              FROM close_retirement_resources resource
              JOIN close_attempt_scopes captured
@@ -6441,20 +6493,22 @@ impl Database {
         request: &RecordCloseRetirementEvidenceRequest,
         inspection_generation: &str,
     ) -> DbResult<()> {
-        let (proof_kind, absence_basis, residual_reason) = match &request.outcome {
-            RetirementOutcome::Retired => ("retired", None, None),
-            RetirementOutcome::AbsenceAdopted { absence_basis } => (
-                "absence_adopted",
-                Some(match absence_basis {
-                    AbsenceBasis::SameAttemptPriorRetirement => "same_attempt_prior_retirement",
+        let (proof_kind, absence_basis, residual_reason, replacement_token) = match &request.outcome {
+            RetirementOutcome::Retired => ("retired", None, None, None),
+            RetirementOutcome::AbsenceAdopted { absence_basis } => {
+                let (basis, token) = match absence_basis {
+                    AbsenceBasis::SameAttemptPriorRetirement => ("same_attempt_prior_retirement", None),
                     AbsenceBasis::PreexistingExactIdentityEvidence => {
-                        "preexisting_exact_identity_evidence"
+                        ("preexisting_exact_identity_evidence", None)
                     }
-                }),
-                None,
-            ),
+                    AbsenceBasis::VerifiedTmuxReplacement { replacement_token } => {
+                        ("verified_tmux_replacement", Some(replacement_token.to_string()))
+                    }
+                };
+                ("absence_adopted", Some(basis), None, token)
+            }
             RetirementOutcome::Residual { residual_reason } => {
-                ("residual", None, Some(residual_reason.as_str()))
+                ("residual", None, Some(residual_reason.as_str()), None)
             }
         };
         let now = Utc::now().to_rfc3339();
@@ -6462,8 +6516,8 @@ impl Database {
             "INSERT OR IGNORE INTO close_retirement_resource_history (
                 attempt_id, scope, inspection_generation, inspection_fingerprint,
                 resource_kind, identity_kind, identity_codec, identity_value,
-                proof_kind, absence_basis, residual_reason, detail, recorded_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                proof_kind, absence_basis, residual_reason, detail, recorded_at, tmux_replacement_token
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .bind(request.attempt_id.as_str())
         .bind(request.scope.as_str())
@@ -6478,20 +6532,22 @@ impl Database {
         .bind(residual_reason)
         .bind(request.detail.as_deref().filter(|value| !value.is_empty()))
         .bind(&now)
+        .bind(replacement_token.as_deref())
         .execute(&mut *tx)
         .await?;
 
         sqlx::query(
             "INSERT INTO close_retirement_resources (
                 attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_codec, identity_value,
-                proof_kind, absence_basis, residual_reason, detail, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+                proof_kind, absence_basis, residual_reason, detail, created_at, updated_at, tmux_replacement_token
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14)
              ON CONFLICT(attempt_id, scope, inspection_generation, inspection_fingerprint, resource_kind, identity_kind, identity_value)
              DO UPDATE SET
                  proof_kind = excluded.proof_kind,
                  absence_basis = excluded.absence_basis,
                  residual_reason = excluded.residual_reason,
                  detail = excluded.detail,
+                 tmux_replacement_token = excluded.tmux_replacement_token,
                  updated_at = excluded.updated_at
              WHERE close_retirement_resources.proof_kind = 'residual'
                AND excluded.proof_kind IN ('retired', 'absence_adopted')",
@@ -6509,6 +6565,7 @@ impl Database {
         .bind(residual_reason)
         .bind(request.detail.as_deref().filter(|value| !value.is_empty()))
         .bind(&now)
+        .bind(replacement_token.as_deref())
         .execute(&mut *tx)
         .await?;
 
@@ -6520,9 +6577,11 @@ impl Database {
                 Option<String>,
                 Option<String>,
                 String,
+                Option<String>,
             ),
         >(
-            "SELECT proof_kind, absence_basis, residual_reason, detail, identity_codec
+            "SELECT proof_kind, absence_basis, residual_reason, detail, identity_codec,
+                    tmux_replacement_token
              FROM close_retirement_resources
              WHERE attempt_id = ?1 AND scope = ?2
                AND inspection_generation = ?3 AND inspection_fingerprint = ?4
@@ -6547,6 +6606,7 @@ impl Database {
                 .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned),
             request.resource.identity().codec().to_string(),
+            replacement_token,
         );
         let reuses_same_attempt_retirement = matches!(
             &request.outcome,
@@ -6787,6 +6847,7 @@ impl Database {
                     resource.identity_kind, resource.identity_codec, resource.identity_value,
                     resource.proof_kind, resource.absence_basis, resource.residual_reason,
                     resource.detail, resource.created_at, resource.updated_at,
+                    resource.tmux_replacement_token,
                     captured.captured_worktree_fingerprint, captured.captured_worktree_locator
              FROM close_retirement_resources resource
              JOIN close_attempt_scopes captured
@@ -9293,7 +9354,44 @@ impl Database {
         close_obligation_for_update(tx, attempt_id.as_str()).await
     }
 
-    /// Reopens a legacy `NeedsRepair` phase only; stopped runs require fresh-run admission.
+    /// Admit an API Retry of a legacy running Initial only before native adoption.
+    pub async fn admit_generic_legacy_close_retry(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<AdmittedGenericLegacyCloseRetry>> {
+        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let native_managed: bool = sqlx::query_scalar(
+                "SELECT native_managed FROM close_obligations WHERE attempt_id = ?1",
+            )
+            .bind(attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if native_managed {
+                return Err(close_precondition("native-managed Close requires native Retry admission"));
+            }
+            Self::reopen_legacy_close_repair_tx(&mut tx, attempt_id).await?;
+            Ok(AdmittedGenericLegacyCloseRetry(attempt_id.clone()))
+        }
+        .await;
+        let released = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match released {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Reopens a legacy `NeedsRepair` fixture, including schemas predating native adoption.
     ///
     /// # Errors
     /// Returns [`DbError`] when the attempt is absent, is not in repair, or persistence fails.
@@ -9302,11 +9400,20 @@ impl Database {
         attempt_id: &CloseAttemptId,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin().await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+        let obligation = Self::reopen_legacy_close_repair_tx(&mut tx, attempt_id).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
+    async fn reopen_legacy_close_repair_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseObligation> {
+        let obligation = close_obligation_for_update(tx, attempt_id.as_str()).await?;
         let legacy_running: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM close_runs run WHERE run.attempt_id = ?1 AND run.run_ordinal = 1
                 AND run.status = 'running' AND NOT EXISTS (SELECT 1 FROM close_cleanup_failures failure WHERE failure.attempt_id = run.attempt_id))",
-        ).bind(attempt_id.as_str()).fetch_one(&mut *tx).await?;
+        ).bind(attempt_id.as_str()).fetch_one(&mut **tx).await?;
         if !legacy_running {
             return Err(close_precondition(
                 "stopped Close outcomes require explicit fresh-run safe retry admission",
@@ -9317,17 +9424,11 @@ impl Database {
                 "attempt {attempt_id} retry requires needs_repair"
             )));
         }
-        Self::require_no_retained_legacy_creation_tx(&mut tx, obligation.product_conversation_id())
+        Self::require_no_retained_legacy_creation_tx(tx, obligation.product_conversation_id())
             .await?;
-        set_close_phase_tx(
-            &mut tx,
-            attempt_id.as_str(),
-            ClosePhase::AwaitingRetirementInspection,
-        )
-        .await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
-        tx.commit().await?;
-        Ok(obligation)
+        set_close_phase_tx(tx, attempt_id.as_str(), ClosePhase::AwaitingRetirementInspection)
+            .await?;
+        close_obligation_for_update(tx, attempt_id.as_str()).await
     }
 
     /// Lists retained retirement evidence for an attempt.
@@ -9343,6 +9444,7 @@ impl Database {
                     resource.inspection_fingerprint, resource.resource_kind, resource.identity_kind,
                     resource.identity_codec, resource.identity_value,
                     resource.proof_kind, resource.absence_basis, resource.residual_reason, resource.detail,
+                    resource.tmux_replacement_token,
                     resource.created_at, resource.updated_at,
                     captured.captured_worktree_fingerprint,
                     captured.captured_worktree_locator
@@ -19721,6 +19823,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_197_preserves_existing_evidence_and_round_trips_tmux_replacement() {
+        const ORIGINAL: &str = "10000000-0000-4000-8000-000000000001";
+        const REPLACEMENT: &str = "10000000-0000-4000-8000-000000000002";
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replacement.db");
+        let path = path.to_str().unwrap();
+        let db = Database::open_prefix_for_test(path, 196).await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt = CloseAttemptId::parse("tmux-replacement-upgrade").unwrap();
+        db.begin_close_foundation(&product_id("root"), &transcript_id("root"), attempt.as_str())
+            .await
+            .unwrap();
+        set_close_phase(&db, attempt.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, attempt.as_str()).await;
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1",
+        )
+        .bind(attempt.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "running");
+        let identity = |kind, value: &str| {
+            RetiredResourceIdentity::parse(
+                kind,
+                LossItemIdentity::Opaque(OpaqueIdentity::parse(value).unwrap()),
+            )
+            .unwrap()
+        };
+        let tmux = identity(RetiredResourceKind::TmuxServer, &format!("tmux-v1:L3RtcC9jbG9zZQ:{ORIGINAL}"));
+        let pty = identity(RetiredResourceKind::PtySession, "old-pty");
+        capture_test_inventory(&db, attempt.as_str(), &scope, &snapshot, vec![tmux.clone(), pty.clone()]).await;
+        let request = |resource, outcome| RecordCloseRetirementEvidenceRequest {
+            attempt_id: attempt.clone(),
+            snapshot: snapshot.clone(),
+            scope: scope.clone(),
+            resource,
+            outcome,
+            detail: None,
+        };
+        for statement in [
+            "INSERT INTO close_retirement_resources (
+                attempt_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value, proof_kind,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, 'pty_session', 'opaque', 'opaque_string_v1', 'old-pty', 'retired', ?5, ?5)",
+            "INSERT INTO close_retirement_resource_history (
+                attempt_id, scope, inspection_generation, inspection_fingerprint,
+                resource_kind, identity_kind, identity_codec, identity_value, proof_kind, recorded_at
+             ) VALUES (?1, ?2, ?3, ?4, 'pty_session', 'opaque', 'opaque_string_v1', 'old-pty', 'retired', ?5)",
+        ] {
+            sqlx::query(statement)
+                .bind(attempt.as_str())
+                .bind(scope.as_str())
+                .bind(snapshot.generation())
+                .bind(snapshot.fingerprint())
+                .bind(Utc::now().to_rfc3339())
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        db.pool().close().await;
+        drop(db);
+
+        let db = Database::open(path).await.unwrap();
+        let absence = |token: &str| RetirementOutcome::AbsenceAdopted {
+            absence_basis: AbsenceBasis::VerifiedTmuxReplacement {
+                replacement_token: uuid::Uuid::parse_str(token).unwrap(),
+            },
+        };
+        let other_target = identity(
+            RetiredResourceKind::TmuxServer,
+            "tmux-v1:L3RtcC9vdGhlcg:10000000-0000-4000-8000-000000000001",
+        );
+        let stale_snapshot = RecordCloseRetirementEvidenceRequest {
+            snapshot: CloseRetirementSnapshot::parse(snapshot.generation(), "different-fingerprint")
+                .unwrap(),
+            ..request(tmux.clone(), absence(REPLACEMENT))
+        };
+        for invalid in [
+            stale_snapshot,
+            request(other_target, absence(REPLACEMENT)),
+            request(tmux.clone(), absence(ORIGINAL)),
+            request(pty.clone(), absence(REPLACEMENT)),
+            request(tmux.clone(), RetirementOutcome::AbsenceAdopted {
+                absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+            }),
+        ] {
+            assert!(db.record_close_retirement_evidence(invalid).await.is_err());
+        }
+        for _ in 0..2 {
+            db.record_close_retirement_evidence(request(tmux.clone(), absence(REPLACEMENT)))
+                .await
+                .unwrap();
+        }
+        assert!(!db.close_retirement_resource_was_dispatched(&attempt, &scope, &snapshot, &tmux)
+            .await
+            .unwrap());
+        db.pool().close().await;
+        drop(db);
+
+        let db = Database::open(path).await.unwrap();
+        let rows = db.list_close_retirement_evidence(attempt.as_str()).await.unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.resource == pty && row.outcome == RetirementOutcome::Retired));
+        assert!(rows.iter().any(|row| row.resource == tmux && row.outcome == absence(REPLACEMENT)));
+        let mutation_error = sqlx::query(
+            "UPDATE close_retirement_resources
+             SET tmux_replacement_token = '10000000-0000-4000-8000-000000000003'
+             WHERE attempt_id = ?1 AND resource_kind = 'tmux_server'",
+        )
+        .bind(attempt.as_str())
+        .execute(db.pool())
+        .await
+        .unwrap_err();
+        assert!(mutation_error.to_string().contains("tmux replacement proof is immutable"));
+        let applied: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM _migrations WHERE version = 197 AND name = 'close_verified_tmux_replacement'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(applied, 1);
+        let history: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT tmux_replacement_token FROM close_retirement_resource_history
+             WHERE attempt_id = ?1 ORDER BY resource_kind",
+        )
+        .bind(attempt.as_str())
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(history, vec![None, Some(REPLACEMENT.to_owned())]);
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
     async fn generic_close_process_batch_replay_rolls_back_unclaimed_resources() {
         use crate::workflow::LocalAuthorityResult::DurableFactEstablished;
 
@@ -21078,6 +21319,51 @@ mod tests {
         }
         let pending = db.list_pending_close_obligations().await.unwrap();
         assert_eq!(pending[0].attempt_id().as_str(), "later-instant");
+    }
+
+    #[tokio::test]
+    async fn generic_legacy_close_retry_serializes_with_native_adoption() {
+        for observe in [false, true] {
+            let db = Database::open_in_memory().await.unwrap();
+            create_root(&db, "root").await;
+            allocate_scope_worktree(&db, "root").await;
+            let attempt = CloseAttemptId::parse("legacy-repair").unwrap();
+            db.begin_close_foundation(
+                &product_id("root"),
+                &transcript_id("root"),
+                attempt.as_str(),
+            )
+            .await
+            .unwrap();
+            set_close_phase(&db, attempt.as_str(), ClosePhase::NeedsRepair).await;
+            if observe {
+                observe_retained_run(&db, &CloseRunRef::initial(attempt.clone())).await;
+            }
+
+            let admission = db
+                .admit_generic_legacy_close_retry(&attempt)
+                .await
+                .established()
+                .expect("classified transaction release");
+            let expected_phase = if observe {
+                assert!(matches!(
+                    admission,
+                    Err(DbError::CloseFoundationPrecondition(detail))
+                        if detail.contains("requires native Retry admission")
+                ));
+                ClosePhase::NeedsRepair
+            } else {
+                assert_eq!(admission.unwrap().attempt_id(), &attempt);
+                observe_retained_run(&db, &CloseRunRef::initial(attempt.clone())).await;
+                let retained = db.read_generic_close_continuation(&attempt).await.unwrap();
+                assert_eq!(retained.phase(), ClosePhase::AwaitingRetirementInspection);
+                ClosePhase::AwaitingRetirementInspection
+            };
+            assert_eq!(
+                db.get_close_obligation(attempt.as_str()).await.unwrap().phase(),
+                expected_phase,
+            );
+        }
     }
 
     #[tokio::test]

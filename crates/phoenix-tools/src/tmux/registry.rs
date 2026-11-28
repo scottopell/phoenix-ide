@@ -360,14 +360,16 @@ pub enum TmuxRetirementOutcome {
 #[derive(Debug, PartialEq, Eq)]
 pub enum TmuxRetirementRehydration {
     Permit(Box<TmuxRetirementPermit>),
-    AbsenceVerified,
+    EndpointAbsent,
+    ReplacementLive { replacement_token: uuid::Uuid },
     Residual { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ExactTmuxIdentityState {
+pub enum ExactTmuxIdentityState {
     Live,
-    Absent,
+    EndpointAbsent,
+    ReplacementLive { replacement_token: uuid::Uuid },
     Ambiguous { reason: String },
 }
 
@@ -1340,7 +1342,11 @@ impl TmuxRegistry {
             .map(|entry| entry.server.clone())
     }
 
-    async fn exact_identity_state(
+    /// Observe the exact socket and token without acquiring registry custody.
+    ///
+    /// # Errors
+    /// Returns [`TmuxError`] when the socket probe fails.
+    pub async fn exact_identity_state(
         &self,
         identity: &TmuxServerInstanceIdentity,
         expires: tokio::time::Instant,
@@ -1367,8 +1373,15 @@ impl TmuxRegistry {
         result: ProbeResult,
         expires: tokio::time::Instant,
     ) -> Result<ExactTmuxIdentityState, TmuxError> {
+        let Ok(expected_token) = uuid::Uuid::parse_str(&identity.server_token) else {
+            return Ok(ExactTmuxIdentityState::Ambiguous {
+                reason: "invalid sealed tmux server token".into(),
+            });
+        };
         match result {
-            ProbeResult::NoSocket | ProbeResult::NoServer => Ok(ExactTmuxIdentityState::Absent),
+            ProbeResult::NoSocket | ProbeResult::NoServer => {
+                Ok(ExactTmuxIdentityState::EndpointAbsent)
+            }
             ProbeResult::DeadSocket => Ok(ExactTmuxIdentityState::Ambiguous {
                 reason: format!(
                     "tmux probe failed for existing socket {}; cannot prove whether {} is absent",
@@ -1380,18 +1393,24 @@ impl TmuxRegistry {
                 .read_server_token_until(&identity.socket_path, expires)
                 .await
             {
-                Some(Some(token)) if token == identity.server_token => {
-                    Ok(ExactTmuxIdentityState::Live)
+                Some(raw) => {
+                    match raw.as_deref().and_then(|token| uuid::Uuid::parse_str(token).ok()) {
+                        Some(token) if token == expected_token => {
+                            Ok(ExactTmuxIdentityState::Live)
+                        }
+                        Some(replacement_token) => {
+                            Ok(ExactTmuxIdentityState::ReplacementLive { replacement_token })
+                        }
+                        None => Ok(ExactTmuxIdentityState::Ambiguous {
+                            reason: format!(
+                                "live tmux server at {} did not report a valid {}; cannot prove whether {} is still current",
+                                identity.socket_path.display(),
+                                SERVER_TOKEN_VAR,
+                                identity.stable_identity()
+                            ),
+                        }),
+                    }
                 }
-                Some(Some(_)) => Ok(ExactTmuxIdentityState::Absent),
-                Some(None) => Ok(ExactTmuxIdentityState::Ambiguous {
-                    reason: format!(
-                        "live tmux server at {} did not report {}; cannot prove whether {} is still current",
-                        identity.socket_path.display(),
-                        SERVER_TOKEN_VAR,
-                        identity.stable_identity()
-                    ),
-                }),
                 None => Ok(ExactTmuxIdentityState::Ambiguous {
                     reason: "tmux exact-identity token read exceeded the Close deadline".to_string(),
                 }),
@@ -1618,10 +1637,9 @@ impl TmuxRegistry {
     ///
     /// The persisted identity is authoritative only when the same live server is
     /// still reachable at the same socket path and reports the same
-    /// `PHOENIX_TMUX_SERVER_TOKEN`. A missing socket or replacement token proves
-    /// exact absence. Any scope conflict or live server without a token remains a
-    /// residual ambiguity so callers do not take destructive action on path or
-    /// token evidence alone.
+    /// `PHOENIX_TMUX_SERVER_TOKEN`. A missing endpoint and a live replacement
+    /// with a different valid token are separate observations. A cached scope
+    /// conflict or an unreadable or malformed live token is not replacement proof.
     ///
     /// # Errors
     /// Returns [`TmuxError`] when probing the persisted socket path fails.
@@ -1648,15 +1666,17 @@ impl TmuxRegistry {
             };
             let exact_current = current.socket_path == persisted.socket_path
                 && current.server_token == persisted.server_token;
-            let current_socket_matches = current.socket_path == persisted.socket_path;
             let current_identity = current.exact_identity();
             let current_fenced = current.retirement_fenced;
             drop(current);
 
             if exact_current {
                 return match self.exact_identity_state(persisted, expires).await? {
-                    ExactTmuxIdentityState::Absent => {
-                        Ok(TmuxRetirementRehydration::AbsenceVerified)
+                    ExactTmuxIdentityState::EndpointAbsent => {
+                        Ok(TmuxRetirementRehydration::EndpointAbsent)
+                    }
+                    ExactTmuxIdentityState::ReplacementLive { replacement_token } => {
+                        Ok(TmuxRetirementRehydration::ReplacementLive { replacement_token })
                     }
                     ExactTmuxIdentityState::Ambiguous { reason } => {
                         Ok(TmuxRetirementRehydration::Residual { reason })
@@ -1744,12 +1764,13 @@ impl TmuxRegistry {
                 };
             }
 
-            if current_socket_matches {
-                return Ok(TmuxRetirementRehydration::AbsenceVerified);
-            }
-
             return match self.exact_identity_state(persisted, expires).await? {
-                ExactTmuxIdentityState::Absent => Ok(TmuxRetirementRehydration::AbsenceVerified),
+                ExactTmuxIdentityState::EndpointAbsent => {
+                    Ok(TmuxRetirementRehydration::EndpointAbsent)
+                }
+                ExactTmuxIdentityState::ReplacementLive { replacement_token } => {
+                    Ok(TmuxRetirementRehydration::ReplacementLive { replacement_token })
+                }
                 ExactTmuxIdentityState::Live => Ok(TmuxRetirementRehydration::Residual {
                     reason: format!(
                         "work scope {} is already materialized as {}; persisted server {} also remains live",
@@ -1785,7 +1806,12 @@ impl TmuxRegistry {
         expires: tokio::time::Instant,
     ) -> Result<TmuxRetirementRehydration, TmuxError> {
         match self.exact_identity_state(persisted, expires).await? {
-            ExactTmuxIdentityState::Absent => Ok(TmuxRetirementRehydration::AbsenceVerified),
+            ExactTmuxIdentityState::EndpointAbsent => {
+                Ok(TmuxRetirementRehydration::EndpointAbsent)
+            }
+            ExactTmuxIdentityState::ReplacementLive { replacement_token } => {
+                Ok(TmuxRetirementRehydration::ReplacementLive { replacement_token })
+            }
             ExactTmuxIdentityState::Ambiguous { reason } => {
                 Ok(TmuxRetirementRehydration::Residual { reason })
             }
@@ -1818,7 +1844,9 @@ impl TmuxRegistry {
                                 .to_string(),
                         });
                     };
-                    if server.socket_path == persisted.socket_path {
+                    if server.socket_path == persisted.socket_path
+                        && server.server_token == persisted.server_token
+                    {
                         None
                     } else {
                         Some(server.exact_identity())
@@ -1835,8 +1863,11 @@ impl TmuxRegistry {
                     });
                 }
                 match self.exact_identity_state(persisted, expires).await? {
-                    ExactTmuxIdentityState::Absent => {
-                        Ok(TmuxRetirementRehydration::AbsenceVerified)
+                    ExactTmuxIdentityState::EndpointAbsent => {
+                        Ok(TmuxRetirementRehydration::EndpointAbsent)
+                    }
+                    ExactTmuxIdentityState::ReplacementLive { replacement_token } => {
+                        Ok(TmuxRetirementRehydration::ReplacementLive { replacement_token })
                     }
                     ExactTmuxIdentityState::Ambiguous { reason } => {
                         Ok(TmuxRetirementRehydration::Residual { reason })
@@ -2956,8 +2987,13 @@ impl TmuxRegistry {
                         },
                     }
                 }
-                Ok(TmuxRetirementRehydration::AbsenceVerified) => {
-                    TmuxRetirementOutcome::AbsenceVerified
+                Ok(TmuxRetirementRehydration::EndpointAbsent
+                | TmuxRetirementRehydration::ReplacementLive { .. }) => {
+                    return CascadeReport {
+                        socket_path: identity.socket_path,
+                        kill_server_error: None,
+                        unlink_error: None,
+                    };
                 }
                 Ok(TmuxRetirementRehydration::Residual { reason }) => {
                     TmuxRetirementOutcome::IdentityNotProven { reason }
@@ -4530,14 +4566,29 @@ mod tests {
         let work_scope = scope("missing-proves-absence");
         let identity = TmuxServerInstanceIdentity {
             socket_path: tmp.path().join("missing.sock"),
-            server_token: "persisted-token".to_string(),
+            server_token: uuid::Uuid::new_v4().to_string(),
         };
+        let malformed = TmuxServerInstanceIdentity {
+            server_token: "not-a-uuid".into(),
+            ..identity.clone()
+        };
+        assert!(matches!(
+            registry.exact_identity_state(&malformed, close_deadline()).await.unwrap(),
+            ExactTmuxIdentityState::Ambiguous { .. },
+        ));
+        assert_eq!(
+            registry
+                .exact_identity_state(&identity, close_deadline())
+                .await
+                .unwrap(),
+            ExactTmuxIdentityState::EndpointAbsent,
+        );
         assert_eq!(
             registry
                 .rehydrate_retirement(&work_scope, &identity, close_deadline())
                 .await
                 .unwrap(),
-            TmuxRetirementRehydration::AbsenceVerified
+            TmuxRetirementRehydration::EndpointAbsent
         );
         let permit = TmuxRetirementPermit::new(TmuxRetirementOriginal {
             work_scope,
@@ -5008,15 +5059,52 @@ mod tests {
         let restarted = with_fake(tmp.path(), &fake);
         assert_eq!(
             restarted
+                .exact_identity_state(&persisted, close_deadline())
+                .await
+                .unwrap(),
+            ExactTmuxIdentityState::ReplacementLive {
+                replacement_token: uuid::Uuid::parse_str(&replacement.server_token).unwrap(),
+            },
+        );
+        assert!(restarted.get_existing(&work_scope).await.is_none());
+        assert_eq!(
+            restarted
                 .rehydrate_retirement(&work_scope, &persisted, close_deadline())
                 .await
                 .unwrap(),
-            TmuxRetirementRehydration::AbsenceVerified
+            TmuxRetirementRehydration::ReplacementLive {
+                replacement_token: uuid::Uuid::parse_str(&replacement.server_token).unwrap(),
+            },
         );
         let survivor = fake.server(&persisted.socket_path).unwrap();
         assert!(survivor.live);
         assert_eq!(survivor.token, Some(replacement.server_token));
         assert_eq!(fake.kill_server_count(&persisted.socket_path), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_cached_tmux_token_cannot_prove_live_target_absent() {
+        let tmp = TempDir::new().unwrap();
+        let fake = FakeTmuxBackend::new();
+        let registry = with_fake(tmp.path(), &fake);
+        let work_scope = scope("stale-token-custody");
+        let server = registry
+            .ensure_live(&work_scope, tmp.path(), None, None)
+            .await
+            .unwrap();
+        let target = live_identity(&server).await;
+        let cached = registry.get_existing(&work_scope).await.unwrap();
+        cached.write().await.server_token = "stale-cached-token".into();
+
+        assert!(matches!(
+            registry.rehydrate_retirement(&work_scope, &target, close_deadline()).await.unwrap(),
+            TmuxRetirementRehydration::Residual { reason } if reason.contains("also remains live")
+        ));
+        assert!(!registry.is_retirement_fenced(&work_scope).await);
+        let survivor = fake.server(&target.socket_path).unwrap();
+        assert!(survivor.live);
+        assert_eq!(survivor.token, Some(target.server_token));
+        assert_eq!(fake.kill_server_count(&target.socket_path), 0);
     }
 
     /// REQ-WL-002d: when the identity cannot be proven, rehydration fails
@@ -5026,6 +5114,27 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let fake = FakeTmuxBackend::new();
         let bootstrap = with_fake(tmp.path(), &fake);
+        let spelling_scope = scope("rehydrate-uuid-spelling");
+        let spelling = live_identity(
+            &bootstrap
+                .ensure_live(&spelling_scope, tmp.path(), None, None)
+                .await
+                .unwrap(),
+        )
+        .await;
+        let alternate = uuid::Uuid::parse_str(&spelling.server_token).unwrap().simple().to_string();
+        fake.set_global_env(&spelling.socket_path, SERVER_TOKEN_VAR, &alternate).await;
+        assert_eq!(
+            bootstrap.exact_identity_state(&spelling, close_deadline()).await.unwrap(),
+            ExactTmuxIdentityState::Live,
+        );
+        fake.set_global_env(&spelling.socket_path, SERVER_TOKEN_VAR, "not-a-uuid").await;
+        assert!(matches!(
+            bootstrap.exact_identity_state(&spelling, close_deadline()).await.unwrap(),
+            ExactTmuxIdentityState::Ambiguous { .. },
+        ));
+        assert_eq!(fake.kill_server_count(&spelling.socket_path), 0);
+
         let tokenless_scope = scope("rehydrate-tokenless");
         let tokenless = live_identity(
             &bootstrap

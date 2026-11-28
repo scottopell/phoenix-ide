@@ -814,6 +814,7 @@ impl LossItemIdentity {
 pub enum AbsenceBasis {
     SameAttemptPriorRetirement,
     PreexistingExactIdentityEvidence,
+    VerifiedTmuxReplacement { replacement_token: uuid::Uuid },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

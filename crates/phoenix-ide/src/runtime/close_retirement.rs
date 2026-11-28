@@ -71,8 +71,8 @@ use phoenix_tools::{
     bash::registry::{BashRetirementOutcome, BashRetirementPermit},
     browser::session::{BrowserRetirementOutcome, BrowserRetirementPermit},
     tmux::registry::{
-        PersistentTmuxDiscovery, TmuxRetirementOutcome, TmuxRetirementPermit,
-        TmuxRetirementRehydration, TmuxServerInstanceIdentity,
+        ExactTmuxIdentityState, PersistentTmuxDiscovery, TmuxRetirementOutcome,
+        TmuxRetirementPermit, TmuxRetirementRehydration, TmuxServerInstanceIdentity,
     },
 };
 
@@ -133,7 +133,10 @@ pub(crate) enum GenericCloseRetryError {
 
 enum GenericRetirementAuthority {
     Fresh(crate::db::FreshGenericCloseRetirement),
-    Retry { attempt_id: CloseAttemptId, snapshot: CloseRetirementSnapshot },
+    Retry {
+        admission: crate::db::AdmittedGenericLegacyCloseRetry,
+        snapshot: CloseRetirementSnapshot,
+    },
     #[cfg(test)]
     Fixture(CloseAttemptId),
 }
@@ -167,7 +170,10 @@ pub(crate) struct CloseResourceLease {
     resources: Vec<RetiredResourceIdentity>,
     capture_evidence: Option<native_initial::capture_binding::CaptureEvidenceBinding>,
     native_initial_entered: Vec<RetiredResourceKind>,
+    generic_entry: Option<GenericCloseLeaseEntry>,
 }
+
+struct GenericCloseLeaseEntry;
 
 #[derive(Debug, PartialEq, Eq)]
 enum CloseLeaseFailure {
@@ -778,6 +784,7 @@ async fn run_close_process_steps<E: CloseProcessStepExecutor>(
     let tmux_already_complete = tmux_resources.iter().all(|resource| {
         prior_retirement_evidence.iter().any(|proof| {
             proof.scope == *scope
+                && proof.snapshot == *snapshot
                 && proof.resource == *resource
                 && matches!(
                     proof.outcome,
@@ -873,6 +880,8 @@ async fn run_close_process_steps<E: CloseProcessStepExecutor>(
 struct LiveCloseProcessStepExecutor<'a> {
     manager: &'a RuntimeManager,
     lease: &'a CloseResourceLease,
+    _entry: GenericCloseLeaseEntry,
+    _dispatches: Vec<FirstCloseRetirementDispatch>,
     browser_custody: phoenix_tools::browser::session::BrowserRetirementCustody,
 }
 
@@ -1204,12 +1213,10 @@ impl RuntimeManager {
             self.bash_handles()
                 .fence_retirement_admission(&resource_scope)
                 .await;
-            drop(self.terminals.begin_retirement(&resource_scope));
-            drop(
-                self.browser_sessions()
-                    .begin_retirement(&resource_scope)
-                    .await,
-            );
+            self.terminals.fence_retirement_admission(&resource_scope);
+            self.browser_sessions()
+                .fence_retirement_admission(&resource_scope)
+                .await;
             self.tmux_registry()
                 .fence_retirement_admission(&resource_scope)
                 .await;
@@ -1291,12 +1298,18 @@ impl RuntimeManager {
         }
     }
 
-    async fn run_admitted_generic_retry_inspection(&self, attempt_id: CloseAttemptId) -> Result<(), String> {
+    async fn run_admitted_generic_retry_inspection(
+        &self,
+        admission: crate::db::AdmittedGenericLegacyCloseRetry,
+    ) -> Result<(), String> {
+        self.require_local_authority_admission()?;
+        let attempt_id = admission.attempt_id();
         let current = self
             .db()
-            .read_generic_close_continuation(&attempt_id)
+            .read_generic_close_continuation(attempt_id)
             .await
             .map_err(|error| error.to_string())?;
+        self.require_local_authority_admission()?;
         match current.phase() {
             ClosePhase::AwaitingRetirementInspection => {}
             _ => return Ok(()),
@@ -1304,11 +1317,12 @@ impl RuntimeManager {
         if let Some(DispatchedWorktreeAbsence {
             snapshot,
             replacement_generation: Some(generation),
-        }) = self.persist_close_retirement_inspection(&attempt_id).await?
+        }) = self.persist_close_retirement_inspection(attempt_id).await?
         {
+            self.require_local_authority_admission()?;
             self.db()
                 .resume_close_retirement_after_dispatched_absence(
-                    &attempt_id,
+                    attempt_id,
                     &snapshot,
                     &generation,
                 )
@@ -1323,7 +1337,8 @@ impl RuntimeManager {
         if current.phase() == ClosePhase::RetirementRequested {
             let snapshot = current.snapshot().cloned()
                 .ok_or_else(|| "Close Retry has no committed inspection snapshot".to_string())?;
-            self.run_close_runtime_retirement(GenericRetirementAuthority::Retry { attempt_id, snapshot }).await?;
+            self.run_close_runtime_retirement(GenericRetirementAuthority::Retry { admission, snapshot })
+                .await?;
         }
         Ok(())
     }
@@ -1776,11 +1791,23 @@ impl RuntimeManager {
         &self,
         attempt_id: CloseAttemptId,
     ) -> Result<(), GenericCloseRetryError> {
-        self.db()
-            .retry_close_retirement(&attempt_id)
-            .await
-            .map_err(|error| GenericCloseRetryError::Admission(error.to_string()))?;
-        let Err(error) = self.run_admitted_generic_retry_inspection(attempt_id.clone()).await else {
+        use phoenix_db::workflow::LocalAuthorityResult;
+
+        self.require_local_authority_admission()
+            .map_err(GenericCloseRetryError::Admission)?;
+        let admission = match self.db().admit_generic_legacy_close_retry(&attempt_id).await {
+            LocalAuthorityResult::DurableFactEstablished(Ok(admission)) => admission,
+            LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                return Err(GenericCloseRetryError::Admission(error.to_string()));
+            }
+            LocalAuthorityResult::DurableFactUnclassified => {
+                self.signal_fatal_local_authority("generic legacy Close Retry admission release");
+                return Err(GenericCloseRetryError::Internal(
+                    "legacy Close Retry admission release is unclassified".into(),
+                ));
+            }
+        };
+        let Err(error) = self.run_admitted_generic_retry_inspection(admission).await else {
             return Ok(());
         };
         if self.fatal_local_authority_is_latched() {
@@ -2012,9 +2039,11 @@ impl RuntimeManager {
                 let (attempt_id, snapshot) = fresh.into_parts();
                 (attempt_id, Some(snapshot), GenericRemovalPolicy::Initial)
             }
-            GenericRetirementAuthority::Retry { attempt_id, snapshot } => {
-                (attempt_id, Some(snapshot), GenericRemovalPolicy::RetainedOnly)
-            }
+            GenericRetirementAuthority::Retry { admission, snapshot } => (
+                admission.into_attempt_id(),
+                Some(snapshot),
+                GenericRemovalPolicy::RetainedOnly,
+            ),
             #[cfg(test)]
             GenericRetirementAuthority::Fixture(attempt_id) => {
                 (attempt_id, None, GenericRemovalPolicy::Initial)
@@ -2060,10 +2089,11 @@ impl RuntimeManager {
         let retired = evidence
             .into_iter()
             .filter(|evidence| {
-                matches!(
-                    evidence.outcome,
-                    RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. }
-                )
+                evidence.snapshot == snapshot
+                    && matches!(
+                        evidence.outcome,
+                        RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. }
+                    )
             })
             .map(|evidence| (evidence.scope, resource_key(&evidence.resource)))
             .collect::<std::collections::BTreeSet<_>>();
@@ -2078,6 +2108,20 @@ impl RuntimeManager {
                 !retired.contains(&(target.scope.clone(), resource_key(&target.resource)))
             })
             .collect::<Vec<_>>();
+        if let Some(target) = runtime_targets.iter().find(|target| {
+            target.resource.kind() == RetiredResourceKind::EquivalentLiveResource
+        }) {
+            return self
+                .record_close_residual(
+                    &run,
+                    &snapshot,
+                    &target.scope,
+                    target.resource.clone(),
+                    RetirementFailureReason::IdentityNotProven,
+                    "no exact Close teardown authority for equivalent live resource",
+                )
+                .await;
+        }
         let mut scopes = runtime_targets
             .iter()
             .map(|target| target.scope.clone())
@@ -2103,7 +2147,31 @@ impl RuntimeManager {
                 .await
                 .complete
                 .contains_key(&(attempt_id.as_str().to_string(), scope.clone()));
+            if has_lease && policy == GenericRemovalPolicy::RetainedOnly {
+                return self
+                    .record_close_process_failure(
+                        &run,
+                        &scope,
+                        None,
+                        expected,
+                        "legacy Close Retry cannot acquire a live process lease",
+                    )
+                    .await;
+            }
             if !has_lease {
+                if expected.len() != 1
+                    || expected.iter().any(|resource| resource.kind() != RetiredResourceKind::TmuxServer)
+                {
+                    return self
+                        .record_close_process_failure(
+                            &run,
+                            &scope,
+                            None,
+                            expected,
+                            "sealed process resources have no original live Close lease",
+                        )
+                        .await;
+                }
                 for resource in &expected {
                     let LossItemIdentity::Opaque(identity) = resource.identity() else {
                         return self
@@ -2132,17 +2200,45 @@ impl RuntimeManager {
                             .await;
                     };
                     let tmux_expires = phoenix_tools::tmux::registry::close_deadline();
-                    match self
-                        .tmux_registry()
-                        .rehydrate_retirement(
-                            &ResourceScopeKey::Work(scope.clone()),
-                            &instance,
-                            tmux_expires,
-                        )
-                        .await
-                    {
+                    let key = ResourceScopeKey::Work(scope.clone());
+                    let tmux = self.tmux_registry();
+                    let prepared = match policy {
+                        GenericRemovalPolicy::Initial => Some(
+                            tmux.rehydrate_retirement(&key, &instance, tmux_expires).await,
+                        ),
+                        GenericRemovalPolicy::RetainedOnly => None,
+                    };
+                    let rehydration = match prepared {
+                        None | Some(Ok(TmuxRetirementRehydration::EndpointAbsent
+                            | TmuxRetirementRehydration::ReplacementLive { .. })) => {
+                            if tokio::time::timeout_at(
+                                tmux_expires,
+                                tmux.fence_retirement_admission(&key),
+                            ).await.is_err() {
+                                return Err("tmux Close admission fence exceeded the deadline".into());
+                            }
+                            tmux.exact_identity_state(&instance, tmux_expires)
+                                .await
+                                .map(|observed| match observed {
+                                    ExactTmuxIdentityState::EndpointAbsent => {
+                                        TmuxRetirementRehydration::EndpointAbsent
+                                    }
+                                    ExactTmuxIdentityState::ReplacementLive { replacement_token } => {
+                                        TmuxRetirementRehydration::ReplacementLive { replacement_token }
+                                    }
+                                    ExactTmuxIdentityState::Ambiguous { reason } => {
+                                        TmuxRetirementRehydration::Residual { reason }
+                                    }
+                                    ExactTmuxIdentityState::Live => TmuxRetirementRehydration::Residual {
+                                        reason: "sealed tmux instance is live on the absence-only path".into(),
+                                    },
+                                })
+                        }
+                        Some(other) => other,
+                    };
+                    self.require_local_authority_admission()?;
+                    match rehydration {
                         Ok(TmuxRetirementRehydration::Permit(permit)) => {
-                            self.require_local_authority_admission()?;
                             let _dispatch = self
                                 .claim_generic_close_processes(
                                     &run,
@@ -2156,6 +2252,7 @@ impl RuntimeManager {
                                 .complete_retirement(permit.as_ref())
                                 .await
                                 .map_err(|error| error.to_string())?;
+                            self.require_local_authority_admission()?;
                             match tmux_retirement_outcome(outcome) {
                                 Ok(RetirementOutcome::Retired) => {
                                     self.record_close_retired(
@@ -2192,20 +2289,50 @@ impl RuntimeManager {
                                 }
                             }
                         }
-                        Ok(TmuxRetirementRehydration::AbsenceVerified) => {
-                            self.require_local_authority_admission()?;
+                        Ok(TmuxRetirementRehydration::ReplacementLive { replacement_token })
+                            if policy == GenericRemovalPolicy::Initial =>
+                        {
                             self.db()
-                                .record_close_retirement_dispatch(
-                                    RecordCloseRetirementDispatchRequest {
-                                        attempt_id: attempt_id.clone(),
-                                        scope: scope.clone(),
-                                        snapshot: snapshot.clone(),
-                                        resource: resource.clone(),
+                                .record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
+                                    attempt_id: run.attempt_id.clone(),
+                                    snapshot: snapshot.clone(),
+                                    scope: scope.clone(),
+                                    resource: resource.clone(),
+                                    outcome: RetirementOutcome::AbsenceAdopted {
+                                        absence_basis: AbsenceBasis::VerifiedTmuxReplacement {
+                                            replacement_token,
+                                        },
                                     },
+                                    detail: None,
+                                })
+                                .await
+                                .map_err(|error| error.to_string())?;
+                        }
+                        Ok(TmuxRetirementRehydration::EndpointAbsent
+                            | TmuxRetirementRehydration::ReplacementLive { .. }) => {
+                            let dispatched = self
+                                .db()
+                                .close_retirement_resource_was_dispatched(
+                                    &run.attempt_id,
+                                    &scope,
+                                    &snapshot,
+                                    resource,
                                 )
                                 .await
                                 .map_err(|error| error.to_string())?;
                             self.require_local_authority_admission()?;
+                            if !dispatched {
+                                return self
+                                    .record_close_residual(
+                                        &run,
+                                        &snapshot,
+                                        &scope,
+                                        resource.clone(),
+                                        RetirementFailureReason::IdentityNotProven,
+                                        "tmux absence on the retained path requires exact prior dispatch",
+                                    )
+                                    .await;
+                            }
                             self.record_close_absence_adopted(
                                 &run,
                                 &snapshot,
@@ -2243,11 +2370,8 @@ impl RuntimeManager {
                 }
                 continue;
             }
-            let dispatches = self
-                .claim_generic_close_processes(&run, &snapshot, &scope, &expected)
-                .await?;
             match self
-                .complete_close_resource_lease(&run, &snapshot, &scope, dispatches)
+                .complete_close_resource_lease(&run, &snapshot, &scope, &expected)
                 .await
             {
                 Ok(()) => (),
@@ -4135,33 +4259,47 @@ impl RuntimeManager {
         run: &CloseRunRef,
         snapshot: &CloseRetirementSnapshot,
         scope: &WorkScopeId,
-        dispatches: Vec<FirstCloseRetirementDispatch>,
+        expected: &[RetiredResourceIdentity],
     ) -> Result<(), CloseLeaseFailure> {
-        let expected = dispatches
-            .into_iter()
-            .map(|dispatch| {
-                let request = dispatch.into_request();
-                if request.attempt_id != run.attempt_id
-                    || &request.scope != scope
-                    || &request.snapshot != snapshot
-                {
-                    return Err(CloseLeaseFailure::Persistence(
-                        "Close process dispatch does not match its lease".into(),
-                    ));
-                }
-                Ok(request.resource)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         let key = (run.attempt_id.as_str().to_string(), scope.clone());
-        // Keep both the store guard and the original entry in place across every
-        // await. The lease owns the sole process-epoch permits; removing it here
-        // would let cancellation drop that custody before any reinsertion.
-        let leases = self.close_retirement_leases.lock().await;
+        // Cancellation drops this guard, not the stored process-epoch permits.
+        let mut leases = self.close_retirement_leases.lock().await;
         #[cfg(test)]
         let completion_hook = leases.completion_hook.clone();
-        let Some(lease) = leases.complete.get(&key) else {
+        let Some(lease) = leases.complete.get_mut(&key) else {
             return Err(CloseLeaseFailure::Unavailable);
         };
+        let durable_lease_targets = lease
+            .resources
+            .iter()
+            .filter(|resource| resource.kind() == RetiredResourceKind::TmuxServer)
+            .collect::<Vec<_>>();
+        if expected.len() != durable_lease_targets.len()
+            || expected.iter().any(|resource| !durable_lease_targets.contains(&resource))
+            || durable_lease_targets.iter().any(|resource| !expected.contains(resource))
+        {
+            return Err(CloseLeaseFailure::Persistence(
+                "live Close lease differs from sealed unresolved inventory".into(),
+            ));
+        }
+        if lease.generic_entry.is_none() {
+            return Err(CloseLeaseFailure::Persistence(
+                "live Close lease has already entered teardown".into(),
+            ));
+        }
+        let dispatches = self
+            .claim_generic_close_processes(run, snapshot, scope, expected)
+            .await
+            .map_err(CloseLeaseFailure::Persistence)?;
+        let entry = lease
+            .generic_entry
+            .take()
+            .expect("entry checked under lease guard");
+        let expected_tmux = expected
+            .iter()
+            .filter(|resource| resource.kind() == RetiredResourceKind::TmuxServer)
+            .cloned()
+            .collect::<Vec<_>>();
         #[cfg(test)]
         if let Some(hook) = completion_hook {
             // This must stay after lease lookup, before the first awaited step,
@@ -4170,15 +4308,6 @@ impl RuntimeManager {
             hook.release.notified().await;
         }
         async {
-            if expected.iter().any(|resource| {
-                resource.kind() != RetiredResourceKind::TmuxServer
-                    || !lease.resources.contains(resource)
-            }) {
-                return Err(CloseLeaseFailure::Tmux {
-                    reason: RetirementFailureReason::IdentityNotProven,
-                    detail: "live Close lease differs from sealed unresolved inventory".to_string(),
-                });
-            }
             self.require_local_authority_admission()
                 .map_err(CloseLeaseFailure::Persistence)?;
             let identities = CloseProcessStepIdentities {
@@ -4204,6 +4333,8 @@ impl RuntimeManager {
             let mut executor = LiveCloseProcessStepExecutor {
                 manager: self,
                 lease,
+                _entry: entry,
+                _dispatches: dispatches,
                 // Legacy execution does not transfer native source/target custody.
                 browser_custody: phoenix_tools::browser::session::BrowserRetirementCustody::new(
                     std::sync::Arc::new(()),
@@ -4215,7 +4346,7 @@ impl RuntimeManager {
                 snapshot,
                 scope,
                 &identities,
-                &expected,
+                &expected_tmux,
                 &mut executor,
             )
             .await
@@ -11565,6 +11696,7 @@ fn is_runtime_resource(kind: RetiredResourceKind) -> bool {
             | RetiredResourceKind::TmuxServer
             | RetiredResourceKind::PtySession
             | RetiredResourceKind::BrowserSession
+            | RetiredResourceKind::EquivalentLiveResource
     )
 }
 
@@ -14365,7 +14497,7 @@ mod tests {
             // spawned task. Leaving this block drops the borrowed future while
             // it holds the original lease at its first post-lookup await.
             let completion =
-                manager.complete_close_resource_lease(&fixture.run, &fixture.snapshot, scope, Vec::new());
+                manager.complete_close_resource_lease(&fixture.run, &fixture.snapshot, scope, &[]);
             tokio::pin!(completion);
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 tokio::select! {
@@ -14410,6 +14542,14 @@ mod tests {
             assert!(!store.has_acquisition(&key));
             assert_eq!(generations(store.complete.get(&key).unwrap()), original);
         }
+
+        assert!(matches!(
+            manager
+                .complete_close_resource_lease(&fixture.run, &fixture.snapshot, scope, &[])
+                .await,
+            Err(super::CloseLeaseFailure::Persistence(detail))
+                if detail.contains("already entered teardown")
+        ));
 
         let db = manager.db();
         assert!(db

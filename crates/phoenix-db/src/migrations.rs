@@ -1028,6 +1028,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "close_settlement_stop_claims",
         sql: "ALTER TABLE native_close_initial_settlement_stop_claims RENAME TO close_settlement_stop_claims;",
     },
+    Migration {
+        version: 197,
+        name: "close_verified_tmux_replacement",
+        sql: "",
+    },
 ];
 
 const MIGRATION_175: &str = r"
@@ -1169,6 +1174,114 @@ BEGIN
     SELECT RAISE(ABORT, 'native Close management cannot be cleared');
 END;
 ";
+
+async fn run_migration_197(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
+    let mut guard = WritableSchemaGuard::enable(pool).await?;
+    let result = async {
+        let mut tx = guard.connection().begin().await?;
+        for (table, basis_list_tail) in [
+            ("close_retirement_resources", "'preexisting_exact_identity_evidence'\n    ))"),
+            ("close_retirement_resource_history", "'preexisting_exact_identity_evidence')"),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "ALTER TABLE {table} ADD COLUMN tmux_replacement_token TEXT CHECK (
+                    CASE WHEN absence_basis = 'verified_tmux_replacement' THEN (
+                        proof_kind = 'absence_adopted' AND resource_kind = 'tmux_server'
+                        AND identity_kind = 'opaque' AND identity_codec = 'opaque_string_v1'
+                        AND substr(identity_value, 1, 8) = 'tmux-v1:'
+                        AND length(identity_value) > 45
+                        AND substr(identity_value, -37, 1) = ':'
+                        AND tmux_replacement_token IS NOT NULL
+                        AND length(tmux_replacement_token) = 36
+                        AND substr(tmux_replacement_token, 9, 1) = '-'
+                        AND substr(tmux_replacement_token, 14, 1) = '-'
+                        AND substr(tmux_replacement_token, 19, 1) = '-'
+                        AND substr(tmux_replacement_token, 24, 1) = '-'
+                        AND length(replace(tmux_replacement_token, '-', '')) = 32
+                        AND replace(tmux_replacement_token, '-', '') NOT GLOB '*[^0-9a-f]*'
+                        AND lower(substr(identity_value, -36)) <> tmux_replacement_token
+                    ) ELSE tmux_replacement_token IS NULL END
+                )"
+            )))
+            .execute(&mut *tx)
+            .await?;
+            let schema: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = ?1",
+            )
+            .bind(table)
+            .fetch_one(&mut *tx)
+            .await?;
+            if schema.matches(basis_list_tail).count() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "migration 197 found unexpected {table} absence basis CHECK"
+                )));
+            }
+            let extended_tail = basis_list_tail.replacen(
+                "'preexisting_exact_identity_evidence'",
+                "'preexisting_exact_identity_evidence', 'verified_tmux_replacement'",
+                1,
+            );
+            sqlx::query("UPDATE sqlite_schema SET sql = ?1 WHERE type = 'table' AND name = ?2")
+                .bind(schema.replacen(basis_list_tail, &extended_tail, 1))
+                .bind(table)
+                .execute(&mut *tx)
+                .await?;
+        }
+        for trigger in [
+            "close_retirement_resources_require_absence_proof_on_insert",
+            "close_retirement_resources_require_absence_proof_on_update",
+        ] {
+            let schema: String = sqlx::query_scalar(
+                "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+            )
+            .bind(trigger)
+            .fetch_one(&mut *tx)
+            .await?;
+            let anchor = "WHEN NEW.proof_kind = 'absence_adopted'";
+            if schema.matches(anchor).count() != 1 {
+                return Err(DbError::Serialization(format!(
+                    "migration 197 found unexpected {trigger} definition"
+                )));
+            }
+            sqlx::query("UPDATE sqlite_schema SET sql = ?1 WHERE type = 'trigger' AND name = ?2")
+                .bind(schema.replacen(
+                    anchor,
+                    "WHEN NEW.proof_kind = 'absence_adopted' AND NEW.absence_basis IS NOT 'verified_tmux_replacement'",
+                    1,
+                ))
+                .bind(trigger)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let version: i64 = sqlx::query_scalar("PRAGMA schema_version")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA schema_version = {}", version + 1)))
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "CREATE TRIGGER close_retirement_resources_preserve_replacement_token
+             BEFORE UPDATE ON close_retirement_resources
+             FOR EACH ROW
+             WHEN OLD.tmux_replacement_token IS NOT NULL
+              AND NEW.tmux_replacement_token IS NOT OLD.tmux_replacement_token
+             BEGIN SELECT RAISE(ABORT, 'tmux replacement proof is immutable'); END",
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("INSERT INTO _migrations (version, name) VALUES (?1, ?2)")
+            .bind(migration.version)
+            .bind(migration.name)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+    .await;
+    let restore = guard.disable().await;
+    result?;
+    restore
+}
 
 async fn run_migration_171(pool: &SqlitePool, migration: &Migration) -> DbResult<()> {
     let mut guard = WritableSchemaGuard::enable(pool).await?;
@@ -12943,6 +13056,12 @@ async fn run_migration_list(pool: &SqlitePool, migrations: &[Migration]) -> DbRe
             continue;
         }
 
+        if migration.version == 197 {
+            run_migration_197(pool, migration).await?;
+            applied += 1;
+            continue;
+        }
+
         if migration.version == 171 {
             run_migration_171(pool, migration).await?;
             applied += 1;
@@ -17350,6 +17469,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (197, "close_verified_tmux_replacement"),
             (196, "close_settlement_stop_claims"),
             (195, "native_close_initial_settlement_stop_claims"),
             (194, "product_creation_repository_identity_pin"),

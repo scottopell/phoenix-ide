@@ -361,6 +361,37 @@ async fn assert_initial_interrupted(db: &Database, run: &CloseRunRef) {
 }
 
 #[tokio::test]
+async fn generic_legacy_close_retry_refuses_owning_native_receipt() {
+    let db = Database::open_in_memory().await.unwrap();
+    create_root(&db, "root").await;
+    let command = retry_command(
+        &db,
+        "generic-retry-native-owner",
+        NativeCloseIntent::Initial {
+            target: product_id("root"),
+        },
+    )
+    .await;
+    let LocalAuthorityResult::DurableFactEstablished(Ok(
+        crate::native_close::NativeCloseInitialResult::NewlyAdmitted(receipt),
+    )) = db.apply_native_close_initial(&command).await
+    else {
+        panic!("expected initial native admission");
+    };
+    let attempt = receipt.admitted.attempt_id;
+    let before = db.get_close_obligation(attempt.as_str()).await.unwrap();
+    assert!(matches!(
+        db.admit_generic_legacy_close_retry(&attempt).await.established(),
+        Some(Err(crate::DbError::CloseFoundationPrecondition(detail)))
+            if detail.contains("requires native Retry admission")
+    ));
+    assert_eq!(
+        db.get_close_obligation(attempt.as_str()).await.unwrap().phase(),
+        before.phase(),
+    );
+}
+
+#[tokio::test]
 async fn initial_native_source_loss_suppresses_allowance_without_a_successor() {
     for replay in [false, true] {
         let db = Database::open_in_memory().await.unwrap();

@@ -1,6 +1,8 @@
-use super::observe_running_close_runs;
+use super::{handlers::api_test_support::make_test_state_with_db, recover_interrupted_close_runs};
 use crate::db::{Database, GenericCloseAdmission};
-use phoenix_core::domain::close::{CloseAttemptId, TranscriptConversationId};
+use crate::terminal::session::ActiveTerminalInsertError;
+use crate::work_scope::ResourceScopeKey;
+use phoenix_core::domain::close::{CloseAttemptId, CloseRunRef, TranscriptConversationId};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::process::Command;
@@ -103,6 +105,7 @@ async fn run_child(mode: &str) {
                 .create_conversation("startup-close", "startup-close", "/tmp", true, None, None)
                 .await
                 .unwrap();
+            assert!(conversation.attached_work_scope_id.is_some());
             let product_id = conversation.product_conversation_id;
             let transcript_id = TranscriptConversationId::parse("startup-close").unwrap();
             let attempt = CloseAttemptId::parse(ATTEMPT).unwrap();
@@ -128,12 +131,35 @@ async fn run_child(mode: &str) {
         "reopen-and-classify" => {
             assert!(std::path::Path::new(&marker_path).exists());
             assert_eq!(db.list_running_close_runs().await.unwrap().len(), 1);
+            let scope = captured_work_scope(&db).await;
+            let state = make_test_state_with_db(db.clone());
+            assert!(state.terminals.reserve_spawn(&scope).is_ok());
+            state.terminals.release_spawn(&scope);
+            let unrelated = ResourceScopeKey::Unattached("unrelated-startup-scope".into());
             let mut commits = 0;
-            assert_eq!(observe_running_close_runs(&db, || commits += 1).await.unwrap(), 1);
+            assert_eq!(
+                recover_interrupted_close_runs(&state.runtime, || {
+                    assert!(matches!(
+                        state.terminals.reserve_spawn(&scope),
+                        Err(ActiveTerminalInsertError::RetirementFenced)
+                    ));
+                    assert!(state.terminals.reserve_spawn(&unrelated).is_ok());
+                    state.terminals.release_spawn(&unrelated);
+                    commits += 1;
+                })
+                .await
+                .unwrap(),
+                1
+            );
             assert_eq!(commits, 1);
             assert!(db.list_running_close_runs().await.unwrap().is_empty());
 
-            assert_eq!(observe_running_close_runs(&db, || commits += 1).await.unwrap(), 0);
+            assert_eq!(
+                recover_interrupted_close_runs(&state.runtime, || commits += 1)
+                    .await
+                    .unwrap(),
+                0
+            );
             assert_eq!(commits, 1, "reopening an already classified run must be idempotent");
 
             let run_status: String = sqlx::query_scalar(
@@ -173,9 +199,20 @@ async fn run_child(mode: &str) {
         }
         "verify-reopen-idempotence" => {
             assert_eq!(db.list_running_close_runs().await.unwrap().len(), 0);
+            let scope = captured_work_scope(&db).await;
+            let state = make_test_state_with_db(db.clone());
             let mut commits = 0;
-            assert_eq!(observe_running_close_runs(&db, || commits += 1).await.unwrap(), 0);
+            assert_eq!(
+                recover_interrupted_close_runs(&state.runtime, || commits += 1)
+                    .await
+                    .unwrap(),
+                0
+            );
             assert_eq!(commits, 0);
+            assert!(matches!(
+                state.terminals.reserve_spawn(&scope),
+                Err(ActiveTerminalInsertError::RetirementFenced)
+            ));
             let run_status: String = sqlx::query_scalar(
                 "SELECT status FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1",
             )
@@ -199,9 +236,45 @@ async fn run_child(mode: &str) {
                     .unwrap(),
                 1
             );
+            let run = CloseRunRef::initial(CloseAttemptId::parse(ATTEMPT).unwrap());
+            let event: (String, String, String, String, String) = sqlx::query_as(
+                "SELECT route_kind, source_occurrence_id, source_transcript_id,
+                        terminal_kind, terminal_reason
+                   FROM coordinator_watch_events
+                  WHERE mandatory_failure_occurrence_id = ?1",
+            )
+            .bind(run.failure_occurrence_id())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                event,
+                (
+                    "mandatory_close_failure".into(),
+                    run.failure_occurrence_id(),
+                    "startup-close".into(),
+                    "cleanup_failed".into(),
+                    "interrupted".into(),
+                ),
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap(),
+                1,
+                "startup emits only the mandatory interruption failure outbox item",
+            );
             assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1").bind(ATTEMPT).fetch_one(db.pool()).await.unwrap(), 0);
             println!("\n{COMPLETE}");
         }
         unexpected => panic!("unknown child mode {unexpected}"),
     }
+}
+
+async fn captured_work_scope(db: &Database) -> ResourceScopeKey {
+    let target = db.get_conversation("startup-close").await.unwrap();
+    let scope = target.attached_work_scope_id.expect("target WorkScope");
+    assert_eq!(db.list_close_execution_fence_scopes().await.unwrap(), [scope.clone()]);
+    ResourceScopeKey::Work(scope)
 }

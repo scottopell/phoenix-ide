@@ -123,6 +123,9 @@ jobs:
           for selector in \
             generic_dispatch_and_failure_preserve_observe_adopted_legacy_initial \
             generic_close_process_batch_replay_rolls_back_unclaimed_resources \
+            migration_197_preserves_existing_evidence_and_round_trips_tmux_replacement \
+            generic_legacy_close_retry_serializes_with_native_adoption \
+            generic_legacy_close_retry_refuses_owning_native_receipt \
             generic_close_no_actor_cancels_and_releases_exact_target_atomically \
             generic_close_stopped_run_cannot_cancel_captured_turn \
             interrupted_generic_handoffs_stop_without_retirement_authority \
@@ -179,6 +182,8 @@ jobs:
             generic_settlement_failure_is_classified_or_fences_authority \
             close_settlement_sends_live_runtime_cancel_without_terminalizing_its_turn \
             process_exit_and_reopen_observes_persisted_generic_close_without_redrive \
+            restarted_tmux_rehydration_persists_absence_proof_and_leaves_replacement_untouched \
+            restarted_missing_tmux_requires_exact_prior_dispatch \
             close_settlement_treats_evicted_actor_as_pending_until_cleanup \
             failed_pre_runtime_worktree_reinspection_persists_typed_residual \
             anchored_native_retry_assessment_preserves_writer_inspection_gap \

@@ -10177,9 +10177,8 @@ mod scope_liveness_tests {
         assert_eq!(fake.kill_server_count(&socket), 0);
     }
 
-    /// REQ-WL-002d: after a restart (fresh registry, no live lease), Close
-    /// rehydrates the sealed tmux identity, proves the original server
-    /// absent, persists that proof, and leaves the replacement untouched.
+    /// REQ-WL-002d: this fresh-registry fixture exercises the no-live-lease path
+    /// without restarting the runtime manager.
     #[tokio::test]
     async fn restarted_tmux_rehydration_persists_absence_proof_and_leaves_replacement_untouched() {
         let socket_dir = tempfile::tempdir().unwrap();
@@ -10207,11 +10206,134 @@ mod scope_liveness_tests {
             .await
             .unwrap();
 
-        assert_tmux_absence_proof(&manager, &attempt_id).await;
+        use phoenix_core::domain::close::{AbsenceBasis, RetiredResourceKind, RetirementOutcome};
+
+        let evidence = manager
+            .db()
+            .list_close_retirement_evidence(attempt_id.as_str())
+            .await
+            .unwrap();
+        let proof = evidence
+            .iter()
+            .find(|entry| entry.resource.kind() == RetiredResourceKind::TmuxServer)
+            .expect("durable tmux evidence");
+        assert_eq!(
+            proof.outcome,
+            RetirementOutcome::AbsenceAdopted {
+                absence_basis: AbsenceBasis::VerifiedTmuxReplacement {
+                    replacement_token: uuid::Uuid::parse_str(&replacement_token).unwrap(),
+                },
+            },
+        );
+        assert!(!manager
+            .db()
+            .close_retirement_resource_was_dispatched(
+                &attempt_id, &scope, &proof.snapshot, &proof.resource,
+            )
+            .await
+            .unwrap());
         let survivor = fake.server(&socket).unwrap();
         assert!(survivor.live, "replacement was retired");
         assert_eq!(survivor.token, Some(replacement_token));
         assert_eq!(fake.kill_server_count(&socket), 0);
+    }
+
+    #[tokio::test]
+    async fn restarted_missing_tmux_requires_exact_prior_dispatch() {
+        use phoenix_core::domain::close::{
+            AbsenceBasis, LossItemIdentity, OpaqueIdentity, RetiredResourceIdentity,
+            RetiredResourceKind, RetirementFailureReason, RetirementOutcome,
+        };
+        use phoenix_db::{
+            CloseRetirementBatchDispatch, RecordCloseRetirementDispatchRequest,
+        };
+        use phoenix_db::workflow::LocalAuthorityResult;
+
+        for dispatched in [false, true] {
+            let socket_dir = tempfile::tempdir().unwrap();
+            let fake = phoenix_tools::tmux::fake_backend::FakeTmuxBackend::new();
+            let mut manager = test_manager().await;
+            manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
+            manager.clean_close_writer_fixture = true;
+            let (_repository, attempt_id, scope, socket_path, server_token) =
+                prepare_clean_close_with_tmux(&manager, "missing-tmux-close", "missing-tmux-attempt")
+                    .await;
+            let snapshot = manager
+                .db()
+                .get_close_obligation(attempt_id.as_str())
+                .await
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .clone();
+            let identity = phoenix_tools::tmux::registry::TmuxServerInstanceIdentity {
+                socket_path: socket_path.clone(),
+                server_token,
+            };
+            let resource = RetiredResourceIdentity::parse(
+                RetiredResourceKind::TmuxServer,
+                LossItemIdentity::Opaque(OpaqueIdentity::parse(identity.stable_identity()).unwrap()),
+            )
+            .unwrap();
+            if dispatched {
+                assert!(matches!(
+                    manager.db().claim_generic_close_process_dispatches(&[
+                        RecordCloseRetirementDispatchRequest {
+                            attempt_id: attempt_id.clone(),
+                            scope: scope.clone(),
+                            snapshot: snapshot.clone(),
+                            resource: resource.clone(),
+                        },
+                    ]).await,
+                    LocalAuthorityResult::DurableFactEstablished(Ok(
+                        CloseRetirementBatchDispatch::First(_)
+                    ))
+                ));
+            }
+            fake.kill_server(&socket_path);
+            manager.close_retirement_leases.lock().await.complete.clear();
+            manager.tmux_registry = fake_tmux_registry(socket_dir.path(), &fake);
+            let manager = Arc::new(manager);
+            let result = manager.retire_close_runtime_resources(attempt_id.clone()).await;
+            assert_eq!(result.is_ok(), dispatched, "{result:?}");
+            if dispatched {
+                let evidence = manager
+                    .db()
+                    .list_close_retirement_evidence(attempt_id.as_str())
+                    .await
+                    .unwrap();
+                let proof = evidence.iter().find(|entry| entry.resource == resource).unwrap();
+                assert_eq!(proof.snapshot, snapshot);
+                assert_eq!(
+                    proof.outcome,
+                    RetirementOutcome::AbsenceAdopted {
+                        absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
+                    },
+                );
+            } else {
+                let evidence = manager
+                    .db()
+                    .list_close_retirement_evidence(attempt_id.as_str())
+                    .await
+                    .unwrap();
+                assert!(evidence.iter().all(|entry| entry.resource != resource
+                    || !matches!(entry.outcome, RetirementOutcome::Retired
+                        | RetirementOutcome::AbsenceAdopted { .. })));
+                let failures = manager
+                    .db()
+                    .list_close_cleanup_failures(attempt_id.as_str())
+                    .await
+                    .unwrap();
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].occurrence.reason, RetirementFailureReason::IdentityNotProven);
+                assert!(!manager
+                    .db()
+                    .close_retirement_resource_was_dispatched(&attempt_id, &scope, &snapshot, &resource)
+                    .await
+                    .unwrap());
+            }
+            assert_eq!(fake.kill_server_count(&socket_path), 0);
+        }
     }
 
     async fn prepare_generic_close_with_worktree(

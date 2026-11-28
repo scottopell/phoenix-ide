@@ -18,7 +18,7 @@ use phoenix_tools::tmux::registry::{
     PersistentTmuxDiscovery, TmuxRetirementPermit, TmuxRetirementRehydration,
 };
 
-use super::{opaque_resource, CloseResourceLease};
+use super::{opaque_resource, CloseResourceLease, GenericCloseLeaseEntry};
 
 type LeaseKey = (String, WorkScopeId);
 type Acquisition = Result<CloseResourceLease, FailedAcquisition>;
@@ -110,6 +110,7 @@ impl FailedAcquisition {
             resources,
             capture_evidence: None,
             native_initial_entered: Vec::new(),
+            generic_entry: Some(GenericCloseLeaseEntry),
         })
     }
 
@@ -526,6 +527,7 @@ impl LeaseRegistries {
             resources,
             capture_evidence: None,
             native_initial_entered: Vec::new(),
+            generic_entry: Some(GenericCloseLeaseEntry),
         })
     }
 
@@ -576,17 +578,11 @@ impl LeaseRegistries {
                     .await
                 {
                     Ok(TmuxRetirementRehydration::Permit(permit)) => *permit,
-                    Ok(TmuxRetirementRehydration::AbsenceVerified) => match self
-                        .tmux
-                        .begin_retirement(key, None, None, tmux_expires)
-                        .await
-                    {
-                        Ok(permit) => permit,
-                        Err(outcome) => {
-                            self.tmux.fence_retirement_admission(key).await;
-                            return Err(format!("tmux retirement fencing failed: {outcome:?}"));
-                        }
-                    },
+                    Ok(TmuxRetirementRehydration::EndpointAbsent
+                    | TmuxRetirementRehydration::ReplacementLive { .. }) => {
+                        self.tmux.fence_retirement_admission(key).await;
+                        return Err("tmux identity changed during Close lease acquisition".into());
+                    }
                     Ok(TmuxRetirementRehydration::Residual { reason }) => {
                         self.tmux.fence_retirement_admission(key).await;
                         return Err(format!("tmux identity is ambiguous: {reason}"));
@@ -624,6 +620,7 @@ impl LeaseRegistries {
                 resources,
                 capture_evidence,
                 native_initial_entered,
+                generic_entry,
             } = lease;
             cancelling.push((
                 key,
@@ -633,6 +630,7 @@ impl LeaseRegistries {
                 resources,
                 capture_evidence,
                 native_initial_entered,
+                generic_entry,
             ));
             permits.push(tmux);
         }
@@ -655,6 +653,7 @@ impl LeaseRegistries {
                             resources,
                             capture_evidence,
                             native_initial_entered,
+                            generic_entry,
                         ),
                         tmux,
                     )| {
@@ -668,6 +667,7 @@ impl LeaseRegistries {
                                 resources,
                                 capture_evidence,
                                 native_initial_entered,
+                                generic_entry,
                             },
                         )
                     },
@@ -693,6 +693,7 @@ impl LeaseRegistries {
                             resources,
                             capture_evidence,
                             native_initial_entered,
+                            generic_entry,
                         ),
                         tmux,
                     )| {
@@ -706,6 +707,7 @@ impl LeaseRegistries {
                                 resources,
                                 capture_evidence,
                                 native_initial_entered,
+                                generic_entry,
                             },
                         )
                     },
@@ -713,7 +715,7 @@ impl LeaseRegistries {
                 .collect();
             return Err((detail, leases));
         }
-        for (_, bash, terminal, browser, _, _, _) in cancelling {
+        for (_, bash, terminal, browser, _, _, _, _) in cancelling {
             self.bash.cancel_retirement(bash).await;
             self.terminal.cancel_retirement(terminal);
             #[cfg(test)]

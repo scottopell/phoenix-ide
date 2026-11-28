@@ -150,6 +150,17 @@ pub(crate) async fn observe_running_close_runs(
     Ok(classified)
 }
 
+async fn recover_interrupted_close_runs(
+    runtime: &RuntimeManager,
+    after_commit: impl FnMut(),
+) -> Result<usize, Box<dyn std::error::Error>> {
+    runtime
+        .restore_close_admission_fences()
+        .await
+        .map_err(std::io::Error::other)?;
+    observe_running_close_runs(runtime.db(), after_commit).await
+}
+
 #[cfg(test)]
 mod close_startup_tests {
     use super::*;
@@ -272,14 +283,7 @@ impl AppState {
             credential_helper.clone(),
             &runtime_env,
         ));
-        runtime
-            .restore_close_admission_fences()
-            .await
-            .map_err(std::io::Error::other)?;
-        observe_running_close_runs(&db, || {
-            runtime.kick_direct_turn_worker();
-        })
-        .await?;
+        recover_interrupted_close_runs(&runtime, || runtime.kick_direct_turn_worker()).await?;
         // Close inspection and exact retirement must fence resources before any
         // resource-producing bridge or worker begins admitting new instances.
         reconcile_startup_continuations(&runtime).await?;

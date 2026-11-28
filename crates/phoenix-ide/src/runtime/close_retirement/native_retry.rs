@@ -324,7 +324,8 @@ impl super::RuntimeManager {
                         .await;
                 }
             }
-            TmuxRetirementRehydration::AbsenceVerified => {}
+            TmuxRetirementRehydration::EndpointAbsent
+            | TmuxRetirementRehydration::ReplacementLive { .. } => {}
             TmuxRetirementRehydration::Residual { reason } => {
                 return self
                     .native_retry_failure(command, admitted, context, effect, &reason)
@@ -389,7 +390,8 @@ impl super::RuntimeManager {
                 TmuxRetirementRehydration::Permit(permit) => Some(backend.tmux_registry()
                     .prepare_retirement(permit.as_ref()).await
                     .map_err(|outcome| NativeRetryExecutionError::ResourceFailure(format!("tmux preparation remained residual: {outcome:?}")))?),
-                TmuxRetirementRehydration::AbsenceVerified => None,
+                TmuxRetirementRehydration::EndpointAbsent
+                | TmuxRetirementRehydration::ReplacementLive { .. } => None,
                 TmuxRetirementRehydration::Residual { reason } => return Err(NativeRetryExecutionError::ResourceFailure(reason)),
             };
             let (dispatch, lease) = backend.db().record_native_close_retry_retirement_dispatch_with_entry(
