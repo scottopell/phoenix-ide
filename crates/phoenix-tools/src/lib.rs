@@ -1330,6 +1330,20 @@ impl ToolRegistry {
 }
 
 #[cfg(test)]
+mod browser_deferral_tests {
+    /// Browser tools are deferred so discovery-capable routes do not send their
+    /// schemas until a transcript needs them; eager routes ignore the flag.
+    #[test]
+    fn every_browser_tool_is_deferred() {
+        let tools = super::browser_tools();
+        assert_eq!(tools.len(), 12);
+        for tool in tools {
+            assert!(tool.defer_loading(), "{} should be deferred", tool.name());
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;

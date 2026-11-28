@@ -942,3 +942,15 @@ THE SYSTEM SHALL account for schemas at their actual provider-visible placement
 AND SHALL NOT count a hidden local catalog as if every schema were advertised.
 
 **Rationale:** Large tool catalogs should consume model context only as needed, while discovery preserves provider-native caching, durable conversation evidence, and independent execution permissions.
+
+### REQ-LLM-004o: Deferred Tools Stay Discoverable
+
+WHEN a request's discovery mode withholds deferred tools from the model's view (native Anthropic search, OpenAI client-executed search, or local search)
+AND the request may call at least one deferred tool
+THE SYSTEM SHALL name those deferred tools in the request's system prompt, in a stable order that depends only on the tool surface, with a bounded name count
+AND SHALL say that they load through tool search.
+
+WHEN the discovery mode is eager, or is hosted OpenAI search that already declares each deferred tool's name and description
+THE SYSTEM SHALL NOT add the list.
+
+Rationale: a deferred tool whose existence the model cannot see is effectively removed. On Codex client-search routes, `ask_user_question` calls per request fell about 85% after it became deferred without such a list.
