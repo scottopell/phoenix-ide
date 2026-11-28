@@ -9774,18 +9774,9 @@ mod scope_liveness_tests {
         .execute(manager.db().pool())
         .await
         .expect("insert active turn");
-        manager
+        let admission = manager
             .db()
-            .begin_close_foundation(
-                &conversation.product_conversation_id,
-                &TranscriptConversationId::parse(conversation_id).unwrap(),
-                "live-attempt",
-            )
-            .await
-            .expect("begin close");
-        let settlement = manager
-            .db()
-            .confirm_generic_close_stop_work_classified(
+            .begin_generic_close_settlement_classified(
                 &conversation.product_conversation_id,
                 &TranscriptConversationId::parse(conversation_id).unwrap(),
                 &CloseAttemptId::parse("live-attempt").unwrap(),
@@ -9794,14 +9785,15 @@ mod scope_liveness_tests {
             .established()
             .expect("classified fixture transaction")
             .unwrap();
-        let mut events = manager
-            .inject_handle_with_event_capture_for_test(
-                conversation_id,
-                ConvState::LlmRequesting { attempt: 1 },
-            )
+        let crate::db::GenericCloseAdmission::InsertedSettling(settlement) = admission else {
+            panic!("expected Initial to capture the active durable turn");
+        };
+        manager
+            .inject_handle_for_test(conversation_id, ConvState::LlmRequesting { attempt: 1 })
             .await;
         let (acknowledge, _acknowledgements) = mpsc::channel(1);
-        let (sender, _, mut stops) = cancellation_inbox::channel(mpsc::channel(1).0, acknowledge);
+        let (ordinary, mut events) = mpsc::channel(1);
+        let (sender, _, mut stops) = cancellation_inbox::channel(ordinary, acknowledge);
         manager
             .runtimes
             .write()
@@ -9862,17 +9854,26 @@ mod scope_liveness_tests {
                 .await,
             DurableFactEstablished(Err(crate::db::DbError::CloseFoundationPrecondition(_))),
         ));
-        manager
-            .db()
-            .fail_generic_close_settlement(&settlement, "stop before receiver")
-            .await
-            .unwrap();
+        assert!(matches!(
+            manager
+                .db()
+                .fail_generic_close_settlement(&settlement, "stop before receiver")
+                .await
+                .unwrap(),
+            crate::db::GenericCloseSettlementFailure::Classified,
+        ));
         assert!(matches!(
             manager.db().claim_generic_close_turn_offer(late).await,
             DurableFactEstablished(Ok(false)),
         ));
-        assert!(stops.try_recv().is_err());
-        assert!(events.try_recv().is_err());
+        assert!(matches!(
+            stops.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
         let terminal_kind: Option<String> =
             sqlx::query_scalar("SELECT terminal_kind FROM durable_turns WHERE turn_id = 1")
                 .fetch_one(manager.db().pool())

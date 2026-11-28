@@ -101,11 +101,14 @@ async fn process_exit_and_reopen_observes_persisted_generic_close_without_redriv
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_child(mode: &str) {
     let database_path = std::env::var(DATABASE_PATH).expect("database path must be supplied");
     let marker_path = std::env::var(MARKER_PATH).expect("marker path must be supplied");
     let db = if mode == "admit-and-wait" {
-        Database::open_prefix_for_test(&database_path, 195).await.unwrap()
+        Database::open_prefix_for_test(&database_path, 195)
+            .await
+            .unwrap()
     } else {
         let db = Database::open(&database_path).await.unwrap();
         crate::db::run_pending_migrations(db.pool()).await.unwrap();
@@ -148,9 +151,6 @@ async fn run_child(mode: &str) {
                 running, 1,
                 "generic admission must durably own the exact running run"
             );
-            db.confirm_generic_close_stop_work(&product_id, &transcript_id, &attempt)
-                .await
-                .unwrap();
             let captured: Vec<(i64, i64)> = sqlx::query_as(
                 "SELECT turn_id, expected_generation FROM close_attempt_direct_turn_settlements
                  WHERE attempt_id = ?1",
@@ -398,7 +398,14 @@ async fn assert_migrated_stop_claim(db: &Database, marker_path: &str) {
     .fetch_all(db.pool())
     .await
     .unwrap();
-    assert_eq!(claim, vec![(1, turn.parse::<i64>().unwrap(), generation.parse::<i64>().unwrap())]);
+    assert_eq!(
+        claim,
+        vec![(
+            1,
+            turn.parse::<i64>().unwrap(),
+            generation.parse::<i64>().unwrap()
+        )]
+    );
     let migration: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM _migrations WHERE version = 196")
         .fetch_one(db.pool())
         .await
@@ -411,5 +418,9 @@ async fn assert_migrated_stop_claim(db: &Database, marker_path: &str) {
     .await
     .unwrap();
     assert_eq!(old_table, 0);
-    assert!(sqlx::query("PRAGMA foreign_key_check").fetch_all(db.pool()).await.unwrap().is_empty());
+    assert!(sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+        .is_empty());
 }

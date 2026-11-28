@@ -20087,6 +20087,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn migration_197_preserves_existing_evidence_and_round_trips_tmux_replacement() {
         const ORIGINAL: &str = "10000000-0000-4000-8000-000000000001";
         const REPLACEMENT: &str = "10000000-0000-4000-8000-000000000002";
@@ -20240,7 +20241,22 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap_err();
-        assert!(matches!(mutation_error, sqlx::Error::Database(_)));
+        let sqlx::Error::Database(mutation_error) = mutation_error else {
+            panic!("expected SQLite to reject the replacement-token rewrite: {mutation_error}");
+        };
+        assert!(matches!(
+            mutation_error.message(),
+            "tmux replacement proof is immutable" | "retirement evidence may only resolve residual proof"
+        ));
+        let retained_token: String = sqlx::query_scalar(
+            "SELECT tmux_replacement_token FROM close_retirement_resources
+             WHERE attempt_id = ?1 AND resource_kind = 'tmux_server'",
+        )
+        .bind(attempt.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(retained_token, REPLACEMENT);
         let applied: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM _migrations WHERE version = 197 AND name = 'close_verified_tmux_replacement'",
         )
