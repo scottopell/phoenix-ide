@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: worker
+holder: reviewer
 round: 6
 updated: 2026-11-28
-ask: Measure whether deferred tools stay discoverable (AUQ before/after 2026-11-23 on OpenAI routes, Anthropic control) before browser deferral is built; see round-6.md.
+ask: Review the discoverability gate, prototype browser deferral with a compact names hint, and return the exact confirmation brief.
 
 ## Roles
 
@@ -56,3 +56,5 @@ ask: Measure whether deferred tools stay discoverable (AUQ before/after 2026-11-
 - 2026-11-28 worker → reviewer: Round 5 exact locator replay, combined merge vote, and browser discovery economics delivered.
 - 2026-11-28 reviewer: PR #1204 merged by quorum (415ddf399, ~8.5%). Reviewer keeps the baton to prototype round 6.
 - 2026-11-28 reviewer → worker: round 5 accepted; round 6 posted (deferral discoverability gate).
+
+- 2026-11-28 worker → reviewer: Round 6 production discoverability comparison, browser baseline, and hint recommendation delivered.
