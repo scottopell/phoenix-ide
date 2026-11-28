@@ -1,11 +1,11 @@
 #[cfg(test)]
 use phoenix_core::domain::close::RetiredResourceKind;
 use phoenix_core::domain::close::{
-    CloseRunRef, CloseStopCertainty, LossItemIdentity, RetirementFailureReason, RetirementOutcome,
+    CloseRunRef, CloseStopCertainty, LossItemIdentity, RetirementFailureReason,
 };
 use phoenix_core::work_scope::{ResourceScopeKey, WorkScopeRetirementPrecondition};
 use phoenix_db::native_close::{
-    NativeCloseCommand, NativeCloseRetryExecutionContext, NativeCloseRunRef,
+    NativeCloseCommand, NativeCloseRetryExecutionContext, NativeCloseRunRef, NativeRetryTmuxProof,
 };
 use phoenix_db::workflow::LocalAuthorityResult;
 use phoenix_db::{
@@ -13,7 +13,9 @@ use phoenix_db::{
     CloseSafeRetryEffect, TerminalizeInitialCloseCleanupFailureRequest,
 };
 use phoenix_tools::tmux::registry::{
-    PersistentTmuxDiscovery, TmuxRetirementRehydration, TmuxServerInstanceIdentity,
+    ExactTmuxIdentityState, PersistentTmuxDiscovery, StrictTmuxRetirementEntry,
+    TmuxReplacementObservation,
+    TmuxRetirementOutcome, TmuxRetirementRehydration, TmuxServerInstanceIdentity,
 };
 #[cfg(test)]
 use std::path::Path;
@@ -106,6 +108,12 @@ pub(crate) enum NativeInitialWorkScopePrecondition {
     Ready(WorkScopeRetirementPrecondition),
     Failed(String),
     Unclassified,
+}
+
+#[derive(Debug)]
+enum NativeRetryTmuxEvidence {
+    Dispatched,
+    Replacement(TmuxReplacementObservation),
 }
 
 impl super::RuntimeManager {
@@ -234,6 +242,7 @@ impl super::RuntimeManager {
         context: &NativeCloseRetryExecutionContext,
         effect: &CloseSafeRetryEffect,
     ) -> Result<(), NativeRetryExecutionError> {
+        let expires = phoenix_tools::tmux::registry::close_deadline();
         let LossItemIdentity::Opaque(value) = effect.resource.identity() else {
             return self
                 .native_retry_failure(
@@ -273,7 +282,7 @@ impl super::RuntimeManager {
                 &key,
                 legacy.as_deref(),
                 None,
-                phoenix_tools::tmux::registry::close_deadline(),
+                expires,
             )
             .await
             .map_err(|_| NativeRetryExecutionError::Unclassified)?;
@@ -298,45 +307,70 @@ impl super::RuntimeManager {
             .rehydrate_retirement(
                 &key,
                 &identity,
-                phoenix_tools::tmux::registry::close_deadline(),
+                expires,
             )
             .await
             .map_err(|_| NativeRetryExecutionError::Unclassified)?
         {
             TmuxRetirementRehydration::Permit(permit) => {
+                let mut confirmed_dispatch = false;
                 let outcome = self
                     .tmux_registry()
-                    .complete_retirement(permit.as_ref())
+                    .prepare_retirement(permit.as_ref())
+                    .await
+                    .map_err(|outcome| NativeRetryExecutionError::ResourceFailure(format!("{outcome:?}")))?
+                    .complete_strict_with_typed_sink(|entry| match entry {
+                        StrictTmuxRetirementEntry::AuthenticatedApproval(sink)
+                        | StrictTmuxRetirementEntry::FinalizeRegistry(sink) => sink(),
+                        StrictTmuxRetirementEntry::DispatchConfirmed(confirmation) => {
+                            assert_eq!(confirmation.instance(), &identity);
+                            confirmed_dispatch = true;
+                            Ok(())
+                        }
+                    })
                     .await
                     .map_err(|_| NativeRetryExecutionError::Unclassified)?;
-                if !matches!(
-                    super::tmux_retirement_outcome(outcome),
-                    Ok(RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. })
-                ) {
+                if !matches!(outcome, TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::AbsenceVerified) {
                     return self
                         .native_retry_failure(
-                            command,
-                            admitted,
-                            context,
-                            effect,
-                            "tmux retirement remained residual",
+                            command, admitted, context, effect, "tmux retirement remained residual",
                         )
                         .await;
                 }
+                if confirmed_dispatch {
+                    let (confirmed, _) = self
+                        .db()
+                        .confirm_native_retry_tmux_dispatch_with_entry(command, admitted, effect, || Ok(()))
+                        .await;
+                    match confirmed {
+                        LocalAuthorityResult::DurableFactEstablished(Ok(())) => {}
+                        LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
+                            return Err(error.to_string().into());
+                        }
+                        LocalAuthorityResult::DurableFactUnclassified => {
+                            return Err(NativeRetryExecutionError::Unclassified);
+                        }
+                    }
+                }
             }
-            TmuxRetirementRehydration::EndpointAbsent
-            | TmuxRetirementRehydration::ReplacementLive(_) => {}
+            TmuxRetirementRehydration::EndpointAbsent => {}
+            TmuxRetirementRehydration::ReplacementLive(observation) => {
+                return self.native_retry_record_tmux_success(
+                    command, admitted, effect, expires, NativeRetryTmuxEvidence::Replacement(observation),
+                ).await;
+            }
             TmuxRetirementRehydration::Residual { reason } => {
                 return self
                     .native_retry_failure(command, admitted, context, effect, &reason)
                     .await
             }
         }
-        self.native_retry_record_success(
+        self.native_retry_record_tmux_success(
             command,
             admitted,
             effect,
-            "exact native retry tmux retirement",
+            expires,
+            NativeRetryTmuxEvidence::Dispatched,
         )
         .await
     }
@@ -360,101 +394,183 @@ impl super::RuntimeManager {
         let runtime = Handle::current();
         task::spawn_blocking(move || {
             runtime.block_on(async {
-            let LossItemIdentity::Opaque(value) = effect.resource.identity() else {
-                return Err(NativeRetryExecutionError::ResourceFailure("tmux identity is not opaque".into()));
-            };
-            let identity = TmuxServerInstanceIdentity::parse_stable_identity(value.as_str())
-                .ok_or_else(|| NativeRetryExecutionError::ResourceFailure("tmux identity is malformed".into()))?;
-            let key = ResourceScopeKey::Work(effect.scope.clone());
-            let captured = context.scopes.iter().find(|scope| scope.scope == effect.scope)
-                .ok_or(NativeRetryExecutionError::Unclassified)?;
-            let legacy = captured.captured_worktree.as_ref().and_then(|worktree| match worktree {
-                super::CapturedWorktreeIdentity::Resolved(worktree) => Some(super::worktree_path(worktree)),
-                super::CapturedWorktreeIdentity::Unresolved { .. } => None,
-            });
-            let expires = tokio::time::Instant::from_std(deadline);
-            // Only read-only inventory is cancellable; the retained worker joins
-            // registry preparation and completion using the same original deadline.
-            let discovery = tokio::time::timeout_at(expires,
-                backend.tmux_registry().discover_persistent_identity(&key, legacy.as_deref(), None, expires),
-            ).await.map_err(|_| NativeRetryExecutionError::ResourceFailure("original tmux retry inventory deadline expired".into()))?
-                .map_err(|_| NativeRetryExecutionError::Unclassified)?;
-            if !matches!(discovery, PersistentTmuxDiscovery::Exact(ref found) if found == &identity)
-                && !matches!(discovery, PersistentTmuxDiscovery::EndpointAbsent | PersistentTmuxDiscovery::ServerAbsent)
-            {
-                return Err(NativeRetryExecutionError::ResourceFailure("tmux discovery found an ambiguous or different server".into()));
-            }
-            let prepared = match backend.tmux_registry().rehydrate_retirement(&key, &identity, expires).await
-                .map_err(|_| NativeRetryExecutionError::Unclassified)?
-            {
-                TmuxRetirementRehydration::Permit(permit) => Some(backend.tmux_registry()
-                    .prepare_retirement(permit.as_ref()).await
-                    .map_err(|outcome| NativeRetryExecutionError::ResourceFailure(format!("tmux preparation remained residual: {outcome:?}")))?),
-                TmuxRetirementRehydration::EndpointAbsent
-                | TmuxRetirementRehydration::ReplacementLive(_) => None,
-                TmuxRetirementRehydration::Residual { reason } => return Err(NativeRetryExecutionError::ResourceFailure(reason)),
-            };
-            let (dispatch, lease) = backend.db().record_native_close_retry_retirement_dispatch_with_entry(
-                &command, &admitted, &effect,
-                || match source_entry.try_acquire_first_effect(&command) {
-                    WorkerEntryResult::Ran(lease) if std::time::Instant::now() < deadline => Ok(lease),
-                    _ => Err(crate::db::DbError::CloseFoundationPrecondition("original native retry source unavailable at tmux dispatch".into())),
-                },
-            ).await;
-            if matches!(dispatch, LocalAuthorityResult::DurableFactUnclassified) {
-                backend.fatal_local_authority_fence.close("native_retry_tmux_dispatch_release_unclassified");
-                // Retain uncertain writer/source custody without preventing the
-                // actor from joining this worker and taking its fatal exit.
-                std::mem::forget(lease);
-                std::mem::forget(source_entry);
-                return Err(NativeRetryExecutionError::Unclassified);
-            }
-            drop(lease);
-            match dispatch {
-                LocalAuthorityResult::DurableFactEstablished(Ok(())) => {},
-                LocalAuthorityResult::DurableFactEstablished(Err(error)) => return Err(NativeRetryExecutionError::ResourceFailure(error.to_string())),
-                LocalAuthorityResult::DurableFactUnclassified => unreachable!(),
-            }
-            let Some(prepared) = prepared else { return Ok(()); };
-            let outcome = prepared.complete_with_sink(|sink| {
-                // Completion is polled inside Handle::block_on on this blocking worker.
-                // Leave that async context before entering the writer-gated sink.
-                tokio::task::block_in_place(|| runtime.block_on(async {
-                    let mut lease = None;
-                    let result = backend.db().with_native_close_retry_tmux_first_effect(
-                        &command, &admitted, &live_source, effect.scope.clone(), context.snapshot.clone(), &effect.resource,
-                        || match source_entry.try_acquire_first_effect(&command) {
-                            WorkerEntryResult::Ran(acquired) if std::time::Instant::now() < deadline => {
-                                lease = Some(acquired);
-                                sink()
+                let LossItemIdentity::Opaque(value) = effect.resource.identity() else {
+                    return Err(NativeRetryExecutionError::ResourceFailure("tmux identity is not opaque".into()));
+                };
+                let identity = TmuxServerInstanceIdentity::parse_stable_identity(value.as_str())
+                    .ok_or_else(|| NativeRetryExecutionError::ResourceFailure("tmux identity is malformed".into()))?;
+                let key = ResourceScopeKey::Work(effect.scope.clone());
+                let captured = context.scopes.iter().find(|scope| scope.scope == effect.scope)
+                    .ok_or(NativeRetryExecutionError::Unclassified)?;
+                let legacy = captured.captured_worktree.as_ref().and_then(|worktree| match worktree {
+                    super::CapturedWorktreeIdentity::Resolved(worktree) => Some(super::worktree_path(worktree)),
+                    super::CapturedWorktreeIdentity::Unresolved { .. } => None,
+                });
+                let expires = tokio::time::Instant::from_std(deadline);
+                // Only read-only inventory is cancellable; the retained worker joins
+                // registry preparation and completion using the same original deadline.
+                let discovery = tokio::time::timeout_at(expires,
+                    backend.tmux_registry().discover_persistent_identity(&key, legacy.as_deref(), None, expires),
+                ).await.map_err(|_| NativeRetryExecutionError::ResourceFailure("original tmux retry inventory deadline expired".into()))?
+                    .map_err(|error| NativeRetryExecutionError::ResourceFailure(format!("strict tmux discovery: {error}")))?;
+                let discovery_conflicts_with_effect = matches!(
+                    discovery, PersistentTmuxDiscovery::Exact(ref found) if found != &identity,
+                );
+                if !matches!(discovery, PersistentTmuxDiscovery::Exact(ref found) if found.socket_path == identity.socket_path)
+                    && !matches!(discovery, PersistentTmuxDiscovery::EndpointAbsent | PersistentTmuxDiscovery::ServerAbsent)
+                {
+                    return Err(NativeRetryExecutionError::ResourceFailure("tmux discovery found an ambiguous or different server".into()));
+                }
+                let prepared = match backend.tmux_registry().rehydrate_retirement(&key, &identity, expires).await
+                    .map_err(|error| NativeRetryExecutionError::ResourceFailure(format!("strict tmux rehydration: {error}")))?
+                {
+                    TmuxRetirementRehydration::Permit(permit) if !discovery_conflicts_with_effect => backend.tmux_registry()
+                        .prepare_retirement(permit.as_ref()).await
+                        .map_err(|outcome| NativeRetryExecutionError::ResourceFailure(format!("tmux preparation remained residual: {outcome:?}")))?,
+                    TmuxRetirementRehydration::ReplacementLive(observation) => {
+                        return backend.commit_native_retry_tmux_evidence(
+                            &command, &admitted, &effect, &source_entry, deadline,
+                            NativeRetryTmuxEvidence::Replacement(observation),
+                        ).await;
+                    },
+                    TmuxRetirementRehydration::EndpointAbsent
+                        if !discovery_conflicts_with_effect
+                            && backend.tmux_registry().strict_retirement_endpoint_absent(&identity) => {
+                        return backend.commit_native_retry_tmux_evidence(
+                            &command, &admitted, &effect, &source_entry, deadline,
+                            NativeRetryTmuxEvidence::Dispatched,
+                        ).await;
+                    },
+                    TmuxRetirementRehydration::Residual { reason } => return Err(NativeRetryExecutionError::ResourceFailure(reason)),
+                    _ => return Err(NativeRetryExecutionError::ResourceFailure("tmux discovery no longer agrees with the exact retry endpoint".into())),
+                };
+                let mut authority_unclassified = false;
+                let mut approval_lease = None;
+                let outcome = prepared.complete_strict_with_typed_sink(|entry| {
+                    tokio::task::block_in_place(|| runtime.block_on(async {
+                        let (sink, approval) = match entry {
+                            StrictTmuxRetirementEntry::AuthenticatedApproval(sink) => (sink, true),
+                            StrictTmuxRetirementEntry::FinalizeRegistry(sink) => (sink, false),
+                            StrictTmuxRetirementEntry::DispatchConfirmed(confirmation) => {
+                                if confirmation.instance() != &identity {
+                                    return Err("tmux command confirmation does not name the sealed instance".into());
+                                }
+                                let Some(lease) = approval_lease.take() else {
+                                    return Err("tmux command confirmation has no retained approval lease".into());
+                                };
+                                let (result, _) = backend.db()
+                                    .confirm_native_retry_tmux_dispatch_with_entry(
+                                        &command, &admitted, &effect, || Ok(()),
+                                    ).await;
+                                return match result {
+                                    LocalAuthorityResult::DurableFactEstablished(result) => {
+                                        drop(lease);
+                                        result.map_err(|error| error.to_string())
+                                    }
+                                    LocalAuthorityResult::DurableFactUnclassified => {
+                                        authority_unclassified = true;
+                                        backend.fatal_local_authority_fence.close("native_retry_tmux_dispatch_release_unclassified");
+                                        std::mem::forget(lease);
+                                        std::mem::forget(source_entry.clone());
+                                        Err("native retry tmux dispatch release was unclassified".into())
+                                    }
+                                };
+                            }
+                        };
+                        let mut lease = None;
+                        let enter = || {
+                            match source_entry.try_acquire_first_effect(&command) {
+                                WorkerEntryResult::Ran(acquired) => lease = Some(acquired),
+                                _ => return Err("original native retry source unavailable at tmux sink".into()),
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                return Err("original native retry tmux sink deadline expired".into());
+                            }
+                            sink()
+                        };
+                        let result = if approval {
+                            backend.db().with_native_close_retry_tmux_approval(
+                                &command, &admitted, &live_source, effect.scope.clone(), context.snapshot.clone(), &effect.resource, enter,
+                            ).await
+                        } else {
+                            backend.db().with_native_close_retry_tmux_first_effect(
+                                &command, &admitted, &live_source, effect.scope.clone(), context.snapshot.clone(), &effect.resource, enter,
+                            ).await
+                        };
+                        match &result {
+                            Ok((_, NativeCloseInitialEntryRelease::Unconfirmed(_)))
+                            | Err(NativeCloseInitialFirstEffectError::Rejected { release: NativeCloseInitialEntryRelease::Unconfirmed(_), .. }) => {
+                                authority_unclassified = true;
+                                backend.fatal_local_authority_fence.close("native_retry_tmux_sink_release_unclassified");
+                                std::mem::forget(lease);
+                                std::mem::forget(source_entry.clone());
+                                return Err("native retry tmux writer release unconfirmed".into());
                             },
-                            _ => Err("original native retry source unavailable at tmux sink".into()),
-                        },
-                    ).await;
-                    match &result {
-                        Ok((_, NativeCloseInitialEntryRelease::Unconfirmed(_)))
-                        | Err(NativeCloseInitialFirstEffectError::Rejected { release: NativeCloseInitialEntryRelease::Unconfirmed(_), .. }) => {
-                            backend.fatal_local_authority_fence.close("native_retry_tmux_sink_release_unclassified");
-                            std::mem::forget(lease);
-                            std::mem::forget(source_entry.clone());
-                            return Err("native retry tmux writer release unconfirmed".into());
-                        },
-                        _ => {},
+                            _ => {},
+                        }
+                        match result {
+                            Ok((outcome, NativeCloseInitialEntryRelease::Confirmed)) => {
+                                if approval && outcome.is_ok() {
+                                    approval_lease = lease.take();
+                                }
+                                outcome
+                            },
+                            Err(error) => Err(format!("native retry tmux entry refused: {error:?}")),
+                            Ok((_, NativeCloseInitialEntryRelease::Unconfirmed(_))) => unreachable!(),
+                        }
+                    }))
+                }).await;
+                drop(approval_lease);
+                if authority_unclassified {
+                    return Err(NativeRetryExecutionError::Unclassified);
+                }
+                let outcome = outcome.map_err(|error| {
+                    NativeRetryExecutionError::ResourceFailure(format!("strict tmux retirement: {error}"))
+                })?;
+                let evidence = match outcome {
+                    TmuxRetirementOutcome::ReplacementLive(observation) => {
+                        NativeRetryTmuxEvidence::Replacement(observation)
                     }
-                    drop(lease);
-                    match result {
-                        Ok((outcome, NativeCloseInitialEntryRelease::Confirmed)) => outcome,
-                        Err(error) => Err(format!("native retry tmux entry refused: {error:?}")),
-                        Ok((_, NativeCloseInitialEntryRelease::Unconfirmed(_))) => unreachable!(),
+                    TmuxRetirementOutcome::Retired | TmuxRetirementOutcome::AbsenceVerified => {
+                        NativeRetryTmuxEvidence::Dispatched
                     }
-                }))
-            }).await.map_err(|_| NativeRetryExecutionError::Unclassified)?;
-            match super::tmux_retirement_outcome(outcome) {
-                Ok(RetirementOutcome::Retired | RetirementOutcome::AbsenceAdopted { .. }) => Ok(()),
-                _ => Err(NativeRetryExecutionError::ResourceFailure("tmux retirement remained residual".into())),
-            }
+                    TmuxRetirementOutcome::IdentityNotProven { reason }
+                    | TmuxRetirementOutcome::RemovalFailed { reason } => {
+                        return Err(NativeRetryExecutionError::ResourceFailure(reason));
+                    }
+                };
+                backend.commit_native_retry_tmux_evidence(
+                    &command, &admitted, &effect, &source_entry, deadline, evidence,
+                ).await
+            })
         })
-        })
+    }
+
+    async fn commit_native_retry_tmux_evidence(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        source_entry: &crate::runtime::executor::SourceEntryWorker,
+        deadline: std::time::Instant,
+        evidence: NativeRetryTmuxEvidence,
+    ) -> Result<(), NativeRetryExecutionError> {
+        use crate::runtime::executor::WorkerEntryResult;
+        let lease = match source_entry.try_acquire_first_effect(command) {
+            WorkerEntryResult::Ran(lease) if std::time::Instant::now() < deadline => lease,
+            _ => return Err(NativeRetryExecutionError::ResourceFailure(
+                "original native retry source unavailable at tmux evidence".into(),
+            )),
+        };
+        let result = self
+            .native_retry_record_tmux_success(command, admitted, effect, deadline.into(), evidence)
+            .await;
+        if matches!(result, Err(NativeRetryExecutionError::Unclassified)) {
+            self.fatal_local_authority_fence.close("native_retry_tmux_success_release_unclassified");
+            std::mem::forget(lease);
+            std::mem::forget(source_entry.clone());
+        }
+        result
     }
 
     pub(crate) fn spawn_native_retry_scope_with_source_entry(
@@ -938,6 +1054,60 @@ impl super::RuntimeManager {
                 .is_some_and(|browser| browser.state != BrowserSessionLiveness::TornDown)
             || self.terminals.get(&key).is_some();
         classify_native_scope_runtime_drain(has_live_other, inventory.tmux.map(|tmux| tmux.status))
+    }
+
+    async fn native_retry_record_tmux_success(
+        &self,
+        command: &NativeCloseCommand,
+        admitted: &NativeCloseRunRef,
+        effect: &CloseSafeRetryEffect,
+        expires: tokio::time::Instant,
+        evidence: NativeRetryTmuxEvidence,
+    ) -> Result<(), NativeRetryExecutionError> {
+        let sealed_identity = TmuxServerInstanceIdentity::parse_stable_identity(
+            &effect.resource.identity().value(),
+        )
+        .ok_or_else(|| NativeRetryExecutionError::ResourceFailure("malformed sealed tmux identity".into()))?;
+        let proof = match &evidence {
+            NativeRetryTmuxEvidence::Dispatched => NativeRetryTmuxProof::Dispatched,
+            NativeRetryTmuxEvidence::Replacement(observation) => {
+                let (sealed, token) = observation.clone().into_parts();
+                NativeRetryTmuxProof::Replacement {
+                    sealed_identity: sealed.stable_identity(),
+                    token,
+                }
+            }
+        };
+        let verify = || async {
+            let same = match evidence {
+                NativeRetryTmuxEvidence::Dispatched => self
+                    .tmux_registry()
+                    .strict_retirement_endpoint_absent(&sealed_identity),
+                NativeRetryTmuxEvidence::Replacement(expected) => matches!(
+                    self.tmux_registry().exact_identity_state(&sealed_identity, expires).await,
+                    Ok(ExactTmuxIdentityState::ReplacementLive(actual)) if actual == expected
+                ),
+            };
+            if same && tokio::time::Instant::now() < expires {
+                Ok(())
+            } else {
+                Err(crate::db::DbError::CloseFoundationPrecondition(
+                    "exact tmux endpoint evidence changed or expired at the Retry writer".into(),
+                ))
+            }
+        };
+        match self
+            .db()
+            .record_native_close_retry_tmux_success(command, admitted, effect, proof, verify)
+            .await
+        {
+            LocalAuthorityResult::DurableFactEstablished(Ok(())) => Ok(()),
+            LocalAuthorityResult::DurableFactEstablished(Err(crate::db::DbError::CloseFoundationPrecondition(detail))) => {
+                Err(NativeRetryExecutionError::ResourceFailure(detail))
+            }
+            LocalAuthorityResult::DurableFactEstablished(Err(error)) => Err(error.to_string().into()),
+            LocalAuthorityResult::DurableFactUnclassified => Err(NativeRetryExecutionError::Unclassified),
+        }
     }
 
     pub(crate) async fn native_retry_record_success(

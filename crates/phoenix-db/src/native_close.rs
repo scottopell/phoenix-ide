@@ -364,7 +364,9 @@ mod retry_execution;
 mod source_fence;
 pub use observe::{NativeCloseObservation, NativeCloseObserveReceipt, NativeCloseObserveResult};
 pub use retry::{NativeCloseRetryResult, NativeCloseRetrySourceAssessment};
-pub use retry_execution::{NativeCloseRetryExecutionContext, NativeCloseRetryPreAdmissionContext};
+pub use retry_execution::{
+    NativeCloseRetryExecutionContext, NativeCloseRetryPreAdmissionContext, NativeRetryTmuxProof,
+};
 pub(crate) use source_fence::{
     acknowledge_initial_result_tx, fence_native_retry_sources_tx, interrupt_native_retry_tx,
     recover_native_retry_sources_tx, NativeInitialSourceFence, NativeRetrySourceFence,

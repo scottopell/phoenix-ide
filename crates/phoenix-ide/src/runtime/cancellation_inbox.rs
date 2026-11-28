@@ -717,6 +717,7 @@ mod tests {
         ));
 
         let (response, mut retry_reply) = oneshot::channel();
+        let attempt_gate = backend.acquire_close_attempt(referenced.attempt_id.clone()).await;
         let retry = Box::new(NativeCloseRetryRequest {
             source,
             target: referenced.target,
@@ -725,7 +726,7 @@ mod tests {
             backend: Arc::clone(&backend),
             admitted: backend.acquire_local_authority_pass().unwrap(),
             target_gate: Arc::new(Mutex::new(())).try_lock_owned().unwrap(),
-            attempt_gate: Arc::new(Mutex::new(())).try_lock_owned().unwrap(),
+            attempt_gate,
             response,
         });
         let original = std::ptr::from_ref(retry.as_ref());

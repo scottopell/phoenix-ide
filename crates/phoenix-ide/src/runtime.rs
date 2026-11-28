@@ -18,6 +18,7 @@ pub use native_spawn::{
     NativeSpawnClosureReceipt, NativeSpawnControl, NativeSpawnTerminalEvidence,
     SubAgentAdmissionReceipt,
 };
+pub(crate) mod close_authority;
 pub(crate) mod close_retirement;
 pub(crate) mod creation_worker;
 pub mod deny_gate;
@@ -778,7 +779,7 @@ pub struct RuntimeManager {
     clean_close_writer_fixture: bool,
     close_retirement_execution: ConversationMutexGates,
     waiting_generic_close_owners: AsyncMutex<
-        HashMap<phoenix_core::domain::close::CloseAttemptId, GenericCloseSettlementOwner>,
+        HashMap<phoenix_core::domain::close::CloseAttemptId, close_authority::GenericCloseSettlementOwner>,
     >,
     scheduled_close_rechecks:
         std::sync::Mutex<HashSet<phoenix_core::domain::close::CloseAttemptId>>,
@@ -982,11 +983,6 @@ impl From<String> for GenericCloseApplyError {
     fn from(error: String) -> Self {
         Self::Definite(error)
     }
-}
-
-struct GenericCloseSettlementOwner {
-    settlement: crate::db::GenericCloseSettlement,
-    deliveries: HashMap<u64, CloseSettlementDelivery>,
 }
 
 struct CloseSettlementDelivery {
@@ -4015,15 +4011,14 @@ impl RuntimeManager {
 
     async fn settle_close_obligation(
         self: &Arc<Self>,
-        mut owner: GenericCloseSettlementOwner,
+        active: close_authority::ActiveGenericCloseSettlement,
     ) -> Result<bool, String> {
-        let settlement = &owner.settlement;
-        match self
-            .apply_generic_close_settlement(settlement, &mut owner.deliveries)
-            .await
-        {
+        let (execution, mut owner) = active.into_parts();
+        let (settlement, deliveries) = owner.settlement_and_deliveries();
+        match self.apply_generic_close_settlement(settlement, deliveries).await {
             Ok(crate::db::GenericCloseSettlementAdvance::Inspect(inspection)) => {
-                self.continue_settled_generic_close(inspection).await?;
+                self.continue_settled_generic_close(&execution, inspection)
+                    .await?;
                 Ok(true)
             }
             Ok(crate::db::GenericCloseSettlementAdvance::Interrupted(run)) => {
@@ -10858,7 +10853,7 @@ mod scope_liveness_tests {
                 let restarted = test_manager_with_db(db.clone());
                 restarted.restore_close_admission_fences().await.unwrap();
                 assert_eq!(
-                    crate::api::observe_running_close_runs(&db, || restarted
+                    crate::runtime::close_authority::observe_running_close_runs(&db, || restarted
                         .kick_direct_turn_worker())
                     .await
                     .unwrap(),

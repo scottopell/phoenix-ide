@@ -17,7 +17,8 @@ use super::{
 };
 use crate::close_foundation::{
     ensure_close_retirement_loss_free_tx, require_control_target_latest_tx,
-    require_exact_live_settlement_target_tx,
+    require_exact_live_settlement_target_tx, CloseProcessDispatchCoverage,
+    SealedCloseProcessDispatchBatch,
 };
 use crate::workflow::LocalAuthorityResult;
 use crate::{
@@ -412,36 +413,14 @@ async fn validate_initial_worktree_entry_tx(
         ));
     }
     require_initial_original_dispatch_tx(tx, &admitted, scope, snapshot, resource).await?;
-    let identity = resource.identity();
-    let already_proven: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_history
-         WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
-           AND inspection_fingerprint = ?4 AND resource_kind = ?5
-           AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
-           AND proof_kind IN ('retired', 'absence_adopted'))
-         OR EXISTS(SELECT 1 FROM close_retirement_resources
-         WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
-           AND inspection_fingerprint = ?4 AND resource_kind = ?5
-           AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
-           AND proof_kind IN ('retired', 'absence_adopted'))",
+    Database::require_original_worktree_unsettled_tx(
+        tx,
+        &admitted.attempt_id,
+        scope,
+        snapshot,
+        resource,
     )
-    .bind(admitted.attempt_id.as_str())
-    .bind(scope.as_str())
-    .bind(snapshot.generation())
-    .bind(snapshot.fingerprint())
-    .bind(resource.kind().as_str())
-    .bind(identity.identity_kind())
-    .bind(identity.codec())
-    .bind(identity.value())
-    .fetch_one(&mut **tx)
-    .await?;
-    if already_proven {
-        return Err(DbError::CloseFoundationPrecondition(
-            "initial worktree entry refuses an exact resource with positive retirement evidence"
-                .into(),
-        ));
-    }
-    Ok(())
+    .await
 }
 
 impl Database {
@@ -1413,29 +1392,12 @@ impl Database {
                 &first.resource,
             )
             .await?;
-            let kind = first.resource.kind();
-            let inventory = expected
-                .iter()
-                .filter(|item| item.scope == first.scope && item.resource.kind() == kind);
-            if matches!(
-                kind,
-                RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope
-            ) || inventory.clone().count() != requests.len()
-                || !inventory.clone().all(|item| {
-                    requests.iter().any(|request| {
-                        request.attempt_id == item.attempt_id
-                            && request.scope == item.scope
-                            && request.snapshot == item.snapshot
-                            && request.resource == item.resource
-                    })
-                })
-            {
-                return Err(DbError::CloseFoundationPrecondition(
-                    "initial process dispatch batch must match the exact process-kind inventory"
-                        .into(),
-                ));
-            }
-            Self::insert_close_process_dispatch_batch_tx(&mut tx, requests).await
+            let batch = SealedCloseProcessDispatchBatch::validate(
+                requests,
+                &expected,
+                CloseProcessDispatchCoverage::EntireKind,
+            )?;
+            Self::insert_close_process_dispatch_batch_tx(&mut tx, batch).await
         }
         .await;
         Self::release_close_process_dispatch_batch(tx, result).await
@@ -2505,11 +2467,22 @@ impl Database {
         &self,
         command: &NativeCloseCommand,
     ) -> LocalAuthorityResult<DbResult<NativeCloseInitialResult>> {
+        let attempt = CloseAttemptId::parse(Uuid::new_v4().to_string()).expect("UUID is an attempt ID");
+        self.apply_native_close_initial_for_attempt(command, &attempt).await
+    }
+
+    /// Admits a source-bound Initial Close with its proposed fresh attempt ID.
+    /// Exact replay and existing operations never adopt the proposed ID.
+    pub async fn apply_native_close_initial_for_attempt(
+        &self,
+        command: &NativeCloseCommand,
+        attempt: &CloseAttemptId,
+    ) -> LocalAuthorityResult<DbResult<NativeCloseInitialResult>> {
         let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
             Ok(tx) => tx,
             Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
         };
-        match apply_initial_tx(&mut tx, command).await {
+        match apply_initial_tx(&mut tx, command, attempt).await {
             Ok(result) => match tx.commit().await {
                 Ok(()) => LocalAuthorityResult::DurableFactEstablished(Ok(result)),
                 Err(_) => LocalAuthorityResult::DurableFactUnclassified,
@@ -2744,6 +2717,7 @@ async fn require_initial_execution_tx(
 async fn apply_initial_tx(
     tx: &mut Transaction<'_, Sqlite>,
     command: &NativeCloseCommand,
+    attempt: &CloseAttemptId,
 ) -> DbResult<NativeCloseInitialResult> {
     super::receipts::require_source_and_target_tx(tx, command).await?;
     let NativeCloseIntent::Initial { target } = command.intent() else {
@@ -2778,10 +2752,9 @@ async fn apply_initial_tx(
         .ok_or_else(|| {
             DbError::CloseFoundationPrecondition("Close target has no retained topology".into())
         })?;
-    // Allocate only after source, exact replay, existing operation and topology checks.
     let latest = TranscriptConversationId::parse(topology.latest.id)
         .map_err(|error| DbError::Serialization(error.to_string()))?;
-    let attempt_id = Uuid::new_v4().to_string();
+    let attempt_id = attempt.as_str();
     // Deferred exact receipt/operation FKs bind original source before creation.
     // A retained unreceipted operation cannot acquire provenance by late adoption.
     sqlx::query(
@@ -2790,7 +2763,7 @@ async fn apply_initial_tx(
           source_message_id, source_tool_use_id, product_conversation_id, initial_run_ordinal)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1)",
     )
-    .bind(&attempt_id)
+    .bind(attempt_id)
     .bind(command.request_id().to_string())
     .bind(command.fingerprint())
     .bind(command.source_transcript_id())
@@ -2800,7 +2773,7 @@ async fn apply_initial_tx(
     .execute(&mut **tx)
     .await?;
     let crate::CloseFoundationAdmission::Inserted(obligation) =
-        Database::begin_close_foundation_inner(tx, target, &latest, &attempt_id, false).await?
+        Database::begin_close_foundation_inner(tx, target, &latest, attempt_id, false).await?
     else {
         return Err(DbError::CloseFoundationConflict(
             "cannot attach a native Initial receipt to an existing Close attempt".into(),

@@ -17,7 +17,7 @@ pub(crate) struct NativeCloseRetryRequest {
     pub backend: Arc<super::super::RuntimeManager>,
     pub admitted: super::super::AdmittedOperation,
     pub target_gate: OwnedMutexGuard<()>,
-    pub attempt_gate: OwnedMutexGuard<()>,
+    pub attempt_gate: super::super::close_authority::CloseAttemptOwner,
     pub response: oneshot::Sender<Result<NativeCloseRetryResult, NativeCloseApplicationError>>,
 }
 
@@ -36,10 +36,7 @@ impl super::super::RuntimeManager {
             .await
             .lock_owned()
             .await;
-        let attempt_gate = self
-            .close_retirement_execution
-            .lock(attempt_id.as_str())
-            .await;
+        let attempt_gate = self.acquire_close_attempt(attempt_id.clone()).await;
         let admitted = self
             .acquire_local_authority_pass()
             .map_err(|()| NativeCloseApplicationError::FatalAuthority)?;

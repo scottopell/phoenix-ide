@@ -124,11 +124,13 @@ jobs:
             generic_dispatch_and_failure_preserve_observe_adopted_legacy_initial \
             generic_close_process_batch_replay_rolls_back_unclaimed_resources \
             migration_197_preserves_existing_evidence_and_round_trips_tmux_replacement \
+            migration_199_installs_immutable_legacy_retry_claims_with_exact_plan_fk \
             generic_legacy_close_retry_serializes_with_native_adoption \
             generic_legacy_close_retry_refuses_owning_native_receipt \
             generic_close_no_actor_cancels_and_releases_exact_target_atomically \
             generic_close_stopped_run_cannot_cancel_captured_turn \
             interrupted_generic_handoffs_stop_without_retirement_authority \
+            native_retry_tmux_replacement_settles_without_dispatch_and_replays_exactly \
             settlement_dispatch_no_actor_terminalizes_only_the_captured_target; do
             cargo test --locked -p phoenix-db --lib "$selector" -- --nocapture 2>&1 | tee "$evidence/$selector.log"
             grep -E "^test .*::$selector \.\.\. ok$" "$evidence/$selector.log"
@@ -1418,6 +1420,9 @@ jobs:
             tmux::registry::tests::prepared_retirement_entry::entry_refusal_before_kill_preserves_live_server_and_registry_entry
             tmux::registry::tests::prepared_retirement_entry::entry_refusal_after_kill_preserves_residual_before_final_gone
             tmux::registry::tests::prepared_retirement_entry::ordinary_prepared_complete_still_retires_without_entry_callback
+            tmux::registry::tests::prepared_retirement_entry::strict_replacement_before_approval_never_dispatches_or_finalizes
+            tmux::registry::tests::prepared_retirement_entry::strict_dispatch_confirmation_precedes_refused_finalization
+            tmux::registry::tests::prepared_retirement_entry::strict_final_probe_observes_replacement_without_finalizing
           )
           for test in "${tests[@]}"; do
             grep -Fx "$test: test" evidence/tmux-inventory.log
@@ -1441,6 +1446,7 @@ jobs:
             disposable::token_change_while_helper_waits_preserves_the_original_server
             disposable::cancellation_before_helper_approval_never_kills_the_server
             disposable::exact_gate_kills_only_the_original_disposable_server
+            disposable::exact_gate_queue_completion_does_not_prove_built_in_kill_executed
             disposable::exact_gate_rejects_birth_and_token_mismatch_without_killing
             disposable::exact_gate_rejects_unsupported_or_format_embedded_helper
           )
@@ -1448,7 +1454,7 @@ jobs:
             grep -Fx "$test: test" evidence/tmux-gate-inventory.log
           done
           cargo test -p phoenix_ide --test tmux_close_gate -- --nocapture --test-threads=1 2>&1 | tee evidence/tmux-gate-execution.log
-          grep -F 'test result: ok. 8 passed; 0 failed; 0 ignored;' evidence/tmux-gate-execution.log
+          grep -F "test result: ok. ${#tests[@]} passed; 0 failed; 0 ignored;" evidence/tmux-gate-execution.log
           for test in "${tests[@]}"; do
             grep -Fx "test $test ... ok" evidence/tmux-gate-execution.log
           done

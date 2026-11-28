@@ -31,7 +31,6 @@ enum Stage {
     ScopeRunning,
     ScopeEvidence,
     TmuxRunning,
-    TmuxEvidence,
     WorktreeDispatch,
     WorktreeDraining,
     WorktreeRecordDispatch,
@@ -67,9 +66,9 @@ pub(in crate::runtime::executor) struct AdmittedRetryCursor {
     #[cfg(unix)]
     stopped_physical_outcome: Option<WorktreePhysicalOutcome>,
     response: Option<oneshot::Sender<Result<NativeCloseRetryResult, NativeCloseApplicationError>>>,
-    _target_gate: OwnedMutexGuard<()>,
-    _attempt_gate: OwnedMutexGuard<()>,
     authority: RuntimeSettlementAuthority,
+    _target_gate: OwnedMutexGuard<()>,
+    attempt_owner: crate::runtime::close_authority::CloseAttemptOwner,
 }
 
 impl AdmittedRetryCursor {
@@ -80,7 +79,7 @@ impl AdmittedRetryCursor {
         backend: Arc<RuntimeManager>,
         admitted: AdmittedOperation,
         target_gate: OwnedMutexGuard<()>,
-        attempt_gate: OwnedMutexGuard<()>,
+        attempt_gate: crate::runtime::close_authority::CloseAttemptOwner,
         response: oneshot::Sender<Result<NativeCloseRetryResult, NativeCloseApplicationError>>,
         source_entry: SourceEntryWorker,
         deadline: std::time::Instant,
@@ -108,7 +107,7 @@ impl AdmittedRetryCursor {
             stopped_physical_outcome: None,
             response: Some(response),
             _target_gate: target_gate,
-            _attempt_gate: attempt_gate,
+            attempt_owner: attempt_gate,
             authority: RuntimeSettlementAuthority {
                 owner: Some(admitted),
                 abandoned_reason: "admitted native retry cursor lost settlement custody",
@@ -262,7 +261,9 @@ impl AdmittedRetryCursor {
         live: &ConvState,
         controller: &mut Option<SourceEntryController>,
     ) -> Result<bool, NativeCloseApplicationError> {
-        if matches!(self.stage, Stage::Fatal) {
+        if matches!(self.stage, Stage::Fatal)
+            || self.attempt_owner.require_exact(&self.receipt.admitted.attempt_id).is_err()
+        {
             return Err(NativeCloseApplicationError::FatalAuthority);
         }
         #[cfg(unix)]
@@ -403,7 +404,9 @@ impl AdmittedRetryCursor {
                 }
                 if current {
                     match result {
-                        Ok(Ok(())) => self.stage = Stage::TmuxEvidence,
+                        Ok(Ok(())) => {
+                            self.accept(Ok(()));
+                        }
                         Ok(Err(error)) => {
                             if self.accept(Err(error)) {
                                 return Ok(true);
@@ -417,20 +420,6 @@ impl AdmittedRetryCursor {
                         "joined tmux retry after source loss; no current-source success recorded"
                     );
                     self.stage = Stage::ObserveTerminal;
-                }
-            }
-            Stage::TmuxEvidence => {
-                let result = self
-                    .backend
-                    .native_retry_record_success(
-                        &self.command,
-                        &self.receipt.admitted,
-                        self.effect(),
-                        "joined exact native retry tmux retirement",
-                    )
-                    .await;
-                if self.accept(result) {
-                    return Ok(true);
                 }
             }
             Stage::ScopeRunning => {

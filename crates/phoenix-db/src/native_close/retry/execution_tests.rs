@@ -694,8 +694,24 @@ async fn native_resource_failure_requires_truthful_original_process_success() {
     ).await);
     assert_eq!(migration_180_retained_state(&db).await, retained);
     let tmux_effect = pending.iter().find(|effect| effect.resource == tmux).unwrap();
-    success_recorded(db.record_native_close_retry_success(
-        &assessment.command, &receipt.admitted, tmux_effect, "original tmux stopped",
+    use crate::native_close::NativeRetryTmuxProof;
+    success_refused(db.record_native_close_retry_tmux_success(
+        &assessment.command, &receipt.admitted, tmux_effect, NativeRetryTmuxProof::Dispatched, || async { Ok(()) },
+    ).await);
+    success_recorded(db.record_native_close_retry_retirement_dispatch(
+        &assessment.command, &receipt.admitted, tmux_effect,
+    ).await);
+    success_refused(db.record_native_close_retry_tmux_success(
+        &assessment.command, &receipt.admitted, tmux_effect, NativeRetryTmuxProof::Dispatched, || async { Ok(()) },
+    ).await);
+    assert!(db.close_safe_retry_progress(&run).await.unwrap().pending.contains(tmux_effect));
+    let (dispatch, lease) = db.confirm_native_retry_tmux_dispatch_with_entry(
+        &assessment.command, &receipt.admitted, tmux_effect, || Ok(()),
+    ).await;
+    assert!(matches!(dispatch, LocalAuthorityResult::DurableFactEstablished(Ok(()))));
+    assert_eq!(lease, Some(()));
+    success_recorded(db.record_native_close_retry_tmux_success(
+        &assessment.command, &receipt.admitted, tmux_effect, NativeRetryTmuxProof::Dispatched, || async { Ok(()) },
     ).await);
     let pending = db.close_safe_retry_progress(&run).await.unwrap().pending;
     let index = pending.iter().position(|effect| effect.resource.kind() == RetiredResourceKind::Worktree).unwrap();
@@ -750,7 +766,10 @@ async fn native_tmux_retry_fixture() -> (Database, Assessment, NativeCloseReceip
     // The generic failure fixture becomes native only after `assess` installs a
     // real executing source and native explicit-retry admission succeeds.
     let db = Database::open_in_memory().await.unwrap();
-    let tmux = opaque_resource(RetiredResourceKind::TmuxServer, "native-retry-tmux");
+    let tmux = opaque_resource(
+        RetiredResourceKind::TmuxServer,
+        "tmux-v1:L3RtcC9uYXRpdmUtcmV0cnk:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    );
     let failure = fixture(&db, vec![tmux], true).await;
     let assessment = assess(&db, &failure, "tmux-retry").await;
     let receipt = admitted(db.apply_native_close_explicit_retry(&assessment).await);
@@ -758,6 +777,94 @@ async fn native_tmux_retry_fixture() -> (Database, Assessment, NativeCloseReceip
         .find(|effect| effect.resource.kind() == RetiredResourceKind::TmuxServer)
         .expect("native retry plan includes a pending tmux effect").clone();
     (db, assessment, receipt, effect)
+}
+
+#[tokio::test]
+async fn native_retry_tmux_replacement_settles_without_dispatch_and_replays_exactly() {
+    use crate::native_close::NativeRetryTmuxProof;
+
+    let (db, assessment, receipt, effect) = native_tmux_retry_fixture().await;
+    let run = CloseRunRef {
+        attempt_id: receipt.admitted.attempt_id.clone(),
+        ordinal: receipt.admitted.run_ordinal,
+    };
+    let sealed_identity = effect.resource.identity().value().to_string();
+    let replacement = |sealed_identity: String, token: &str| NativeRetryTmuxProof::Replacement {
+        sealed_identity,
+        token: uuid::Uuid::parse_str(token).unwrap(),
+    };
+    let record = |proof| db.record_native_close_retry_tmux_success(
+        &assessment.command, &receipt.admitted, &effect, proof, || async { Ok(()) },
+    );
+    let original = "AAAAAAAA-AAAA-4AAA-8AAA-AAAAAAAAAAAA";
+    let new = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let wrong_identity = sealed_identity.replace("L3RtcC9uYXRpdmUtcmV0cnk", "L3RtcC93cm9uZw");
+    let before = db.close_safe_retry_progress(&run).await.unwrap();
+    success_refused(record(NativeRetryTmuxProof::Dispatched).await);
+    success_refused(record(replacement(sealed_identity.clone(), original)).await);
+    success_refused(record(replacement(wrong_identity, new)).await);
+    assert_eq!(db.close_safe_retry_progress(&run).await.unwrap(), before);
+
+    let rechecked = std::cell::Cell::new(false);
+    success_refused(
+        db.record_native_close_retry_tmux_success(
+            &assessment.command,
+            &receipt.admitted,
+            &effect,
+            replacement(sealed_identity.clone(), new),
+            || async {
+                rechecked.set(true);
+                Err(crate::DbError::CloseFoundationPrecondition(
+                    "replacement changed at writer entry".into(),
+                ))
+            },
+        )
+        .await,
+    );
+    assert!(rechecked.get());
+    assert_eq!(db.close_safe_retry_progress(&run).await.unwrap(), before);
+    let replacement_history: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM close_retirement_resource_history
+         WHERE attempt_id = ?1 AND tmux_replacement_token IS NOT NULL",
+    )
+    .bind(run.attempt_id.as_str())
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(replacement_history, 0);
+
+    success_recorded(record(replacement(sealed_identity.clone(), new)).await);
+    let history_sequence = || {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT seq FROM sqlite_sequence WHERE name = 'close_retirement_resource_history'",
+        )
+        .fetch_one(db.pool())
+    };
+    let sequence = history_sequence().await.unwrap();
+    success_recorded(record(replacement(sealed_identity.clone(), new)).await);
+    assert_eq!(history_sequence().await.unwrap(), sequence);
+    assert!(db.close_safe_retry_progress(&run).await.unwrap().successful.contains(&effect));
+    success_refused(record(replacement(
+        sealed_identity,
+        "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    )).await);
+    success_refused(record(NativeRetryTmuxProof::Dispatched).await);
+    let proofs: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT inspection_generation, inspection_fingerprint, proof_kind, tmux_replacement_token
+         FROM close_retirement_resource_history
+         WHERE attempt_id = ?1 AND tmux_replacement_token IS NOT NULL",
+    )
+    .bind(run.attempt_id.as_str())
+    .fetch_all(db.pool()).await.unwrap();
+    assert_eq!(proofs, vec![(
+        assessment.proof.snapshot.generation().to_owned(),
+        assessment.proof.snapshot.fingerprint().to_owned(),
+        "absence_adopted".to_owned(),
+        new.to_owned(),
+    )]);
+    assert!(!db.close_retirement_resource_was_dispatched(
+        &run.attempt_id, &effect.scope, &assessment.proof.snapshot, &effect.resource,
+    ).await.unwrap());
 }
 
 #[tokio::test]
@@ -837,6 +944,21 @@ async fn native_retry_tmux_first_effect_requires_exact_source_dispatch_identity_
         &assessment.command, &receipt.admitted, &effect,
     ).await);
     let callback_calls = Cell::new(0);
+    let premature = db.with_native_close_retry_tmux_first_effect(
+        &assessment.command, &receipt.admitted, &live_source, effect.scope.clone(),
+        assessment.proof.snapshot.clone(), &effect.resource, || panic!("preclaim cannot finalize"),
+    ).await;
+    assert!(matches!(premature, Err(NativeCloseInitialFirstEffectError::Rejected { .. })));
+    let (confirmed, lease) = db.confirm_native_retry_tmux_dispatch_with_entry(
+        &assessment.command, &receipt.admitted, &effect, || Ok(()),
+    ).await;
+    success_recorded(confirmed);
+    assert_eq!(lease, Some(()));
+    let duplicate_approval = db.with_native_close_retry_tmux_approval(
+        &assessment.command, &receipt.admitted, &live_source, effect.scope.clone(),
+        assessment.proof.snapshot.clone(), &effect.resource, || panic!("must not dispatch twice"),
+    ).await;
+    assert!(matches!(duplicate_approval, Err(NativeCloseInitialFirstEffectError::Rejected { .. })));
     let (result, release) = db.with_native_close_retry_tmux_first_effect(
         &assessment.command, &receipt.admitted, &live_source, effect.scope.clone(),
         assessment.proof.snapshot.clone(), &effect.resource, || {

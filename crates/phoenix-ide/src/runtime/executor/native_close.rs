@@ -100,6 +100,7 @@ pub(super) struct NativeCloseInitialContinuation {
         std::collections::HashMap<u64, crate::runtime::CloseSettlementDelivery>,
     pub(super) terminal_observation_retry: bool,
     pub(super) authority: RuntimeSettlementAuthority,
+    _attempt_owner: crate::runtime::close_authority::CloseAttemptOwner,
     pub(super) target_gate: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,
     pub(super) response: Option<
         tokio::sync::oneshot::Sender<Result<NativeCloseInitialResult, NativeCloseApplicationError>>,
@@ -1251,10 +1252,25 @@ where
                 return Err(error);
             }
         };
-        match db.apply_native_close_initial(&command).await {
+        let Some(attempt_owner) = backend.reserve_native_initial_attempt().await else {
+            authority.owner = None;
+            let error = NativeCloseApplicationError::Unavailable;
+            let _ = response.send(Err(error.clone()));
+            return Err(error);
+        };
+        match db
+            .apply_native_close_initial_for_attempt(&command, attempt_owner.attempt())
+            .await
+        {
             LocalAuthorityResult::DurableFactEstablished(Ok(
                 NativeCloseInitialResult::NewlyAdmitted(receipt),
             )) => {
+                if attempt_owner.require_exact(&receipt.admitted.attempt_id).is_err() {
+                    backend.signal_fatal_local_authority("native_close_initial_admission_owner_mismatch");
+                    let error = NativeCloseApplicationError::FatalAuthority;
+                    let _ = response.send(Err(error.clone()));
+                    return Err(error);
+                }
                 let result = NativeCloseInitialResult::NewlyAdmitted(receipt.clone());
                 let continuation = NativeCloseInitialContinuation {
                     #[cfg(test)]
@@ -1282,6 +1298,7 @@ where
                     confirmed_settlement_deliveries: Default::default(),
                     terminal_observation_retry: false,
                     authority,
+                    _attempt_owner: attempt_owner,
                     target_gate: std::sync::Arc::new(target_gate),
                     response: Some(response),
                 };

@@ -19,8 +19,8 @@ use std::fmt::Write as _;
 
 use crate::coordinator_watches::append_mandatory_close_failure_event_tx;
 use crate::{
-    conv_state_kind, parse_conversation_row, CloseFoundationRepair, ConvState, Conversation,
-    Database, DbError, DbResult,
+    CloseFoundationRepair, ConvState, Conversation, Database, DbError, DbResult, conv_state_kind,
+    parse_conversation_row,
 };
 
 pub(crate) struct LiveCloseSettlementTarget<'a, 'db> {
@@ -328,6 +328,40 @@ impl AdmittedGenericLegacyCloseRetry {
     pub fn into_attempt_id(self) -> CloseAttemptId {
         self.0
     }
+}
+
+/// First-only authority to begin teardown for the exact retained legacy worktree.
+#[derive(Debug)]
+pub struct FirstLegacyRetryWorktreeClaim {
+    attempt_id: CloseAttemptId,
+    scope: WorkScopeId,
+    snapshot: CloseRetirementSnapshot,
+    resource: RetiredResourceIdentity,
+}
+
+impl FirstLegacyRetryWorktreeClaim {
+    #[must_use]
+    pub fn attempt_id(&self) -> &CloseAttemptId {
+        &self.attempt_id
+    }
+    #[must_use]
+    pub fn scope(&self) -> &WorkScopeId {
+        &self.scope
+    }
+    #[must_use]
+    pub fn snapshot(&self) -> &CloseRetirementSnapshot {
+        &self.snapshot
+    }
+    #[must_use]
+    pub fn resource(&self) -> &RetiredResourceIdentity {
+        &self.resource
+    }
+}
+
+#[derive(Debug)]
+pub enum LegacyRetryWorktreeClaimRelease {
+    First(FirstLegacyRetryWorktreeClaim),
+    Replay,
 }
 
 /// Exact generic attempt accepted for pre-retirement cancellation.
@@ -1821,6 +1855,11 @@ pub struct CloseSafeRetryEffect {
 pub struct CloseSafeRetryProgress {
     pub successful: Vec<CloseSafeRetryEffect>,
     pub pending: Vec<CloseSafeRetryEffect>,
+}
+
+pub(crate) enum CloseRetrySuccessWrite {
+    Inserted,
+    Replay,
 }
 
 async fn close_safe_retry_progress_tx(
@@ -5742,6 +5781,69 @@ type WorktreeCleanupPlanColumns = (
     Option<String>,
 );
 
+#[derive(Clone, Copy)]
+pub(crate) enum CloseProcessDispatchCoverage {
+    ScopeSubset,
+    EntireKind,
+}
+
+pub(crate) struct SealedCloseProcessDispatchBatch<'a>(&'a [RecordCloseRetirementDispatchRequest]);
+
+impl<'a> SealedCloseProcessDispatchBatch<'a> {
+    pub(crate) fn validate(
+        requests: &'a [RecordCloseRetirementDispatchRequest],
+        expected: &[CloseExpectedRetirementResource],
+        coverage: CloseProcessDispatchCoverage,
+    ) -> DbResult<Self> {
+        let first = requests.first().ok_or_else(|| {
+            close_precondition("Close process dispatch requires a nonempty batch")
+        })?;
+        let matches_resource =
+            |request: &RecordCloseRetirementDispatchRequest,
+             item: &CloseExpectedRetirementResource| {
+                request.attempt_id == item.attempt_id
+                    && request.scope == item.scope
+                    && request.snapshot == item.snapshot
+                    && request.resource == item.resource
+            };
+        if requests.iter().any(|request| {
+            request.attempt_id != first.attempt_id
+                || request.scope != first.scope
+                || request.snapshot != first.snapshot
+                || matches!(
+                    request.resource.kind(),
+                    RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope
+                )
+                || !expected.iter().any(|item| matches_resource(request, item))
+        }) {
+            return Err(close_precondition(
+                "Close process dispatch does not match the exact sealed scope inventory",
+            ));
+        }
+        if matches!(coverage, CloseProcessDispatchCoverage::EntireKind) {
+            let kind = first.resource.kind();
+            let inventory = expected
+                .iter()
+                .filter(|item| item.scope == first.scope && item.resource.kind() == kind);
+            if requests
+                .iter()
+                .any(|request| request.resource.kind() != kind)
+                || inventory.clone().count() != requests.len()
+                || !inventory.clone().all(|item| {
+                    requests
+                        .iter()
+                        .any(|request| matches_resource(request, item))
+                })
+            {
+                return Err(close_precondition(
+                    "Close process dispatch does not cover the exact sealed process kind",
+                ));
+            }
+        }
+        Ok(Self(requests))
+    }
+}
+
 enum GenericCloseDispatchKind {
     Legacy,
     OriginalWorktree(Box<RecordCloseWorktreeCleanupPlanRequest>),
@@ -5760,9 +5862,17 @@ impl Database {
         &self,
         request: RecordCloseRetirementDispatchRequest,
     ) -> DbResult<()> {
-        self.record_generic_close_dispatch(request, GenericCloseDispatchKind::Legacy)
-            .await?;
-        Ok(())
+        match self
+            .record_generic_close_dispatch(request, GenericCloseDispatchKind::Legacy)
+            .await
+        {
+            crate::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map(|_| ())
+            }
+            crate::workflow::LocalAuthorityResult::DurableFactUnclassified => Err(
+                close_precondition("legacy Close dispatch release is unclassified"),
+            ),
+        }
     }
 
     /// Claims API process teardown for an exact running Initial scope. The whole
@@ -5803,24 +5913,11 @@ impl Database {
             let expected =
                 list_close_expected_retirement_resources_tx(&mut tx, first.attempt_id.as_str())
                     .await?;
-            for request in requests {
-                if request.scope != first.scope
-                    || matches!(
-                        request.resource.kind(),
-                        RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope
-                    )
-                    || !expected.iter().any(|item| {
-                        item.attempt_id == request.attempt_id
-                            && item.scope == request.scope
-                            && item.snapshot == request.snapshot
-                            && item.resource == request.resource
-                    })
-                {
-                    return Err(close_precondition(
-                        "process dispatch does not match the sealed generic inventory",
-                    ));
-                }
-            }
+            let batch = SealedCloseProcessDispatchBatch::validate(
+                requests,
+                &expected,
+                CloseProcessDispatchCoverage::ScopeSubset,
+            )?;
             // Legacy reinspection can rotate the snapshot without creating a new run.
             for request in requests {
                 let identity = request.resource.identity();
@@ -5844,7 +5941,7 @@ impl Database {
                     return Ok(CloseRetirementBatchDispatch::Replay);
                 }
             }
-            Self::insert_close_process_dispatch_batch_tx(&mut tx, requests).await
+            Self::insert_close_process_dispatch_batch_tx(&mut tx, batch).await
         }
         .await;
         Self::release_close_process_dispatch_batch(tx, result).await
@@ -5852,7 +5949,7 @@ impl Database {
 
     pub(crate) async fn insert_close_process_dispatch_batch_tx(
         tx: &mut Transaction<'_, Sqlite>,
-        requests: &[RecordCloseRetirementDispatchRequest],
+        SealedCloseProcessDispatchBatch(requests): SealedCloseProcessDispatchBatch<'_>,
     ) -> DbResult<CloseRetirementBatchDispatch> {
         let mut claimed = Vec::with_capacity(requests.len());
         for request in requests {
@@ -5881,6 +5978,45 @@ impl Database {
         }
     }
 
+    pub(crate) async fn require_original_worktree_unsettled_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<()> {
+        let identity = resource.identity();
+        let already_proven: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_history
+             WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+               AND inspection_fingerprint = ?4 AND resource_kind = ?5
+               AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
+               AND proof_kind IN ('retired', 'absence_adopted'))
+             OR EXISTS(SELECT 1 FROM close_retirement_resources
+             WHERE attempt_id = ?1 AND scope = ?2 AND inspection_generation = ?3
+               AND inspection_fingerprint = ?4 AND resource_kind = ?5
+               AND identity_kind = ?6 AND identity_codec = ?7 AND identity_value = ?8
+               AND proof_kind IN ('retired', 'absence_adopted'))",
+        )
+        .bind(attempt_id.as_str())
+        .bind(scope.as_str())
+        .bind(snapshot.generation())
+        .bind(snapshot.fingerprint())
+        .bind(resource.kind().as_str())
+        .bind(identity.identity_kind())
+        .bind(identity.codec())
+        .bind(identity.value())
+        .fetch_one(&mut **tx)
+        .await?;
+        if already_proven {
+            return Err(DbError::CloseFoundationPrecondition(
+                "initial worktree entry refuses an exact resource with positive retirement evidence"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Claims the first generic dispatch and commits its exact cleanup plan
     /// together. A replay grants no ownership and cannot install a plan. Neither
     /// result authorizes relaxed writer inspection.
@@ -5891,7 +6027,7 @@ impl Database {
     pub async fn claim_generic_original_worktree_dispatch(
         &self,
         plan: RecordCloseWorktreeCleanupPlanRequest,
-    ) -> DbResult<CloseRetirementDispatch> {
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<CloseRetirementDispatch>> {
         let request = RecordCloseRetirementDispatchRequest {
             attempt_id: plan.attempt_id.clone(),
             scope: plan.scope.clone(),
@@ -5909,14 +6045,37 @@ impl Database {
         &self,
         request: RecordCloseRetirementDispatchRequest,
         kind: GenericCloseDispatchKind,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<CloseRetirementDispatch>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error.into())),
+        };
+        let result = Self::stage_generic_close_dispatch(&mut tx, request, kind).await;
+        let released = match &result {
+            Ok(CloseRetirementDispatch::First(_)) => tx.commit().await,
+            Ok(CloseRetirementDispatch::Replay) | Err(_) => tx.rollback().await,
+        };
+        match released {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    async fn stage_generic_close_dispatch(
+        tx: &mut Transaction<'_, Sqlite>,
+        request: RecordCloseRetirementDispatchRequest,
+        kind: GenericCloseDispatchKind,
     ) -> DbResult<CloseRetirementDispatch> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let native_initial: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM native_close_initial_receipts
              WHERE attempt_id = ?1 AND run_ordinal = 1 AND intent = 'initial')",
         )
         .bind(request.attempt_id.as_str())
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if native_initial {
             return Err(close_precondition(
@@ -5924,14 +6083,14 @@ impl Database {
             ));
         }
         // An observation/adoption receipt alone must not revoke a legacy initial run.
-        let current = close_obligation_for_update(&mut tx, request.attempt_id.as_str()).await?;
+        let current = close_obligation_for_update(tx, request.attempt_id.as_str()).await?;
         if current.phase() == ClosePhase::Completed {
             let native_managed: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM close_obligations
                  WHERE attempt_id = ?1 AND native_managed = 1)",
             )
             .bind(request.attempt_id.as_str())
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             if native_managed {
                 return Err(close_precondition(
@@ -5955,7 +6114,7 @@ impl Database {
                  )",
             )
             .bind(request.attempt_id.as_str())
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             if !initial_run_active {
                 return Err(close_precondition(
@@ -5987,7 +6146,7 @@ impl Database {
             )
             .bind(request.attempt_id.as_str()).bind(request.scope.as_str())
             .bind(request.resource.kind().as_str()).bind(identity.identity_kind())
-            .bind(identity.codec()).bind(identity.value()).fetch_one(&mut *tx).await?
+            .bind(identity.codec()).bind(identity.value()).fetch_one(&mut **tx).await?
         } else {
             false
         };
@@ -6002,8 +6161,8 @@ impl Database {
                 request.attempt_id
             )));
         }
-        ensure_close_retirement_loss_free_tx(&mut tx, request.attempt_id.as_str()).await?;
-        let dispatch = Self::insert_close_retirement_dispatch_tx(&mut tx, &request).await?;
+        ensure_close_retirement_loss_free_tx(tx, request.attempt_id.as_str()).await?;
+        let dispatch = Self::insert_close_retirement_dispatch_tx(tx, &request).await?;
         if let (
             GenericCloseDispatchKind::OriginalWorktree(plan),
             CloseRetirementDispatch::First(_),
@@ -6024,15 +6183,21 @@ impl Database {
             .bind(identity.value())
             .bind(request.snapshot.generation())
             .bind(request.snapshot.fingerprint())
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?;
             if prior_dispatch {
-                tx.rollback().await?;
                 return Ok(CloseRetirementDispatch::Replay);
             }
-            Self::record_close_worktree_cleanup_plan_tx(&mut tx, *plan).await?;
+            Self::require_original_worktree_unsettled_tx(
+                tx,
+                &request.attempt_id,
+                &request.scope,
+                &request.snapshot,
+                &request.resource,
+            )
+            .await?;
+            Self::record_close_worktree_cleanup_plan_tx(tx, *plan).await?;
         }
-        tx.commit().await?;
         Ok(dispatch)
     }
 
@@ -6354,6 +6519,17 @@ impl Database {
         snapshot: &CloseRetirementSnapshot,
         resource: &RetiredResourceIdentity,
     ) -> DbResult<Option<CloseWorktreeCleanupPlan>> {
+        Self::read_close_worktree_cleanup_plan(&self.pool, attempt_id, scope, snapshot, resource)
+            .await
+    }
+
+    async fn read_close_worktree_cleanup_plan<'e>(
+        executor: impl sqlx::SqliteExecutor<'e>,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<Option<CloseWorktreeCleanupPlan>> {
         let identity = resource.identity();
         let rows: Vec<WorktreeCleanupPlanColumns> = sqlx::query_as(
             "SELECT DISTINCT administrative_dir_codec, administrative_dir_value,
@@ -6375,21 +6551,23 @@ impl Database {
         .bind(identity.value())
         .bind(snapshot.generation())
         .bind(snapshot.fingerprint())
-        .fetch_all(&self.pool)
+        .fetch_all(executor)
         .await?;
         match rows.as_slice() {
             [] => Ok(None),
-            [(
-                codec,
-                value,
-                incarnation,
-                tombstone_codec,
-                tombstone_value,
-                tombstone_device,
-                tombstone_inode,
-                object_device,
-                object_inode,
-            )] => {
+            [
+                (
+                    codec,
+                    value,
+                    incarnation,
+                    tombstone_codec,
+                    tombstone_value,
+                    tombstone_device,
+                    tombstone_inode,
+                    object_device,
+                    object_inode,
+                ),
+            ] => {
                 let final_tombstone = match (
                     tombstone_codec.as_deref(),
                     tombstone_value.as_deref(),
@@ -6448,6 +6626,19 @@ impl Database {
         snapshot: &CloseRetirementSnapshot,
         resource: &RetiredResourceIdentity,
     ) -> DbResult<bool> {
+        Self::close_retirement_resource_was_dispatched_on(
+            &self.pool, attempt_id, scope, snapshot, resource,
+        )
+        .await
+    }
+
+    pub(crate) async fn close_retirement_resource_was_dispatched_on<'e>(
+        executor: impl sqlx::Executor<'e, Database = Sqlite>,
+        attempt_id: &CloseAttemptId,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+    ) -> DbResult<bool> {
         let identity = resource.identity();
         sqlx::query_scalar(
             "SELECT EXISTS(
@@ -6466,7 +6657,7 @@ impl Database {
         .bind(identity.identity_kind())
         .bind(identity.codec())
         .bind(identity.value())
-        .fetch_one(&self.pool)
+        .fetch_one(executor)
         .await
         .map_err(Into::into)
     }
@@ -7562,7 +7753,7 @@ impl Database {
         effect: &CloseSafeRetryEffect,
         detail: &str,
         effect_count: i64,
-    ) -> DbResult<()> {
+    ) -> DbResult<CloseRetrySuccessWrite> {
         let progress = close_safe_retry_progress_tx(tx, run).await?;
         let count = progress.successful.len() + progress.pending.len();
         if effect_count <= 0
@@ -7582,7 +7773,7 @@ impl Database {
         run: &CloseRunRef,
         effect: &CloseSafeRetryEffect,
         detail: &str,
-    ) -> DbResult<()> {
+    ) -> DbResult<CloseRetrySuccessWrite> {
         if detail.trim().is_empty() {
             return Err(close_precondition("retry success requires evidence"));
         }
@@ -7603,7 +7794,7 @@ impl Database {
             .bind(identity.value()).fetch_optional(&mut **tx).await?;
         if let Some(retained) = retained {
             if retained == detail {
-                return Ok(());
+                return Ok(CloseRetrySuccessWrite::Replay);
             }
             return Err(close_precondition(
                 "retry success replay conflicts with retained detail",
@@ -7630,7 +7821,7 @@ impl Database {
                 "retry success requires exact running planned resource",
             ));
         }
-        Ok(())
+        Ok(CloseRetrySuccessWrite::Inserted)
     }
 
     /// Atomically archives the original outcome after complete exact-run retry proof.
@@ -8687,7 +8878,7 @@ impl Database {
             | CloseCleanupFailureAuthority::ExplicitlySuppressed => {
                 return Err(close_precondition(
                     "resource occurrence requires resource authority",
-                ))
+                ));
             }
         };
         let identity = resource.identity();
@@ -9172,7 +9363,8 @@ impl Database {
             stop_certainty: CloseStopCertainty::ShutdownUncertain,
             occurred_at_us,
         };
-        let result = Self::persist_validated_close_failure_tx(tx, &run, &request, obligation).await?;
+        let result =
+            Self::persist_validated_close_failure_tx(tx, &run, &request, obligation).await?;
         if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
             sqlx::query("UPDATE close_completion_retry_allowances SET suppressed = 1 WHERE attempt_id = ?1 AND suppressed = 0")
                 .bind(run.attempt_id.as_str()).execute(&mut **tx).await?;
@@ -9246,7 +9438,8 @@ impl Database {
             stop_certainty: CloseStopCertainty::ShutdownUncertain,
             occurred_at_us: Utc::now().timestamp_micros(),
         };
-        let obligation = Self::persist_validated_close_failure_tx(tx, run, &request, obligation).await?;
+        let obligation =
+            Self::persist_validated_close_failure_tx(tx, run, &request, obligation).await?;
         if request.authority == CloseCleanupFailureAuthority::ExplicitlySuppressed {
             sqlx::query(
                 "UPDATE close_completion_retry_allowances SET suppressed = 1
@@ -9494,7 +9687,104 @@ impl Database {
         close_obligation_for_update(tx, attempt_id.as_str()).await
     }
 
-    /// Admit an API Retry of a legacy running Initial only before native adoption.
+    /// Claim one exact worktree retirement for an admitted legacy Retry.
+    pub async fn claim_generic_legacy_retry_worktree(
+        &self,
+        admitted: &AdmittedGenericLegacyCloseRetry,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+        expected_plan: &CloseWorktreeCleanupPlan,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<LegacyRetryWorktreeClaimRelease>> {
+        use crate::workflow::LocalAuthorityResult::{
+            DurableFactEstablished, DurableFactUnclassified,
+        };
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error.into())),
+        };
+        let attempt_id = admitted.attempt_id();
+        let result = async {
+            let obligation = close_obligation_for_update(&mut tx, attempt_id.as_str()).await?;
+            if obligation.phase() != ClosePhase::RetirementRequested
+                || obligation.snapshot() != Some(snapshot)
+                || resource.kind() != RetiredResourceKind::Worktree
+            {
+                return Err(close_precondition("legacy retry worktree claim lacks exact retirement authority"));
+            }
+            let native: bool = sqlx::query_scalar(
+                "SELECT native_managed OR EXISTS (SELECT 1 FROM native_close_initial_receipts WHERE attempt_id = close_obligations.attempt_id AND run_ordinal = 1 AND intent = 'initial') FROM close_obligations WHERE attempt_id = ?1",
+            ).bind(attempt_id.as_str()).fetch_one(&mut *tx).await?;
+            if native {
+                return Err(close_precondition("native-managed attempt cannot use a legacy retry claim"));
+            }
+            let running_initial: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 1 AND status = 'running')",
+            ).bind(attempt_id.as_str()).fetch_one(&mut *tx).await?;
+            if !running_initial {
+                return Err(close_precondition("legacy retry claim requires a running Initial run"));
+            }
+            Self::require_no_retained_legacy_creation_for_attempt_tx(&mut tx, attempt_id).await?;
+            ensure_close_retirement_loss_free_tx(&mut tx, attempt_id.as_str()).await?;
+            if Self::read_close_worktree_cleanup_plan(&mut *tx, attempt_id, scope, snapshot, resource)
+                .await?
+                .as_ref() != Some(expected_plan)
+            {
+                return Err(close_precondition("legacy retry worktree cleanup plan changed"));
+            }
+            let identity = resource.identity();
+            let dispatch_and_plan: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM close_retirement_resource_dispatches dispatch
+                   JOIN close_worktree_cleanup_plans plan
+                     ON plan.attempt_id = dispatch.attempt_id AND plan.scope = dispatch.scope
+                    AND plan.inspection_generation = dispatch.inspection_generation
+                    AND plan.inspection_fingerprint = dispatch.inspection_fingerprint
+                    AND plan.resource_kind = dispatch.resource_kind AND plan.identity_kind = dispatch.identity_kind
+                    AND plan.identity_codec = dispatch.identity_codec
+                    AND plan.identity_value = dispatch.identity_value
+                  WHERE dispatch.attempt_id = ?1 AND dispatch.scope = ?2
+                    AND dispatch.inspection_generation = ?3 AND dispatch.inspection_fingerprint = ?4
+                    AND dispatch.resource_kind = 'worktree' AND dispatch.identity_kind = ?5
+                    AND dispatch.identity_codec = ?6 AND dispatch.identity_value = ?7)",
+            ).bind(attempt_id.as_str()).bind(scope.as_str())
+                .bind(snapshot.generation()).bind(snapshot.fingerprint())
+                .bind(identity.identity_kind()).bind(identity.codec()).bind(identity.value())
+                .fetch_one(&mut *tx).await?;
+            if !dispatch_and_plan {
+                return Err(close_precondition("legacy retry claim requires the exact persisted dispatch and cleanup plan"));
+            }
+            let inserted = sqlx::query(
+                "INSERT INTO close_legacy_retry_worktree_claims
+                 (attempt_id, run_ordinal, scope, inspection_generation, inspection_fingerprint,
+                  resource_kind, identity_kind, identity_codec, identity_value, continuation_kind)
+                 VALUES (?1, 1, ?2, ?3, ?4, 'worktree', ?5, ?6, ?7, 'legacy_initial') ON CONFLICT DO NOTHING",
+            ).bind(attempt_id.as_str()).bind(scope.as_str())
+                .bind(snapshot.generation()).bind(snapshot.fingerprint())
+                .bind(identity.identity_kind()).bind(identity.codec()).bind(identity.value())
+                .execute(&mut *tx).await?;
+            if inserted.rows_affected() == 1 {
+                Ok(LegacyRetryWorktreeClaimRelease::First(FirstLegacyRetryWorktreeClaim {
+                    attempt_id: attempt_id.clone(), scope: scope.clone(),
+                    snapshot: snapshot.clone(), resource: resource.clone(),
+                }))
+            } else {
+                Ok(LegacyRetryWorktreeClaimRelease::Replay)
+            }
+        }.await;
+        let released = if result
+            .as_ref()
+            .is_ok_and(|release| matches!(release, LegacyRetryWorktreeClaimRelease::First(_)))
+        {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match released {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
     pub async fn admit_generic_legacy_close_retry(
         &self,
         attempt_id: &CloseAttemptId,
@@ -10519,9 +10809,11 @@ mod tests {
         .execute(db.pool())
         .await
         .expect_err("cross-product participant identity must be rejected");
-        assert!(error
-            .to_string()
-            .contains("close participant must belong to the attempted ProductConversation"));
+        assert!(
+            error
+                .to_string()
+                .contains("close participant must belong to the attempted ProductConversation")
+        );
     }
 
     #[tokio::test]
@@ -10597,9 +10889,11 @@ mod tests {
             .execute(db.pool())
             .await
             .expect_err("active sealed participant must be undeletable");
-        assert!(error
-            .to_string()
-            .contains("active Close rejects sealed participant deletion"));
+        assert!(
+            error
+                .to_string()
+                .contains("active Close rejects sealed participant deletion")
+        );
         sqlx::query(
             "UPDATE close_obligations
              SET phase = 'completed', completed_at = updated_at, close_outcome = 'cancelled'
@@ -10826,9 +11120,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("non-writable ProductConversation rejects new aggregate participants"));
+        assert!(
+            error
+                .to_string()
+                .contains("non-writable ProductConversation rejects new aggregate participants")
+        );
         assert!(matches!(
             db.get_conversation("late-subordinate").await,
             Err(DbError::ConversationNotFound(_))
@@ -10998,11 +11294,12 @@ mod tests {
                 .await
                 .unwrap());
         }
-        assert!(db
-            .list_unsettled_close_direct_turn_settlement_targets("attempt-exact-receipt")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            db.list_unsettled_close_direct_turn_settlement_targets("attempt-exact-receipt")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -11069,11 +11366,12 @@ mod tests {
                 .await,
             Err(DbError::CloseFoundationStaleLatest { .. })
         ));
-        assert!(db
-            .list_pending_generic_close_settlements(Some(&attempt_id))
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            db.list_pending_generic_close_settlements(Some(&attempt_id))
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         let settlement = db
             .confirm_generic_close_stop_work(&target, &latest, &attempt_id)
@@ -11229,10 +11527,14 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        assert!(db
-            .record_close_direct_turn_settlement_if_released("attempt-all-members", latest_target)
+        assert!(
+            db.record_close_direct_turn_settlement_if_released(
+                "attempt-all-members",
+                latest_target
+            )
             .await
-            .unwrap());
+            .unwrap()
+        );
 
         assert!(matches!(
             db.advance_close_settlement_when_quiescent("attempt-all-members")
@@ -11247,13 +11549,14 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        assert!(db
-            .record_close_direct_turn_settlement_if_released(
+        assert!(
+            db.record_close_direct_turn_settlement_if_released(
                 "attempt-all-members",
                 participant_target,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert_eq!(
             db.advance_close_settlement_when_quiescent("attempt-all-members")
                 .await
@@ -11336,13 +11639,14 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        assert!(db
-            .record_close_direct_turn_settlement_if_released(
+        assert!(
+            db.record_close_direct_turn_settlement_if_released(
                 "attempt-subordinate-turn",
                 &targets[0],
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert_eq!(
             db.advance_close_settlement_when_quiescent("attempt-subordinate-turn")
                 .await
@@ -11406,17 +11710,19 @@ mod tests {
                 ("live-b".to_string(), "live".to_string()),
             ]
         );
-        assert!(db
-            .advance_close_settlement_when_quiescent("deleted-a-attempt")
-            .await
-            .is_err());
+        assert!(
+            db.advance_close_settlement_when_quiescent("deleted-a-attempt")
+                .await
+                .is_err()
+        );
         db.request_close_settlement_cancellation("deleted-a-attempt")
             .await
             .unwrap();
-        assert!(db
-            .advance_close_settlement_when_quiescent("deleted-a-attempt")
-            .await
-            .is_err());
+        assert!(
+            db.advance_close_settlement_when_quiescent("deleted-a-attempt")
+                .await
+                .is_err()
+        );
         assert_eq!(
             db.get_close_obligation("deleted-a-attempt")
                 .await
@@ -11978,9 +12284,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resources.len(), 2);
-        assert!(resources
-            .iter()
-            .any(|resource| { resource.resource.kind() == RetiredResourceKind::WorkScope }));
+        assert!(
+            resources
+                .iter()
+                .any(|resource| { resource.resource.kind() == RetiredResourceKind::WorkScope })
+        );
     }
 
     #[tokio::test]
@@ -11993,15 +12301,17 @@ mod tests {
             .unwrap();
 
         for replacement in [None, Some("other")] {
-            assert!(sqlx::query(
-                "UPDATE close_obligations
+            assert!(
+                sqlx::query(
+                    "UPDATE close_obligations
                  SET product_conversation_id = ?1
                  WHERE attempt_id = 'attempt-owned'",
-            )
-            .bind(replacement)
-            .execute(db.pool())
-            .await
-            .is_err());
+                )
+                .bind(replacement)
+                .execute(db.pool())
+                .await
+                .is_err()
+            );
         }
         assert_eq!(
             db.get_close_obligation("attempt-owned")
@@ -12049,12 +12359,14 @@ mod tests {
         .execute(db.pool())
         .await
         .is_err());
-        assert!(sqlx::query(
-            "UPDATE close_obligations SET topology_sealed = 0 WHERE attempt_id = 'attempt-1'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+        assert!(
+            sqlx::query(
+                "UPDATE close_obligations SET topology_sealed = 0 WHERE attempt_id = 'attempt-1'",
+            )
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
 
         let active = db
             .get_active_close_obligation_for_product(&product_id("root"))
@@ -12121,13 +12433,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(sqlx::query(
-            "UPDATE close_obligations SET topology_sealed = 1
+        assert!(
+            sqlx::query(
+                "UPDATE close_obligations SET topology_sealed = 1
              WHERE attempt_id = 'attempt-wrong-scope'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+            )
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
     }
     #[tokio::test]
     async fn topology_seal_rejects_captured_continuation_edge_that_differs_from_live_member() {
@@ -12161,13 +12475,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(sqlx::query(
-            "UPDATE close_obligations SET topology_sealed = 1
+        assert!(
+            sqlx::query(
+                "UPDATE close_obligations SET topology_sealed = 1
              WHERE attempt_id = 'attempt-wrong-edge'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+            )
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -12175,12 +12491,14 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "predecessor").await;
         create_root(&db, "root").await;
-        assert!(sqlx::query(
-            "UPDATE conversations SET continued_in_conv_id = 'root' WHERE id = 'predecessor'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+        assert!(
+            sqlx::query(
+                "UPDATE conversations SET continued_in_conv_id = 'root' WHERE id = 'predecessor'",
+            )
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -12189,12 +12507,12 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         create_root(&db, "fork").await;
-        assert!(sqlx::query(
-            "UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'fork'"
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+        assert!(
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'fork'")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -12671,11 +12989,12 @@ mod tests {
                 .unwrap(),
             GenericCloseSettlementFailure::NoTransition(CloseRunStatus::Running)
         );
-        assert!(db
-            .list_close_cleanup_failures(attempt.as_str())
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            db.list_close_cleanup_failures(attempt.as_str())
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let fresh = db
             .commit_fresh_generic_close_inspection(
                 inspection,
@@ -12762,16 +13081,18 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(expected_count, 0);
-            assert!(db
-                .list_close_retirement_evidence(attempt.as_str())
-                .await
-                .unwrap()
-                .is_empty());
-            assert!(db
-                .list_pending_generic_close_settlements(Some(&attempt))
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                db.list_close_retirement_evidence(attempt.as_str())
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                db.list_pending_generic_close_settlements(Some(&attempt))
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(
                 db.classify_interrupted_close_run(&run).await.unwrap(),
                 stopped
@@ -12833,10 +13154,11 @@ mod tests {
             inserted.obligation().phase(),
             ClosePhase::SettlingActiveWork
         );
-        assert!(db
-            .validate_generic_close_settlement(&inserted)
-            .await
-            .unwrap());
+        assert!(
+            db.validate_generic_close_settlement(&inserted)
+                .await
+                .unwrap()
+        );
         assert!(matches!(
             db.finish_generic_close_settlement(&inserted).await.unwrap(),
             GenericCloseSettlementAdvance::WaitingForQuiescence
@@ -13025,32 +13347,36 @@ mod tests {
             .unwrap();
         assert_eq!(first, second);
 
-        assert!(sqlx::query(
-            "UPDATE conversations SET continued_in_conv_id = 'new-latest' WHERE id = 'latest'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+        assert!(
+            sqlx::query(
+                "UPDATE conversations SET continued_in_conv_id = 'new-latest' WHERE id = 'latest'",
+            )
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
         let latest_scope = db
             .get_conversation("latest")
             .await
             .unwrap()
             .attached_work_scope_id
             .unwrap();
-        assert!(sqlx::query(
-            "INSERT INTO conversations (
+        assert!(
+            sqlx::query(
+                "INSERT INTO conversations (
                  id, title, cwd, active_model_id, state_json, created_at, updated_at,
                  archived, version, runtime_role, work_scope_id, continued_in_conv_id
              ) VALUES (
                  'new-predecessor', 'new-predecessor', '/tmp', 'model',
                  '{\"type\":\"awaiting_user_input\"}', ?1, ?1, 0, 0, 'user', ?2, 'latest'
              )",
-        )
-        .bind(Utc::now().to_rfc3339())
-        .bind(latest_scope.as_str())
-        .execute(db.pool())
-        .await
-        .is_err());
+            )
+            .bind(Utc::now().to_rfc3339())
+            .bind(latest_scope.as_str())
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
         assert!(
             sqlx::query("UPDATE conversations SET work_scope_id = NULL WHERE id = 'latest'")
                 .execute(db.pool())
@@ -13228,12 +13554,14 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(sqlx::query(
-            "UPDATE conversations SET continued_in_conv_id = 'later' WHERE id = 'leaf'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+        assert!(
+            sqlx::query(
+                "UPDATE conversations SET continued_in_conv_id = 'later' WHERE id = 'leaf'",
+            )
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
         let live = db
             .close_foundation_topology(&product_id("root"))
             .await
@@ -13287,14 +13615,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(db
-            .begin_close_foundation(
+        assert!(
+            db.begin_close_foundation(
                 &parent.product_conversation_id,
                 &transcript_id(&parent.id),
                 "attempt-b"
             )
             .await
-            .is_ok());
+            .is_ok()
+        );
         let member_ids: Vec<String> = db
             .list_close_attempt_members("attempt-b")
             .await
@@ -13344,12 +13673,12 @@ mod tests {
         create_root(&db, "root").await;
         create_child(&db, "leaf", "root").await;
         create_root(&db, "fork").await;
-        assert!(sqlx::query(
-            "UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'fork'"
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+        assert!(
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = 'leaf' WHERE id = 'fork'")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -13425,15 +13754,21 @@ mod tests {
                 == CloseLossItem::IgnoredPath(GitPathIdentity::from_bytes(b"ignored.bin".to_vec()))
         }));
 
-        assert!(losses
-            .iter()
-            .any(|loss| loss.item == CloseLossItem::StagedTrackedPath(lossy_left.clone())));
-        assert!(losses
-            .iter()
-            .any(|loss| loss.item == CloseLossItem::StagedTrackedPath(lossy_right.clone())));
-        assert!(losses
-            .iter()
-            .any(|loss| { loss.item == CloseLossItem::DetachedUnreachableCommit(oid.clone()) }));
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.item == CloseLossItem::StagedTrackedPath(lossy_left.clone()))
+        );
+        assert!(
+            losses
+                .iter()
+                .any(|loss| loss.item == CloseLossItem::StagedTrackedPath(lossy_right.clone()))
+        );
+        assert!(
+            losses
+                .iter()
+                .any(|loss| { loss.item == CloseLossItem::DetachedUnreachableCommit(oid.clone()) })
+        );
     }
 
     #[tokio::test]
@@ -13584,16 +13919,18 @@ mod tests {
         let reentered = db.get_close_obligation("attempt-reentry").await.unwrap();
         assert_eq!(reentered.phase(), ClosePhase::AwaitingRetirementInspection);
         assert!(reentered.snapshot().is_none());
-        assert!(db
-            .list_close_retirement_inspections("attempt-reentry")
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(db
-            .list_close_retirement_losses("attempt-reentry")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            db.list_close_retirement_inspections("attempt-reentry")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_close_retirement_losses("attempt-reentry")
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
         sqlx::query(
             "UPDATE close_obligations
@@ -13706,15 +14043,19 @@ mod tests {
         let stale = db
             .confirm_close_loss_retirement(&attempt_id, &first_token)
             .unwrap_err();
-        assert!(stale
-            .to_string()
-            .contains("cannot be confirmed for destructive retirement"));
+        assert!(
+            stale
+                .to_string()
+                .contains("cannot be confirmed for destructive retirement")
+        );
         let confirmation = db
             .confirm_close_loss_retirement(&attempt_id, &second_token)
             .unwrap_err();
-        assert!(confirmation
-            .to_string()
-            .contains("cannot be confirmed for destructive retirement"));
+        assert!(
+            confirmation
+                .to_string()
+                .contains("cannot be confirmed for destructive retirement")
+        );
         let after_confirmation = db.get_close_obligation(attempt_id.as_str()).await.unwrap();
         assert_eq!(
             after_confirmation.phase(),
@@ -13762,11 +14103,12 @@ mod tests {
         let obligation = db.get_close_obligation("attempt-clean").await.unwrap();
         assert_eq!(obligation.phase(), ClosePhase::RetirementRequested);
         assert!(obligation.snapshot().is_some());
-        assert!(db
-            .list_close_retirement_losses("attempt-clean")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            db.list_close_retirement_losses("attempt-clean")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -13830,21 +14172,24 @@ mod tests {
         let snapshot = obligation.snapshot().expect("rotated no-worktree snapshot");
         assert_eq!(snapshot.generation(), "server_git_status_v2_retry_test");
         assert_eq!(snapshot.fingerprint(), "no-worktree");
-        assert!(db
-            .list_close_retirement_inspections_for_snapshot("attempt-empty-retry", snapshot)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            db.list_close_retirement_inspections_for_snapshot("attempt-empty-retry", snapshot)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         let unrelated =
             CloseRetirementSnapshot::parse("unproven-generation", "no-worktree").unwrap();
-        assert!(db
-            .list_close_retirement_inspections_for_snapshot("attempt-empty-retry", &unrelated)
-            .await
-            .is_err());
-        assert!(db
-            .list_close_retirement_inspections_for_snapshot("missing-attempt", snapshot)
-            .await
-            .is_err());
+        assert!(
+            db.list_close_retirement_inspections_for_snapshot("attempt-empty-retry", &unrelated)
+                .await
+                .is_err()
+        );
+        assert!(
+            db.list_close_retirement_inspections_for_snapshot("missing-attempt", snapshot)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -13922,8 +14267,8 @@ mod tests {
 
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
-    async fn replace_close_inspection_supports_multi_scope_fingerprints_and_replacement_clears_stale(
-    ) {
+    async fn replace_close_inspection_supports_multi_scope_fingerprints_and_replacement_clears_stale()
+     {
         let db = Database::open_in_memory().await.unwrap();
         create_root(&db, "root").await;
         create_child(&db, "mid", "root").await;
@@ -14044,12 +14389,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(inspections.len(), 2);
-        assert!(inspections
-            .iter()
-            .any(|i| i.target.scope == root_scope && i.snapshot.fingerprint() == "scope-root-one"));
-        assert!(inspections
-            .iter()
-            .any(|i| i.target.scope == leaf_scope && i.snapshot.fingerprint() == "scope-leaf-two"));
+        assert!(
+            inspections
+                .iter()
+                .any(|i| i.target.scope == root_scope
+                    && i.snapshot.fingerprint() == "scope-root-one")
+        );
+        assert!(
+            inspections
+                .iter()
+                .any(|i| i.target.scope == leaf_scope
+                    && i.snapshot.fingerprint() == "scope-leaf-two")
+        );
         let losses = db.list_close_retirement_losses("attempt-1").await.unwrap();
         assert_eq!(losses.len(), 2);
         assert!(!losses.iter().any(|loss| matches!(&loss.item, CloseLossItem::UntrackedNonIgnoredPath(v) if v.as_bytes() == b"leaf:stale")));
@@ -14090,11 +14441,10 @@ mod tests {
         ] {
             let mut changed_inspection = inspection.clone();
             changed_inspection.snapshot = changed;
-            assert!(validate_close_retirement_inspection_aggregate(
-                &aggregate,
-                &[changed_inspection],
-            )
-            .is_err());
+            assert!(
+                validate_close_retirement_inspection_aggregate(&aggregate, &[changed_inspection],)
+                    .is_err()
+            );
         }
         let empty = CloseRetirementSnapshot::parse("custom-generation", "no-worktree").unwrap();
         validate_close_retirement_inspection_aggregate(&empty, &[]).unwrap();
@@ -14262,9 +14612,11 @@ mod tests {
             .await
             .unwrap();
         assert!(!resources.is_empty());
-        assert!(resources
-            .iter()
-            .all(|resource| resource.snapshot == new_aggregate));
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.snapshot == new_aggregate)
+        );
     }
 
     #[tokio::test]
@@ -14285,9 +14637,11 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap_err();
-        assert!(conflict
-            .to_string()
-            .contains("different ordinary product conversation"));
+        assert!(
+            conflict
+                .to_string()
+                .contains("different ordinary product conversation")
+        );
         set_state(&db, "other-root", ConvState::Terminal).await;
         db.begin_close_foundation(
             &product_id("root"),
@@ -14415,10 +14769,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(provenance, (0, 1));
-        assert!(db
-            .close_retirement_inventory_is_complete(attempt.as_str())
-            .await
-            .unwrap());
+        assert!(
+            db.close_retirement_inventory_is_complete(attempt.as_str())
+                .await
+                .unwrap()
+        );
         assert_eq!(
             db.list_close_expected_retirement_resources(attempt.as_str())
                 .await
@@ -14487,16 +14842,21 @@ mod tests {
             .unwrap();
         assert_eq!(resources.len(), 2);
         assert!(resources.iter().all(|resource| resource.snapshot == g2));
-        assert!(resources
-            .iter()
-            .any(|resource| resource.resource == scope_resource));
-        assert!(resources
-            .iter()
-            .any(|resource| resource.resource == worktree_resource));
-        assert!(db
-            .close_retirement_inventory_is_complete(attempt.as_str())
-            .await
-            .unwrap());
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource.resource == scope_resource)
+        );
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource.resource == worktree_resource)
+        );
+        assert!(
+            db.close_retirement_inventory_is_complete(attempt.as_str())
+                .await
+                .unwrap()
+        );
         assert_eq!(
             db.list_close_expected_retirement_resources(attempt.as_str())
                 .await
@@ -14513,10 +14873,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(sealed_generations.len(), 2);
-        assert!(sealed_generations
-            .contains(&(g1.generation().to_string(), g1.fingerprint().to_string())));
-        assert!(sealed_generations
-            .contains(&(g2.generation().to_string(), g2.fingerprint().to_string())));
+        assert!(
+            sealed_generations
+                .contains(&(g1.generation().to_string(), g1.fingerprint().to_string()))
+        );
+        assert!(
+            sealed_generations
+                .contains(&(g2.generation().to_string(), g2.fingerprint().to_string()))
+        );
         let provenance: (i64, i64) = sqlx::query_as(
             "SELECT
                  (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
@@ -14630,16 +14994,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resources.len(), 2);
-        assert!(resources
-            .iter()
-            .all(|resource| resource.snapshot == snapshot));
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.snapshot == snapshot)
+        );
         assert!(resources.iter().any(|resource| {
             resource.scope == scope && resource.resource.kind() == RetiredResourceKind::WorkScope
         }));
-        assert!(db
-            .close_retirement_inventory_is_complete(attempt.as_str())
-            .await
-            .unwrap());
+        assert!(
+            db.close_retirement_inventory_is_complete(attempt.as_str())
+                .await
+                .unwrap()
+        );
         let provenance: (i64, i64) = sqlx::query_as(
             "SELECT
                  (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
@@ -14751,19 +15118,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resources.len(), 2);
-        assert!(resources
-            .iter()
-            .all(|resource| resource.snapshot == snapshot));
-        assert!(resources
-            .iter()
-            .any(|resource| resource.resource == residual));
+        assert!(
+            resources
+                .iter()
+                .all(|resource| resource.snapshot == snapshot)
+        );
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource.resource == residual)
+        );
         assert!(resources.iter().any(|resource| {
             resource.scope == scope && resource.resource.kind() == RetiredResourceKind::WorkScope
         }));
-        assert!(db
-            .close_retirement_inventory_is_complete(attempt.as_str())
-            .await
-            .unwrap());
+        assert!(
+            db.close_retirement_inventory_is_complete(attempt.as_str())
+                .await
+                .unwrap()
+        );
         assert_eq!(
             db.list_close_expected_retirement_resources(attempt.as_str())
                 .await
@@ -15178,21 +15550,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(replayed, resources);
-        assert!(sqlx::query(
-            "INSERT INTO close_expected_retirement_resources (
+        assert!(
+            sqlx::query(
+                "INSERT INTO close_expected_retirement_resources (
                  attempt_id, scope, inspection_generation, inspection_fingerprint,
                  resource_kind, identity_kind, identity_codec, identity_value
              ) VALUES (
                  'attempt-1', ?1, ?2, ?3, 'browser_session', 'opaque',
                  'opaque_string_v1', 'late-browser'
              )",
-        )
-        .bind(scope.as_str())
-        .bind(snapshot.generation())
-        .bind(snapshot.fingerprint())
-        .execute(db.pool())
-        .await
-        .is_err());
+            )
+            .bind(scope.as_str())
+            .bind(snapshot.generation())
+            .bind(snapshot.fingerprint())
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
 
         let wrong_worktree = RetiredResourceIdentity::parse(
             RetiredResourceKind::Worktree,
@@ -15217,8 +15591,8 @@ mod tests {
             .await
             .unwrap();
         set_close_phase(&db2, "attempt-2", ClosePhase::RetirementRequested).await;
-        assert!(db2
-            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+        assert!(
+            db2.capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
                 attempt_id: CloseAttemptId::parse("attempt-2").unwrap(),
                 snapshot: current_test_snapshot(&db2, "attempt-2").await,
                 scopes: vec![CaptureCloseRetirementInventoryScopeRequest {
@@ -15240,16 +15614,18 @@ mod tests {
                 }],
             })
             .await
-            .is_err());
+            .is_err()
+        );
 
-        assert!(db
-            .capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
+        assert!(
+            db.capture_close_retirement_inventory(CaptureCloseRetirementInventoryRequest {
                 attempt_id: CloseAttemptId::parse("attempt-1").unwrap(),
                 snapshot: current_test_snapshot(&db, "attempt-1").await,
                 scopes: Vec::new(),
             })
             .await
-            .is_err());
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -15407,9 +15783,11 @@ mod tests {
                 .execute(db.pool())
                 .await
                 .unwrap_err();
-        assert!(conflict
-            .to_string()
-            .contains("different ordinary product conversation"));
+        assert!(
+            conflict
+                .to_string()
+                .contains("different ordinary product conversation")
+        );
         db.begin_close_foundation(
             &product_id("root"),
             &transcript_id("root"),
@@ -15511,10 +15889,12 @@ mod tests {
             "UPDATE close_runs SET status = 'running', ended_at_us = NULL",
             "DELETE FROM close_runs",
         ] {
-            assert!(sqlx::query(sqlx::AssertSqlSafe(sql))
-                .execute(db.pool())
-                .await
-                .is_err());
+            assert!(
+                sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .execute(db.pool())
+                    .await
+                    .is_err()
+            );
         }
     }
 
@@ -15559,11 +15939,12 @@ mod tests {
                 CloseRunStatus::Stopped
             );
             assert!(db.list_running_close_runs().await.unwrap().is_empty());
-            assert!(db
-                .list_pending_close_obligations()
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                db.list_pending_close_obligations()
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             let projection = db
                 .get_active_close_projection_for_product(&product_id("root"))
                 .await
@@ -15584,14 +15965,15 @@ mod tests {
                     panic!("admitted stopped Close: {other:?}")
                 }
             }
-            assert!(db
-                .begin_close_foundation(
+            assert!(
+                db.begin_close_foundation(
                     &product_id("root"),
                     &transcript_id("latest"),
                     "unrelated-new-attempt"
                 )
                 .await
-                .is_err());
+                .is_err()
+            );
             assert!(db.retry_close_retirement(&run.attempt_id).await.is_err());
             assert!(
                 sqlx::query("UPDATE close_runs SET status = 'running', ended_at_us = NULL")
@@ -15748,14 +16130,15 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        assert!(db
-            .begin_close_foundation(
+        assert!(
+            db.begin_close_foundation(
                 &product_id("rollback-root"),
                 &transcript_id("rollback-root"),
                 "rollback-attempt",
             )
             .await
-            .is_err());
+            .is_err()
+        );
         for (table, query) in [
             (
                 "close_obligations",
@@ -15975,9 +16358,11 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap_err();
-        assert!(missing_run
-            .to_string()
-            .contains("FOREIGN KEY constraint failed"));
+        assert!(
+            missing_run
+                .to_string()
+                .contains("FOREIGN KEY constraint failed")
+        );
         let foreign_keys: Vec<(String, String, String)> = sqlx::query_as(
             "SELECT \"table\", \"from\", \"to\" FROM pragma_foreign_key_list('native_close_initial_receipts')",
         ).fetch_all(db.pool()).await.unwrap();
@@ -16003,7 +16388,10 @@ mod tests {
             "DELETE FROM native_close_initial_receipts",
             "INSERT OR REPLACE INTO native_close_initial_receipts SELECT * FROM native_close_initial_receipts",
         ] {
-            assert!(sqlx::query(statement).execute(db.pool()).await.is_err(), "{statement}");
+            assert!(
+                sqlx::query(statement).execute(db.pool()).await.is_err(),
+                "{statement}"
+            );
         }
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM native_close_initial_receipts",)
@@ -16012,11 +16400,13 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert!(sqlx::query("PRAGMA foreign_key_check")
-            .fetch_all(db.pool())
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             crate::migrations::run_pending_migrations(db.pool())
                 .await
@@ -16037,9 +16427,11 @@ mod tests {
         observe_retained_run(&db, &request.failed_run).await;
         assert!(db.admit_close_safe_retry(&request).await.is_err());
         let mut tx = db.pool().begin_with("BEGIN IMMEDIATE").await.unwrap();
-        assert!(Database::admit_close_safe_retry_tx(&mut tx, &request)
-            .await
-            .is_err());
+        assert!(
+            Database::admit_close_safe_retry_tx(&mut tx, &request)
+                .await
+                .is_err()
+        );
         tx.rollback().await.unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM close_runs")
@@ -16284,14 +16676,16 @@ mod tests {
                     pending: request.remaining_effects.clone(),
                 }
             );
-            assert!(db
-                .close_safe_retry_progress(&request.failed_run)
-                .await
-                .is_err());
-            assert!(db
-                .list_close_safe_retry_effects(&request.failed_run)
-                .await
-                .is_err());
+            assert!(
+                db.close_safe_retry_progress(&request.failed_run)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                db.list_close_safe_retry_effects(&request.failed_run)
+                    .await
+                    .is_err()
+            );
             assert!(db.complete_close_safe_retry(&run).await.is_err());
             assert_eq!(
                 db.get_close_obligation(run.attempt_id.as_str())
@@ -16299,14 +16693,15 @@ mod tests {
                     .unwrap(),
                 original
             );
-            assert!(db
-                .record_close_safe_retry_success(
+            assert!(
+                db.record_close_safe_retry_success(
                     &request.failed_run,
                     &request.remaining_effects[0],
                     "not this run"
                 )
                 .await
-                .is_err());
+                .is_err()
+            );
             db.record_close_safe_retry_success(
                 &run,
                 &request.remaining_effects[0],
@@ -16328,10 +16723,15 @@ mod tests {
                     pending: request.remaining_effects[1..].to_vec(),
                 }
             );
-            assert!(db
-                .record_close_safe_retry_success(&run, &request.remaining_effects[0], "duplicate")
+            assert!(
+                db.record_close_safe_retry_success(
+                    &run,
+                    &request.remaining_effects[0],
+                    "duplicate"
+                )
                 .await
-                .is_err());
+                .is_err()
+            );
             assert!(db.complete_close_safe_retry(&run).await.is_err());
             for effect in request.remaining_effects.iter().skip(1) {
                 db.record_close_safe_retry_success(&run, effect, "verified exact resource retired")
@@ -16435,10 +16835,12 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(sqlx::query("DELETE FROM close_run_retry_effects")
-            .execute(db.pool())
-            .await
-            .is_err());
+        assert!(
+            sqlx::query("DELETE FROM close_run_retry_effects")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -16454,10 +16856,11 @@ mod tests {
         let run_two = db.admit_close_safe_retry(&retry).await.unwrap();
         let mut changed = failure.clone();
         changed.detail = "late callback from stopped run one".into();
-        assert!(db
-            .terminalize_initial_close_cleanup_failure(&changed)
-            .await
-            .is_err());
+        assert!(
+            db.terminalize_initial_close_cleanup_failure(&changed)
+                .await
+                .is_err()
+        );
         assert_eq!(
             db.get_close_run(&run_two).await.unwrap().status,
             CloseRunStatus::Running
@@ -16478,10 +16881,11 @@ mod tests {
             original
         );
         changed.detail = "conflicting replay".into();
-        assert!(db
-            .terminalize_close_run_cleanup_failure(&run_two, &changed)
-            .await
-            .is_err());
+        assert!(
+            db.terminalize_close_run_cleanup_failure(&run_two, &changed)
+                .await
+                .is_err()
+        );
         let mut next = safe_retry_request(&failure);
         next.failed_run = run_two;
         let run_three = db.admit_close_safe_retry(&next).await.unwrap();
@@ -16652,10 +17056,11 @@ mod tests {
         ] {
             let mut conflict = interruption.clone();
             conflict.stop_certainty = certainty;
-            assert!(db
-                .terminalize_close_run_cleanup_failure(&run, &conflict)
-                .await
-                .is_err());
+            assert!(
+                db.terminalize_close_run_cleanup_failure(&run, &conflict)
+                    .await
+                    .is_err()
+            );
         }
         let outcome: String =
             sqlx::query_scalar("SELECT content FROM messages WHERE message_id = ?1")
@@ -16726,10 +17131,11 @@ mod tests {
         );
         let mut conflict = next.clone();
         conflict.stop_certainty = CloseStopCertainty::ShutdownUncertain;
-        assert!(db
-            .terminalize_close_run_cleanup_failure(&completion, &conflict)
-            .await
-            .is_err());
+        assert!(
+            db.terminalize_close_run_cleanup_failure(&completion, &conflict)
+                .await
+                .is_err()
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
                 .fetch_one(db.pool())
@@ -16883,14 +17289,15 @@ mod tests {
         db.record_close_safe_retry_success(&run, &request.remaining_effects[0], "worktree removed")
             .await
             .unwrap();
-        assert!(db
-            .record_close_safe_retry_success(
+        assert!(
+            db.record_close_safe_retry_success(
                 &run,
                 &request.remaining_effects[0],
                 "different detail"
             )
             .await
-            .is_err());
+            .is_err()
+        );
         db.record_close_safe_retry_success(&run, &request.remaining_effects[0], "worktree removed")
             .await
             .unwrap();
@@ -16912,22 +17319,24 @@ mod tests {
         db.record_close_safe_retry_success(&run, &request.remaining_effects[0], "worktree removed")
             .await
             .unwrap();
-        assert!(db
-            .record_close_safe_retry_success(
+        assert!(
+            db.record_close_safe_retry_success(
                 &run,
                 &request.remaining_effects[0],
                 "changed after interruption",
             )
             .await
-            .is_err());
-        assert!(db
-            .record_close_safe_retry_success(
+            .is_err()
+        );
+        assert!(
+            db.record_close_safe_retry_success(
                 &run,
                 &request.remaining_effects[1],
                 "new success after interruption",
             )
             .await
-            .is_err());
+            .is_err()
+        );
         let after = sqlx::query_as::<_, (i64, String, i64)>(retained_successes)
             .bind(run.attempt_id.as_str())
             .bind(run.ordinal.get())
@@ -16978,21 +17387,23 @@ mod tests {
                 .unwrap();
             let request = safe_retry_request(&failure);
             let run = db.admit_close_safe_retry(&request).await.unwrap();
-            assert!(!db
-                .close_retry_verified_completion_eligible(&run)
-                .await
-                .unwrap());
+            assert!(
+                !db.close_retry_verified_completion_eligible(&run)
+                    .await
+                    .unwrap()
+            );
             for effect in &request.remaining_effects {
                 db.record_close_safe_retry_success(&run, effect, "retired")
                     .await
                     .unwrap();
             }
-            assert!(db
-                .close_safe_retry_progress(&run)
-                .await
-                .unwrap()
-                .pending
-                .is_empty());
+            assert!(
+                db.close_safe_retry_progress(&run)
+                    .await
+                    .unwrap()
+                    .pending
+                    .is_empty()
+            );
             assert_eq!(
                 db.classify_interrupted_close_run(&run).await.unwrap(),
                 original
@@ -17044,14 +17455,16 @@ mod tests {
                 .unwrap(),
                 i64::try_from(request.remaining_effects.len()).unwrap()
             );
-            assert!(db
-                .close_retry_verified_completion_eligible(&run)
-                .await
-                .unwrap());
-            assert!(!db
-                .close_retry_verified_completion_eligible(&request.failed_run)
-                .await
-                .unwrap());
+            assert!(
+                db.close_retry_verified_completion_eligible(&run)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !db.close_retry_verified_completion_eligible(&request.failed_run)
+                    .await
+                    .unwrap()
+            );
             assert!(db.complete_close_safe_retry(&run).await.is_err());
             let mut explicit = safe_retry_request(&failure);
             explicit.failed_run = run.clone();
@@ -17060,27 +17473,30 @@ mod tests {
             explicit.precondition_resolution =
                 "fresh read-only check confirms finalization is safe".into();
             explicit.safety_evidence = "exact completed retry effect proofs reverified".into();
-            assert!(db
-                .admit_close_safe_retry(&safe_retry_request(&failure))
-                .await
-                .is_err());
+            assert!(
+                db.admit_close_safe_retry(&safe_retry_request(&failure))
+                    .await
+                    .is_err()
+            );
             let mut stale = explicit.clone();
             stale.observed_at_us = failures[1].occurrence.occurred_at_us;
             assert!(db.admit_close_safe_retry(&stale).await.is_err());
             let completion = db.admit_close_safe_retry(&explicit).await.unwrap();
             assert_eq!(completion.ordinal.get(), 3);
-            assert!(db
-                .list_close_safe_retry_effects(&completion)
-                .await
-                .unwrap()
-                .is_empty());
+            assert!(
+                db.list_close_safe_retry_effects(&completion)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(sqlx::query_scalar::<_, String>("SELECT retry_evidence_kind FROM close_runs WHERE attempt_id = ?1 AND run_ordinal = 3")
             .bind(failure.attempt_id.as_str()).fetch_one(db.pool()).await.unwrap(), "verified_completion");
             assert!(db.admit_close_safe_retry(&explicit).await.is_err());
-            assert!(!db
-                .close_retry_verified_completion_eligible(&run)
-                .await
-                .unwrap());
+            assert!(
+                !db.close_retry_verified_completion_eligible(&run)
+                    .await
+                    .unwrap()
+            );
             assert_eq!(
                 db.complete_close_safe_retry(&completion)
                     .await
@@ -17105,10 +17521,11 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         let initial = scope_free_close_fixture(&db).await;
         db.classify_interrupted_close_run(&initial).await.unwrap();
-        assert!(!db
-            .close_retry_verified_completion_eligible(&initial)
-            .await
-            .unwrap());
+        assert!(
+            !db.close_retry_verified_completion_eligible(&initial)
+                .await
+                .unwrap()
+        );
         let missing_capture = AdmitCloseSafeRetryRequest {
             failed_run: initial,
             requested_by: CloseRetryRequestedBy::User,
@@ -17141,10 +17558,11 @@ mod tests {
             stop_certainty: CloseStopCertainty::ShutdownUncertain,
             occurred_at_us: Utc::now().timestamp_micros(),
         };
-        assert!(db
-            .terminalize_close_run_cleanup_failure(&run, &forged)
-            .await
-            .is_err());
+        assert!(
+            db.terminalize_close_run_cleanup_failure(&run, &forged)
+                .await
+                .is_err()
+        );
         assert_eq!(
             db.get_close_run(&run).await.unwrap().status,
             CloseRunStatus::Running
@@ -17154,10 +17572,11 @@ mod tests {
             stopped.close_outcome(),
             Some(CloseCompletionOutcome::CloseIncomplete)
         );
-        assert!(!db
-            .close_retry_verified_completion_eligible(&run)
-            .await
-            .unwrap());
+        assert!(
+            !db.close_retry_verified_completion_eligible(&run)
+                .await
+                .unwrap()
+        );
         let mut empty = safe_retry_request(&failure);
         empty.failed_run = run;
         empty.remaining_effects.clear();
@@ -17343,11 +17762,12 @@ mod tests {
         .execute(db.pool())
         .await
         .unwrap();
-        assert!(db
-            .list_close_attempt_scopes("scope-free")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            db.list_close_attempt_scopes("scope-free")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         CloseRunRef::initial(CloseAttemptId::parse("scope-free").unwrap())
     }
 
@@ -17355,17 +17775,19 @@ mod tests {
     async fn close_scope_free_interruption_is_atomic_exact_and_has_no_resource_children() {
         let db = Database::open_in_memory().await.unwrap();
         let run = scope_free_close_fixture(&db).await;
-        assert!(sqlx::query(
-            "INSERT INTO close_cleanup_failures
+        assert!(
+            sqlx::query(
+                "INSERT INTO close_cleanup_failures
             (failure_occurrence_id, attempt_id, cleanup_run_ordinal, source_product_conversation_id,
              authority_kind, reason, detail, stop_certainty, confirmed_at_us, occurred_at_us)
             VALUES ('close-failure:1:scope-free', 'scope-free', 1, 'root',
              'attempt_interrupted', 'interrupted', 'forged certainty',
              'conversation_and_processes_stopped', 1, 2)"
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+            )
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
         sqlx::raw_sql("CREATE TRIGGER reject_scope_free_event BEFORE INSERT ON coordinator_watch_events BEGIN SELECT RAISE(ABORT, 'event failed'); END;")
             .execute(db.pool()).await.unwrap();
         assert!(db.classify_interrupted_close_run(&run).await.is_err());
@@ -17373,11 +17795,12 @@ mod tests {
             db.get_close_run(&run).await.unwrap().status,
             CloseRunStatus::Running
         );
-        assert!(db
-            .list_close_cleanup_failures("scope-free")
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            db.list_close_cleanup_failures("scope-free")
+                .await
+                .unwrap()
+                .is_empty()
+        );
         sqlx::raw_sql("DROP TRIGGER reject_scope_free_event")
             .execute(db.pool())
             .await
@@ -17406,10 +17829,11 @@ mod tests {
         );
         let mut conflicting = failures[0].occurrence.clone();
         conflicting.detail.push_str(" changed");
-        assert!(db
-            .terminalize_initial_close_cleanup_failure(&conflicting)
-            .await
-            .is_err());
+        assert!(
+            db.terminalize_initial_close_cleanup_failure(&conflicting)
+                .await
+                .is_err()
+        );
         let counts: (i64, i64, i64) = sqlx::query_as("SELECT
             (SELECT COUNT(*) FROM coordinator_watch_events WHERE event_id = 'close-failure:1:scope-free'),
             (SELECT COUNT(*) FROM close_cleanup_failure_resources),
@@ -17575,20 +17999,23 @@ mod tests {
             );
             let mut conflict = success.clone();
             conflict.outcome = CloseProcessStepOutcome::AbsenceVerified;
-            assert!(db
-                .record_close_process_step_success(&conflict)
-                .await
-                .is_err());
+            assert!(
+                db.record_close_process_step_success(&conflict)
+                    .await
+                    .is_err()
+            );
             conflict = success.clone();
             conflict.observed_at_us += 1;
-            assert!(db
-                .record_close_process_step_success(&conflict)
-                .await
-                .is_err());
-            assert!(db
-                .terminalize_initial_close_cleanup_failure(&failure)
-                .await
-                .is_err());
+            assert!(
+                db.record_close_process_step_success(&conflict)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                db.terminalize_initial_close_cleanup_failure(&failure)
+                    .await
+                    .is_err()
+            );
             failure
                 .remaining_resources
                 .retain(|target| target.resource.identity().value() != "epoch-A:target-18");
@@ -17600,20 +18027,23 @@ mod tests {
                 .unwrap();
             conflict = success.clone();
             conflict.identity = OpaqueIdentity::parse("epoch-A:new-target").unwrap();
-            assert!(db
-                .record_close_process_step_success(&conflict)
-                .await
-                .is_err());
-            assert!(sqlx::query(
-                "UPDATE close_process_step_successes SET outcome = 'absence_verified'"
-            )
-            .execute(db.pool())
-            .await
-            .is_err());
-            assert!(sqlx::query("DELETE FROM close_process_step_successes")
-                .execute(db.pool())
-                .await
-                .is_err());
+            assert!(
+                db.record_close_process_step_success(&conflict)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                sqlx::query("UPDATE close_process_step_successes SET outcome = 'absence_verified'")
+                    .execute(db.pool())
+                    .await
+                    .is_err()
+            );
+            assert!(
+                sqlx::query("DELETE FROM close_process_step_successes")
+                    .execute(db.pool())
+                    .await
+                    .is_err()
+            );
             assert_eq!(
                 db.list_close_cleanup_failures(failure.attempt_id.as_str())
                     .await
@@ -17697,14 +18127,15 @@ mod tests {
                 .unwrap(),
             vec![request.clone()]
         );
-        assert!(db
-            .list_close_writer_observations(
+        assert!(
+            db.list_close_writer_observations(
                 &request.run,
                 &WorkScopeId::parse("other-scope").unwrap()
             )
             .await
             .unwrap()
-            .is_empty());
+            .is_empty()
+        );
         let row: (i64, String, Vec<u8>, Vec<u8>, String, String, String) = sqlx::query_as(
             "SELECT pid, incarnation, executable, matched_path, matched_kind, access, authority FROM close_writer_observations",
         ).fetch_one(db.pool()).await.unwrap();
@@ -17813,11 +18244,12 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(db
-            .pending_coordinator_watch_events(16)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            db.pending_coordinator_watch_events(16)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     async fn writer_lifetime_counts(
@@ -17846,17 +18278,21 @@ mod tests {
             CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us: 1 };
         db.record_close_writer_observation(&request).await.unwrap();
 
-        assert!(sqlx::query("DELETE FROM close_writer_observations")
-            .execute(db.pool())
-            .await
-            .is_err());
+        assert!(
+            sqlx::query("DELETE FROM close_writer_observations")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
         db.terminalize_initial_close_cleanup_failure(&failure)
             .await
             .unwrap();
-        assert!(sqlx::query("DELETE FROM close_writer_observations")
-            .execute(db.pool())
-            .await
-            .is_err());
+        assert!(
+            sqlx::query("DELETE FROM close_writer_observations")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
         for sql in [
             "UPDATE close_writer_observations SET pid = 124",
             "INSERT OR REPLACE INTO close_writer_observations
@@ -18087,10 +18523,11 @@ mod tests {
         if let CloseWriterObservation::Authority { process, .. } = &mut conflicting.observation {
             process.incarnation = OpaqueIdentity::parse("boot:46").unwrap();
         }
-        assert!(db
-            .record_close_writer_observation(&conflicting)
-            .await
-            .is_err());
+        assert!(
+            db.record_close_writer_observation(&conflicting)
+                .await
+                .is_err()
+        );
         let mut failed_retry = failure;
         failed_retry.failure_occurrence_id = run.failure_occurrence_id();
         db.terminalize_close_run_cleanup_failure(&run, &failed_retry)
@@ -18105,8 +18542,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_observation_rejects_same_id_wrong_fingerprint_or_locator_before_write_and_replay(
-    ) {
+    async fn writer_observation_rejects_same_id_wrong_fingerprint_or_locator_before_write_and_replay()
+     {
         let db = Database::open_in_memory().await.unwrap();
         let (request, failure) = writer_observation_fixture(&db).await;
         let LossItemIdentity::Worktree(worktree) = request.resource.identity() else {
@@ -18314,16 +18751,22 @@ mod tests {
         db.record_close_process_step_success(&success)
             .await
             .unwrap();
-        assert!(!db
-            .unresolved_expected_close_cleanup_resources(failure.attempt_id.as_str())
+        assert!(
+            !db.unresolved_expected_close_cleanup_resources(failure.attempt_id.as_str())
+                .await
+                .unwrap()
+                .iter()
+                .any(|target| target.resource == process)
+        );
+        assert!(
+            db.expected_close_cleanup_failure_resources(
+                failure.attempt_id.as_str(),
+                &scope,
+                &process
+            )
             .await
-            .unwrap()
-            .iter()
-            .any(|target| target.resource == process));
-        assert!(db
-            .expected_close_cleanup_failure_resources(failure.attempt_id.as_str(), &scope, &process)
-            .await
-            .is_err());
+            .is_err()
+        );
         let mut wrong = failure.clone();
         wrong.authority = CloseCleanupFailureAuthority::ObservedProcessResource {
             scope: scope.clone(),
@@ -18334,10 +18777,11 @@ mod tests {
             resource: process,
             disposition: CloseCleanupResourceDisposition::Failed,
         }];
-        assert!(db
-            .terminalize_initial_close_cleanup_failure(&wrong)
-            .await
-            .is_err());
+        assert!(
+            db.terminalize_initial_close_cleanup_failure(&wrong)
+                .await
+                .is_err()
+        );
         failure.remaining_resources = db
             .expected_close_cleanup_failure_resources(
                 failure.attempt_id.as_str(),
@@ -18554,10 +18998,11 @@ mod tests {
                     }
                     _ => unreachable!(),
                 }
-                assert!(db
-                    .terminalize_initial_close_cleanup_failure(&changed)
-                    .await
-                    .is_err());
+                assert!(
+                    db.terminalize_initial_close_cleanup_failure(&changed)
+                        .await
+                        .is_err()
+                );
             }
             db.terminalize_initial_close_cleanup_failure(&request)
                 .await
@@ -18604,13 +19049,14 @@ mod tests {
                     3 => changed.remaining_resources.reverse(),
                     _ => unreachable!(),
                 }
-                assert!(db
-                    .terminalize_initial_close_cleanup_failure(&changed)
-                    .await
-                    .is_err());
+                assert!(
+                    db.terminalize_initial_close_cleanup_failure(&changed)
+                        .await
+                        .is_err()
+                );
             }
-            assert!(db
-                .admit_close_safe_retry(&AdmitCloseSafeRetryRequest {
+            assert!(
+                db.admit_close_safe_retry(&AdmitCloseSafeRetryRequest {
                     failed_run: CloseRunRef::initial(request.attempt_id.clone()),
                     requested_by: CloseRetryRequestedBy::Global,
                     observed_at_us: Utc::now().timestamp_micros(),
@@ -18622,7 +19068,8 @@ mod tests {
                     }],
                 })
                 .await
-                .is_err());
+                .is_err()
+            );
             for sql in [
                 "UPDATE close_cleanup_failure_resources SET disposition = 'unknown'",
                 "DELETE FROM close_cleanup_failure_resources",
@@ -18810,9 +19257,11 @@ mod tests {
             && target.disposition == CloseCleanupResourceDisposition::Failed));
         assert!(remaining.iter().any(|target| target.resource == later
             && target.disposition == CloseCleanupResourceDisposition::Unattempted));
-        assert!(remaining
-            .iter()
-            .any(|target| target.scope.as_str() == "later-scope"));
+        assert!(
+            remaining
+                .iter()
+                .any(|target| target.scope.as_str() == "later-scope")
+        );
         let request = TerminalizeInitialCloseCleanupFailureRequest {
             failure_occurrence_id: "close-failure:1:attempt-multi".into(),
             attempt_id: CloseAttemptId::parse("attempt-multi").unwrap(),
@@ -18859,10 +19308,11 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            assert!(db
-                .terminalize_initial_close_cleanup_failure(&changed)
-                .await
-                .is_err());
+            assert!(
+                db.terminalize_initial_close_cleanup_failure(&changed)
+                    .await
+                    .is_err()
+            );
         }
         db.terminalize_initial_close_cleanup_failure(&request)
             .await
@@ -18877,8 +19327,8 @@ mod tests {
                 .occurrence,
             request
         );
-        assert!(db
-            .admit_close_safe_retry(&AdmitCloseSafeRetryRequest {
+        assert!(
+            db.admit_close_safe_retry(&AdmitCloseSafeRetryRequest {
                 failed_run: CloseRunRef::initial(request.attempt_id.clone()),
                 requested_by: CloseRetryRequestedBy::User,
                 observed_at_us: Utc::now().timestamp_micros(),
@@ -18890,7 +19340,8 @@ mod tests {
                 }],
             })
             .await
-            .is_err());
+            .is_err()
+        );
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM coordinator_watch_events")
                 .fetch_one(db.pool())
@@ -18969,10 +19420,11 @@ mod tests {
                 let mut invalid = request.clone();
                 invalid.stop_certainty =
                     CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us: 1 };
-                assert!(db
-                    .terminalize_initial_close_cleanup_failure(&invalid)
-                    .await
-                    .is_err());
+                assert!(
+                    db.terminalize_initial_close_cleanup_failure(&invalid)
+                        .await
+                        .is_err()
+                );
                 for (kind, value) in [
                     (RetiredResourceKind::WorkScope, "wrong-scope"),
                     (
@@ -18989,10 +19441,11 @@ mod tests {
                         )
                         .unwrap(),
                     };
-                    assert!(db
-                        .terminalize_initial_close_cleanup_failure(&invalid)
-                        .await
-                        .is_err());
+                    assert!(
+                        db.terminalize_initial_close_cleanup_failure(&invalid)
+                            .await
+                            .is_err()
+                    );
                 }
                 for (generation, fingerprint, kind, codec, value, certainty, confirmed) in [
                     (
@@ -19125,15 +19578,18 @@ mod tests {
                     snapshot: CloseRetirementSnapshot::parse("invented", "invented").unwrap(),
                     resource: resource.clone(),
                 };
-                assert!(db
-                    .terminalize_initial_close_cleanup_failure(&conflicting)
-                    .await
-                    .is_err());
-                assert!(sqlx::query("PRAGMA foreign_key_check")
-                    .fetch_all(db.pool())
-                    .await
-                    .unwrap()
-                    .is_empty());
+                assert!(
+                    db.terminalize_initial_close_cleanup_failure(&conflicting)
+                        .await
+                        .is_err()
+                );
+                assert!(
+                    sqlx::query("PRAGMA foreign_key_check")
+                        .fetch_all(db.pool())
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
             }
         }
     }
@@ -19191,10 +19647,11 @@ mod tests {
                 vec![process.clone()],
             )
             .await;
-            assert!(db
-                .terminalize_initial_close_cleanup_failure(&request)
-                .await
-                .is_err());
+            assert!(
+                db.terminalize_initial_close_cleanup_failure(&request)
+                    .await
+                    .is_err()
+            );
             assert_initial_cleanup_unchanged(&db).await;
             let CloseCleanupFailureAuthority::ExpectedResource { snapshot, .. } =
                 &request.authority
@@ -19392,36 +19849,41 @@ mod tests {
             );
             let mut changed = request.clone();
             changed.detail.push_str("different");
-            assert!(db
-                .terminalize_initial_close_cleanup_failure(&changed)
-                .await
-                .is_err());
+            assert!(
+                db.terminalize_initial_close_cleanup_failure(&changed)
+                    .await
+                    .is_err()
+            );
             changed = request.clone();
             changed.failure_occurrence_id = "other-failure".into();
-            assert!(db
-                .terminalize_initial_close_cleanup_failure(&changed)
-                .await
-                .is_err());
+            assert!(
+                db.terminalize_initial_close_cleanup_failure(&changed)
+                    .await
+                    .is_err()
+            );
             changed = request.clone();
             changed.occurred_at_us += 1;
-            assert!(db
-                .terminalize_initial_close_cleanup_failure(&changed)
-                .await
-                .is_err());
+            assert!(
+                db.terminalize_initial_close_cleanup_failure(&changed)
+                    .await
+                    .is_err()
+            );
             changed = request.clone();
             changed.stop_certainty = if archived {
                 CloseStopCertainty::ShutdownUncertain
             } else {
                 CloseStopCertainty::ConversationAndProcessesStopped { confirmed_at_us: 1 }
             };
-            assert!(db
-                .terminalize_initial_close_cleanup_failure(&changed)
-                .await
-                .is_err());
-            assert!(db
-                .retry_close_retirement(&request.attempt_id)
-                .await
-                .is_err());
+            assert!(
+                db.terminalize_initial_close_cleanup_failure(&changed)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                db.retry_close_retirement(&request.attempt_id)
+                    .await
+                    .is_err()
+            );
             let fk_errors = sqlx::query("PRAGMA foreign_key_check")
                 .fetch_all(db.pool())
                 .await
@@ -19527,11 +19989,13 @@ mod tests {
                 .unwrap(),
             0
         );
-        assert!(sqlx::query("PRAGMA foreign_key_check")
-            .fetch_all(db.pool())
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(db.pool())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -19544,10 +20008,11 @@ mod tests {
         .await;
         sqlx::raw_sql("CREATE TRIGGER injected_cleanup_crash BEFORE UPDATE OF phase ON close_obligations WHEN NEW.phase = 'completed' BEGIN SELECT RAISE(ABORT, 'injected crash'); END;")
             .execute(db.pool()).await.unwrap();
-        assert!(db
-            .terminalize_initial_close_cleanup_failure(&request)
-            .await
-            .is_err());
+        assert!(
+            db.terminalize_initial_close_cleanup_failure(&request)
+                .await
+                .is_err()
+        );
         assert_initial_cleanup_unchanged(&db).await;
         sqlx::raw_sql("DROP TRIGGER injected_cleanup_crash;")
             .execute(db.pool())
@@ -19601,8 +20066,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initial_cleanup_failure_rejects_stale_snapshot_resource_and_transition_without_occurrence(
-    ) {
+    async fn initial_cleanup_failure_rejects_stale_snapshot_resource_and_transition_without_occurrence()
+     {
         let db = Database::open_in_memory().await.unwrap();
         let request =
             initial_cleanup_failure_fixture(&db, CloseStopCertainty::ShutdownUncertain).await;
@@ -19618,10 +20083,11 @@ mod tests {
             snapshot: CloseRetirementSnapshot::parse("stale", "stale").unwrap(),
             resource: resource.clone(),
         };
-        assert!(db
-            .terminalize_initial_close_cleanup_failure(&changed)
-            .await
-            .is_err());
+        assert!(
+            db.terminalize_initial_close_cleanup_failure(&changed)
+                .await
+                .is_err()
+        );
         changed = request.clone();
         changed.authority = CloseCleanupFailureAuthority::ExpectedResource {
             scope: request.authority.scope().unwrap().clone(),
@@ -19632,10 +20098,11 @@ mod tests {
             )
             .unwrap(),
         };
-        assert!(db
-            .terminalize_initial_close_cleanup_failure(&changed)
-            .await
-            .is_err());
+        assert!(
+            db.terminalize_initial_close_cleanup_failure(&changed)
+                .await
+                .is_err()
+        );
         for outcome in ["close_incomplete", "archived_cleanup_attention"] {
             assert!(sqlx::query("UPDATE close_obligations SET phase = 'completed', close_outcome = ?1, completed_at = updated_at WHERE attempt_id = 'attempt-failure'")
                 .bind(outcome).execute(db.pool()).await.is_err());
@@ -20002,12 +20469,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(evidence.len(), 3);
-        assert!(evidence
-            .iter()
-            .any(|item| item.resource.kind() == RetiredResourceKind::Worktree
-                && item.resource.identity() == &retired_identity
-                && item.outcome == RetirementOutcome::Retired
-                && item.detail.is_none()));
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item.resource.kind() == RetiredResourceKind::Worktree
+                    && item.resource.identity() == &retired_identity
+                    && item.outcome == RetirementOutcome::Retired
+                    && item.detail.is_none())
+        );
         assert!(evidence.iter().any(|item| item.resource.kind()
             == RetiredResourceKind::BrowserSession
             && item.outcome == RetirementOutcome::Retired
@@ -20144,10 +20613,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        assert!(!db
-            .close_retirement_resource_was_dispatched(&attempt, &scope, &snapshot, &tmux)
-            .await
-            .unwrap());
+        assert!(
+            !db.close_retirement_resource_was_dispatched(&attempt, &scope, &snapshot, &tmux)
+                .await
+                .unwrap()
+        );
         db.pool().close().await;
         drop(db);
 
@@ -20160,12 +20630,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .any(|row| row.resource == pty && row.outcome == RetirementOutcome::Retired));
-        assert!(rows
-            .iter()
-            .any(|row| row.resource == tmux && row.outcome == absence(REPLACEMENT)));
+        assert!(
+            rows.iter()
+                .any(|row| row.resource == pty && row.outcome == RetirementOutcome::Retired)
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.resource == tmux && row.outcome == absence(REPLACEMENT))
+        );
         let mutation_error = sqlx::query(
             "UPDATE close_retirement_resources
              SET tmux_replacement_token = '10000000-0000-4000-8000-000000000003'
@@ -20252,6 +20724,25 @@ mod tests {
             vec![first.resource.clone(), second.resource.clone()],
         )
         .await;
+
+        let mut wrong_snapshot = second.clone();
+        wrong_snapshot.snapshot =
+            CloseRetirementSnapshot::parse("other-generation", "other-fingerprint").unwrap();
+        assert!(matches!(
+            db.claim_generic_close_process_dispatches(&[first.clone(), wrong_snapshot])
+                .await,
+            DurableFactEstablished(Err(_))
+        ));
+        assert!(
+            !db.close_retirement_resource_was_dispatched(
+                &attempt_id,
+                &scope,
+                &snapshot,
+                &first.resource
+            )
+            .await
+            .unwrap()
+        );
 
         // Drop the first committed claim without dispatching.
         assert!(matches!(
@@ -20348,10 +20839,14 @@ mod tests {
         let error = db
             .claim_generic_original_worktree_dispatch(invalid_plan)
             .await
+            .established()
+            .expect("invalid plan must release its transaction")
             .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("length(administrative_dir_incarnation)"));
+        assert!(
+            error
+                .to_string()
+                .contains("length(administrative_dir_incarnation)")
+        );
         let counts: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_worktree_cleanup_plans WHERE attempt_id = ?1)",
@@ -20369,7 +20864,10 @@ mod tests {
             db.claim_generic_original_worktree_dispatch(plan.clone()),
             db.claim_generic_original_worktree_dispatch(alternate.clone()),
         );
-        let (first, winning_plan) = match (left.unwrap(), right.unwrap()) {
+        let (first, winning_plan) = match (
+            left.established().unwrap().unwrap(),
+            right.established().unwrap().unwrap(),
+        ) {
             (CloseRetirementDispatch::First(first), CloseRetirementDispatch::Replay) => {
                 (first, plan)
             }
@@ -20398,6 +20896,30 @@ mod tests {
                 winning_plan.administrative_dir_incarnation,
             )],
         );
+        let admission = AdmittedGenericLegacyCloseRetry(request.attempt_id.clone());
+        let exact_plan = db
+            .close_worktree_cleanup_plan(
+                &request.attempt_id, &request.scope, &request.snapshot, &request.resource,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut other_plan = exact_plan.clone();
+        other_plan.administrative_dir.push("different-registration");
+        let claim = |plan| db.claim_generic_legacy_retry_worktree(
+            &admission, &request.scope, &request.snapshot, &request.resource, plan,
+        );
+        assert!(claim(&other_plan).await.established().unwrap().is_err());
+        let (left, right) = tokio::join!(claim(&exact_plan), claim(&exact_plan));
+        let first = match (left.established().unwrap().unwrap(), right.established().unwrap().unwrap()) {
+            (LegacyRetryWorktreeClaimRelease::First(first), LegacyRetryWorktreeClaimRelease::Replay)
+            | (LegacyRetryWorktreeClaimRelease::Replay, LegacyRetryWorktreeClaimRelease::First(first)) => first,
+            pair => panic!("expected exactly one retained cleanup claim, got {pair:?}"),
+        };
+        assert_eq!(first.attempt_id(), &request.attempt_id);
+        assert_eq!(first.scope(), &request.scope);
+        assert_eq!(first.snapshot(), &request.snapshot);
+        assert_eq!(first.resource(), &request.resource);
         let before: i64 = sqlx::query_scalar(
             "SELECT dispatched_at_us FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
         )
@@ -20619,18 +21141,20 @@ mod tests {
         assert_eq!(timestamp_types.1, "integer");
         assert!(timestamp_types.2 >= 0);
         assert!(timestamp_types.3 >= 0);
-        assert!(sqlx::query(
-            "UPDATE close_retirement_resource_dispatches SET dispatched_at_us = -1"
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
-        assert!(sqlx::query(
-            "UPDATE close_worktree_cleanup_plans SET planned_at_us = 'not-a-timestamp'"
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+        assert!(
+            sqlx::query("UPDATE close_retirement_resource_dispatches SET dispatched_at_us = -1")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
+        assert!(
+            sqlx::query(
+                "UPDATE close_worktree_cleanup_plans SET planned_at_us = 'not-a-timestamp'"
+            )
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
 
         let divergent = db
             .record_close_worktree_cleanup_plan(RecordCloseWorktreeCleanupPlanRequest {
@@ -20757,11 +21281,13 @@ mod tests {
             "attempt-1",
             &scope,
             &snapshot,
-            vec![RetiredResourceIdentity::parse(
-                RetiredResourceKind::BrowserSession,
-                identity.clone(),
-            )
-            .unwrap()],
+            vec![
+                RetiredResourceIdentity::parse(
+                    RetiredResourceKind::BrowserSession,
+                    identity.clone(),
+                )
+                .unwrap(),
+            ],
         )
         .await;
 
@@ -20967,11 +21493,13 @@ mod tests {
             "attempt-1",
             &scope,
             &snapshot,
-            vec![RetiredResourceIdentity::parse(
-                RetiredResourceKind::Worktree,
-                LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
-            )
-            .unwrap()],
+            vec![
+                RetiredResourceIdentity::parse(
+                    RetiredResourceKind::Worktree,
+                    LossItemIdentity::Worktree(current_test_worktree(&db, &scope).await),
+                )
+                .unwrap(),
+            ],
         )
         .await;
         let worktree = current_test_worktree(&db, &scope).await;
@@ -21079,11 +21607,13 @@ mod tests {
             "attempt-1",
             &root_scope,
             &aggregate_snapshot,
-            vec![RetiredResourceIdentity::parse(
-                RetiredResourceKind::BrowserSession,
-                identity.clone(),
-            )
-            .unwrap()],
+            vec![
+                RetiredResourceIdentity::parse(
+                    RetiredResourceKind::BrowserSession,
+                    identity.clone(),
+                )
+                .unwrap(),
+            ],
         )
         .await;
         let per_scope_error = db
@@ -21321,9 +21851,11 @@ mod tests {
                 obligation.snapshot().unwrap(),
             )
             .unwrap_err();
-        assert!(exact_confirmation
-            .to_string()
-            .contains("cannot be confirmed for destructive retirement"));
+        assert!(
+            exact_confirmation
+                .to_string()
+                .contains("cannot be confirmed for destructive retirement")
+        );
         let after_confirmation = db
             .get_close_obligation("attempt-confirm-loss")
             .await
@@ -21381,14 +21913,16 @@ mod tests {
         .unwrap();
         set_obligation_snapshot(&db, "attempt-lossy", &aggregate_snapshot).await;
 
-        assert!(sqlx::query(
-            "UPDATE close_obligations
+        assert!(
+            sqlx::query(
+                "UPDATE close_obligations
              SET phase = 'retirement_requested'
              WHERE attempt_id = 'attempt-lossy'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+            )
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
         let obligation = db.get_close_obligation("attempt-lossy").await.unwrap();
         assert_eq!(obligation.phase(), ClosePhase::AwaitingRetirementInspection);
         let mut tx = db.pool().begin().await.unwrap();
@@ -21439,14 +21973,16 @@ mod tests {
         .unwrap();
         set_obligation_snapshot(&db, "attempt-clean-branch", &aggregate_snapshot).await;
 
-        assert!(sqlx::query(
-            "UPDATE close_obligations
+        assert!(
+            sqlx::query(
+                "UPDATE close_obligations
              SET phase = 'awaiting_loss_confirmation'
              WHERE attempt_id = 'attempt-clean-branch'",
-        )
-        .execute(db.pool())
-        .await
-        .is_err());
+            )
+            .execute(db.pool())
+            .await
+            .is_err()
+        );
         let obligation = db
             .get_close_obligation("attempt-clean-branch")
             .await
@@ -21796,19 +22332,21 @@ mod tests {
         .unwrap();
         assert_eq!(retained_anchor, original_anchor);
         assert_ne!(retained_anchor.0, current_snapshot.generation());
-        assert!(db
-            .close_retirement_inventory_is_complete(attempt.as_str())
-            .await
-            .unwrap());
-        assert!(db
-            .close_retirement_resource_was_dispatched(
+        assert!(
+            db.close_retirement_inventory_is_complete(attempt.as_str())
+                .await
+                .unwrap()
+        );
+        assert!(
+            db.close_retirement_resource_was_dispatched(
                 &attempt,
                 &scope,
                 &replacement,
                 &worktree.resource,
             )
             .await
-            .unwrap());
+            .unwrap()
+        );
         assert_eq!(
             db.close_worktree_cleanup_plan(&attempt, &scope, &replacement, &worktree.resource,)
                 .await
@@ -21819,22 +22357,26 @@ mod tests {
                 final_tombstone: None,
             }),
         );
-        assert!(db
-            .close_retirement_inventory_is_complete(attempt.as_str())
-            .await
-            .unwrap());
+        assert!(
+            db.close_retirement_inventory_is_complete(attempt.as_str())
+                .await
+                .unwrap()
+        );
         let current_resources = db
             .list_close_expected_retirement_resources(attempt.as_str())
             .await
             .unwrap();
         assert!(!current_resources.is_empty());
-        assert!(current_resources
-            .iter()
-            .all(|resource| resource.snapshot == replacement));
-        assert!(db
-            .list_close_retirement_inspections_for_snapshot(attempt.as_str(), &snapshot)
-            .await
-            .is_err());
+        assert!(
+            current_resources
+                .iter()
+                .all(|resource| resource.snapshot == replacement)
+        );
+        assert!(
+            db.list_close_retirement_inspections_for_snapshot(attempt.as_str(), &snapshot)
+                .await
+                .is_err()
+        );
         // The later generation may succeed without rewriting the G1 residual.
         // Original-bound reads must not substitute this conflicting G2 receipt.
         db.record_close_retirement_evidence(RecordCloseRetirementEvidenceRequest {
@@ -21848,10 +22390,11 @@ mod tests {
         .await
         .unwrap();
         let initial_run = CloseRunRef::initial(attempt.clone());
-        assert!(db
-            .read_stopped_close_original_retirement_proof(&initial_run)
-            .await
-            .is_err());
+        assert!(
+            db.read_stopped_close_original_retirement_proof(&initial_run)
+                .await
+                .is_err()
+        );
         let stopped = db
             .classify_interrupted_close_run(&initial_run)
             .await
@@ -21890,18 +22433,20 @@ mod tests {
             Some(CloseCompletionOutcome::CloseIncomplete)
         );
         let missing_run = CloseRunRef::initial(CloseAttemptId::parse("missing-proof-run").unwrap());
-        assert!(db
-            .read_stopped_close_original_retirement_proof(&missing_run)
-            .await
-            .is_err());
+        assert!(
+            db.read_stopped_close_original_retirement_proof(&missing_run)
+                .await
+                .is_err()
+        );
         let stale_run = CloseRunRef {
             attempt_id: attempt,
             ordinal: CloseRunOrdinal::parse(99).unwrap(),
         };
-        assert!(db
-            .read_stopped_close_original_retirement_proof(&stale_run)
-            .await
-            .is_err());
+        assert!(
+            db.read_stopped_close_original_retirement_proof(&stale_run)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -21982,10 +22527,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(proof.resources, resources);
-        assert!(proof
-            .resources
-            .iter()
-            .any(|expected| expected.resource == work_scope.resource));
+        assert!(
+            proof
+                .resources
+                .iter()
+                .any(|expected| expected.resource == work_scope.resource)
+        );
         // Interruption records the missing scope outcome as unresolved; it must
         // never inherit the distinct worktree's successful retirement.
         assert_eq!(proof.outcomes.len(), 2);
@@ -22006,10 +22553,12 @@ mod tests {
                 residual_reason: RetirementFailureReason::ManualRepairRequired,
             }
         );
-        assert!(proof
-            .outcomes
-            .iter()
-            .all(|outcome| outcome.snapshot == snapshot));
+        assert!(
+            proof
+                .outcomes
+                .iter()
+                .all(|outcome| outcome.snapshot == snapshot)
+        );
     }
 
     #[tokio::test]
@@ -22017,28 +22566,32 @@ mod tests {
         let db = Database::open_in_memory().await.unwrap();
         let run = scope_free_close_fixture(&db).await;
         db.classify_interrupted_close_run(&run).await.unwrap();
-        assert!(db
-            .read_stopped_close_original_retirement_proof(&run)
-            .await
-            .is_err());
+        assert!(
+            db.read_stopped_close_original_retirement_proof(&run)
+                .await
+                .is_err()
+        );
         sqlx::query("INSERT INTO close_retirement_anchor_exclusions (attempt_id) VALUES (?1)")
             .bind(run.attempt_id.as_str())
             .execute(db.pool())
             .await
             .unwrap();
-        assert!(db
-            .read_stopped_close_original_retirement_proof(&run)
-            .await
-            .is_err());
+        assert!(
+            db.read_stopped_close_original_retirement_proof(&run)
+                .await
+                .is_err()
+        );
     }
 
     #[test]
     fn retirement_evidence_request_requires_typed_resource_identity() {
-        assert!(RetiredResourceIdentity::parse(
-            RetiredResourceKind::BrowserSession,
-            LossItemIdentity::GitPath(GitPathIdentity::from_bytes(b"browser".to_vec())),
-        )
-        .is_err());
+        assert!(
+            RetiredResourceIdentity::parse(
+                RetiredResourceKind::BrowserSession,
+                LossItemIdentity::GitPath(GitPathIdentity::from_bytes(b"browser".to_vec())),
+            )
+            .is_err()
+        );
     }
 
     #[tokio::test]

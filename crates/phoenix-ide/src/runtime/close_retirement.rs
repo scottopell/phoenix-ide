@@ -1240,8 +1240,10 @@ impl RuntimeManager {
 
     pub(super) async fn continue_settled_generic_close(
         &self,
+        execution: &super::close_authority::CloseAttemptOwner,
         inspection: crate::db::GenericCloseInspection,
     ) -> Result<(), String> {
+        execution.require_exact(inspection.attempt_id())?;
         let run = CloseRunRef::initial(inspection.attempt_id().clone());
         let result = match self.commit_settled_generic_inspection(inspection).await {
             Ok(Some(retirement)) => {
@@ -1313,10 +1315,12 @@ impl RuntimeManager {
 
     async fn run_admitted_generic_retry_inspection(
         &self,
+        execution: &super::close_authority::CloseAttemptOwner,
         admission: crate::db::AdmittedGenericLegacyCloseRetry,
     ) -> Result<(), String> {
         self.require_local_authority_admission()?;
         let attempt_id = admission.attempt_id();
+        execution.require_exact(attempt_id)?;
         let current = self
             .db()
             .read_generic_close_continuation(attempt_id)
@@ -1792,9 +1796,9 @@ impl RuntimeManager {
         self: &Arc<Self>,
         attempt_id: CloseAttemptId,
     ) -> Result<(), String> {
-        self.start_generic_close_worker(attempt_id, |manager, attempt_id| async move {
+        self.start_generic_close_worker(attempt_id, |manager, execution| async move {
             manager
-                .run_close_runtime_retirement(GenericRetirementAuthority::Fixture(attempt_id))
+                .run_close_runtime_retirement(GenericRetirementAuthority::Fixture(execution.attempt().clone()))
                 .await
         })
         .await?
@@ -1806,8 +1810,8 @@ impl RuntimeManager {
         self: &Arc<Self>,
         attempt_id: CloseAttemptId,
     ) -> Result<(), GenericCloseRetryError> {
-        self.start_generic_close_worker(attempt_id, |manager, attempt_id| async move {
-            manager.run_generic_close_retry(attempt_id).await
+        self.start_generic_close_worker(attempt_id, |manager, execution| async move {
+            manager.run_generic_close_retry(&execution).await
         })
         .await
         .map_err(GenericCloseRetryError::Admission)?
@@ -1819,15 +1823,17 @@ impl RuntimeManager {
 
     async fn run_generic_close_retry(
         &self,
-        attempt_id: CloseAttemptId,
+        execution: &super::close_authority::CloseAttemptOwner,
     ) -> Result<(), GenericCloseRetryError> {
         use phoenix_db::workflow::LocalAuthorityResult;
+
+        let attempt_id = execution.attempt();
 
         self.require_local_authority_admission()
             .map_err(GenericCloseRetryError::Admission)?;
         let admission = match self
             .db()
-            .admit_generic_legacy_close_retry(&attempt_id)
+            .admit_generic_legacy_close_retry(attempt_id)
             .await
         {
             LocalAuthorityResult::DurableFactEstablished(Ok(admission)) => admission,
@@ -1841,7 +1847,7 @@ impl RuntimeManager {
                 ));
             }
         };
-        let Err(error) = self.run_admitted_generic_retry_inspection(admission).await else {
+        let Err(error) = self.run_admitted_generic_retry_inspection(execution, admission).await else {
             return Ok(());
         };
         if self.fatal_local_authority_is_latched() {
@@ -1884,10 +1890,10 @@ impl RuntimeManager {
         attempt_id: CloseAttemptId,
         resume: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<tokio::task::JoinHandle<Result<(), String>>, String> {
-        self.start_generic_close_worker(attempt_id, |manager, attempt_id| async move {
+        self.start_generic_close_worker(attempt_id, |manager, execution| async move {
             resume.await.map_err(|error| error.to_string())?;
             manager
-                .run_close_runtime_retirement(GenericRetirementAuthority::Fixture(attempt_id))
+                .run_close_runtime_retirement(GenericRetirementAuthority::Fixture(execution.attempt().clone()))
                 .await
         })
         .await
@@ -1905,59 +1911,25 @@ impl RuntimeManager {
             GenericCloseIngress::ConfirmStop(admission) => Some(admission),
         };
         self.spawn_generic_close_owner(
-            attempt_id.clone(),
+            attempt_id,
             stop_admission,
-            move |manager, stop_guard| async move {
-                use crate::db::GenericCloseAdmission;
+            move |manager, execution, stop_guard| async move {
+                use super::close_authority::GenericCloseAuthorityAdmission;
 
-                let admission = if let Some(stop_guard) = stop_guard {
-                    let confirmed = manager
-                        .db()
-                        .confirm_generic_close_stop_work_classified(&target, &latest, &attempt_id)
-                        .await;
-                    let confirmed = match confirmed {
-                        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
-                            result.map_err(GenericCloseIngressError::Admission)?
-                        }
-                        phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
-                            manager.signal_fatal_local_authority("generic_close_stop_confirmation_unclassified");
-                            return Err(GenericCloseIngressError::Worker(
-                                "generic Close stop-work transaction release is unclassified".into(),
-                            ));
-                        }
-                    };
-                    drop(stop_guard);
-                    GenericCloseAdmission::InsertedSettling(confirmed)
-                } else {
-                    match manager
-                        .db()
-                        .begin_generic_close_settlement_classified(&target, &latest, &attempt_id)
-                        .await
-                    {
-                        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
-                            result.map_err(GenericCloseIngressError::Admission)?
-                        }
-                        phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
-                            manager.signal_fatal_local_authority("generic_close_initial_admission_unclassified");
-                            return Err(GenericCloseIngressError::Worker(
-                                "generic Close Initial admission transaction release is unclassified".into(),
-                            ));
-                        }
+                let admitted = manager
+                    .admit_generic_close(&execution, &target, &latest, stop_guard)
+                    .await?;
+                match admitted {
+                    GenericCloseAuthorityAdmission::Settle(owner) => {
+                        manager
+                            .settle_close_obligation(owner.activate(execution)?)
+                            .await?;
+                        Ok(GenericCloseIngressOutcome::Continued)
                     }
-                };
-                Ok(match admission {
-                    GenericCloseAdmission::InsertedSettling(settlement) => {
-                        manager.settle_close_obligation(super::GenericCloseSettlementOwner {
-                            settlement,
-                            deliveries: Default::default(),
-                        }).await?;
-                        GenericCloseIngressOutcome::Continued
+                    GenericCloseAuthorityAdmission::Observe(obligation) => {
+                        Ok(GenericCloseIngressOutcome::Observed(obligation))
                     }
-                    GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
-                    | GenericCloseAdmission::Existing(obligation) => {
-                        GenericCloseIngressOutcome::Observed(Box::new(obligation))
-                    }
-                })
+                }
             },
         )
     }
@@ -1966,14 +1938,14 @@ impl RuntimeManager {
         self: &Arc<Self>,
         attempt_id: CloseAttemptId,
     ) -> Result<tokio::task::JoinHandle<Result<bool, String>>, String> {
-        self.spawn_generic_close_owner(attempt_id.clone(), None, move |manager, _| async move {
+        self.spawn_generic_close_owner(attempt_id, None, |manager, execution, _| async move {
             let owner = manager
                 .waiting_generic_close_owners
                 .lock()
                 .await
-                .remove(&attempt_id);
+                .remove(execution.attempt());
             match owner {
-                Some(owner) => manager.settle_close_obligation(owner).await,
+                Some(owner) => manager.settle_close_obligation(owner.activate(execution)?).await,
                 None => Ok(false),
             }
         })
@@ -1986,7 +1958,13 @@ impl RuntimeManager {
         operation: F,
     ) -> Result<tokio::task::JoinHandle<Result<T, E>>, String>
     where
-        F: FnOnce(Arc<Self>, Option<tokio::sync::OwnedMutexGuard<()>>) -> Fut + Send + 'static,
+        F: FnOnce(
+                Arc<Self>,
+                super::close_authority::CloseAttemptOwner,
+                Option<tokio::sync::OwnedMutexGuard<()>>,
+            ) -> Fut
+            + Send
+            + 'static,
         Fut: std::future::Future<Output = Result<T, E>> + Send,
         T: Send + 'static,
         E: From<String> + Send + 'static,
@@ -2001,17 +1979,17 @@ impl RuntimeManager {
                 Some(admission) => Some(admission.lock_owned().await),
                 None => None,
             };
-            let _execution = manager
-                .close_retirement_execution
-                .lock(attempt_id.as_str())
-                .await;
+            let execution = manager.acquire_close_attempt(attempt_id).await;
+            let _panic_classification_lease = execution.retain_lease();
             use futures::FutureExt as _;
             manager
                 .require_local_authority_admission()
                 .map_err(E::from)?;
-            match std::panic::AssertUnwindSafe(operation(Arc::clone(&manager), stop_guard))
-                .catch_unwind()
-                .await
+            match std::panic::AssertUnwindSafe(async {
+                operation(Arc::clone(&manager), execution, stop_guard).await
+            })
+            .catch_unwind()
+            .await
             {
                 Ok(result) => result,
                 Err(_) => {
@@ -2031,22 +2009,18 @@ impl RuntimeManager {
         operation: F,
     ) -> Result<tokio::task::JoinHandle<T>, String>
     where
-        F: FnOnce(Arc<Self>, CloseAttemptId) -> Fut + Send + 'static,
+        F: FnOnce(Arc<Self>, super::close_authority::CloseAttemptOwner) -> Fut + Send + 'static,
         Fut: std::future::Future<Output = T> + Send,
         T: Send + 'static,
     {
-        let execution = self
-            .close_retirement_execution
-            .lock(attempt_id.as_str())
-            .await;
+        let execution = self.acquire_close_attempt(attempt_id).await;
         let owner = self
             .acquire_local_authority_pass()
             .map_err(|()| "local authority closed before Close retirement".to_string())?;
         let manager = Arc::clone(self);
         Ok(tokio::spawn(async move {
-            let _execution = execution;
             let _owner = owner;
-            operation(manager, attempt_id).await
+            operation(manager, execution).await
         }))
     }
 
@@ -2099,22 +2073,23 @@ impl RuntimeManager {
         &self,
         authority: GenericRetirementAuthority,
     ) -> Result<(), String> {
-        let (attempt_id, expected_snapshot, policy) = match authority {
+        let (attempt_id, expected_snapshot, policy, retry) = match authority {
             GenericRetirementAuthority::Fresh(fresh) => {
                 let (attempt_id, snapshot) = fresh.into_parts();
-                (attempt_id, Some(snapshot), GenericRemovalPolicy::Initial)
+                (attempt_id, Some(snapshot), GenericRemovalPolicy::Initial, None)
             }
             GenericRetirementAuthority::Retry {
                 admission,
                 snapshot,
             } => (
-                admission.into_attempt_id(),
+                admission.attempt_id().clone(),
                 Some(snapshot),
                 GenericRemovalPolicy::RetainedOnly,
+                Some(admission),
             ),
             #[cfg(test)]
             GenericRetirementAuthority::Fixture(attempt_id) => {
-                (attempt_id, None, GenericRemovalPolicy::Initial)
+                (attempt_id, None, GenericRemovalPolicy::Initial, None)
             }
         };
         let run = CloseRunRef::initial(attempt_id.clone());
@@ -2509,7 +2484,7 @@ impl RuntimeManager {
                 }
             };
         }
-        self.retire_close_worktrees_and_scopes(&run, &snapshot, None, policy)
+        self.retire_close_worktrees_and_scopes(&run, &snapshot, None, policy, retry.as_ref())
             .await?;
         self.complete_close_retirement_and_publish(&attempt_id)
             .await?;
@@ -2817,13 +2792,14 @@ impl RuntimeManager {
                             Some(CapturedWorktreeIdentity::Resolved(id)) => Some(worktree_path(id)),
                             _ => None,
                         };
-                        let discovery = self
-                            .tmux_registry()
+                        let expires = phoenix_tools::tmux::registry::close_deadline();
+                        let tmux = self.tmux_registry();
+                        let discovery = tmux
                             .discover_persistent_identity(
                                 &ResourceScopeKey::Work(scope.clone()),
                                 legacy_path.as_deref(),
                                 None,
-                                phoenix_tools::tmux::registry::close_deadline(),
+                                expires,
                             )
                             .await
                             .map_err(|error| error.to_string())?;
@@ -2854,6 +2830,20 @@ impl RuntimeManager {
                                 }
                                 observations.push(format!(
                                     "{scope}: dispatched exact tmux {} absent",
+                                    value.as_str()
+                                ));
+                            }
+                            PersistentTmuxDiscovery::Exact(observed)
+                                if observed.socket_path == identity.socket_path
+                                    && matches!(
+                                        tmux.exact_identity_state(&identity, expires)
+                                            .await
+                                            .map_err(|error| error.to_string())?,
+                                        ExactTmuxIdentityState::ReplacementLive(_)
+                                    ) =>
+                            {
+                                observations.push(format!(
+                                    "{scope}: exact original tmux {} absent with a verified replacement",
                                     value.as_str()
                                 ));
                             }
@@ -3006,6 +2996,35 @@ impl RuntimeManager {
         }
     }
 
+    async fn claim_retained_worktree_cleanup(
+        &self,
+        retry: Option<&crate::db::AdmittedGenericLegacyCloseRetry>,
+        scope: &WorkScopeId,
+        snapshot: &CloseRetirementSnapshot,
+        resource: &RetiredResourceIdentity,
+        plan: &crate::db::CloseWorktreeCleanupPlan,
+    ) -> Result<crate::db::FirstLegacyRetryWorktreeClaim, String> {
+        use crate::db::LegacyRetryWorktreeClaimRelease;
+        use phoenix_db::workflow::LocalAuthorityResult;
+
+        self.require_local_authority_admission()?;
+        let retry = retry.ok_or("retained worktree cleanup requires exact legacy Retry admission")?;
+        match self.db().claim_generic_legacy_retry_worktree(retry, scope, snapshot, resource, plan).await {
+            LocalAuthorityResult::DurableFactEstablished(Ok(LegacyRetryWorktreeClaimRelease::First(first))) => {
+                self.require_local_authority_admission()?;
+                Ok(first)
+            }
+            LocalAuthorityResult::DurableFactEstablished(Ok(LegacyRetryWorktreeClaimRelease::Replay)) => {
+                Err("retained worktree cleanup already claimed; refusing to replay it".into())
+            }
+            LocalAuthorityResult::DurableFactEstablished(Err(error)) => Err(error.to_string()),
+            LocalAuthorityResult::DurableFactUnclassified => {
+                self.signal_fatal_local_authority("legacy Retry worktree claim release");
+                Err("legacy Retry worktree claim release is unclassified".into())
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn retire_close_worktrees_and_scopes(
         &self,
@@ -3013,6 +3032,7 @@ impl RuntimeManager {
         snapshot: &CloseRetirementSnapshot,
         plan: Option<&[CloseSafeRetryEffect]>,
         policy: GenericRemovalPolicy,
+        retry: Option<&crate::db::AdmittedGenericLegacyCloseRetry>,
     ) -> Result<(), String> {
         let attempt_id = &run.attempt_id;
         let targets = self
@@ -3174,7 +3194,16 @@ impl RuntimeManager {
                                 snapshot: snapshot.clone(),
                                 resource: target.resource.clone(),
                             };
+                            let claim = self.claim_retained_worktree_cleanup(
+                                retry, &scope, snapshot, &target.resource, &cleanup_plan,
+                            ).await?;
                             let recovery = tokio::task::spawn_blocking(move || {
+                                require_retained_worktree_claim(claim, &writer_probe, &identity)?;
+                                if !both_worktree_paths_absent(
+                                    &worktree_path(&identity), &worktree_quarantine_path(&identity)?,
+                                )? {
+                                    return Err("worktree paths changed before retained cleanup".into());
+                                }
                                 match resume_final_worktree_tombstone(
                                     cleanup_plan
                                         .final_tombstone
@@ -3320,7 +3349,16 @@ impl RuntimeManager {
                                 snapshot: snapshot.clone(),
                                 resource: target.resource.clone(),
                             };
+                            let claim = self.claim_retained_worktree_cleanup(
+                                retry, &scope, snapshot, &target.resource, &cleanup_plan,
+                            ).await?;
                             let recovery = tokio::task::spawn_blocking(move || {
+                                require_retained_worktree_claim(claim, &writer_probe, &identity)?;
+                                if !both_worktree_paths_absent(
+                                    &worktree_path(&identity), &worktree_quarantine_path(&identity)?,
+                                )? {
+                                    return Err("worktree paths changed before retained cleanup".into());
+                                }
                                 if let Some(tombstone) = &cleanup_plan.final_tombstone {
                                     match resume_final_worktree_tombstone(
                                         tombstone,
@@ -3499,7 +3537,10 @@ impl RuntimeManager {
                                 }
                             };
                             let removal_entry = if is_original {
-                                match self
+                                use phoenix_db::workflow::LocalAuthorityResult;
+
+                                self.require_local_authority_admission()?;
+                                let claim = match self
                                     .db()
                                     .claim_generic_original_worktree_dispatch(
                                         RecordCloseWorktreeCleanupPlanRequest {
@@ -3516,9 +3557,23 @@ impl RuntimeManager {
                                         },
                                     )
                                     .await
-                                    .map_err(|error| error.to_string())?
                                 {
+                                    LocalAuthorityResult::DurableFactEstablished(result) => {
+                                        result.map_err(|error| error.to_string())?
+                                    }
+                                    LocalAuthorityResult::DurableFactUnclassified => {
+                                        self.signal_fatal_local_authority(
+                                            "generic original worktree dispatch release",
+                                        );
+                                        return Err(
+                                            "generic original worktree dispatch release is unclassified"
+                                                .into(),
+                                        );
+                                    }
+                                };
+                                match claim {
                                     CloseRetirementDispatch::First(first) => {
+                                        self.require_local_authority_admission()?;
                                         WorktreeRemovalEntry::GenericOriginal(first)
                                     }
                                     CloseRetirementDispatch::Replay => {
@@ -3535,7 +3590,11 @@ impl RuntimeManager {
                                     }
                                 }
                             } else {
-                                WorktreeRemovalEntry::RetainedQuarantine
+                                WorktreeRemovalEntry::RetainedQuarantine(
+                                    self.claim_retained_worktree_cleanup(
+                                        retry, &scope, snapshot, &target.resource, &cleanup_plan,
+                                    ).await?,
+                                )
                             };
                             let confirmed_snapshot = confirmed.snapshot.clone();
                             let db = self.db().clone();
@@ -10494,9 +10553,25 @@ enum WorktreeRemovalWriterChecks {
     },
 }
 
+fn require_retained_worktree_claim(
+    claim: crate::db::FirstLegacyRetryWorktreeClaim,
+    probe: &CloseWriterProbe,
+    identity: &WorktreeIdentity,
+) -> Result<(), String> {
+    if claim.attempt_id() != &probe.run.attempt_id
+        || claim.scope() != &probe.scope
+        || claim.snapshot() != &probe.snapshot
+        || claim.resource() != &probe.resource
+        || claim.resource().identity() != &LossItemIdentity::Worktree(identity.clone())
+    {
+        return Err("retained worktree claim does not match the physical cleanup".into());
+    }
+    Ok(())
+}
+
 enum WorktreeRemovalEntry {
     GenericOriginal(FirstCloseRetirementDispatch),
-    RetainedQuarantine,
+    RetainedQuarantine(crate::db::FirstLegacyRetryWorktreeClaim),
     AdmittedNativeRetry,
     #[cfg(test)]
     Test,
@@ -10725,10 +10800,16 @@ where
                     return Err("first dispatch does not match the present original worktree".to_string());
                 }
             }
-            WorktreeRemovalEntry::RetainedQuarantine if !resuming_quarantine => {
-                return Err("quarantine continuation cannot enter the original worktree".to_string());
+            WorktreeRemovalEntry::RetainedQuarantine(claim) => {
+                if !resuming_quarantine {
+                    return Err("quarantine continuation cannot enter the original worktree".into());
+                }
+                let WorktreeRemovalWriterChecks::MovedObject { probe, .. } = &writers else {
+                    return Err("retained worktree cleanup requires moved-object checks".into());
+                };
+                require_retained_worktree_claim(claim, probe, &inspection_identity)?;
             }
-            WorktreeRemovalEntry::RetainedQuarantine | WorktreeRemovalEntry::AdmittedNativeRetry => {}
+            WorktreeRemovalEntry::AdmittedNativeRetry => {}
             #[cfg(test)]
             WorktreeRemovalEntry::Test => {}
         }
@@ -11899,6 +11980,10 @@ fn tmux_retirement_outcome(
         TmuxRetirementOutcome::AbsenceVerified => Ok(RetirementOutcome::AbsenceAdopted {
             absence_basis: AbsenceBasis::SameAttemptPriorRetirement,
         }),
+        TmuxRetirementOutcome::ReplacementLive(_) => Err((
+            RetirementFailureReason::IdentityNotProven,
+            "tmux replacement requires the strict Retry evidence boundary".into(),
+        )),
         TmuxRetirementOutcome::IdentityNotProven { reason } => {
             Err((RetirementFailureReason::IdentityNotProven, reason))
         }

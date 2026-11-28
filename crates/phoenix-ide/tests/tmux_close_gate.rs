@@ -177,8 +177,8 @@ mod disposable {
                 .await;
             assert_eq!(
                 outcome,
-                TokenBoundKill::Killed,
-                "explicit fixture cleanup outcome"
+                TokenBoundKill::QueueCompletedWithoutExecutionWitness,
+                "fixture cleanup queue outcome (exit is observed separately)"
             );
             tokio::time::timeout(Duration::from_secs(5), async {
                 while current_process_identity(self.process.pid) == Some(self.process) {
@@ -217,11 +217,18 @@ mod disposable {
                     tokio::time::Instant::now() + Duration::from_secs(3),
                     Path::new(env!("CARGO_BIN_EXE_phoenix_ide")),
                 ));
-                if outcome == TokenBoundKill::Killed {
-                    Ok(())
-                } else {
-                    Err(format!("exact cleanup returned {outcome:?}"))
+                if outcome != TokenBoundKill::QueueCompletedWithoutExecutionWitness {
+                    return Err(format!("exact cleanup returned {outcome:?}"));
                 }
+                runtime.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(3), async {
+                        while current_process_identity(process.pid) == Some(process) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .map_err(|_| "exact fixture process did not exit".to_string())
+                })
             });
             match worker {
                 Ok(worker) => match worker.join() {
@@ -348,7 +355,7 @@ mod disposable {
             helper.release().await;
         };
         let (outcome, ()) = tokio::join!(operation, witness);
-        assert_eq!(outcome, TokenBoundKill::Killed);
+        assert_eq!(outcome, TokenBoundKill::QueueCompletedWithoutExecutionWitness);
         helper.wait_exit(0).await;
         tokio::time::timeout(Duration::from_secs(5), async {
             while current_process_identity(original.process.pid) == Some(original.process) {
@@ -445,7 +452,7 @@ mod disposable {
                 Path::new(env!("CARGO_BIN_EXE_phoenix_ide")),
             )
             .await;
-        assert_eq!(outcome, TokenBoundKill::Killed);
+        assert_eq!(outcome, TokenBoundKill::QueueCompletedWithoutExecutionWitness);
         tokio::time::timeout(Duration::from_secs(5), async {
             while current_process_identity(fixture.process.pid) == Some(fixture.process) {
                 tokio::task::yield_now().await;
@@ -453,6 +460,39 @@ mod disposable {
         })
         .await
         .expect("original process exit observation");
+    }
+
+    #[tokio::test]
+    async fn exact_gate_queue_completion_does_not_prove_built_in_kill_executed() {
+        let fixture = Fixture::new().await;
+        command(
+            &fixture.socket,
+            &fixture.config,
+            &[
+                "set-option",
+                "-s",
+                "command-alias[99]",
+                "kill-server=display-message -p PHOENIX_TEST_KILL_SKIPPED",
+            ],
+        )
+        .await;
+        let outcome = fixture
+            .retire(
+                fixture.process,
+                &fixture.token,
+                Path::new(env!("CARGO_BIN_EXE_phoenix_ide")),
+            )
+            .await;
+        command(
+            &fixture.socket,
+            &fixture.config,
+            &["set-option", "-su", "command-alias[99]"],
+        )
+        .await;
+
+        assert_eq!(outcome, TokenBoundKill::QueueCompletedWithoutExecutionWitness);
+        fixture.assert_original_running();
+        fixture.cleanup().await;
     }
 
     #[tokio::test]

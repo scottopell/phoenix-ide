@@ -1033,6 +1033,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "close_verified_tmux_replacement",
         sql: "",
     },
+    Migration {
+        version: 198,
+        name: "close_retry_tmux_dispatch_confirmation",
+        sql: include_str!("migrations/close_retry_tmux_dispatch_confirmation.sql"),
+    },
+    Migration {
+        version: 199,
+        name: "close_legacy_retry_worktree_claims",
+        sql: include_str!("migrations/close_legacy_retry_worktree_claims.sql"),
+    },
 ];
 
 const MIGRATION_175: &str = r"
@@ -17464,11 +17474,49 @@ mod tests {
             .is_empty());
     }
 
+    #[tokio::test]
+    async fn migration_199_installs_immutable_legacy_retry_claims_with_exact_plan_fk() {
+        let pool = test_pool().await;
+        run_through_for_test(&pool, 198).await.unwrap();
+        assert_eq!(run_through_for_test(&pool, 199).await.unwrap(), 1);
+        assert_eq!(run_through_for_test(&pool, 199).await.unwrap(), 0);
+        let definition: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'close_legacy_retry_worktree_claims'",
+        ).fetch_one(&pool).await.unwrap();
+        assert!(definition.contains("PRIMARY KEY (attempt_id, run_ordinal, scope, resource_kind, identity_kind, identity_codec, identity_value)"));
+        assert!(definition.contains("continuation_kind TEXT NOT NULL"));
+        for name in [
+            "close_legacy_retry_worktree_claims_exact_cleanup_plan",
+            "close_legacy_retry_worktree_claims_immutable",
+            "close_legacy_retry_worktree_claims_no_delete",
+        ] {
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'trigger' AND name = ?1",
+                )
+                .bind(name)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+                1
+            );
+        }
+        assert!(
+            sqlx::query("PRAGMA foreign_key_check")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn capability_migrations_are_forward_only_and_unique() {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (199, "close_legacy_retry_worktree_claims"),
+            (198, "close_retry_tmux_dispatch_confirmation"),
             (197, "close_verified_tmux_replacement"),
             (196, "close_settlement_stop_claims"),
             (195, "native_close_initial_settlement_stop_claims"),
