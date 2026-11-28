@@ -13868,10 +13868,11 @@ mod tests {
     #[allow(clippy::too_many_lines)]
     #[tokio::test]
     async fn migration_177_preserves_175_receipt_and_exact_observe_constraints_on_real_schema() {
+        const LEGACY_VERSION: u32 = 176;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("before-observe.db");
         let db = Database::open(path.to_str().unwrap()).await.unwrap();
-        crate::migrations::run_through_for_test(db.pool(), 176)
+        crate::migrations::run_through_for_test(db.pool(), LEGACY_VERSION)
             .await
             .unwrap();
         let failure =
@@ -13917,12 +13918,26 @@ mod tests {
         .await
         .unwrap();
 
+        // Verify the historical receipt survives an upgrade to the current schema,
+        // not just the introduction of Observe in migration 177.
+        let expected_tail: Vec<u32> = crate::migrations::migration_identities()
+            .map(|(version, _)| version)
+            .filter(|version| *version > LEGACY_VERSION)
+            .collect();
         assert_eq!(
             crate::migrations::run_pending_migrations(db.pool())
                 .await
                 .unwrap(),
-            15
+            u32::try_from(expected_tail.len()).unwrap()
         );
+        let applied_tail: Vec<u32> = sqlx::query_scalar(
+            "SELECT version FROM _migrations WHERE version > ?1 ORDER BY version",
+        )
+        .bind(LEGACY_VERSION)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(applied_tail, expected_tail);
         let after: (String, String, String, String, String, String, String, i64) = sqlx::query_as(
             "SELECT request_id, source_transcript_id, source_message_id, source_tool_use_id,
                     request_fingerprint, product_conversation_id, attempt_id, run_ordinal
