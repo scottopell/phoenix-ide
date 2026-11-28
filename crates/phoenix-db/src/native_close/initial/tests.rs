@@ -4167,11 +4167,16 @@ async fn generic_close_stopped_run_cannot_cancel_captured_turn() {
 
     let (f, settlement, target) = generic_close_with_captured_turn().await;
     let attempt = settlement.obligation().attempt_id();
+    let unclaimed_offer = settlement.offer_turn(target.clone()).unwrap();
     assert_eq!(
         f.db.fail_generic_close_settlement(&settlement, "test stops settlement")
             .await.unwrap(),
         GenericCloseSettlementFailure::Classified,
     );
+    assert!(matches!(
+        f.db.claim_generic_close_turn_offer(unclaimed_offer).await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(false)),
+    ));
     assert!(matches!(
         f.db.cancel_generic_close_turn_without_actor(&settlement, &target).await,
         LocalAuthorityResult::DurableFactEstablished(Ok(GenericCloseTurnRelease::NoTransition)),
