@@ -10308,9 +10308,10 @@ mod scope_liveness_tests {
             } else {
                 db.create_conversation(id, id, "/tmp", true, None, None)
                     .await
-                    .unwrap();
-                None
-            };
+                    .unwrap()
+                    .attached_work_scope_id
+            }
+            .expect("ordinary Close fixture owns a WorkScope in both Explore and Work modes");
             let target = db.get_conversation(id).await.unwrap().product_conversation_id;
             let attempt = CloseAttemptId::parse(id).unwrap();
             let run = CloseRunRef::initial(attempt.clone());
@@ -10405,24 +10406,19 @@ mod scope_liveness_tests {
             .await
             .unwrap();
             assert_eq!(events, 1);
-            if let Some(scope) = scope {
-                let CloseCleanupFailureAuthority::CapturedScope { scope: failed_scope, resource } =
-                    &failure.occurrence.authority
-                else {
-                    panic!("expected captured WorkScope authority");
-                };
-                assert_eq!(failed_scope, &scope);
-                assert_eq!(resource.kind(), RetiredResourceKind::WorkScope);
-                let [child] = failure.occurrence.remaining_resources.as_slice() else {
-                    panic!("expected the exact captured WorkScope child");
-                };
-                assert_eq!(child.scope, scope);
-                assert_eq!(&child.resource, resource);
-                assert_eq!(child.disposition, CloseCleanupResourceDisposition::Failed);
-            } else {
-                assert_eq!(failure.occurrence.authority, CloseCleanupFailureAuthority::AttemptInterrupted);
-                assert!(failure.occurrence.remaining_resources.is_empty());
-            }
+            let CloseCleanupFailureAuthority::CapturedScope { scope: failed_scope, resource } =
+                &failure.occurrence.authority
+            else {
+                panic!("expected captured WorkScope authority");
+            };
+            assert_eq!(failed_scope, &scope);
+            assert_eq!(resource.kind(), RetiredResourceKind::WorkScope);
+            let [child] = failure.occurrence.remaining_resources.as_slice() else {
+                panic!("expected the exact captured WorkScope child");
+            };
+            assert_eq!(child.scope, scope);
+            assert_eq!(&child.resource, resource);
+            assert_eq!(child.disposition, CloseCleanupResourceDisposition::Failed);
         }
     }
 
