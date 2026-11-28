@@ -12753,11 +12753,15 @@ mod tests {
                 )
             ));
             assert_eq!(stopped.snapshot(), before.snapshot());
-            assert!(db
-                .list_close_expected_retirement_resources(attempt.as_str())
-                .await
-                .unwrap()
-                .is_empty());
+            assert_eq!(stopped.snapshot().is_some(), commit_inspection);
+            let expected_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM close_expected_retirement_resources WHERE attempt_id = ?1",
+            )
+            .bind(attempt.as_str())
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(expected_count, 0);
             assert!(db
                 .list_close_retirement_evidence(attempt.as_str())
                 .await
