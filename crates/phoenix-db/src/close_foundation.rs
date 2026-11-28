@@ -2585,7 +2585,7 @@ impl Database {
 
     pub async fn confirm_close_stop_work(&self, attempt_id: &str) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
         match obligation.phase() {
             ClosePhase::AwaitingBlockerResolution => {
                 set_close_phase_tx(
@@ -2616,7 +2616,7 @@ impl Database {
 
     pub async fn begin_close_idle_settlement(&self, attempt_id: &str) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
         match obligation.phase() {
             ClosePhase::AwaitingBlockerResolution => {
                 set_close_phase_tx(&mut tx, attempt_id, ClosePhase::SettlingActiveWork).await?;
@@ -2646,7 +2646,7 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
         match obligation.phase() {
             ClosePhase::AwaitingStopWorkConfirmation => {
                 set_close_phase_tx(&mut tx, attempt_id, ClosePhase::SettlingActiveWork).await?;
@@ -2676,7 +2676,7 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
         match obligation.phase() {
             ClosePhase::SettlingActiveWork => {
                 set_close_phase_tx(
@@ -2724,7 +2724,7 @@ impl Database {
         attempt_id: &str,
     ) -> DbResult<CloseObligation> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let obligation = close_obligation_for_update(&mut tx, attempt_id).await?;
+        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id).await?;
         match obligation.phase() {
             ClosePhase::SettlingActiveWork => {
                 set_close_phase_tx(
@@ -2875,6 +2875,20 @@ impl Database {
         .fetch_one(&mut **tx)
         .await?;
         Ok(active_members)
+    }
+
+    async fn generic_close_settlement_for_update(
+        tx: &mut Transaction<'_, Sqlite>,
+        attempt_id: &str,
+    ) -> DbResult<CloseObligation> {
+        let obligation = close_obligation_for_update(tx, attempt_id).await?;
+        Self::require_generic_close_settlement_tx(
+            tx,
+            attempt_id,
+            obligation.product_conversation_id().as_str(),
+        )
+        .await?;
+        Ok(obligation)
     }
 
     async fn require_generic_close_settlement_tx(
@@ -18555,27 +18569,52 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("length(administrative_dir_incarnation)"));
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1),
+                    (SELECT COUNT(*) FROM close_worktree_cleanup_plans WHERE attempt_id = ?1)",
+        )
+        .bind(request.attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0));
+
+        let mut alternate = plan.clone();
+        alternate.administrative_dir = std::path::PathBuf::from("/example/git/worktrees/alternate");
+        alternate.administrative_dir_incarnation = "alternate-admin".to_string();
         let (left, right) = tokio::join!(
             db.claim_generic_original_worktree_dispatch(plan.clone()),
-            db.claim_generic_original_worktree_dispatch(plan),
+            db.claim_generic_original_worktree_dispatch(alternate.clone()),
         );
-        let first = match (left.unwrap(), right.unwrap()) {
-            (CloseRetirementDispatch::First(first), CloseRetirementDispatch::Replay)
-            | (CloseRetirementDispatch::Replay, CloseRetirementDispatch::First(first)) => first,
+        let (first, winning_plan) = match (left.unwrap(), right.unwrap()) {
+            (CloseRetirementDispatch::First(first), CloseRetirementDispatch::Replay) => {
+                (first, plan)
+            }
+            (CloseRetirementDispatch::Replay, CloseRetirementDispatch::First(first)) => {
+                (first, alternate)
+            }
             other => panic!("expected one first dispatch and one replay, got {other:?}"),
         };
         assert_eq!(first.request().resource, request.resource);
         assert_eq!(first.request().scope, request.scope);
         assert_eq!(first.request().snapshot, request.snapshot);
         assert_eq!(first.request().attempt_id, request.attempt_id);
-        let persisted_incarnation: String = sqlx::query_scalar(
-            "SELECT administrative_dir_incarnation FROM close_worktree_cleanup_plans WHERE attempt_id = ?1",
+        let persisted_plans: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT administrative_dir_codec, administrative_dir_value, administrative_dir_incarnation
+             FROM close_worktree_cleanup_plans WHERE attempt_id = ?1",
         )
         .bind(request.attempt_id.as_str())
-        .fetch_one(db.pool())
+        .fetch_all(db.pool())
         .await
         .unwrap();
-        assert_eq!(persisted_incarnation, "legacy-admin");
+        assert_eq!(
+            persisted_plans,
+            vec![(
+                "hex_path_v1".to_string(),
+                encode_host_path(&winning_plan.administrative_dir),
+                winning_plan.administrative_dir_incarnation,
+            )],
+        );
         let before: i64 = sqlx::query_scalar(
             "SELECT dispatched_at_us FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
         )

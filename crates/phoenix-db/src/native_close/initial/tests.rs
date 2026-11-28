@@ -2223,6 +2223,19 @@ async fn prepared_native_initial_is_not_generic_settlement_work() {
         .await
         .unwrap()
         .is_empty());
+    let attempt = receipt.admitted.attempt_id.as_str();
+    for result in [
+        f.db.begin_close_idle_settlement(attempt).await,
+        f.db.begin_close_active_work_settlement(attempt).await,
+        f.db.cancel_close_before_retirement(attempt).await,
+        f.db.request_close_settlement_cancellation(attempt).await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("owned by native initial Close settlement")
+        ));
+    }
     assert!(f
         .db
         .advance_close_settlement_when_quiescent(receipt.admitted.attempt_id.as_str())
@@ -2757,6 +2770,17 @@ async fn initial_execution_preserves_captured_busy_decision_without_confirming_w
         prepared.phase,
         phoenix_core::domain::close::ClosePhase::AwaitingStopWorkConfirmation
     );
+    let attempt = receipt.admitted.attempt_id.as_str();
+    for result in [
+        f.db.begin_close_active_work_settlement(attempt).await,
+        f.db.cancel_close_before_retirement(attempt).await,
+    ] {
+        assert!(matches!(
+            result,
+            Err(DbError::CloseFoundationPrecondition(message))
+                if message.contains("owned by native initial Close settlement")
+        ));
+    }
     let phase: String =
         sqlx::query_scalar("SELECT phase FROM close_obligations WHERE attempt_id = ?1")
             .bind(receipt.admitted.attempt_id.as_str())
@@ -3030,9 +3054,15 @@ async fn exact_receipt_replay_keeps_run_one_after_operation_progress() {
         panic!("expected a new operation")
     };
 
-    f.db.begin_close_idle_settlement(receipt.admitted.attempt_id.as_str())
+    let live_source = f.db.get_conversation(&f.coordinator).await.unwrap().state;
+    let prepared = f
+        .db
+        .prepare_native_close_initial_execution(&command, &receipt, &live_source)
         .await
+        .established()
+        .unwrap()
         .unwrap();
+    assert_eq!(prepared.phase, ClosePhase::SettlingActiveWork);
 
     assert_eq!(
         f.apply(&command).await.unwrap(),
