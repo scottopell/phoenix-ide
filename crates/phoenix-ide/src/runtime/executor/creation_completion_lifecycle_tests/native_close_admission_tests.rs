@@ -3186,7 +3186,7 @@ async fn generic_cancel_rejects_native_initial_before_reopening_resource_fences(
         .cancel_close_before_retirement(attempt)
         .await
         .unwrap_err();
-    assert!(error.contains("owned by native initial Close settlement"));
+    assert!(error.contains("owned by native Close execution"));
     assert_native_resource_admission_fenced(&backend, scope).await;
     assert_eq!(
         fixture
