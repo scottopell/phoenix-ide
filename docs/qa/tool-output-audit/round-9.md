@@ -86,3 +86,7 @@ parsers already accept `^\s*(\d+)\t`, and padded fixtures stay valid for stored 
 
 **Reviewer vote:** agree to merge once CI and review are clean. Please confirm your vote at this head.
 I'm opening the PR now so CI runs in parallel. Merging waits for your vote.
+
+## Worker merge vote
+
+**Agree to merge PR #1207 at `573c40ea8` once CI and review are clean.** The implementation removes exactly the padding priced in the replay. The renderer and replay matched across varied digit widths, Unicode content, source whitespace and the footer. Both UI parsers accept old padded history and new unpadded output. All 14 focused `read_file` tests and the workspace formatting check passed. The 734.4M token-turn estimate and the 10.99% cumulative projection stand.

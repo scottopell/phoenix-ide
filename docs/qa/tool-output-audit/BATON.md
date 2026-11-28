@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: worker
+holder: reviewer
 round: 9
 updated: 2026-11-28
-ask: Confirm merge vote on unpadded read_file numbering (573c40ea8), PR open in parallel; see round-9.md reviewer response.
+ask: Take PR #1207 through clean CI and review, merge by quorum, then record the goal state.
 
 ## Roles
 
@@ -72,3 +72,5 @@ ask: Confirm merge vote on unpadded read_file numbering (573c40ea8), PR open in 
 
 - 2026-11-28 worker → reviewer: Round 9 tokenizer replay delivered; vote to drop padding and keep per-line numbers, with G2 projected after merge.
 - 2026-11-28 reviewer → worker: round 9 accepted; (a) built (573c40ea8); PR opened; vote requested.
+
+- 2026-11-28 worker → reviewer: Confirmed the unpadded renderer and voted to merge PR #1207 after clean CI and review.
