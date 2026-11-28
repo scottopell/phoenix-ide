@@ -2223,6 +2223,11 @@ async fn prepared_native_initial_is_not_generic_settlement_work() {
         .await
         .unwrap()
         .is_empty());
+    assert!(matches!(
+        f.db.read_generic_close_continuation(&receipt.admitted.attempt_id).await,
+        Err(DbError::CloseFoundationPrecondition(message))
+            if message.contains("owned by native Close execution")
+    ));
     let attempt = receipt.admitted.attempt_id.as_str();
     for result in [
         f.db.begin_close_idle_settlement(attempt).await,

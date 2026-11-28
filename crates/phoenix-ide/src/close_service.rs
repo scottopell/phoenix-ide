@@ -213,76 +213,42 @@ pub(crate) async fn run_legacy_close_compat(
                 }
                 observe_close_settlement(state, obligation.attempt_id()).await?
             }
-            ClosePhase::AwaitingRetirementInspection => {
-                if let Err(error) = state
+            ClosePhase::AwaitingRetirementInspection | ClosePhase::RetirementRequested => {
+                let result = state
                     .runtime
-                    .inspect_close_retirement(obligation.attempt_id().clone())
-                    .await
-                {
-                    let current = state
-                        .db
-                        .get_close_obligation(obligation.attempt_id().as_str())
-                        .await
-                        .map_err(|db_error| AppError::Internal(db_error.to_string()))?;
-                    let error_type = if current.close_outcome()
-                        == Some(CloseCompletionOutcome::CloseIncomplete)
-                    {
-                        "close_incomplete"
-                    } else if current.phase() == ClosePhase::NeedsRepair {
-                        "close_retirement_needs_repair"
-                    } else {
-                        "close_inspection_failed"
-                    };
-                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        error, error_type,
-                    ))));
-                }
-                state
-                    .db
-                    .get_close_obligation(obligation.attempt_id().as_str())
-                    .await
-                    .map_err(|error| AppError::Internal(error.to_string()))?
-            }
-            ClosePhase::AwaitingLossConfirmation => {
-                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                    "Close requires confirmation of the exact persisted loss inventory",
-                    "close_loss_confirmation_required",
-                ))));
-            }
-            ClosePhase::RetirementRequested => {
-                if let Err(error) = state
-                    .runtime
-                    .retire_close_runtime_resources(obligation.attempt_id().clone())
-                    .await
-                {
-                    let current = state
-                        .db
-                        .get_close_obligation(obligation.attempt_id().as_str())
-                        .await
-                        .map_err(|db_error| AppError::Internal(db_error.to_string()))?;
-                    let error_type = if current.close_outcome()
-                        == Some(CloseCompletionOutcome::CloseIncomplete)
-                    {
-                        "close_incomplete"
-                    } else {
-                        "close_retirement_needs_repair"
-                    };
-                    return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        error, error_type,
-                    ))));
+                    .continue_legacy_close(obligation.attempt_id().clone())
+                    .await;
+                if let Err(error) = result {
+                    return Err(
+                        project_close_worker_failure(state, obligation.attempt_id(), error).await,
+                    );
                 }
                 let current = state
                     .db
                     .get_close_obligation(obligation.attempt_id().as_str())
                     .await
                     .map_err(|error| AppError::Internal(error.to_string()))?;
-                if current.phase() == ClosePhase::RetirementRequested {
+                if matches!(
+                    current.phase(),
+                    ClosePhase::AwaitingRetirementInspection | ClosePhase::RetirementRequested
+                ) {
+                    let error_type = if current.phase() == ClosePhase::RetirementRequested {
+                        "close_retirement_needs_repair"
+                    } else {
+                        "close_inspection_failed"
+                    };
                     return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-                        "Close retirement has not reached a durable outcome",
-                        "close_retirement_needs_repair",
+                        "Close continuation has not reached a durable outcome",
+                        error_type,
                     ))));
                 }
                 current
+            }
+            ClosePhase::AwaitingLossConfirmation => {
+                return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                    "Close requires confirmation of the exact persisted loss inventory",
+                    "close_loss_confirmation_required",
+                ))));
             }
             ClosePhase::NeedsRepair => {
                 return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(

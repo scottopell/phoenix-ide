@@ -1171,8 +1171,7 @@ impl RuntimeManager {
         Ok(())
     }
 
-    /// Inspects and continues under the same attempt owner used by retirement and cancellation.
-    pub(crate) async fn inspect_close_retirement(
+    pub(crate) async fn continue_legacy_close(
         self: &Arc<Self>,
         attempt_id: CloseAttemptId,
     ) -> Result<(), String> {
@@ -1181,13 +1180,20 @@ impl RuntimeManager {
         })
         .await?
         .await
-        .map_err(|error| format!("Close inspection worker failed: {error}"))?
+        .map_err(|error| format!("Close continuation worker failed: {error}"))?
     }
 
-    pub(super) async fn run_close_inspection(&self, attempt_id: CloseAttemptId) -> Result<(), String> {
+    pub(super) async fn continue_settled_generic_close(
+        &self,
+        inspection: crate::db::GenericCloseInspection,
+    ) -> Result<(), String> {
+        self.run_close_inspection(inspection.into_attempt_id()).await
+    }
+
+    async fn run_close_inspection(&self, attempt_id: CloseAttemptId) -> Result<(), String> {
         let current = self
             .db()
-            .get_close_obligation(attempt_id.as_str())
+            .read_generic_close_continuation(&attempt_id)
             .await
             .map_err(|error| error.to_string())?;
         match current.phase() {
@@ -1628,6 +1634,7 @@ impl RuntimeManager {
     }
 
     /// Retires exactly the unresolved inventory targets, independently of the waiter.
+    #[cfg(test)]
     pub(crate) async fn retire_close_runtime_resources(
         self: &Arc<Self>,
         attempt_id: CloseAttemptId,

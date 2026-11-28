@@ -2992,6 +2992,16 @@ impl Database {
         Ok(obligation)
     }
 
+    pub async fn read_generic_close_continuation(
+        &self,
+        attempt_id: &CloseAttemptId,
+    ) -> DbResult<CloseObligation> {
+        let mut tx = self.pool.begin().await?;
+        let obligation = Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+        tx.commit().await?;
+        Ok(obligation)
+    }
+
     pub(crate) async fn require_generic_close_settlement_tx(
         tx: &mut Transaction<'_, Sqlite>,
         attempt_id: &str,

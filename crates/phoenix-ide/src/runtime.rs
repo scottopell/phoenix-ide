@@ -3868,7 +3868,7 @@ impl RuntimeManager {
             .await
         {
             Ok(crate::db::GenericCloseSettlementAdvance::Inspect(inspection)) => {
-                self.run_close_inspection(inspection.into_attempt_id()).await?;
+                self.continue_settled_generic_close(inspection).await?;
                 Ok(true)
             }
             Ok(crate::db::GenericCloseSettlementAdvance::Cancelled) => Ok(true),
@@ -10220,7 +10220,7 @@ mod scope_liveness_tests {
             .try_lock(attempt_id.as_str())
             .await
             .is_none());
-        let mut competing_inspection = Box::pin(manager.inspect_close_retirement(attempt_id.clone()));
+        let mut competing_inspection = Box::pin(manager.continue_legacy_close(attempt_id.clone()));
         assert!(futures::poll!(&mut competing_inspection).is_pending());
         resume.send(()).unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(60), competing_inspection)

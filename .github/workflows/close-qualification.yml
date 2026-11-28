@@ -450,6 +450,7 @@ jobs:
             native_initial_control_route_confirms_stop_and_captures_settlement_targets \
             native_initial_control_cancel_terminalizes_only_unencumbered_stop_confirmation \
             native_initial_control_refuses_cancel_after_stop_settlement_begins \
+            prepared_native_initial_is_not_generic_settlement_work \
             settlement_dispatch_no_actor_terminalizes_only_the_captured_target \
             settlement_stop_claim_rejects_revoked_source_and_competing_delivery \
             initial_effect_admission_rejects_retained_losses_even_in_anomalous_phase \
@@ -742,6 +743,7 @@ jobs:
             native_initial_control_route_confirms_stop_and_captures_settlement_targets \
             native_initial_control_cancel_terminalizes_only_unencumbered_stop_confirmation \
             native_initial_control_refuses_cancel_after_stop_settlement_begins \
+            prepared_native_initial_is_not_generic_settlement_work \
             settlement_dispatch_no_actor_terminalizes_only_the_captured_target \
             settlement_stop_claim_rejects_revoked_source_and_competing_delivery \
             initial_effect_admission_rejects_retained_losses_even_in_anomalous_phase \
