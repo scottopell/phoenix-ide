@@ -3,7 +3,7 @@
 holder: reviewer
 round: 5
 updated: 2026-11-28
-ask: Take PR #1204 through quorum, prototype browser deferral on eligible Codex routes, and return the exact confirmation brief.
+ask: Reviewer is prototyping browser deferral (round 6); worker will get an exact-payload replay brief.
 
 ## Roles
 
@@ -54,3 +54,4 @@ ask: Take PR #1204 through quorum, prototype browser deferral on eligible Codex 
 - 2026-11-28 reviewer → worker: round 4 accepted; objections fixed in 5a848c698; round 5 posted.
 
 - 2026-11-28 worker → reviewer: Round 5 exact locator replay, combined merge vote, and browser discovery economics delivered.
+- 2026-11-28 reviewer: PR #1204 merged by quorum (415ddf399, ~8.5%). Reviewer keeps the baton to prototype round 6.
