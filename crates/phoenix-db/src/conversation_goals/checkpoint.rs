@@ -150,26 +150,24 @@ pub(super) async fn retained_result_tx(
             "pending report retained result type",
         ));
     }
-    let ToolContent {
-        tool_use_id,
-        content,
-        is_error,
-        images,
-    } = serde_json::from_str(&row.try_get::<String, _>("content")?)
+    let retained: ToolContent = serde_json::from_str(&row.try_get::<String, _>("content")?)
         .map_err(|_| GoalDbError::Integrity("pending report retained result content"))?;
-    if tool_use_id != report.call().tool_use_id.as_str() || !images.is_empty() {
+    if retained.tool_use_id != report.call().tool_use_id.as_str()
+        || !retained.images.is_empty()
+        || retained.clearable_preview().is_some()
+    {
         return Err(GoalDbError::Integrity(
             "pending report retained result identity",
         ));
     }
     let accepted = retry_tx(tx, &report.mutation()).await?;
-    if is_error == accepted.is_some() {
+    if retained.is_error == accepted.is_some() {
         return Err(GoalDbError::Integrity(
             "pending report retained result history",
         ));
     }
     if let Some(entry) = accepted {
-        if content != accepted_output(&entry)? {
+        if retained.content() != accepted_output(&entry)? {
             return Err(GoalDbError::Integrity(
                 "pending report retained success differs",
             ));
@@ -191,6 +189,9 @@ pub(super) async fn retained_result_tx(
                 .transpose()?
         }
     };
+    let is_error = retained.is_error;
+    let tool_use_id = retained.tool_use_id.clone();
+    let content = retained.into_content();
     let mut result = if is_error {
         ToolResult::error(tool_use_id, content)
     } else {

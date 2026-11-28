@@ -289,7 +289,7 @@ async fn codex_native_discovery_runtime_sqlite_roundtrip() {
     };
     let saved = db.get_messages(CONVERSATION).await.unwrap();
     assert!(saved.iter().any(|message| message.message_id==selection.owner_message_id && matches!(&message.content, MessageContent::Agent(blocks) if blocks.iter().any(|block| matches!(block,ContentBlock::ToolUse { id, name, .. } if id==&selection.tool_call_id && name==TOOL_SEARCH_NAME)))));
-    assert!(saved.iter().any(|message| message.message_id==selection.result_message_id && matches!(&message.content,MessageContent::Tool(result) if !result.is_error && result.tool_use_id==selection.tool_call_id && result.content==tool_search_result_text(&selection.tools))));
+    assert!(saved.iter().any(|message| message.message_id==selection.result_message_id && matches!(&message.content,MessageContent::Tool(result) if !result.is_error && result.tool_use_id==selection.tool_call_id && result.content()==tool_search_result_text(&selection.tools))));
     accept_tool(&mut runtime).await;
     assert_eq!(
         &*tools.executions.lock().unwrap(),

@@ -161,6 +161,7 @@ THE SYSTEM SHALL accept:
 WHEN patches are applied successfully
 THE SYSTEM SHALL return confirmation to LLM
 AND include the applied unified diff in the LLM-visible response so the agent can confirm where each edit landed without re-reading the file
+AND mark that diff as a clearable unified-diff preview, so stale-result clearing can later remove the diff while keeping the confirmation and hunk headers (specs/stale-tool-results REQ-STR-013)
 AND generate the same unified diff for UI display
 
 WHEN the applied diff exceeds the response's bounds on line count, single-line length, or total bytes

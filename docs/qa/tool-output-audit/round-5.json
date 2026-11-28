@@ -1,0 +1,241 @@
+{
+  "recorded_input": 60920443578,
+  "corpus": {
+    "transcripts": 12747,
+    "ordinary_anchors": 563490
+  },
+  "wire_model": {
+    "browser_query_limit": 20,
+    "call_id_size_bytes": 37
+  },
+  "observed_discovery": {
+    "subagent_explore": {
+      "transcripts": 7837,
+      "search_calls": 352,
+      "search_transcripts": 295,
+      "persisted_search_results": 352,
+      "returned_deferred_definitions": 0,
+      "transcripts_with_eager_browser_evidence": 4319,
+      "browser_calling_transcripts": 180,
+      "followed_by_successful_deferred_use": 0,
+      "first_browser_within_first_three_requests": 44
+    },
+    "subagent_legacy_mode": {
+      "transcripts": 1383,
+      "search_calls": 56,
+      "search_transcripts": 53,
+      "persisted_search_results": 56,
+      "returned_deferred_definitions": 0,
+      "transcripts_with_eager_browser_evidence": 1208,
+      "followed_by_successful_deferred_use": 0,
+      "browser_calling_transcripts": 1
+    },
+    "subagent_work": {
+      "transcripts": 1807,
+      "search_calls": 5,
+      "search_transcripts": 4,
+      "persisted_search_results": 5,
+      "returned_deferred_definitions": 0,
+      "transcripts_with_eager_browser_evidence": 909,
+      "followed_by_successful_deferred_use": 0,
+      "browser_calling_transcripts": 6
+    },
+    "ordinary_parent": {
+      "transcripts": 1649,
+      "search_calls": 22,
+      "search_transcripts": 18,
+      "persisted_search_results": 22,
+      "returned_deferred_definitions": 11,
+      "transcripts_with_eager_browser_evidence": 1075,
+      "browser_calling_transcripts": 158,
+      "followed_by_successful_deferred_use": 1,
+      "first_browser_within_first_three_requests": 9
+    },
+    "coordinator": {
+      "transcripts": 71,
+      "search_calls": 0,
+      "search_transcripts": 0,
+      "persisted_search_results": 0,
+      "returned_deferred_definitions": 0,
+      "transcripts_with_eager_browser_evidence": 0
+    }
+  },
+  "browser_replay": {
+    "subagent_explore": {
+      "all_recorded": {
+        "anchors": 116641,
+        "with_eager_definitions": 57933,
+        "definition_and_replay_delta": 166464922.09315565,
+        "definition_and_replay_delta_cache_read": 139930839.43620744,
+        "additional_searches": 122,
+        "additional_search_input": 5975280.7668349985,
+        "additional_search_read": 5320595.921091798,
+        "net_input": 160489641.32632065,
+        "net_cache_read": 134610243.51511565
+      },
+      "positioned_history": {
+        "anchors": 62704,
+        "with_eager_definitions": 57933,
+        "definition_and_replay_delta": 166464922.09315565,
+        "definition_and_replay_delta_cache_read": 139930839.43620744,
+        "additional_searches": 122,
+        "additional_search_input": 5975280.7668349985,
+        "additional_search_read": 5320595.921091798,
+        "net_input": 160489641.32632065,
+        "net_cache_read": 134610243.51511565
+      },
+      "matched_codex_capacity": {
+        "anchors": 42734,
+        "with_eager_definitions": 38449,
+        "definition_and_replay_delta": 113130683.63507819,
+        "definition_and_replay_delta_cache_read": 94808373.56470801,
+        "additional_searches": 100,
+        "additional_search_input": 5094796.05341422,
+        "additional_search_read": 4555064.0395376785,
+        "net_input": 108035887.58166397,
+        "net_cache_read": 90253309.52517033
+      }
+    },
+    "subagent_legacy_mode": {
+      "all_recorded": {
+        "anchors": 35877,
+        "with_eager_definitions": 29098,
+        "definition_and_replay_delta": 90525831.08486985,
+        "definition_and_replay_delta_cache_read": 80823348.04817618,
+        "net_input": 90525831.08486985,
+        "net_cache_read": 80823348.04817618
+      },
+      "positioned_history": {
+        "anchors": 29550,
+        "with_eager_definitions": 29098,
+        "definition_and_replay_delta": 90525831.08486985,
+        "definition_and_replay_delta_cache_read": 80823348.04817618,
+        "net_input": 90525831.08486985,
+        "net_cache_read": 80823348.04817618
+      },
+      "matched_codex_capacity": {
+        "anchors": 21188,
+        "with_eager_definitions": 20854,
+        "definition_and_replay_delta": 66759768.94584144,
+        "definition_and_replay_delta_cache_read": 59237667.27702139,
+        "net_input": 66759768.94584144,
+        "net_cache_read": 59237667.27702139
+      }
+    },
+    "subagent_work": {
+      "all_recorded": {
+        "anchors": 60721,
+        "with_eager_definitions": 24290,
+        "definition_and_replay_delta": 74883391.45288217,
+        "definition_and_replay_delta_cache_read": 68779615.24235596,
+        "additional_searches": 5,
+        "additional_search_input": 213718.80439128669,
+        "additional_search_read": 207084.47027641503,
+        "net_input": 74669672.64849089,
+        "net_cache_read": 68572530.77207954
+      },
+      "positioned_history": {
+        "anchors": 24720,
+        "with_eager_definitions": 24290,
+        "definition_and_replay_delta": 74883391.45288217,
+        "definition_and_replay_delta_cache_read": 68779615.24235596,
+        "additional_searches": 5,
+        "additional_search_input": 213718.80439128669,
+        "additional_search_read": 207084.47027641503,
+        "net_input": 74669672.64849089,
+        "net_cache_read": 68572530.77207954
+      },
+      "matched_codex_capacity": {
+        "anchors": 16414,
+        "with_eager_definitions": 16154,
+        "definition_and_replay_delta": 51025629.7445312,
+        "definition_and_replay_delta_cache_read": 46966815.137682654,
+        "additional_searches": 5,
+        "additional_search_input": 213718.80439128669,
+        "additional_search_read": 207084.47027641503,
+        "net_input": 50811910.94013991,
+        "net_cache_read": 46759730.66740624
+      }
+    },
+    "ordinary_parent": {
+      "all_recorded": {
+        "anchors": 316766,
+        "with_eager_definitions": 160643,
+        "definition_and_replay_delta": 489910904.5328523,
+        "definition_and_replay_delta_cache_read": 411526253.41339475,
+        "additional_searches": 66,
+        "additional_search_input": 6514953.535655448,
+        "additional_search_read": 5135770.743913357,
+        "net_input": 483395950.99719685,
+        "net_cache_read": 406390482.6694814
+      },
+      "positioned_history": {
+        "anchors": 157431,
+        "with_eager_definitions": 157431,
+        "definition_and_replay_delta": 479780559.83766687,
+        "definition_and_replay_delta_cache_read": 403250927.3398442,
+        "additional_searches": 60,
+        "additional_search_input": 6208221.753225253,
+        "additional_search_read": 4951839.990107482,
+        "net_input": 473572338.0844416,
+        "net_cache_read": 398299087.34973675
+      },
+      "matched_codex_capacity": {
+        "anchors": 89263,
+        "with_eager_definitions": 89263,
+        "definition_and_replay_delta": 290248667.2400576,
+        "definition_and_replay_delta_cache_read": 242695528.20692402,
+        "additional_searches": 36,
+        "additional_search_input": 2673209.333300573,
+        "additional_search_read": 2222769.9644475617,
+        "net_input": 287575457.906757,
+        "net_cache_read": 240472758.24247646
+      },
+      "latest_snapshot_proxy": {
+        "anchors": 3212,
+        "with_eager_definitions": 3212,
+        "definition_and_replay_delta": 10130344.695178095,
+        "definition_and_replay_delta_cache_read": 8275326.073549289,
+        "additional_searches": 6,
+        "additional_search_input": 306731.78243019624,
+        "additional_search_read": 183930.75380587435,
+        "net_input": 9823612.9127479,
+        "net_cache_read": 8091395.319743415
+      }
+    },
+    "coordinator": {
+      "all_recorded": {
+        "anchors": 33485,
+        "with_eager_definitions": 0,
+        "definition_and_replay_delta": 0.0,
+        "definition_and_replay_delta_cache_read": 0.0,
+        "net_input": 0.0,
+        "net_cache_read": 0.0
+      },
+      "positioned_history": {
+        "anchors": 27516,
+        "with_eager_definitions": 0,
+        "definition_and_replay_delta": 0.0,
+        "definition_and_replay_delta_cache_read": 0.0,
+        "net_input": 0.0,
+        "net_cache_read": 0.0
+      },
+      "matched_codex_capacity": {
+        "anchors": 14493,
+        "with_eager_definitions": 0,
+        "definition_and_replay_delta": 0.0,
+        "definition_and_replay_delta_cache_read": 0.0,
+        "net_input": 0.0,
+        "net_cache_read": 0.0
+      }
+    }
+  },
+  "marker_replay": {
+    "a_ordinary_whole_savings": 1777908839.2223592,
+    "b_savings": 3157767117.932483,
+    "a_existing_patch_savings": 258923252.9022099,
+    "a_new_patch_savings": 29535.154558011054,
+    "a_live_savings": 2036861627.2791271,
+    "b_plus_a_live_savings": 5194628745.211611
+  }
+}

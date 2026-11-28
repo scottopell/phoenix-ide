@@ -824,8 +824,8 @@ mod live {
                 _ => None,
             })
             .expect("real checkpoint retains the tool result");
-        assert!(!result.is_error, "{}", result.content);
-        let receipt: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert!(!result.is_error, "{}", result.content());
+        let receipt: serde_json::Value = serde_json::from_str(result.content()).unwrap();
         assert_eq!(receipt["outcome"], "applied");
         assert_eq!(client.recorded_requests().len(), 2);
         assert_eq!(*fixture.calls.lock().unwrap(), vec!["tracking"]);

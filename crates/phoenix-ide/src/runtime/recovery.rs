@@ -326,12 +326,12 @@ mod tests {
             conversation_id: "test-conv".to_string(),
             sequence_id: seq,
             message_type: MessageType::Tool,
-            content: MessageContent::Tool(ToolContent {
-                tool_use_id: tool_use_id.to_string(),
-                content: output.to_string(),
-                is_error: false,
-                images: vec![],
-            }),
+            content: MessageContent::Tool(ToolContent::with_images(
+                tool_use_id.to_string(),
+                output.to_string(),
+                false,
+                Vec::new(),
+            )),
             display_data: None,
             usage_data: None,
             created_at: Utc::now(),
@@ -834,12 +834,12 @@ mod proptests {
                     }])
                 }
             }
-            MessageType::Tool => MessageContent::Tool(ToolContent {
-                tool_use_id: format!("tool-{}", seq - 1),
-                content: "tool output".to_string(),
-                is_error: false,
-                images: vec![],
-            }),
+            MessageType::Tool => MessageContent::Tool(ToolContent::with_images(
+                format!("tool-{}", seq - 1),
+                "tool output".to_string(),
+                false,
+                Vec::new(),
+            )),
             _ => MessageContent::User(UserContent {
                 text: "fallback".to_string(),
                 images: vec![],

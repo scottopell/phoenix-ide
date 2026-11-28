@@ -16623,7 +16623,7 @@ fn build_materialized_tool_round(
         let display = match entry {
             MaterializedToolResult::Recorded(_) => match spawn_fan_ins.get(&result.tool_use_id) {
                 Some((output, display)) => {
-                    content.content.clone_from(output);
+                    content.replace_content(output.clone());
                     content.is_error = false;
                     Some(display.clone())
                 }
@@ -26397,7 +26397,7 @@ mod tests {
             MessageContent::Tool(tc) => {
                 assert_eq!(tc.tool_use_id, "tool-123");
                 assert!(tc.is_error);
-                assert!(tc.content.contains("interrupted"));
+                assert!(tc.content().contains("interrupted"));
             }
             MessageContent::User(_)
             | MessageContent::Agent(_)
@@ -26669,12 +26669,12 @@ mod tests {
         let r3 = by_id("tool-3").expect("tool-3 result present");
 
         // Completed tool keeps its real output, not a placeholder.
-        assert_eq!(r1.content, "real output for tool-1");
+        assert_eq!(r1.content(), "real output for tool-1");
         assert!(!r1.is_error, "completed tool result must not be an error");
 
         // In-flight + queued tools get synthetic interrupted errors.
-        assert!(r2.is_error && r2.content.contains("interrupted"));
-        assert!(r3.is_error && r3.content.contains("interrupted"));
+        assert!(r2.is_error && r2.content().contains("interrupted"));
+        assert!(r3.is_error && r3.content().contains("interrupted"));
 
         // Idempotent: re-running the sweep must not duplicate or 400-trip.
         db.reset_all_to_idle().await.unwrap();
@@ -26809,12 +26809,12 @@ mod tests {
         let r3 = by_id("tool-3").expect("tool-3 result present");
 
         // Completed tool keeps its real output, not a placeholder.
-        assert_eq!(r1.content, "real output for tool-1");
+        assert_eq!(r1.content(), "real output for tool-1");
         assert!(!r1.is_error, "completed tool result must not be an error");
 
         // Cancelling + skipped tools get synthetic interrupted errors.
-        assert!(r2.is_error && r2.content.contains("interrupted"));
-        assert!(r3.is_error && r3.content.contains("interrupted"));
+        assert!(r2.is_error && r2.content().contains("interrupted"));
+        assert!(r3.is_error && r3.content().contains("interrupted"));
 
         // Idempotent: re-running the sweep must not duplicate or 400-trip.
         db.reset_all_to_idle().await.unwrap();
@@ -26978,25 +26978,27 @@ mod tests {
             "spawn_agents fan-in is not itself an error result"
         );
         assert!(
-            spawn_tc.content.contains("Sub-agent results (2 completed)"),
+            spawn_tc
+                .content()
+                .contains("Sub-agent results (2 completed)"),
             "spawn result must carry the fan-in summary, got: {}",
-            spawn_tc.content
+            spawn_tc.content()
         );
         assert!(
-            spawn_tc.content.contains("investigate the parser")
-                && spawn_tc.content.contains("audit the lexer"),
+            spawn_tc.content().contains("investigate the parser")
+                && spawn_tc.content().contains("audit the lexer"),
             "fan-in must name both sub-agent tasks, got: {}",
-            spawn_tc.content
+            spawn_tc.content()
         );
         assert!(
-            spawn_tc.content.contains("interrupted by server restart"),
+            spawn_tc.content().contains("interrupted by server restart"),
             "fan-in must reflect the interrupted outcome, got: {}",
-            spawn_tc.content
+            spawn_tc.content()
         );
         assert!(
-            !spawn_tc.content.starts_with("Spawning"),
+            !spawn_tc.content().starts_with("Spawning"),
             "raw placeholder must be replaced, got: {}",
-            spawn_tc.content
+            spawn_tc.content()
         );
 
         // display_data carries the typed subagent_summary blob the UI renders.
@@ -27012,7 +27014,7 @@ mod tests {
         );
 
         // The in-flight `think` tool still gets its synthetic interrupted error.
-        assert!(think_tc.is_error && think_tc.content.contains("interrupted"));
+        assert!(think_tc.is_error && think_tc.content().contains("interrupted"));
 
         // Idempotent: re-running the sweep must not duplicate or 400-trip.
         db.reset_all_to_idle().await.unwrap();
@@ -27156,8 +27158,8 @@ mod tests {
         let MessageContent::Tool(content) = &spawn_result.content else {
             unreachable!()
         };
-        assert!(content.content.contains("exact recovered result"));
-        assert!(!content.content.contains("interrupted by server restart"));
+        assert!(content.content().contains("exact recovered result"));
+        assert!(!content.content().contains("interrupted by server restart"));
 
         let reconciled = db.reconcile_startup_obligated_parents(&ids).await.unwrap();
         assert_eq!(reconciled.len(), 1);
@@ -27320,7 +27322,7 @@ mod tests {
         let messages = db.get_messages(conversation_id).await.unwrap();
         assert_eq!(messages.len(), 3);
         assert!(messages.iter().any(|message| message.message_id == earlier_result_id
-            && matches!(&message.content, MessageContent::Tool(content) if content.content == "Earlier result")));
+            && matches!(&message.content, MessageContent::Tool(content) if content.content() == "Earlier result")));
         let tool_result = messages
             .iter()
             .find(|message| {
@@ -27561,7 +27563,7 @@ mod tests {
             .find(|message| message.message_id == "earlier-spawn-result")
             .unwrap();
         assert!(
-            matches!(&earlier.content, MessageContent::Tool(content) if content.content == "Earlier completed result")
+            matches!(&earlier.content, MessageContent::Tool(content) if content.content() == "Earlier completed result")
         );
         let message = messages
             .iter()
@@ -27573,8 +27575,8 @@ mod tests {
         let MessageContent::Tool(content) = &message.content else {
             unreachable!()
         };
-        assert!(content.content.contains("exact sibling result"));
-        assert!(content.content.contains("interrupted by server restart"));
+        assert!(content.content().contains("exact sibling result"));
+        assert!(content.content().contains("interrupted by server restart"));
         assert!(matches!(
             db.get_conversation(live_id).await.unwrap().state,
             ConvState::Failed {
@@ -28261,15 +28263,15 @@ mod tests {
 
         // The done agent's real result is fanned in; it is NOT "interrupted".
         assert!(
-            spawn.content.contains("found the bug in the parser"),
+            spawn.content().contains("found the bug in the parser"),
             "completed sub-agent must show its real result, got: {}",
-            spawn.content
+            spawn.content()
         );
         // The still-running agent keeps the interrupted fallback.
         assert!(
-            spawn.content.contains("interrupted by server restart"),
+            spawn.content().contains("interrupted by server restart"),
             "still-running sub-agent must show interrupted, got: {}",
-            spawn.content
+            spawn.content()
         );
     }
 

@@ -604,13 +604,13 @@ async fn ready_typed_outcome_survives_when_cancel_is_selected_first() {
             .collect::<Vec<_>>(),
         ["slow", "fast"]
     );
-    assert_eq!(results[0].content, "Cancelled by user");
+    assert_eq!(results[0].content(), "Cancelled by user");
     assert!(
         !results[0].is_error,
         "Cancelled retains its existing transcript wire disposition"
     );
     assert!(!results[1].is_error);
-    assert!(results[1].content.contains("completed fast-command"));
+    assert!(results[1].content().contains("completed fast-command"));
     assert!(messages.iter().find(|message| matches!(&message.content, MessageContent::Tool(result) if result.tool_use_id == "fast"))
         .unwrap().display_data.as_ref().unwrap()["duration_ms"].is_number());
     assert!(runtime.llm_client.recorded_requests().is_empty());
@@ -738,7 +738,7 @@ async fn cancel_stops_all_eight_active_calls_and_never_starts_unissued_tail() {
     );
     assert!(results[8..]
         .iter()
-        .all(|result| result.content.contains("Skipped due to cancellation")));
+        .all(|result| result.content().contains("Skipped due to cancellation")));
 }
 
 async fn cancellation_during_batch_read(work_scope: bool) {
@@ -1006,7 +1006,7 @@ async fn forced_batch_retirement_drains_ready_receipts_and_retires_every_owner_o
             .collect::<Vec<_>>()
     );
     assert!(!results[1].is_error);
-    assert!(results[1].content.contains("completed fast-command"));
+    assert!(results[1].content().contains("completed fast-command"));
     assert_eq!(messages.iter().filter(|message| matches!(&message.content, MessageContent::System(system) if system.text.contains("Cancellation completed"))).count(), 1);
     assert!(runtime.llm_client.recorded_requests().is_empty());
 }
@@ -1172,8 +1172,8 @@ async fn serial_special_source_cancellation_drains_affirmative_unissued_tail() {
             .collect::<Vec<_>>(),
         ["native", "first", "second"]
     );
-    assert_eq!(results[0].content, "authentic native completion");
-    assert_eq!(results[2].content, "Skipped due to cancellation");
+    assert_eq!(results[0].content(), "authentic native completion");
+    assert_eq!(results[2].content(), "Skipped due to cancellation");
 }
 
 #[tokio::test]

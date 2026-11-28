@@ -381,7 +381,7 @@ pub(crate) async fn acknowledge_initial_result_tx(
         if tool_result.is_error {
             continue;
         }
-        let Ok(output) = serde_json::from_str::<serde_json::Value>(&tool_result.content) else {
+        let Ok(output) = serde_json::from_str::<serde_json::Value>(tool_result.content()) else {
             continue;
         };
         let Some((name, input)) = blocks.iter().find_map(|block| match block {

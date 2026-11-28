@@ -153,6 +153,9 @@ pub enum ToolOutput {
         images: Vec<ToolImage>,
         display_data: Option<Value>,
         llm_usage: Option<Box<ToolLlmUsage>>,
+        /// Span of `output` that stale-result clearing may remove
+        /// (specs/stale-tool-results REQ-STR-013).
+        clearable_preview: Option<Box<phoenix_core::domain::db_schema::ClearablePreview>>,
     },
     /// Instructions from an authenticated audience-bound built-in skill.
     TrustedInstructions(skill::TrustedInstructions),
@@ -171,6 +174,7 @@ impl ToolOutput {
             images: vec![],
             display_data: None,
             llm_usage: None,
+            clearable_preview: None,
         }
     }
 
@@ -198,9 +202,32 @@ impl ToolOutput {
     pub fn with_output(mut self, text: impl Into<String>) -> Self {
         match &mut self {
             Self::TrustedInstructions(_) => {}
-            Self::Success { output, .. } | Self::Error { output, .. } => *output = text.into(),
+            Self::Success {
+                output,
+                clearable_preview,
+                ..
+            } => {
+                *output = text.into();
+                // a span into the old text is meaningless for the new text
+                *clearable_preview = None;
+            }
+            Self::Error { output, .. } => *output = text.into(),
         }
         self
+    }
+
+    /// A success whose text carries a clearable preview (REQ-STR-013). The
+    /// span comes from the same parts as the text, so it always fits.
+    #[must_use]
+    pub fn success_with_preview(text: phoenix_core::domain::db_schema::PreviewedText) -> Self {
+        let (output, preview) = text.into_parts();
+        Self::Success {
+            output,
+            images: vec![],
+            display_data: None,
+            llm_usage: None,
+            clearable_preview: Some(Box::new(preview)),
+        }
     }
 
     /// Attach tool-spent LLM usage for runtime accounting.

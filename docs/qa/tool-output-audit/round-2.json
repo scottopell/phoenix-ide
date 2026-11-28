@@ -1,0 +1,233 @@
+{
+  "partial_run": false,
+  "ledger": {
+    "rows": 566541,
+    "recorded_input": 60791524563
+  },
+  "corpus": {
+    "transcripts": 12698,
+    "request_anchors": 561647,
+    "anchored_input": 60238498958
+  },
+  "candidate_a": {
+    "transcripts_with_markers": 2616,
+    "requests_with_markers": 281290,
+    "result_rows": 233100,
+    "marker_turns": 43350170,
+    "current_calibrated": 2309796766.456455,
+    "proposed_calibrated": 375910962.3304478,
+    "current_bytes_quarter": 2066655627,
+    "proposed_bytes_quarter": 346728612,
+    "transcripts_with_later_retrieval": 674,
+    "transcripts_with_exact_retrieval": 12,
+    "calibrated_savings": 1933885804.1260076,
+    "bytes_quarter_savings": 1719927015,
+    "calibrated_savings_share": 0.03181176682157175,
+    "bytes_quarter_savings_share": 0.028292217169477142,
+    "foreign_source_rows_in_replay": 0,
+    "current_marker_byte_distribution": {
+      "p50": 219,
+      "p90": 221,
+      "p99": 222,
+      "max": 222
+    },
+    "compact_marker_byte_distribution": {
+      "p50": 31,
+      "p90": 32,
+      "p99": 32,
+      "max": 32
+    },
+    "current_marker_token_distribution": {
+      "p50": 56.88203782660981,
+      "p90": 66.43663123466885,
+      "p99": 72.53736206768866,
+      "max": 79.09628546515098
+    },
+    "compact_marker_token_distribution": {
+      "p50": 8.525290370925442,
+      "p90": 9.451814768460576,
+      "p99": 10.113173479705331,
+      "max": 10.950248756218906
+    },
+    "retrieval_calls_by_tool": {
+      "query_database": {
+        "later_calls": 17515,
+        "transcripts_with_later_call": 476,
+        "exact_cleared_source_calls": 18,
+        "transcripts_with_exact_call": 10
+      },
+      "resolve_reference": {
+        "later_calls": 1583,
+        "transcripts_with_later_call": 66
+      },
+      "read_conversation": {
+        "later_calls": 2658,
+        "transcripts_with_later_call": 407,
+        "exact_cleared_source_calls": 3,
+        "transcripts_with_exact_call": 3
+      },
+      "previous_transcripts": {
+        "later_calls": 377,
+        "transcripts_with_later_call": 116
+      },
+      "read_event_evidence": {
+        "later_calls": 87,
+        "transcripts_with_later_call": 17
+      }
+    }
+  },
+  "candidate_b": {
+    "results": 71597,
+    "unmodified_carry": 4733685819.580698,
+    "errors": 7807,
+    "error_carry": 131072932.14264828,
+    "recognized_success_previews": 62047,
+    "hunks": 118623,
+    "hunks_with_context_label": 0,
+    "pretruncated_previews": 9674,
+    "explicit_path_overhead": 146061850.54274517,
+    "cleared_previews": 38118,
+    "preview_marker_turns": 6790630,
+    "carry_saved": 3388532012.900278,
+    "preview_tokens_before_removal": 3451414872.1232224,
+    "replay_carry": 1345153806.68042,
+    "saving_share": 0.055740204531120864,
+    "carry_saved_with_explicit_path": 3242470162.357533,
+    "saving_share_with_explicit_path": 0.053337536534344816,
+    "sweep_count": 14006,
+    "sweeps_with_added_gain": 5946,
+    "sweep_local_gain_before": 451433789,
+    "sweep_local_gain_added": 18645324,
+    "gain_added_distribution_on_affected_sweeps": {
+      "p50": 2034,
+      "p90": 7430,
+      "p99": 15279,
+      "max": 27406
+    },
+    "record_tokens_using_path_in_call": {
+      "p50": 24.036658653846157,
+      "p90": 49.014507698289584,
+      "p99": 79.38146216427482,
+      "max": 133.24948665297742
+    },
+    "record_tokens_with_explicit_path_field": {
+      "p50": 41.8540675277589,
+      "p90": 71.92432365041765,
+      "p99": 103.50870323708469,
+      "max": 188.7448582545859
+    },
+    "follow_up_measured_requests": 20,
+    "risk_immediately_after_clear": {
+      "patches": 33429,
+      "same_path_read": 5987,
+      "git_diff_or_show": 6088,
+      "same_path_failed_patch": 2506
+    },
+    "risk_at_fixed_age": {
+      "10": {
+        "retained": {
+          "patches": 19628,
+          "same_path_read": 3930,
+          "git_diff_or_show": 4135,
+          "same_path_failed_patch": 1486
+        },
+        "cleared": {
+          "patches": 4970,
+          "same_path_read": 951,
+          "git_diff_or_show": 807,
+          "same_path_failed_patch": 402
+        },
+        "cleared_with_retained_comparators": {
+          "patches": 4966,
+          "same_path_read": 949,
+          "git_diff_or_show": 806,
+          "same_path_failed_patch": 402
+        },
+        "retained_standardized_to_cleared": {
+          "patches": 4966,
+          "same_path_read": 1109.8271748418304,
+          "git_diff_or_show": 915.2526086356315,
+          "same_path_failed_patch": 430.01068120135506
+        }
+      },
+      "25": {
+        "retained": {
+          "patches": 10982,
+          "same_path_read": 2109,
+          "git_diff_or_show": 2283,
+          "same_path_failed_patch": 725
+        },
+        "cleared": {
+          "patches": 14466,
+          "same_path_read": 2584,
+          "git_diff_or_show": 2519,
+          "same_path_failed_patch": 1047
+        },
+        "cleared_with_retained_comparators": {
+          "patches": 14462,
+          "same_path_read": 2584,
+          "git_diff_or_show": 2519,
+          "same_path_failed_patch": 1047
+        },
+        "retained_standardized_to_cleared": {
+          "patches": 14462,
+          "same_path_read": 3301.471215558896,
+          "git_diff_or_show": 2554.648517543778,
+          "same_path_failed_patch": 1265.7340368356897
+        }
+      },
+      "50": {
+        "retained": {
+          "patches": 4484,
+          "same_path_read": 855,
+          "git_diff_or_show": 896,
+          "same_path_failed_patch": 297
+        },
+        "cleared": {
+          "patches": 20899,
+          "same_path_read": 3637,
+          "git_diff_or_show": 3752,
+          "same_path_failed_patch": 1438
+        },
+        "cleared_with_retained_comparators": {
+          "patches": 20579,
+          "same_path_read": 3556,
+          "git_diff_or_show": 3699,
+          "same_path_failed_patch": 1409
+        },
+        "retained_standardized_to_cleared": {
+          "patches": 20579,
+          "same_path_read": 4582.797166071082,
+          "git_diff_or_show": 3250.0220766601146,
+          "same_path_failed_patch": 1773.755541670921
+        }
+      },
+      "100": {
+        "retained": {
+          "patches": 473,
+          "same_path_read": 87,
+          "git_diff_or_show": 92,
+          "same_path_failed_patch": 31
+        },
+        "cleared": {
+          "patches": 22499,
+          "same_path_read": 3790,
+          "git_diff_or_show": 4173,
+          "same_path_failed_patch": 1530
+        },
+        "cleared_with_retained_comparators": {
+          "patches": 21279,
+          "same_path_read": 3496,
+          "git_diff_or_show": 3963,
+          "same_path_failed_patch": 1427
+        },
+        "retained_standardized_to_cleared": {
+          "patches": 21279,
+          "same_path_read": 3641.295413215612,
+          "git_diff_or_show": 2583.2810868604033,
+          "same_path_failed_patch": 1648.1230993642448
+        }
+      }
+    }
+  }
+}

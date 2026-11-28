@@ -394,7 +394,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
     ))
     .await;
     let pending_cancelled: serde_json::Value =
-        serde_json::from_str(&pending_cancelled.content).unwrap();
+        serde_json::from_str(pending_cancelled.content()).unwrap();
     assert_eq!(pending_cancelled["status"], "refused");
     assert_eq!(
         pending_cancelled["reason"],
@@ -410,7 +410,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         RoundEnding::Complete,
     ))
     .await;
-    let refused: serde_json::Value = serde_json::from_str(&refused.content).unwrap();
+    let refused: serde_json::Value = serde_json::from_str(refused.content()).unwrap();
     assert_eq!(refused["reason"], "auto_continuation_disabled");
     assert!(db.conversation_goal(&owner).await.unwrap().is_none());
     let enabled = Box::pin(terminal_self_tool(
@@ -423,7 +423,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         RoundEnding::Complete,
     ))
     .await;
-    let enabled: serde_json::Value = serde_json::from_str(&enabled.content).unwrap();
+    let enabled: serde_json::Value = serde_json::from_str(enabled.content()).unwrap();
     assert_eq!(enabled["status"], "auto_continuation_enabled");
     assert!(db.conversation_goal(&owner).await.unwrap().is_none());
     let created = Box::pin(terminal_self_tool(
@@ -436,7 +436,7 @@ async fn database_runtime_self_goal_tools_finalize_before_terminal_settlement_wi
         RoundEnding::Complete,
     ))
     .await;
-    let created: serde_json::Value = serde_json::from_str(&created.content).unwrap();
+    let created: serde_json::Value = serde_json::from_str(created.content()).unwrap();
     assert_eq!(created["status"], "goal_created");
     assert_eq!(
         db.conversation_goal(&owner)
@@ -650,7 +650,7 @@ async fn database_runtime_mixed_self_goal_round_refuses_both_intents_in_either_o
                         _ => None,
                     })
                     .expect("canonical checkpoint persists each own-tool result");
-                let content: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+                let content: serde_json::Value = serde_json::from_str(result.content()).unwrap();
                 assert_eq!(content["status"], "refused");
                 assert_eq!(content["reason"], "mixed_self_goal_operations");
             }

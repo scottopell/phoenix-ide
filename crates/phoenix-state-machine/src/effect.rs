@@ -381,12 +381,12 @@ impl Effect {
         let tool_use_id = tool_use_id.into();
         let message_id = uuid::Uuid::new_v4().to_string();
         Effect::PersistMessage {
-            content: MessageContent::Tool(ToolContent {
-                tool_use_id: tool_use_id.clone(),
-                content: output.into(),
+            content: MessageContent::Tool(ToolContent::with_images(
+                tool_use_id.clone(),
+                output.into(),
                 is_error,
                 images,
-            }),
+            )),
             display_data,
             usage_data: None,
             message_id,

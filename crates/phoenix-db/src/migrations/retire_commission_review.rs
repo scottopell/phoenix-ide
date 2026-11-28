@@ -464,7 +464,7 @@ fn retired_tail_identity(
         return None;
     };
     if !result.is_error
-        || result.content != "commission_review is unavailable because the capability was retired"
+        || result.content() != "commission_review is unavailable because the capability was retired"
     {
         return None;
     }

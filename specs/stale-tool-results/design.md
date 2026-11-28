@@ -155,7 +155,8 @@ The tool name is carried on the assistant `ToolUse` block paired with each
 ## What clearing produces (REQ-STR-004, REQ-STR-005, REQ-STR-011)
 
 Clearing a result replaces the textual body sent to the model with a fixed
-placeholder — `[tool result cleared to save context]` — and sends no image
+marker — `[tool result cleared; source @self#seq-<n>]`, or the exact
+`@transcript:<conversation>#message-<message>` form in continuation input — and sends no image
 blocks for it. The paired assistant `ToolUse` block is left untouched, so the
 model still sees that the call was made and with what arguments; only the result
 body is elided. The decision is a typed verdict per tool-result message, not an

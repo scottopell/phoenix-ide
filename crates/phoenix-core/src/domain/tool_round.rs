@@ -218,6 +218,7 @@ mod tests {
                         media_type: "image/png".into(),
                         data: "image-bytes".into(),
                     }],
+                    clearable_preview: None,
                 },
                 duration_ms: Some(17),
             },

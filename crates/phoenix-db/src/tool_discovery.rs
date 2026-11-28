@@ -119,7 +119,7 @@ async fn load_result_tx(
     let call_id: String = row.try_get("tool_call_id")?;
     if content.tool_use_id != call_id
         || (content.is_error && !tools.is_empty())
-        || (!content.is_error && tool_search_result_text(&tools) != content.content)
+        || (!content.is_error && tool_search_result_text(&tools) != content.content())
     {
         return Err(invalid("tool discovery result witness differs"));
     }
@@ -162,7 +162,8 @@ pub(crate) async fn record_round_tx(
         if let Some(stored) = load_result_tx(tx, &result.message_id).await? {
             if stored.owner_message_id != assistant.message_id
                 || stored.tool_call_id != content.tool_use_id
-                || (!content.is_error && tool_search_result_text(&stored.tools) != content.content)
+                || (!content.is_error
+                    && tool_search_result_text(&stored.tools) != content.content())
             {
                 return Err(invalid("immutable tool discovery result differs"));
             }
@@ -186,7 +187,7 @@ pub(crate) async fn record_round_tx(
             }
             let query = ToolSearchQuery::parse_input(input).map_err(DbError::Serialization)?;
             let tools = search_tools(&catalog_tx(tx, &assistant.conversation_id).await?, &query);
-            if tool_search_result_text(&tools) != content.content {
+            if tool_search_result_text(&tools) != content.content() {
                 return Err(invalid("tool discovery output differs from frozen catalog"));
             }
             tools

@@ -77,11 +77,13 @@ enum RetentionVerdict { kept | cleared }
 -- modelling it explicitly lets the trailing-result guarantee be stated
 -- directly (REQ-STR-003, REQ-STR-007).
 --
--- `producing_tool_clearable` is the Tool::clearable() capability of the
--- tool that produced the result: true iff the tool reads re-queryable
+-- `result_clearable` is true iff either the Tool::clearable() capability of
+-- the tool that produced the result is true — the tool reads re-queryable
 -- state, so the agent can re-obtain what it needs about the current state
--- by re-invoking it (REQ-STR-002). The exact earlier snapshot is not
--- preserved — only the ability to re-read — which is the accepted
+-- by re-invoking it (REQ-STR-002) — or the result is a non-error result
+-- carrying a valid clearable preview whose cleared form is estimated
+-- smaller than the full result (REQ-STR-013). The exact earlier snapshot is
+-- not preserved — only the ability to re-read — which is the accepted
 -- tradeoff. Defaulted false for any tool that has not opted in (a human
 -- answer, a state-changing effect, is not a re-queryable read).
 --
@@ -107,7 +109,7 @@ value ToolResultRendering {
     tool_use_id: String
     round_sequence_id: Integer
     within_recency_floor: Boolean
-    producing_tool_clearable: Boolean
+    result_clearable: Boolean
     token_estimate: Integer
     marker_token_estimate: Integer
     has_images: Boolean
@@ -220,7 +222,7 @@ actor HistoryAssembler {
 -- clearable_tokens_between(a, lo, hi): max(0, sum(token_estimate) minus
 --     sum(marker_token_estimate)) over the
 --     renderings r of assembly a for which lo < r.round_sequence_id <= hi
---     AND r.producing_tool_clearable = true. It counts only results in the
+--     AND r.result_clearable = true. It counts only results in the
 --     half-open round range that are recoverable; it EXCLUDES results
 --     already cleared on a prior turn (round_sequence_id <= lo), results
 --     whose tool is not clearable, and floor-protected results
@@ -321,23 +323,29 @@ rule WatermarkAdvancedUnderPressure {
 ------------------------------------------------------------
 
 -- A result is cleared iff it is within the (post-advance) watermark's
--- reach AND its producing tool is clearable. Clearing drops the body and
--- the images together (REQ-STR-002, REQ-STR-011).
+-- reach AND it is clearable. Clearing drops the body (or, for a result
+-- with a clearable preview, only the preview) and the images together
+-- (REQ-STR-002, REQ-STR-011, REQ-STR-013).
 rule ToolResultCleared {
     when: RenderingDecided(assembly, r)
 
     requires: r.round_sequence_id <= assembly.new_watermark
-    requires: r.producing_tool_clearable = true
+    requires: r.result_clearable = true
 
     ensures: r.verdict = cleared
     ensures: r.images_sent = false
 
     @guidance
         -- Clearing replaces the rendered ToolResult body with a stable
-        -- marker identifying removal and its immutable persisted source
-        -- (conversation, message, sequence), and emits no
+        -- marker identifying removal and its immutable persisted source as a
+        -- read_conversation reference: `@self#seq-<n>` in the transcript's own
+        -- requests, which read_conversation resolves against the caller's
+        -- transcript, and the exact `@transcript:<conversation>#message-<message>`
+        -- pair in continuation input, which a successor may carry. It emits no
         -- image blocks; the paired assistant ToolUse block is left intact
-        -- (REQ-STR-004). The persisted db::ToolContent is read-only here —
+        -- (REQ-STR-004). A result with a clearable preview keeps its text
+        -- outside the preview verbatim and replaces only the preview with the
+        -- preview kind's summary followed by the marker (REQ-STR-013). The persisted db::ToolContent is read-only here —
         -- the cleared form exists only in the Vec<LlmMessage> for this one
         -- request (REQ-STR-005).
 }
@@ -355,8 +363,7 @@ rule ToolResultKeptBeyondWatermark {
     ensures: r.images_sent = r.has_images
 }
 
--- A result within the watermark's reach but whose producing tool is not
--- clearable is kept: it is the sole record of information the agent cannot
+-- A result within the watermark's reach that is not clearable is kept: it is the sole record of information the agent cannot
 -- re-obtain by re-invoking a tool (a human answer, a state-changing
 -- effect), so removal would be unrecoverable data loss. The watermark
 -- passing it by does not clear it (REQ-STR-002). Images are sent iff the
@@ -365,7 +372,7 @@ rule ToolResultKeptNotClearable {
     when: RenderingDecided(assembly, r)
 
     requires: r.round_sequence_id <= assembly.new_watermark
-    requires: r.producing_tool_clearable = false
+    requires: r.result_clearable = false
 
     ensures: r.verdict = kept
     ensures: r.images_sent = r.has_images
@@ -408,7 +415,7 @@ invariant RecencyFloorAlwaysKept {
 invariant ClearedImpliesRecoverable {
     for a in HistoryAssemblies:
         for r in a.renderings:
-            r.verdict = cleared implies r.producing_tool_clearable = true
+            r.verdict = cleared implies r.result_clearable = true
 }
 
 -- REQ-STR-007. A cleared result is always within the watermark's reach.
