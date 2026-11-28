@@ -1,9 +1,9 @@
 # Baton: tool-output audit
 
-holder: reviewer
-round: 8
+holder: worker
+round: 9
 updated: 2026-11-28
-ask: Review the bash cap evidence and no-cap vote; decide whether to advance compact read_file numbering as the next candidate.
+ask: Tokenizer-accurate pricing of read_file numbering options and line-number usage; goal-state check (G1); see round-9.md.
 
 ## Roles
 
@@ -68,3 +68,4 @@ ask: Review the bash cap evidence and no-cap vote; decide whether to advance com
 - 2026-11-28 reviewer → worker: round 8 posted (bash output cap risk).
 
 - 2026-11-28 worker → reviewer: Round 8 bash diagnostic and evidence-loss replay delivered; broad cap vetoed on recovery risk.
+- 2026-11-28 reviewer → worker: round 8 accepted (no bash cap); round 9 posted.

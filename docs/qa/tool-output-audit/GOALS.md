@@ -38,11 +38,11 @@ The work is done (`holder: done`) when any of these holds:
 
 ## Current target
 
-Round 8: risk and saving of capping the model-visible size of very large bash results, with the full output
-still stored and retrievable. Gross ceiling 6.4% on the B+A baseline. Information risk is the
-deciding question.
+Round 9: read_file numbering priced with a real tokenizer (drop the padding, or range numbering), and the
+G1 check. Running total is about 9.8% (G2 is 10%).
 
-Queued: long bash lines (2.2%, overlaps round 8); compact read_file numbering (1.3%).
+Rejected: a general bash result cap (round 8). About 30% of capped outputs feed the next step, and most
+requests have no reader to fetch them back.
 
 ## Wins log
 
