@@ -21,8 +21,13 @@ use phoenix_core::{
 };
 use phoenix_db::validate_close_retirement_inspection_aggregate;
 
+#[cfg(all(test, target_os = "linux"))]
+use crate::runtime::executor::native_close_retry::test_hooks::Hooks;
+
 use std::path::{Path, PathBuf};
 
+#[cfg(all(test, target_os = "linux"))]
+use super::super::super::ExternalWriterEvidence;
 use super::super::super::{
     ensure_no_ignored_content_with_status_leaf_until, inspect_worktree_at_with_git_leaf_until,
     observe_administrative_dir_incarnation,
@@ -708,17 +713,42 @@ impl PhysicalDeletionDriver<'_> {
         object: &Path,
         self_descriptor: Option<&SelfDeletionDescriptorBorrow<'_>>,
     ) -> Result<(), String> {
-        let evidence = self.custody.writer_probe.observe_and_retain_until(
-            object,
-            self.deadline(),
-            |path, deadline| {
-                quarantine_has_external_writer_until_with_self_descriptor(
-                    path,
-                    deadline,
-                    self_descriptor,
-                )
-            },
-        );
+        let original = self
+            .custody
+            .git
+            .original_effect
+            .as_ref()
+            .expect("original physical context");
+        let probe = &self.custody.writer_probe;
+        #[cfg(all(test, target_os = "linux"))]
+        let injected = original
+            .test_hooks
+            .as_ref()
+            .and_then(Hooks::take_final_writer_gap);
+        // Earlier probes can use the clean fixture. This final observation must
+        // go through the same retain-before-veto path as a real detector result.
+        #[cfg(all(test, target_os = "linux"))]
+        let mut injected_probe;
+        #[cfg(all(test, target_os = "linux"))]
+        let probe = if injected.is_some() {
+            injected_probe = probe.clone();
+            injected_probe.clean_writer_fixture = false;
+            &injected_probe
+        } else {
+            probe
+        };
+        let evidence = probe.observe_and_retain_until(object, self.deadline(), |path, deadline| {
+            #[cfg(all(test, target_os = "linux"))]
+            if let Some((observation, scanned_path)) = injected {
+                let _ = scanned_path.send(path.to_path_buf());
+                return Ok(ExternalWriterEvidence::Observed(observation));
+            }
+            quarantine_has_external_writer_until_with_self_descriptor(
+                path,
+                deadline,
+                self_descriptor,
+            )
+        });
         if self
             .custody
             .writer_probe
@@ -728,15 +758,28 @@ impl PhysicalDeletionDriver<'_> {
         {
             retain_unclassified_physical(self.custody);
         }
-        // Only positive external authority vetoes this admitted physical step.
-        // Target checks and persistence errors are never process-inspection gaps.
-        if evidence?.is_positive() {
-            return Err(format!(
-                "external writer holds confirmed worktree at {}; durable evidence retained",
-                object.display()
-            ));
+        // The mutation gate rejects Observe before the move. Only a fresh
+        // Initial may proceed through an ambient inspection gap.
+        let evidence = evidence?;
+        let veto = match original.command.intent() {
+            NativeCloseIntent::Initial { .. } => evidence.is_positive(),
+            NativeCloseIntent::ExplicitRetry { .. } => evidence.blocks_retirement(),
+            NativeCloseIntent::Observe { .. } => {
+                return Err("observational Close cannot authorize Worktree deletion".into());
+            }
+        };
+        if !veto {
+            return Ok(());
         }
-        Ok(())
+        let reason = if evidence.is_positive() {
+            "external writer holds confirmed worktree"
+        } else {
+            "external writer inspection gap blocks explicit Retry of confirmed worktree"
+        };
+        Err(format!(
+            "{reason} at {}; durable evidence retained",
+            object.display()
+        ))
     }
 
     fn verify_retired_paths(&self, administrative_dir: &Path) -> Result<(), String> {

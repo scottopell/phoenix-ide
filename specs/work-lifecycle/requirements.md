@@ -178,12 +178,12 @@ WHEN an admitted Close run observes positive external writer authority or an ext
 THE SYSTEM SHALL persist a representative immutable child observation bound to the exact attempt, admitted run ordinal, WorkScope, inspection generation and fingerprint, and captured resource identity before deciding whether to continue
 AND SHALL distinguish positive authority from an inspection gap and shall not let a gap mask independent verifiable positive evidence
 
-WHEN native Close has confirmed shutdown of the exact Phoenix-owned resources and is authorized to physically retire the worktree
+WHEN an admitted initial Close has confirmed shutdown of the exact Phoenix-owned resources and is authorized to physically retire the worktree
 THE SYSTEM SHALL block on current positive target-bound writer authority
 AND SHALL NOT block this admitted physical step solely because an external process or its inventory cannot be fully inspected
 AND SHALL NOT classify such a gap as unrelated, clean, or proof that no external writer exists
 
-The exception is limited to external process inspection. Uncertain shutdown, target inspection, loss checks, identity, permissions, custody, deadline, or evidence persistence still prevent unproven removal. Pre-admission retry checks and other strict retirement paths still block on gaps. A concurrent editor save or Git change by an undetected writer can be lost; removal of the checkout and exact Git registration does not prove immediate disk-space recovery when open handles remain.
+The exception is limited to external process inspection. Uncertain shutdown, target inspection, loss checks, identity, permissions, custody, deadline, or evidence persistence still prevent unproven removal. Explicit Retry (including its final moved-object scan) and other strict retirement paths still block on gaps. A concurrent editor save or Git change by an undetected writer can be lost; removal of the checkout and exact Git registration does not prove immediate disk-space recovery when open handles remain.
 
 Positive evidence shall retain the detector, PID and process incarnation, executable when observable, matched path and object kind, access mode, and authority kind. A gap shall retain its detector, reason, and PID when attributable; it shall not fabricate process identity or writer authority. A reused PID shall not identify the same process without an equal incarnation.
 

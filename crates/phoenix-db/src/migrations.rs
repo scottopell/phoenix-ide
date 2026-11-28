@@ -1003,6 +1003,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "native_close_origin_owner_cleanup",
         sql: include_str!("migrations/native_close_origin_owner_cleanup.sql"),
     },
+    Migration {
+        version: 192,
+        name: "native_close_captured_retry_writer_observations",
+        sql: include_str!("migrations/native_close_captured_retry_writer_observations.sql"),
+    },
 ];
 
 const MIGRATION_175: &str = r"
@@ -17325,6 +17330,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (192, "native_close_captured_retry_writer_observations"),
             (191, "native_close_origin_owner_cleanup"),
             (190, "native_close_retry_origin_gate"),
             (189, "native_close_retry_tmux_dispatch"),
@@ -17669,7 +17675,7 @@ mod tests {
         assert_eq!(run_pending_migrations(cached.pool()).await.unwrap(), 0);
 
         let dir = tempfile::tempdir().unwrap();
-        for (prefix, pending) in [(171, 20), (172, 19)] {
+        for prefix in [171, 172] {
             let path = dir.path().join(format!("prefix-{prefix}.db"));
             let path = path.to_str().unwrap();
             let db = crate::Database::open(path).await.unwrap();
@@ -17679,7 +17685,10 @@ mod tests {
                 sqlx::query_as(ledger_query).fetch_all(pool).await.unwrap();
             assert_eq!(before.last().unwrap().0, prefix);
 
-            assert_eq!(run_pending_migrations(pool).await.unwrap(), pending);
+            assert_eq!(
+                run_pending_migrations(pool).await.unwrap(),
+                registered_after(prefix)
+            );
             let installed: Vec<(u32, String, String)> =
                 sqlx::query_as(ledger_query).fetch_all(pool).await.unwrap();
             assert!(installed.starts_with(&before));
@@ -24967,7 +24976,7 @@ mod close_completion_allowance_tests {
             2
         );
 
-        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 16);
+        assert_eq!(run_pending_migrations(&pool).await.unwrap(), 17);
         let migrated: (i64, i64) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM close_original_retirement_anchors WHERE attempt_id = ?1),
                     (SELECT COUNT(*) FROM close_retirement_anchor_exclusions WHERE attempt_id = ?1)"
