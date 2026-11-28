@@ -8,6 +8,7 @@ for test_name in \
   runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_with_production_detector_retires_worktree_and_replays \
   runtime::executor::creation_completion_lifecycle_tests::native_close_admission_tests::worktree_physical::registered_native_close_refuses_a_live_writable_descriptor \
   runtime::close_retirement::tests::linux_first_descriptor_link_distinguishes_denial_from_identity_loss \
+  runtime::close_retirement::tests::linux_descriptor_denial_does_not_mask_process_replacement \
   runtime::close_retirement::tests::linux_writer_scan_keeps_searching_after_an_unavailable_process \
   runtime::close_retirement::tests::linux_mapping_scan_requires_writable_shared_authority; do
   grep -Fx "$test_name: test" "$evidence_dir/runtime-inventory.log"

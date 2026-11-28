@@ -9017,22 +9017,12 @@ fn linux_writer_scan_until(
                 continue;
             }
         };
-        let observed_result = inspect(&process.path(), &canonical);
+        let inspected = inspect(&process.path(), &canonical);
         check_directory_deletion_deadline(Some(deadline))?;
-        let observed = match observed_result {
-            Ok(observed) => observed,
+        let observed = match inspected {
+            Ok(observed) => Ok(observed),
+            Err(WriterScanError::Gap(reason)) => Err(reason),
             Err(WriterScanError::Stopped(message)) => return Err(message),
-            Err(WriterScanError::Gap(reason)) => {
-                tracing::debug!(
-                    operation = "inspect_process",
-                    detector = detector.as_str(),
-                    pid,
-                    ?before,
-                    ?reason
-                );
-                incomplete.remember_gap(writer_gap(detector, Some(pid), reason));
-                continue;
-            }
         };
         if !linux_writer_process_still_matches_until(
             &process,
@@ -9049,16 +9039,29 @@ fn linux_writer_scan_until(
             ));
             continue;
         }
-        if let Some((matched_path, authority)) = observed {
-            check_directory_deletion_deadline(Some(deadline))?;
-            return Ok(ExternalWriterEvidence::Observed(
-                CloseWriterObservation::Authority {
-                    detector,
-                    process: before,
-                    matched_path,
-                    authority,
-                },
-            ));
+        match observed {
+            Ok(Some((matched_path, authority))) => {
+                check_directory_deletion_deadline(Some(deadline))?;
+                return Ok(ExternalWriterEvidence::Observed(
+                    CloseWriterObservation::Authority {
+                        detector,
+                        process: before,
+                        matched_path,
+                        authority,
+                    },
+                ));
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                tracing::debug!(
+                    operation = "inspect_process",
+                    detector = detector.as_str(),
+                    pid,
+                    ?before,
+                    ?reason
+                );
+                incomplete.remember_gap(writer_gap(detector, Some(pid), reason));
+            }
         }
     }
     check_directory_deletion_deadline(Some(deadline))?;
@@ -20616,6 +20619,42 @@ mod tests {
                 ..
             }) if visited[1] == process.pid.to_string().as_str() && matched_path == target.canonicalize().unwrap()
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_descriptor_denial_does_not_mask_process_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target");
+        let proc_root = temp.path().join("proc");
+        std::fs::create_dir(&target).unwrap();
+        fake_linux_process(&proc_root, 17, 1, 42);
+        let evidence = super::linux_writer_scan(
+            &target,
+            &proc_root,
+            1,
+            super::CloseWriterDetector::LinuxDescriptor,
+            |process, _| {
+                let stat = process.join("stat");
+                let original = std::fs::read_to_string(&stat).unwrap();
+                let (prefix, start) = original.trim_end().rsplit_once(' ').unwrap();
+                assert_eq!(start, "42");
+                std::fs::write(stat, format!("{prefix} 43\n")).unwrap();
+                Err(super::initial_linux_descriptor_link_gap(
+                    &std::io::Error::from_raw_os_error(libc::EACCES),
+                ))
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            evidence,
+            super::ExternalWriterEvidence::Observed(super::CloseWriterObservation::InspectionGap {
+                pid: Some(17),
+                reason: super::CloseWriterGap::ProcessChanged,
+                ..
+            })
+        ));
+        assert!(evidence.blocks_initial_removal());
     }
 
     #[cfg(target_os = "linux")]
