@@ -17501,13 +17501,11 @@ mod tests {
                 1
             );
         }
-        assert!(
-            sqlx::query("PRAGMA foreign_key_check")
-                .fetch_all(&pool)
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        assert!(sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

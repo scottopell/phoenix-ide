@@ -255,8 +255,13 @@ where
             LocalAuthorityResult::DurableFactEstablished(Ok(
                 NativeCloseRetryResult::NewlyAdmitted(receipt),
             )) => {
-                if attempt_gate.require_exact(&receipt.admitted.attempt_id).is_err() {
-                    backend.signal_fatal_local_authority("native_close_retry_admission_owner_mismatch");
+                if attempt_gate
+                    .require_exact(&receipt.admitted.attempt_id)
+                    .is_err()
+                {
+                    backend.signal_fatal_local_authority(
+                        "native_close_retry_admission_owner_mismatch",
+                    );
                     let _ = response.send(Err(NativeCloseApplicationError::FatalAuthority));
                     return (true, None);
                 }

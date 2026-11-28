@@ -20,9 +20,8 @@ use crate::close_foundation::{
     BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
     CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
     CloseRetrySuccessWrite, CloseSafeRetryEffect, CloseSafeRetryProgress,
-    RecordCloseRetirementDispatchRequest,
-    RecordCloseWorktreeCleanupPlanRequest, StoppedCloseOriginalRetirementProof,
-    TerminalizeInitialCloseCleanupFailureRequest,
+    RecordCloseRetirementDispatchRequest, RecordCloseWorktreeCleanupPlanRequest,
+    StoppedCloseOriginalRetirementProof, TerminalizeInitialCloseCleanupFailureRequest,
 };
 use crate::workflow::LocalAuthorityResult;
 use crate::{Database, DbError, DbResult};
@@ -195,7 +194,10 @@ impl NativeCloseRetryWorktreeMetadata {
 #[derive(Debug)]
 pub enum NativeRetryTmuxProof {
     Dispatched,
-    Replacement { sealed_identity: String, token: uuid::Uuid },
+    Replacement {
+        sealed_identity: String,
+        token: uuid::Uuid,
+    },
 }
 
 impl Database {
@@ -440,9 +442,17 @@ impl Database {
         F: FnOnce() -> T,
     {
         self.with_native_close_retry_resource_first_effect(
-            command, admitted, live_source, scope, snapshot, resource,
-            NativeCloseRetryDispatchKind::Tmux, false, sink,
-        ).await
+            command,
+            admitted,
+            live_source,
+            scope,
+            snapshot,
+            resource,
+            NativeCloseRetryDispatchKind::Tmux,
+            false,
+            sink,
+        )
+        .await
     }
 
     // Check run, source, resource identity, and required dispatch kind before invoking the callback.
@@ -794,10 +804,8 @@ impl Database {
     where
         F: FnOnce() -> DbResult<L>,
     {
-        self.record_native_retry_dispatch_with_entry(
-            admitted, command, effect, entry, true,
-        )
-        .await
+        self.record_native_retry_dispatch_with_entry(admitted, command, effect, entry, true)
+            .await
     }
 
     async fn record_native_retry_dispatch_with_entry<F, L>(
@@ -822,7 +830,13 @@ impl Database {
         };
         let mut lease = None;
         let result = Self::record_native_close_retry_retirement_dispatch_tx(
-            &mut tx, command, admitted, effect, entry, &mut lease, confirm_tmux,
+            &mut tx,
+            command,
+            admitted,
+            effect,
+            entry,
+            &mut lease,
+            confirm_tmux,
         )
         .await;
         let classification = match result {
@@ -1469,7 +1483,9 @@ impl Database {
     ) -> DbResult<()> {
         let plan = Self::require_native_close_retry_plan_identity_tx(tx, command, admitted).await?;
         if !plan.running {
-            return Err(refused("native retry success requires its exact latest running plan"));
+            return Err(refused(
+                "native retry success requires its exact latest running plan",
+            ));
         }
         Self::require_native_close_retry_members_quiescent_tx(tx, &admitted.attempt_id).await?;
         let run = CloseRunRef {
@@ -1497,8 +1513,15 @@ impl Database {
         )
         .await?;
         if let Some(proof) = tmux_proof {
-            Self::record_native_retry_tmux_proof_tx(tx, admitted, &plan.snapshot, effect, write, proof)
-                .await?;
+            Self::record_native_retry_tmux_proof_tx(
+                tx,
+                admitted,
+                &plan.snapshot,
+                effect,
+                write,
+                proof,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1534,22 +1557,30 @@ impl Database {
         proof: NativeRetryTmuxProof,
     ) -> DbResult<()> {
         let identity = effect.resource.identity();
-        let NativeRetryTmuxProof::Replacement { sealed_identity, token } = proof else {
-            let dispatched = Self::native_retry_tmux_dispatch_confirmed_tx(
-                tx, admitted, snapshot, effect,
-            )
-            .await?;
+        let NativeRetryTmuxProof::Replacement {
+            sealed_identity,
+            token,
+        } = proof
+        else {
+            let dispatched =
+                Self::native_retry_tmux_dispatch_confirmed_tx(tx, admitted, snapshot, effect)
+                    .await?;
             return if dispatched {
                 Ok(())
             } else {
                 Err(refused("tmux absence requires exact confirmed dispatch"))
             };
         };
-        let original_token = sealed_identity.strip_prefix("tmux-v1:")
+        let original_token = sealed_identity
+            .strip_prefix("tmux-v1:")
             .and_then(|identity| identity.rsplit_once(':'))
             .and_then(|(_, token)| uuid::Uuid::parse_str(token).ok());
-        if identity.value() != sealed_identity || original_token.is_none_or(|original| original == token) {
-            return Err(refused("replacement requires the exact sealed tmux identity and a different token"));
+        if identity.value() != sealed_identity
+            || original_token.is_none_or(|original| original == token)
+        {
+            return Err(refused(
+                "replacement requires the exact sealed tmux identity and a different token",
+            ));
         }
         let retained: Option<String> = sqlx::query_scalar(
             "SELECT tmux_replacement_token FROM close_retirement_resource_history
@@ -1571,11 +1602,15 @@ impl Database {
         let token = token.to_string();
         match (retained, write) {
             (Some(retained), _) if retained != token => {
-                return Err(refused("replacement conflicts with retained tmux absence proof"));
+                return Err(refused(
+                    "replacement conflicts with retained tmux absence proof",
+                ));
             }
             (Some(_), _) => {}
             (None, CloseRetrySuccessWrite::Replay) => {
-                return Err(refused("replacement replay lacks its retained tmux absence proof"));
+                return Err(refused(
+                    "replacement replay lacks its retained tmux absence proof",
+                ));
             }
             (None, CloseRetrySuccessWrite::Inserted) => {
                 sqlx::query(

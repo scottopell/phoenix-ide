@@ -1265,8 +1265,13 @@ where
             LocalAuthorityResult::DurableFactEstablished(Ok(
                 NativeCloseInitialResult::NewlyAdmitted(receipt),
             )) => {
-                if attempt_owner.require_exact(&receipt.admitted.attempt_id).is_err() {
-                    backend.signal_fatal_local_authority("native_close_initial_admission_owner_mismatch");
+                if attempt_owner
+                    .require_exact(&receipt.admitted.attempt_id)
+                    .is_err()
+                {
+                    backend.signal_fatal_local_authority(
+                        "native_close_initial_admission_owner_mismatch",
+                    );
                     let error = NativeCloseApplicationError::FatalAuthority;
                     let _ = response.send(Err(error.clone()));
                     return Err(error);

@@ -355,7 +355,10 @@ mod disposable {
             helper.release().await;
         };
         let (outcome, ()) = tokio::join!(operation, witness);
-        assert_eq!(outcome, TokenBoundKill::QueueCompletedWithoutExecutionWitness);
+        assert_eq!(
+            outcome,
+            TokenBoundKill::QueueCompletedWithoutExecutionWitness
+        );
         helper.wait_exit(0).await;
         tokio::time::timeout(Duration::from_secs(5), async {
             while current_process_identity(original.process.pid) == Some(original.process) {
@@ -452,7 +455,10 @@ mod disposable {
                 Path::new(env!("CARGO_BIN_EXE_phoenix_ide")),
             )
             .await;
-        assert_eq!(outcome, TokenBoundKill::QueueCompletedWithoutExecutionWitness);
+        assert_eq!(
+            outcome,
+            TokenBoundKill::QueueCompletedWithoutExecutionWitness
+        );
         tokio::time::timeout(Duration::from_secs(5), async {
             while current_process_identity(fixture.process.pid) == Some(fixture.process) {
                 tokio::task::yield_now().await;
@@ -490,7 +496,10 @@ mod disposable {
         )
         .await;
 
-        assert_eq!(outcome, TokenBoundKill::QueueCompletedWithoutExecutionWitness);
+        assert_eq!(
+            outcome,
+            TokenBoundKill::QueueCompletedWithoutExecutionWitness
+        );
         fixture.assert_original_running();
         fixture.cleanup().await;
     }

@@ -164,15 +164,17 @@ mod close_startup_tests {
 
         let commits = Cell::new(0);
         assert_eq!(
-            crate::runtime::close_authority::observe_running_close_runs(&db, || commits.set(commits.get() + 1))
-                .await
-                .unwrap(),
+            crate::runtime::close_authority::observe_running_close_runs(&db, || commits
+                .set(commits.get() + 1))
+            .await
+            .unwrap(),
             1
         );
         assert_eq!(
-            crate::runtime::close_authority::observe_running_close_runs(&db, || commits.set(commits.get() + 1))
-                .await
-                .unwrap(),
+            crate::runtime::close_authority::observe_running_close_runs(&db, || commits
+                .set(commits.get() + 1))
+            .await
+            .unwrap(),
             0
         );
         assert_eq!(commits.get(), 1);

@@ -717,7 +717,9 @@ mod tests {
         ));
 
         let (response, mut retry_reply) = oneshot::channel();
-        let attempt_gate = backend.acquire_close_attempt(referenced.attempt_id.clone()).await;
+        let attempt_gate = backend
+            .acquire_close_attempt(referenced.attempt_id.clone())
+            .await;
         let retry = Box::new(NativeCloseRetryRequest {
             source,
             target: referenced.target,

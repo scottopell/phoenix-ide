@@ -262,7 +262,10 @@ impl AdmittedRetryCursor {
         controller: &mut Option<SourceEntryController>,
     ) -> Result<bool, NativeCloseApplicationError> {
         if matches!(self.stage, Stage::Fatal)
-            || self.attempt_owner.require_exact(&self.receipt.admitted.attempt_id).is_err()
+            || self
+                .attempt_owner
+                .require_exact(&self.receipt.admitted.attempt_id)
+                .is_err()
         {
             return Err(NativeCloseApplicationError::FatalAuthority);
         }

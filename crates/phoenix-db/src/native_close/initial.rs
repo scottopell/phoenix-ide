@@ -2467,8 +2467,10 @@ impl Database {
         &self,
         command: &NativeCloseCommand,
     ) -> LocalAuthorityResult<DbResult<NativeCloseInitialResult>> {
-        let attempt = CloseAttemptId::parse(Uuid::new_v4().to_string()).expect("UUID is an attempt ID");
-        self.apply_native_close_initial_for_attempt(command, &attempt).await
+        let attempt =
+            CloseAttemptId::parse(Uuid::new_v4().to_string()).expect("UUID is an attempt ID");
+        self.apply_native_close_initial_for_attempt(command, &attempt)
+            .await
     }
 
     /// Admits a source-bound Initial Close with its proposed fresh attempt ID.

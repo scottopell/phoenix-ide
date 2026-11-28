@@ -779,7 +779,10 @@ pub struct RuntimeManager {
     clean_close_writer_fixture: bool,
     close_retirement_execution: ConversationMutexGates,
     waiting_generic_close_owners: AsyncMutex<
-        HashMap<phoenix_core::domain::close::CloseAttemptId, close_authority::GenericCloseSettlementOwner>,
+        HashMap<
+            phoenix_core::domain::close::CloseAttemptId,
+            close_authority::GenericCloseSettlementOwner,
+        >,
     >,
     scheduled_close_rechecks:
         std::sync::Mutex<HashSet<phoenix_core::domain::close::CloseAttemptId>>,
@@ -4015,7 +4018,10 @@ impl RuntimeManager {
     ) -> Result<bool, String> {
         let (execution, mut owner) = active.into_parts();
         let (settlement, deliveries) = owner.settlement_and_deliveries();
-        match self.apply_generic_close_settlement(settlement, deliveries).await {
+        match self
+            .apply_generic_close_settlement(settlement, deliveries)
+            .await
+        {
             Ok(crate::db::GenericCloseSettlementAdvance::Inspect(inspection)) => {
                 self.continue_settled_generic_close(&execution, inspection)
                     .await?;

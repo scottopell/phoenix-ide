@@ -1798,7 +1798,9 @@ impl RuntimeManager {
     ) -> Result<(), String> {
         self.start_generic_close_worker(attempt_id, |manager, execution| async move {
             manager
-                .run_close_runtime_retirement(GenericRetirementAuthority::Fixture(execution.attempt().clone()))
+                .run_close_runtime_retirement(GenericRetirementAuthority::Fixture(
+                    execution.attempt().clone(),
+                ))
                 .await
         })
         .await?
@@ -1831,11 +1833,7 @@ impl RuntimeManager {
 
         self.require_local_authority_admission()
             .map_err(GenericCloseRetryError::Admission)?;
-        let admission = match self
-            .db()
-            .admit_generic_legacy_close_retry(attempt_id)
-            .await
-        {
+        let admission = match self.db().admit_generic_legacy_close_retry(attempt_id).await {
             LocalAuthorityResult::DurableFactEstablished(Ok(admission)) => admission,
             LocalAuthorityResult::DurableFactEstablished(Err(error)) => {
                 return Err(GenericCloseRetryError::Admission(error.to_string()));
@@ -1847,7 +1845,10 @@ impl RuntimeManager {
                 ));
             }
         };
-        let Err(error) = self.run_admitted_generic_retry_inspection(execution, admission).await else {
+        let Err(error) = self
+            .run_admitted_generic_retry_inspection(execution, admission)
+            .await
+        else {
             return Ok(());
         };
         if self.fatal_local_authority_is_latched() {
@@ -1893,7 +1894,9 @@ impl RuntimeManager {
         self.start_generic_close_worker(attempt_id, |manager, execution| async move {
             resume.await.map_err(|error| error.to_string())?;
             manager
-                .run_close_runtime_retirement(GenericRetirementAuthority::Fixture(execution.attempt().clone()))
+                .run_close_runtime_retirement(GenericRetirementAuthority::Fixture(
+                    execution.attempt().clone(),
+                ))
                 .await
         })
         .await
@@ -1945,7 +1948,11 @@ impl RuntimeManager {
                 .await
                 .remove(execution.attempt());
             match owner {
-                Some(owner) => manager.settle_close_obligation(owner.activate(execution)?).await,
+                Some(owner) => {
+                    manager
+                        .settle_close_obligation(owner.activate(execution)?)
+                        .await
+                }
                 None => Ok(false),
             }
         })
@@ -2076,7 +2083,12 @@ impl RuntimeManager {
         let (attempt_id, expected_snapshot, policy, retry) = match authority {
             GenericRetirementAuthority::Fresh(fresh) => {
                 let (attempt_id, snapshot) = fresh.into_parts();
-                (attempt_id, Some(snapshot), GenericRemovalPolicy::Initial, None)
+                (
+                    attempt_id,
+                    Some(snapshot),
+                    GenericRemovalPolicy::Initial,
+                    None,
+                )
             }
             GenericRetirementAuthority::Retry {
                 admission,
@@ -3008,15 +3020,22 @@ impl RuntimeManager {
         use phoenix_db::workflow::LocalAuthorityResult;
 
         self.require_local_authority_admission()?;
-        let retry = retry.ok_or("retained worktree cleanup requires exact legacy Retry admission")?;
-        match self.db().claim_generic_legacy_retry_worktree(retry, scope, snapshot, resource, plan).await {
-            LocalAuthorityResult::DurableFactEstablished(Ok(LegacyRetryWorktreeClaimRelease::First(first))) => {
+        let retry =
+            retry.ok_or("retained worktree cleanup requires exact legacy Retry admission")?;
+        match self
+            .db()
+            .claim_generic_legacy_retry_worktree(retry, scope, snapshot, resource, plan)
+            .await
+        {
+            LocalAuthorityResult::DurableFactEstablished(Ok(
+                LegacyRetryWorktreeClaimRelease::First(first),
+            )) => {
                 self.require_local_authority_admission()?;
                 Ok(first)
             }
-            LocalAuthorityResult::DurableFactEstablished(Ok(LegacyRetryWorktreeClaimRelease::Replay)) => {
-                Err("retained worktree cleanup already claimed; refusing to replay it".into())
-            }
+            LocalAuthorityResult::DurableFactEstablished(Ok(
+                LegacyRetryWorktreeClaimRelease::Replay,
+            )) => Err("retained worktree cleanup already claimed; refusing to replay it".into()),
             LocalAuthorityResult::DurableFactEstablished(Err(error)) => Err(error.to_string()),
             LocalAuthorityResult::DurableFactUnclassified => {
                 self.signal_fatal_local_authority("legacy Retry worktree claim release");
@@ -3194,15 +3213,24 @@ impl RuntimeManager {
                                 snapshot: snapshot.clone(),
                                 resource: target.resource.clone(),
                             };
-                            let claim = self.claim_retained_worktree_cleanup(
-                                retry, &scope, snapshot, &target.resource, &cleanup_plan,
-                            ).await?;
+                            let claim = self
+                                .claim_retained_worktree_cleanup(
+                                    retry,
+                                    &scope,
+                                    snapshot,
+                                    &target.resource,
+                                    &cleanup_plan,
+                                )
+                                .await?;
                             let recovery = tokio::task::spawn_blocking(move || {
                                 require_retained_worktree_claim(claim, &writer_probe, &identity)?;
                                 if !both_worktree_paths_absent(
-                                    &worktree_path(&identity), &worktree_quarantine_path(&identity)?,
+                                    &worktree_path(&identity),
+                                    &worktree_quarantine_path(&identity)?,
                                 )? {
-                                    return Err("worktree paths changed before retained cleanup".into());
+                                    return Err(
+                                        "worktree paths changed before retained cleanup".into()
+                                    );
                                 }
                                 match resume_final_worktree_tombstone(
                                     cleanup_plan
@@ -3349,15 +3377,24 @@ impl RuntimeManager {
                                 snapshot: snapshot.clone(),
                                 resource: target.resource.clone(),
                             };
-                            let claim = self.claim_retained_worktree_cleanup(
-                                retry, &scope, snapshot, &target.resource, &cleanup_plan,
-                            ).await?;
+                            let claim = self
+                                .claim_retained_worktree_cleanup(
+                                    retry,
+                                    &scope,
+                                    snapshot,
+                                    &target.resource,
+                                    &cleanup_plan,
+                                )
+                                .await?;
                             let recovery = tokio::task::spawn_blocking(move || {
                                 require_retained_worktree_claim(claim, &writer_probe, &identity)?;
                                 if !both_worktree_paths_absent(
-                                    &worktree_path(&identity), &worktree_quarantine_path(&identity)?,
+                                    &worktree_path(&identity),
+                                    &worktree_quarantine_path(&identity)?,
                                 )? {
-                                    return Err("worktree paths changed before retained cleanup".into());
+                                    return Err(
+                                        "worktree paths changed before retained cleanup".into()
+                                    );
                                 }
                                 if let Some(tombstone) = &cleanup_plan.final_tombstone {
                                     match resume_final_worktree_tombstone(
@@ -3592,8 +3629,13 @@ impl RuntimeManager {
                             } else {
                                 WorktreeRemovalEntry::RetainedQuarantine(
                                     self.claim_retained_worktree_cleanup(
-                                        retry, &scope, snapshot, &target.resource, &cleanup_plan,
-                                    ).await?,
+                                        retry,
+                                        &scope,
+                                        snapshot,
+                                        &target.resource,
+                                        &cleanup_plan,
+                                    )
+                                    .await?,
                                 )
                             };
                             let confirmed_snapshot = confirmed.snapshot.clone();

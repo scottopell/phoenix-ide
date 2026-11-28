@@ -206,12 +206,10 @@ async fn strict_final_probe_observes_replacement_without_finalizing() {
     let fake = FakeTmuxBackend::new();
     let final_probe_ready = Arc::new(tokio::sync::Notify::new());
     let release_final_probe = Arc::new(tokio::sync::Notify::new());
-    let registry = Arc::new(
-        with_fake(tmp.path(), &fake).with_final_authority_test_hook(
-            Arc::clone(&final_probe_ready),
-            Arc::clone(&release_final_probe),
-        ),
-    );
+    let registry = Arc::new(with_fake(tmp.path(), &fake).with_final_authority_test_hook(
+        Arc::clone(&final_probe_ready),
+        Arc::clone(&release_final_probe),
+    ));
     let work_scope = scope("strict-final-probe-replacement");
     let server = registry
         .ensure_live(&work_scope, tmp.path(), None, None)

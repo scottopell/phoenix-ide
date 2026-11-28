@@ -33,7 +33,10 @@ impl ActiveGenericCloseSettlement {
 impl GenericCloseSettlementOwner {
     pub(super) fn settlement_and_deliveries(
         &mut self,
-    ) -> (&crate::db::GenericCloseSettlement, &mut HashMap<u64, CloseSettlementDelivery>) {
+    ) -> (
+        &crate::db::GenericCloseSettlement,
+        &mut HashMap<u64, CloseSettlementDelivery>,
+    ) {
         (&self.settlement, &mut self.deliveries)
     }
 
@@ -74,14 +77,23 @@ impl CloseAttemptOwner {
 impl RuntimeManager {
     pub(super) async fn acquire_close_attempt(&self, attempt: CloseAttemptId) -> CloseAttemptOwner {
         let lease = self.close_retirement_execution.lock(attempt.as_str()).await;
-        CloseAttemptOwner { attempt, lease: Arc::new(lease) }
+        CloseAttemptOwner {
+            attempt,
+            lease: Arc::new(lease),
+        }
     }
 
     pub(super) async fn reserve_native_initial_attempt(&self) -> Option<CloseAttemptOwner> {
-        let attempt = CloseAttemptId::parse(uuid::Uuid::new_v4().to_string())
-            .expect("UUID is an attempt ID");
-        let lease = self.close_retirement_execution.try_lock(attempt.as_str()).await?;
-        Some(CloseAttemptOwner { attempt, lease: Arc::new(lease) })
+        let attempt =
+            CloseAttemptId::parse(uuid::Uuid::new_v4().to_string()).expect("UUID is an attempt ID");
+        let lease = self
+            .close_retirement_execution
+            .try_lock(attempt.as_str())
+            .await?;
+        Some(CloseAttemptOwner {
+            attempt,
+            lease: Arc::new(lease),
+        })
     }
 
     pub(super) async fn admit_generic_close(
@@ -101,10 +113,14 @@ impl RuntimeManager {
                     result.map_err(GenericCloseIngressError::Admission)?
                 }
                 LocalAuthorityResult::DurableFactUnclassified => {
-                    self.signal_fatal_local_authority("generic_close_stop_confirmation_unclassified");
-                    return Err("generic Close stop-work transaction release is unclassified"
-                        .to_string()
-                        .into());
+                    self.signal_fatal_local_authority(
+                        "generic_close_stop_confirmation_unclassified",
+                    );
+                    return Err(
+                        "generic Close stop-work transaction release is unclassified"
+                            .to_string()
+                            .into(),
+                    );
                 }
             };
             drop(stop_guard);
@@ -119,10 +135,14 @@ impl RuntimeManager {
                     result.map_err(GenericCloseIngressError::Admission)?
                 }
                 LocalAuthorityResult::DurableFactUnclassified => {
-                    self.signal_fatal_local_authority("generic_close_initial_admission_unclassified");
-                    return Err("generic Close Initial admission transaction release is unclassified"
-                        .to_string()
-                        .into());
+                    self.signal_fatal_local_authority(
+                        "generic_close_initial_admission_unclassified",
+                    );
+                    return Err(
+                        "generic Close Initial admission transaction release is unclassified"
+                            .to_string()
+                            .into(),
+                    );
                 }
             }
         };
@@ -132,15 +152,17 @@ impl RuntimeManager {
                     self.signal_fatal_local_authority("generic_close_admission_owner_mismatch");
                     return Err(error.into());
                 }
-                Ok(GenericCloseAuthorityAdmission::Settle(GenericCloseSettlementOwner {
-                    settlement,
-                    deliveries: Default::default(),
-                }))
+                Ok(GenericCloseAuthorityAdmission::Settle(
+                    GenericCloseSettlementOwner {
+                        settlement,
+                        deliveries: Default::default(),
+                    },
+                ))
             }
             GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
-            | GenericCloseAdmission::Existing(obligation) => {
-                Ok(GenericCloseAuthorityAdmission::Observe(Box::new(obligation)))
-            }
+            | GenericCloseAdmission::Existing(obligation) => Ok(
+                GenericCloseAuthorityAdmission::Observe(Box::new(obligation)),
+            ),
         }
     }
 
