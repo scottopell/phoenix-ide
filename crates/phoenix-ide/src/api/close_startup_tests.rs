@@ -4,12 +4,14 @@ use crate::terminal::session::ActiveTerminalInsertError;
 use crate::work_scope::ResourceScopeKey;
 use phoenix_core::domain::close::{CloseAttemptId, CloseRunRef, TranscriptConversationId};
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 const CHILD_MODE: &str = "PHOENIX_TEST_CLOSE_STARTUP_MODE";
 const DATABASE_PATH: &str = "PHOENIX_TEST_CLOSE_STARTUP_DATABASE";
 const MARKER_PATH: &str = "PHOENIX_TEST_CLOSE_STARTUP_MARKER";
+const ADMISSION_COMMITTED: &str = "close-startup-admission-committed";
 const COMPLETE: &str = "close-startup-process-reopen-complete";
 const ATTEMPT: &str = "startup-close-process-reopen-attempt";
 
@@ -40,22 +42,29 @@ async fn process_exit_and_reopen_observes_persisted_generic_close_without_redriv
         .spawn()
         .unwrap();
 
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while !marker.exists() {
-        if let Some(status) = abandoned.try_wait().unwrap() {
-            let output = abandoned.wait_with_output().await.unwrap();
-            panic!(
-                "admission child exited before its commit marker ({status}):\n{}\n{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+    let mut child_lines = BufReader::new(abandoned.stdout.take().unwrap()).lines();
+    let mut stdout = String::new();
+    let ready = tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(line) = child_lines.next_line().await.unwrap() {
+            if line == ADMISSION_COMMITTED {
+                return true;
+            }
+            stdout.push_str(&line);
+            stdout.push('\n');
         }
-        assert!(
-            Instant::now() < deadline,
-            "admission child did not commit in time"
+        false
+    })
+    .await
+    .expect("admission child did not commit in time");
+    if !ready {
+        let output = abandoned.wait_with_output().await.unwrap();
+        panic!(
+            "admission child exited before its commit marker ({}):\n{stdout}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
         );
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    assert!(marker.is_file());
 
     abandoned.start_kill().unwrap();
     let killed = tokio::time::timeout(Duration::from_secs(30), abandoned.wait_with_output())
@@ -177,9 +186,8 @@ async fn run_child(mode: &str) {
             let pending_marker = marker.with_extension("pending");
             std::fs::write(&pending_marker, format!("{turn}:{generation}")).unwrap();
             std::fs::rename(pending_marker, marker).unwrap();
-            loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
-            }
+            println!("\n{ADMISSION_COMMITTED}");
+            std::future::pending::<()>().await;
         }
         "reopen-and-classify" => {
             assert!(std::path::Path::new(&marker_path).exists());
