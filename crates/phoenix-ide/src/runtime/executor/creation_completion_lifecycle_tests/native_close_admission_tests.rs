@@ -691,7 +691,7 @@ async fn queued_native_close_settlement_stop_refuses_after_source_revocation() {
     ).bind(i64::try_from(turn.0).unwrap()).fetch_one(parked.fixture.db.pool()).await.unwrap();
     assert_eq!(retained, (0, None, true));
     let claims: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM native_close_initial_settlement_stop_claims WHERE attempt_id = ?1 AND turn_id = ?2",
+        "SELECT count(*) FROM close_settlement_stop_claims WHERE attempt_id = ?1 AND turn_id = ?2",
     )
     .bind(parked.run.attempt_id.as_str())
     .bind(i64::try_from(turn.0).unwrap())

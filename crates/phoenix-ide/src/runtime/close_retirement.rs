@@ -1231,7 +1231,10 @@ impl RuntimeManager {
                     .await
             }
             Ok(None) => Ok(()),
-            Err(error) => Err(error),
+            Err(super::GenericCloseApplyError::Unclassified) => {
+                return Err("fresh Close inspection transaction release is unclassified".into());
+            }
+            Err(super::GenericCloseApplyError::Definite(error)) => Err(error),
         };
         match result {
             Ok(()) => Ok(()),
@@ -1242,17 +1245,25 @@ impl RuntimeManager {
     async fn commit_settled_generic_inspection(
         &self,
         inspection: crate::db::GenericCloseInspection,
-    ) -> Result<Option<crate::db::FreshGenericCloseRetirement>, String> {
+    ) -> Result<Option<crate::db::FreshGenericCloseRetirement>, super::GenericCloseApplyError> {
         let CollectedCloseInspection::Present { request, .. } = self
             .collect_close_retirement_inspection(inspection.attempt_id())
             .await?
         else {
-            return Err("Initial Close cannot resume a dispatched absence".into());
+            return Err("Initial Close cannot resume a dispatched absence".to_string().into());
         };
-        self.db()
-            .commit_fresh_generic_close_inspection(inspection, request)
+        match self.db()
+            .commit_fresh_generic_close_inspection_classified(inspection, request)
             .await
-            .map_err(|error| error.to_string())
+        {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                result.map_err(|error| super::GenericCloseApplyError::Definite(error.to_string()))
+            }
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                self.signal_fatal_local_authority("fresh_generic_close_inspection_unclassified");
+                Err(super::GenericCloseApplyError::Unclassified)
+            }
+        }
     }
 
     async fn record_interrupted_generic_handoff(&self, run: &CloseRunRef, cause: String) -> String {
@@ -1821,18 +1832,37 @@ impl RuntimeManager {
                 let admission = if let Some(stop_guard) = stop_guard {
                     let confirmed = manager
                         .db()
-                        .confirm_generic_close_stop_work(&target, &latest, &attempt_id)
+                        .confirm_generic_close_stop_work_classified(&target, &latest, &attempt_id)
                         .await;
+                    let confirmed = match confirmed {
+                        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                            result.map_err(GenericCloseIngressError::Admission)?
+                        }
+                        phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                            manager.signal_fatal_local_authority("generic_close_stop_confirmation_unclassified");
+                            return Err(GenericCloseIngressError::Worker(
+                                "generic Close stop-work transaction release is unclassified".into(),
+                            ));
+                        }
+                    };
                     drop(stop_guard);
-                    GenericCloseAdmission::InsertedSettling(
-                        confirmed.map_err(GenericCloseIngressError::Admission)?,
-                    )
+                    GenericCloseAdmission::InsertedSettling(confirmed)
                 } else {
-                    manager
+                    match manager
                         .db()
-                        .begin_generic_close_settlement(&target, &latest, &attempt_id)
+                        .begin_generic_close_settlement_classified(&target, &latest, &attempt_id)
                         .await
-                        .map_err(GenericCloseIngressError::Admission)?
+                    {
+                        phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => {
+                            result.map_err(GenericCloseIngressError::Admission)?
+                        }
+                        phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                            manager.signal_fatal_local_authority("generic_close_initial_admission_unclassified");
+                            return Err(GenericCloseIngressError::Worker(
+                                "generic Close Initial admission transaction release is unclassified".into(),
+                            ));
+                        }
+                    }
                 };
                 Ok(match admission {
                     GenericCloseAdmission::InsertedSettling(settlement) => {
@@ -1849,13 +1879,6 @@ impl RuntimeManager {
                 })
             },
         )
-    }
-
-    pub(super) fn start_generic_close_settlement(
-        self: &Arc<Self>,
-        settlement: crate::db::GenericCloseSettlement,
-    ) -> Result<tokio::task::JoinHandle<Result<bool, String>>, String> {
-        self.start_generic_close_recheck(settlement.obligation().attempt_id().clone())
     }
 
     pub(super) fn start_generic_close_recheck(

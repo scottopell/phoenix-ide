@@ -2306,8 +2306,6 @@ impl Database {
                 &mut tx.tx, command, receipt, live_source,
             )
             .await?;
-            let already_claimed =
-                native_initial_stop_claim_exists_tx(&mut tx.tx, &admitted, target).await?;
             let Some(live_target) =
                 require_exact_live_settlement_target_tx(&mut tx, &admitted.attempt_id, target)
                     .await?
@@ -2322,11 +2320,6 @@ impl Database {
                     Ok(NativeCloseInitialTurnDispatchResult::Backpressure)
                 }
                 NativeCloseInitialTurnDispatch::NoLiveActor => {
-                    if already_claimed {
-                        return Err(DbError::CloseFoundationPrecondition(
-                            "claimed settlement Stop lost its actor before durable turn release".into(),
-                        ));
-                    }
                     live_target.cancel_without_actor(&workflow).await?;
                     Ok(NativeCloseInitialTurnDispatchResult::Released)
                 }
@@ -2370,32 +2363,13 @@ impl Database {
                 &mut tx.tx, command, receipt, live_source,
             )
             .await?;
-            if require_exact_live_settlement_target_tx(&mut tx, &admitted.attempt_id, target)
-                .await?
-                .is_none()
-            {
+            let Some(live_target) =
+                require_exact_live_settlement_target_tx(&mut tx, &admitted.attempt_id, target)
+                    .await?
+            else {
                 return Ok(false);
-            }
-            let turn_id = i64::try_from(target.turn_id)
-                .map_err(|error| DbError::Serialization(format!("turn id overflow: {error}")))?;
-            let generation = i64::try_from(target.expected_generation).map_err(|error| {
-                DbError::Serialization(format!("turn generation overflow: {error}"))
-            })?;
-            if native_initial_stop_claim_exists_tx(&mut tx.tx, &admitted, target).await? {
-                return Ok(false);
-            }
-            lease = Some(enter()?);
-            let inserted = sqlx::query(
-                "INSERT INTO native_close_initial_settlement_stop_claims
-                 (attempt_id, run_ordinal, turn_id, expected_generation) VALUES (?1, ?2, ?3, ?4)",
-            )
-            .bind(admitted.attempt_id.as_str())
-            .bind(CloseRunOrdinal::INITIAL.get())
-            .bind(turn_id)
-            .bind(generation)
-            .execute(&mut *tx.tx)
-            .await?;
-            Ok(inserted.rows_affected() == 1)
+            };
+            live_target.claim_stop(enter, &mut lease).await
         }
         .await;
         let authority = match result {
@@ -2703,28 +2677,6 @@ async fn require_initial_settlement_dispatch_tx(
         ));
     }
     Ok(admitted)
-}
-
-async fn native_initial_stop_claim_exists_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    admitted: &NativeCloseRunRef,
-    target: &crate::CloseDirectTurnSettlementTarget,
-) -> DbResult<bool> {
-    let turn_id = i64::try_from(target.turn_id)
-        .map_err(|error| DbError::Serialization(format!("turn id overflow: {error}")))?;
-    let generation = i64::try_from(target.expected_generation)
-        .map_err(|error| DbError::Serialization(format!("turn generation overflow: {error}")))?;
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM native_close_initial_settlement_stop_claims
-         WHERE attempt_id = ?1 AND run_ordinal = ?2 AND turn_id = ?3
-           AND expected_generation = ?4)",
-    )
-    .bind(admitted.attempt_id.as_str())
-    .bind(CloseRunOrdinal::INITIAL.get())
-    .bind(turn_id)
-    .bind(generation)
-    .fetch_one(&mut **tx)
-    .await?)
 }
 
 async fn require_initial_execution_tx(

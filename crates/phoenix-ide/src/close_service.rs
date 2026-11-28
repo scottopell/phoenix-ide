@@ -498,20 +498,20 @@ mod tests {
         .unwrap();
         assert_eq!(attempts, 1);
 
-        let stale = state.db.begin_generic_close_settlement(
+        let stale = state.db.begin_generic_close_settlement_classified(
             &product, &TranscriptConversationId::parse("stale-old-transcript").unwrap(), &losing_attempt,
-        ).await;
+        ).await.established().expect("classified fixture transaction");
         assert!(matches!(stale, Err(crate::db::DbError::CloseFoundationStaleLatest { .. })));
         let other = "different-close-target";
         let other_product = state.db.create_conversation(other, other, "/tmp", true, None, None)
             .await.unwrap().product_conversation_id;
-        state.db.begin_generic_close_settlement(
+        state.db.begin_generic_close_settlement_classified(
             &other_product, &TranscriptConversationId::parse(other).unwrap(), &losing_attempt,
-        ).await.unwrap();
+        ).await.established().expect("classified fixture transaction").unwrap();
         assert!(matches!(
-            state.db.begin_generic_close_settlement(
+            state.db.begin_generic_close_settlement_classified(
                 &product, &TranscriptConversationId::parse(id).unwrap(), &losing_attempt,
-            ).await,
+            ).await.established().expect("classified fixture transaction"),
             Err(crate::db::DbError::CloseFoundationConflict(_))
         ));
         assert!(matches!(crate::api::product_conversations::close_product_conversation(

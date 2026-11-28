@@ -3721,6 +3721,7 @@ impl RuntimeManager {
         settlement: &crate::db::GenericCloseSettlement,
         deliveries: &mut HashMap<u64, CloseSettlementDelivery>,
     ) -> Result<CloseTurnDispatchPass, GenericCloseApplyError> {
+        use crate::db::GenericCloseTurnRelease;
         use phoenix_db::workflow::LocalAuthorityResult::{
             DurableFactEstablished, DurableFactUnclassified,
         };
@@ -3741,7 +3742,23 @@ impl RuntimeManager {
                         if Arc::ptr_eq(&delivery.actor, &actor.identity) && delivery.poll_handling() {
                             continue;
                         }
-                        deliveries.remove(&target.turn_id);
+                        match self.db.reconcile_lost_generic_close_turn_offer(settlement, &target).await {
+                            DurableFactEstablished(Ok(GenericCloseTurnRelease::Released)) => {
+                                deliveries.remove(&target.turn_id);
+                                continue;
+                            }
+                            DurableFactEstablished(Ok(GenericCloseTurnRelease::NoTransition)) => {
+                                return Ok(CloseTurnDispatchPass::NoTransition);
+                            }
+                            DurableFactEstablished(Ok(GenericCloseTurnRelease::Unclaimed)) => {
+                                deliveries.remove(&target.turn_id);
+                            }
+                            DurableFactEstablished(Err(error)) => return Err(error.to_string().into()),
+                            DurableFactUnclassified => {
+                                self.signal_fatal_local_authority("generic_close_turn_offer_reconcile_unclassified");
+                                return Err(GenericCloseApplyError::Unclassified);
+                            }
+                        }
                     }
                     if let Ok(reservation) = actor.event_tx.try_reserve_direct_turn_cancellation() {
                         let offer = settlement.offer_turn(target.clone()).ok_or_else(|| {
@@ -3761,8 +3778,8 @@ impl RuntimeManager {
                     .cancel_generic_close_turn_without_actor(settlement, &target)
                     .await
                 {
-                    DurableFactEstablished(Ok(crate::db::GenericCloseTurnRelease::Released)) => {}
-                    DurableFactEstablished(Ok(crate::db::GenericCloseTurnRelease::NoTransition)) => {
+                    DurableFactEstablished(Ok(GenericCloseTurnRelease::Released | GenericCloseTurnRelease::Unclaimed)) => {}
+                    DurableFactEstablished(Ok(GenericCloseTurnRelease::NoTransition)) => {
                         return Ok(CloseTurnDispatchPass::NoTransition);
                     }
                     DurableFactEstablished(Err(error)) => return Err(error.to_string().into()),
@@ -3897,15 +3914,18 @@ impl RuntimeManager {
         self: &Arc<Self>,
         attempt_id: Option<&phoenix_core::domain::close::CloseAttemptId>,
     ) -> Result<usize, String> {
-        let obligations = self
-            .db
-            .list_pending_generic_close_settlements(attempt_id)
+        let attempts: Vec<_> = self
+            .waiting_generic_close_owners
+            .lock()
             .await
-            .map_err(|error| error.to_string())?;
+            .keys()
+            .filter(|attempt| attempt_id.is_none_or(|exact| *attempt == exact))
+            .cloned()
+            .collect();
         let mut completed = 0;
         let mut first_error = None;
-        for settlement in obligations {
-            let worker = self.start_generic_close_settlement(settlement)?;
+        for attempt in attempts {
+            let worker = self.start_generic_close_recheck(attempt)?;
             match worker.await {
                 Ok(Ok(true)) => completed += 1,
                 Ok(Ok(false)) => {}
@@ -3992,10 +4012,14 @@ impl RuntimeManager {
         {
             return Ok(GenericCloseSettlementAdvance::NoTransition);
         }
-        self.db
-            .finish_generic_close_settlement(settlement)
-            .await
-            .map_err(|error| GenericCloseApplyError::Definite(error.to_string()))
+        match self.db.finish_generic_close_settlement_classified(settlement).await {
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished(result) => result
+                .map_err(|error| GenericCloseApplyError::Definite(error.to_string())),
+            phoenix_db::workflow::LocalAuthorityResult::DurableFactUnclassified => {
+                self.signal_fatal_local_authority("generic_close_settlement_unclassified");
+                Err(GenericCloseApplyError::Unclassified)
+            }
+        }
     }
 
     /// Materialize persisted continuation operations so restart recovery does
@@ -9663,11 +9687,11 @@ mod scope_liveness_tests {
             )
             .await
             .expect("begin close");
-        let settlement = manager.db().confirm_generic_close_stop_work(
+        let settlement = manager.db().confirm_generic_close_stop_work_classified(
             &conversation.product_conversation_id,
             &TranscriptConversationId::parse(conversation_id).unwrap(),
             &CloseAttemptId::parse("live-attempt").unwrap(),
-        ).await.unwrap();
+        ).await.established().expect("classified fixture transaction").unwrap();
         let mut events = manager
             .inject_handle_with_event_capture_for_test(
                 conversation_id,
@@ -9685,14 +9709,30 @@ mod scope_liveness_tests {
         };
         assert_eq!(stop.scope.turn_id, phoenix_workflow::TurnAuthorityId(1));
         assert_eq!(stop.scope.generation, 0);
-        assert!(stop.offer.claim(Arc::clone(&manager.fatal_local_authority_fence)).await);
         let _ = stop.applied.send(cancellation_inbox::ScopedStopHandling::Refused);
         manager.settle_close_direct_turn_targets(&settlement, &mut deliveries).await.unwrap();
         let cancellation_inbox::CancellationInput::DirectTurn(stale) = stops.try_recv().unwrap() else {
             panic!("expected exact re-offer");
         };
+        let target = manager.db().list_unsettled_close_direct_turn_settlement_targets("live-attempt")
+            .await.unwrap().pop().unwrap();
+        let duplicate = settlement.offer_turn(target.clone()).unwrap();
+        let late = settlement.offer_turn(target.clone()).unwrap();
+        assert!(stale.offer.claim(Arc::clone(&manager.fatal_local_authority_fence)).await);
+        use phoenix_db::workflow::LocalAuthorityResult::DurableFactEstablished;
+        assert!(matches!(
+            manager.db().claim_generic_close_turn_offer(duplicate).await,
+            DurableFactEstablished(Ok(false)),
+        ));
+        assert!(matches!(
+            manager.db().reconcile_lost_generic_close_turn_offer(&settlement, &target).await,
+            DurableFactEstablished(Err(crate::db::DbError::CloseFoundationPrecondition(_))),
+        ));
         manager.db().fail_generic_close_settlement(&settlement, "stop before receiver").await.unwrap();
-        assert!(!stale.offer.claim(Arc::clone(&manager.fatal_local_authority_fence)).await);
+        assert!(matches!(
+            manager.db().claim_generic_close_turn_offer(late).await,
+            DurableFactEstablished(Ok(false)),
+        ));
         assert!(stops.try_recv().is_err());
         assert!(events.try_recv().is_err());
         let terminal_kind: Option<String> =
@@ -10481,9 +10521,7 @@ mod scope_liveness_tests {
                 assert_eq!(obligation.phase(), ClosePhase::SettlingActiveWork);
                 assert_eq!(db.get_close_run(&run).await.unwrap().status, CloseRunStatus::Running);
                 assert_eq!(manager.observed_local_authority_failure_boundary(), Some("generic_close_settlement_unclassified"));
-                assert!(manager.start_generic_close_settlement(
-                    db.list_pending_generic_close_settlements(Some(&attempt)).await.unwrap().pop().unwrap(),
-                ).is_err());
+                assert!(manager.start_generic_close_recheck(attempt.clone()).is_err());
                 sqlx::query("DROP TRIGGER fail_settlement_terminalization")
                     .execute(db.pool())
                     .await

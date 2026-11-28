@@ -216,6 +216,23 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
         }
     }
 
+    async fn await_scoped_stop_claim(
+        &mut self,
+        claim: impl Future<Output = bool> + Send,
+    ) -> bool {
+        tokio::pin!(claim);
+        if let Some(cutoff) = self.cancellation_custody.pending_cutoff() {
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(cutoff) => {
+                    self.service_cancellation_resource_cutoff();
+                }
+                accepted = &mut claim => return accepted,
+            }
+        }
+        claim.await
+    }
+
     pub(super) async fn settle_cancellation_input(&mut self) -> Option<RuntimeExitDisposition> {
         let ObservedCancellation { input, cutoff } = self
             .cancellation_custody
@@ -223,19 +240,25 @@ impl<S: Storage + Clone + 'static, L: LlmClient + 'static, T: ToolExecutor + 'st
             .expect("retained cancellation receipt");
         let (event, receipt, scoped, cutoff) = match input {
             CancellationInput::DirectTurn(scoped) => {
+                self.cancellation_custody =
+                    cutoff.map_or(CancellationCustody::Idle, CancellationCustody::Closing);
+                let fatal = self.fatal_local_authority_fence.clone();
                 if !self.direct_turn_cancellation_is_current(&scoped.scope)
-                    || !scoped.offer.claim(self.fatal_local_authority_fence.clone()).await
+                    || !self.await_scoped_stop_claim(scoped.offer.claim(fatal.clone())).await
+                    || fatal.is_closed()
                 {
-                    self.cancellation_custody = cutoff.map_or(
-                        CancellationCustody::Idle, CancellationCustody::Closing,
-                    );
                     let _ = scoped.applied.send(ScopedStopHandling::Refused);
                     return self.fatal_local_authority_fence.fatal_authority_loss_is_latched()
                         .then(|| self.fatal_local_authority_exit());
                 }
-                let cutoff = self.start_cancellation_cutoff(cutoff);
-                (scoped.cancellation.into_event(), CancellationReceipt::DirectTurn(scoped.applied),
-                    Some(scoped.scope), cutoff)
+                let retained = self.cancellation_custody.take_closing();
+                let cutoff = self.start_cancellation_cutoff(retained);
+                (
+                    scoped.cancellation.into_event(),
+                    CancellationReceipt::DirectTurn(scoped.applied),
+                    Some(scoped.scope),
+                    cutoff,
+                )
             }
             other => {
                 let (event, receipt, scope) = other.into_parts();

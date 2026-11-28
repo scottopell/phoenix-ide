@@ -117,7 +117,7 @@ impl CloseSettlementStopOffer {
         }
         match self {
             Self::Native(offer) => offer.claim(fatal).await,
-            Self::Generic(db, offer) => match db.validate_generic_close_turn_offer(offer).await {
+            Self::Generic(db, offer) => match db.claim_generic_close_turn_offer(offer).await {
                 DurableFactEstablished(Ok(accepted)) => accepted,
                 DurableFactEstablished(Err(error)) => {
                     tracing::debug!(%error, "generic Close settlement Stop refused");

@@ -1,9 +1,9 @@
 use super::observe_running_close_runs;
 use crate::db::{Database, GenericCloseAdmission};
 use phoenix_core::domain::close::{CloseAttemptId, TranscriptConversationId};
-use tokio::process::Command;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
+use tokio::process::Command;
 
 const CHILD_MODE: &str = "PHOENIX_TEST_CLOSE_STARTUP_MODE";
 const DATABASE_PATH: &str = "PHOENIX_TEST_CLOSE_STARTUP_DATABASE";
@@ -53,11 +53,17 @@ async fn process_exit_and_reopen_observes_persisted_generic_close_without_redriv
     }
 
     abandoned.start_kill().unwrap();
-    let killed = abandoned.wait_with_output().await.unwrap();
-    assert!(
-        !killed.status.success(),
-        "the child must be terminated after its durable admission marker"
-    );
+    let killed = tokio::time::timeout(Duration::from_secs(30), abandoned.wait_with_output())
+        .await
+        .expect("killed child did not reap")
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(killed.status.signal(), Some(libc::SIGKILL));
+    }
+    #[cfg(not(unix))]
+    assert!(!killed.status.success());
 
     for mode in ["reopen-and-classify", "verify-reopen-idempotence"] {
         let output = tokio::time::timeout(
@@ -101,8 +107,8 @@ async fn run_child(mode: &str) {
             let transcript_id = TranscriptConversationId::parse("startup-close").unwrap();
             let attempt = CloseAttemptId::parse(ATTEMPT).unwrap();
             assert!(matches!(
-                db.begin_generic_close_settlement(&product_id, &transcript_id, &attempt)
-                    .await
+                db.begin_generic_close_settlement_classified(&product_id, &transcript_id, &attempt)
+                    .await.established().expect("classified fixture transaction")
                     .unwrap(),
                 GenericCloseAdmission::InsertedSettling(_)
             ));

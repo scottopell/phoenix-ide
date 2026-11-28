@@ -1023,6 +1023,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "native_close_initial_settlement_stop_claims",
         sql: include_str!("migrations/native_close_initial_settlement_stop_claims.sql"),
     },
+    Migration {
+        version: 196,
+        name: "close_settlement_stop_claims",
+        sql: "ALTER TABLE native_close_initial_settlement_stop_claims RENAME TO close_settlement_stop_claims;",
+    },
 ];
 
 const MIGRATION_175: &str = r"
@@ -17345,6 +17350,7 @@ mod tests {
         let ledger = compiled_migration_ledger();
         assert!(ledger.windows(2).all(|pair| pair[0].0 < pair[1].0));
         let expected_tail = [
+            (196, "close_settlement_stop_claims"),
             (195, "native_close_initial_settlement_stop_claims"),
             (194, "product_creation_repository_identity_pin"),
             (193, "dismiss_pending_fork_proposals"),
