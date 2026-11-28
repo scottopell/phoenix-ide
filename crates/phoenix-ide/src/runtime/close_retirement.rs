@@ -6254,6 +6254,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn inspect_and_remove_exact_worktree_with_hook_and_plan<F, B>(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
@@ -6364,6 +6365,7 @@ fn prepare_generic_worktree_removal(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn inspect_and_remove_exact_worktree_with_hook_and_plan_until<F, B>(
     runtime: &tokio::runtime::Handle,
     identity: &WorktreeIdentity,
@@ -6468,6 +6470,7 @@ fn path_is_within(candidate: &Path, directory: &Path) -> bool {
     candidate == directory || candidate.starts_with(directory)
 }
 
+#[cfg(test)]
 fn exact_worktree_common_git_dir(worktree: &Path) -> Result<PathBuf, String> {
     exact_worktree_common_git_dir_until(
         worktree,
@@ -7291,6 +7294,7 @@ fn remove_empty_tombstone_before_deadline_with_executor<E: WorktreeMutationExecu
 
 // This helper accepts a budget but does not establish original physical authority or ownership.
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn remove_identity_bound_directory_with_deadline<F, B, A, O>(
     deletion_target: &Path,
     tombstone_root: Option<&Path>,
@@ -10272,7 +10276,7 @@ fn mac_inspect_open_descriptors_until(
     })
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn quarantine_has_open_descriptors_mac_until(
     path: &Path,
     deadline: std::time::Instant,
@@ -10301,7 +10305,7 @@ fn quarantine_has_open_descriptors(_path: &Path) -> Result<ExternalWriterEvidenc
     Err("open-descriptor inspection is unsupported on this platform".to_string())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn quarantine_has_open_descriptors_until(
     path: &Path,
     deadline: std::time::Instant,
@@ -10327,7 +10331,7 @@ fn quarantine_has_open_descriptors_until_with_self_descriptor(
     result
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn quarantine_has_open_descriptors_until(
     path: &Path,
     deadline: std::time::Instant,
@@ -10579,8 +10583,10 @@ type StopFsmonitorEffect = Box<
         ) -> Result<FsmonitorStop, String>
         + Send,
 >;
+#[cfg(test)]
 type OpenDescriptorsEffect =
     Box<dyn FnOnce(&Path, std::time::Instant) -> Result<ExternalWriterEvidence, String> + Send>;
+#[cfg(test)]
 type ExternalWriterEffect =
     Box<dyn FnOnce(&Path, std::time::Instant) -> Result<bool, String> + Send>;
 
@@ -10600,6 +10606,7 @@ pub(super) struct CloseWorktreeEffects {
 }
 
 enum WorktreeRemovalWriterChecks {
+    #[cfg(test)]
     Quarantine {
         descriptors: OpenDescriptorsEffect,
         external: ExternalWriterEffect,
@@ -10629,12 +10636,14 @@ fn require_retained_worktree_claim(
 enum WorktreeRemovalEntry {
     GenericOriginal(FirstCloseRetirementDispatch),
     RetainedQuarantine(crate::db::FirstLegacyRetryWorktreeClaim),
+    #[cfg(test)]
     AdmittedNativeRetry,
     #[cfg(test)]
     Test,
 }
 
 impl CloseWorktreeEffects {
+    #[cfg(test)]
     fn for_admitted_native_retry(probe: CloseWriterProbe) -> Self {
         let descriptor_probe = probe.clone();
         Self::with_writer_checks(
@@ -10859,11 +10868,15 @@ where
                 if !resuming_quarantine {
                     return Err("quarantine continuation cannot enter the original worktree".into());
                 }
+                #[cfg(not(test))]
+                let WorktreeRemovalWriterChecks::MovedObject { probe, .. } = &writers;
+                #[cfg(test)]
                 let WorktreeRemovalWriterChecks::MovedObject { probe, .. } = &writers else {
                     return Err("retained worktree cleanup requires moved-object checks".into());
                 };
                 require_retained_worktree_claim(claim, probe, &inspection_identity)?;
             }
+            #[cfg(test)]
             WorktreeRemovalEntry::AdmittedNativeRetry => {}
             #[cfg(test)]
             WorktreeRemovalEntry::Test => {}
@@ -10971,6 +10984,7 @@ where
         }
         check_directory_deletion_deadline(Some(deadline))?;
         let moved_writer = match writers {
+            #[cfg(test)]
             WorktreeRemovalWriterChecks::Quarantine { descriptors, external } => {
                 let open_descriptors = descriptors(&quarantine, deadline)?;
                 check_directory_deletion_deadline(Some(deadline))?;
