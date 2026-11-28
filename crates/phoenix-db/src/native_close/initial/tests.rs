@@ -4116,6 +4116,156 @@ async fn settlement_dispatch_no_actor_terminalizes_only_the_captured_target() {
         .await.unwrap().is_empty());
 }
 
+async fn generic_close_with_captured_turn() -> (
+    Fixture,
+    crate::GenericCloseSettlement,
+    crate::CloseDirectTurnSettlementTarget,
+) {
+    use crate::GenericCloseAdmission;
+
+    let f = Fixture::new().await;
+    let turn_id = source_turn(&f.db, f.target.as_str(), "generic-no-actor-turn").await;
+    let latest: String = sqlx::query_scalar(
+        "SELECT id FROM conversations WHERE product_conversation_id = ?1 AND parent_conversation_id IS NULL",
+    )
+    .bind(f.target.as_str())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    let promised_state = f.db.get_conversation(&f.coordinator).await.unwrap().state;
+    f.db.update_conversation_state(&latest, &promised_state).await.unwrap();
+    let latest = TranscriptConversationId::parse(latest).unwrap();
+    let attempt = CloseAttemptId::parse("generic-no-actor-attempt").unwrap();
+    let GenericCloseAdmission::InsertedAwaitingStopWork(_) = f
+        .db
+        .begin_generic_close_settlement(&f.target, &latest, &attempt)
+        .await
+        .unwrap()
+    else {
+        panic!("expected the captured live turn to require Stop confirmation");
+    };
+    let settlement = f
+        .db
+        .confirm_generic_close_stop_work(&f.target, &latest, &attempt)
+        .await
+        .unwrap();
+    let targets = f
+        .db
+        .list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
+        .await
+        .unwrap();
+    let [target] = targets.as_slice() else {
+        panic!("expected exactly one captured turn");
+    };
+    assert_eq!(target.turn_id, turn_id);
+    (f, settlement, target.clone())
+}
+
+#[tokio::test]
+async fn generic_close_stopped_run_cannot_cancel_captured_turn() {
+    use crate::{GenericCloseSettlementFailure, GenericCloseTurnRelease};
+
+    let (f, settlement, target) = generic_close_with_captured_turn().await;
+    let attempt = settlement.obligation().attempt_id();
+    assert_eq!(
+        f.db.fail_generic_close_settlement(&settlement, "test stops settlement")
+            .await.unwrap(),
+        GenericCloseSettlementFailure::Classified,
+    );
+    assert!(matches!(
+        f.db.cancel_generic_close_turn_without_actor(&settlement, &target).await,
+        LocalAuthorityResult::DurableFactEstablished(Ok(GenericCloseTurnRelease::NoTransition)),
+    ));
+    let turn: (i64, Option<String>, i64) = sqlx::query_as(
+        "SELECT generation, terminal_kind, owns_conversation FROM durable_turns WHERE turn_id = ?1",
+    )
+    .bind(i64::try_from(target.turn_id).unwrap())
+    .fetch_one(f.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(turn, (0, None, 1));
+    assert_eq!(
+        f.db.list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
+            .await.unwrap(),
+        vec![target],
+    );
+    assert!(matches!(
+        f.db.finish_generic_close_settlement(&settlement).await.unwrap(),
+        crate::GenericCloseSettlementAdvance::NoTransition,
+    ));
+}
+
+#[tokio::test]
+async fn generic_close_no_actor_cancels_and_releases_exact_target_atomically() {
+    use crate::GenericCloseTurnRelease;
+
+    let (f, settlement, target) = generic_close_with_captured_turn().await;
+    let attempt = settlement.obligation().attempt_id();
+    let turn_id = target.turn_id;
+    let target = &target;
+    let wrong = crate::CloseDirectTurnSettlementTarget {
+        conversation_id: f.coordinator.clone(),
+        ..target.clone()
+    };
+    let stale = crate::CloseDirectTurnSettlementTarget {
+        expected_generation: target.expected_generation + 1,
+        ..target.clone()
+    };
+    for rejected in [&wrong, &stale] {
+        assert!(matches!(
+            f.db.cancel_generic_close_turn_without_actor(&settlement, rejected).await,
+            LocalAuthorityResult::DurableFactEstablished(Err(DbError::CloseFoundationPrecondition(_)))
+        ));
+    }
+
+    sqlx::query(
+        "CREATE TRIGGER test_reject_generic_settlement_release
+         BEFORE UPDATE OF settled_at ON close_attempt_direct_turn_settlements
+         WHEN NEW.settled_at IS NOT NULL
+         BEGIN SELECT RAISE(ABORT, 'test refuses exact receipt update'); END",
+    )
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    assert!(matches!(
+        f.db.cancel_generic_close_turn_without_actor(&settlement, target).await,
+        LocalAuthorityResult::DurableFactEstablished(Err(error))
+            if error.to_string().contains("test refuses exact receipt update")
+    ));
+    let turn = || async {
+        sqlx::query_as::<_, (i64, Option<String>, i64)>(
+            "SELECT generation, terminal_kind, owns_conversation FROM durable_turns WHERE turn_id = ?1",
+        )
+        .bind(i64::try_from(turn_id).unwrap())
+        .fetch_one(f.db.pool())
+        .await
+        .unwrap()
+    };
+    assert_eq!(turn().await, (0, None, 1));
+    assert_eq!(
+        f.db.list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
+            .await
+            .unwrap(),
+        vec![target.clone()],
+    );
+    sqlx::query("DROP TRIGGER test_reject_generic_settlement_release")
+        .execute(f.db.pool())
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        assert!(matches!(
+            f.db.cancel_generic_close_turn_without_actor(&settlement, target).await,
+            LocalAuthorityResult::DurableFactEstablished(Ok(GenericCloseTurnRelease::Released))
+        ));
+        assert_eq!(turn().await, (1, Some("Cancelled".to_string()), 0));
+        assert!(f.db.list_unsettled_close_direct_turn_settlement_targets(attempt.as_str())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
 #[tokio::test]
 async fn settlement_stop_claim_rejects_revoked_source_and_competing_delivery() {
     let f = Fixture::new().await;

@@ -97,9 +97,44 @@ impl NativeCloseSettlementStopOffer {
     }
 }
 
+pub(crate) enum CloseSettlementStopOffer {
+    Native(Box<NativeCloseSettlementStopOffer>),
+    Generic(phoenix_db::Database, phoenix_db::GenericCloseTurnOffer),
+}
+
+impl CloseSettlementStopOffer {
+    fn target(&self) -> &phoenix_db::CloseDirectTurnSettlementTarget {
+        match self {
+            Self::Native(offer) => &offer.target,
+            Self::Generic(_, offer) => offer.target(),
+        }
+    }
+
+    pub(crate) async fn claim(self, fatal: std::sync::Arc<super::FatalLocalAuthorityFence>) -> bool {
+        use phoenix_db::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+        if fatal.is_closed() {
+            return false;
+        }
+        match self {
+            Self::Native(offer) => offer.claim(fatal).await,
+            Self::Generic(db, offer) => match db.validate_generic_close_turn_offer(offer).await {
+                DurableFactEstablished(Ok(accepted)) => accepted,
+                DurableFactEstablished(Err(error)) => {
+                    tracing::debug!(%error, "generic Close settlement Stop refused");
+                    false
+                }
+                DurableFactUnclassified => {
+                    fatal.close("generic_close_settlement_stop_unknown_writer_release");
+                    false
+                }
+            },
+        }
+    }
+}
+
 pub(crate) struct ScopedDirectTurnCancellation {
     pub(crate) scope: DirectTurnCancellation,
-    pub(crate) offer: NativeCloseSettlementStopOffer,
+    pub(crate) offer: CloseSettlementStopOffer,
     pub(crate) cancellation: UserCancellation,
     pub(crate) applied: oneshot::Sender<ScopedStopHandling>,
 }
@@ -164,12 +199,12 @@ pub(crate) struct DirectTurnCancellationReservation(mpsc::OwnedPermit<Cancellati
 impl DirectTurnCancellationReservation {
     pub(crate) fn send(
         self,
-        offer: NativeCloseSettlementStopOffer,
+        offer: CloseSettlementStopOffer,
     ) -> oneshot::Receiver<ScopedStopHandling> {
         let (applied, receipt) = oneshot::channel();
         let scope = DirectTurnCancellation {
-            turn_id: phoenix_workflow::TurnAuthorityId(offer.target.turn_id),
-            generation: offer.target.expected_generation,
+            turn_id: phoenix_workflow::TurnAuthorityId(offer.target().turn_id),
+            generation: offer.target().expected_generation,
         };
         self.0.send(CancellationInput::DirectTurn(ScopedDirectTurnCancellation {
             scope,
@@ -300,6 +335,14 @@ impl ConversationEventSender {
                 }),
             #[cfg(test)]
             EventDestination::TestReceiver(_) => Err(mpsc::error::TrySendError::Closed(())),
+        }
+    }
+
+    pub(crate) fn is_cancellation_closed(&self) -> bool {
+        match &self.0 {
+            EventDestination::Runtime { cancellation, .. } => cancellation.is_closed(),
+            #[cfg(test)]
+            EventDestination::TestReceiver(sender) => sender.is_closed(),
         }
     }
 
@@ -533,8 +576,10 @@ mod tests {
     async fn closed_cancellation_inbox_returns_stop_envelope_with_original_receipt() {
         let (events, _events_rx) = mpsc::channel(1);
         let (ordinary, mut ordinary_rx) = mpsc::channel(1);
-        let (_events, sender, mut cancellation_rx) = channel(events, ordinary);
+        let (events, sender, mut cancellation_rx) = channel(events, ordinary);
         cancellation_rx.close();
+        assert!(!events.is_closed());
+        assert!(events.is_cancellation_closed());
         let (request, peer) = EventReceiptPeer::request(Event::UserCancel {
             reason: Some("close race".into()),
             cause: CancelCause::Timeout,

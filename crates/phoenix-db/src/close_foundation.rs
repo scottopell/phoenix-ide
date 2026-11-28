@@ -23,6 +23,113 @@ use crate::{
     Database, DbError, DbResult,
 };
 
+pub(crate) struct LiveCloseSettlementTarget<'a, 'db> {
+    tx: &'a mut crate::workflow::WorkflowTx<'db>,
+    attempt_id: &'a CloseAttemptId,
+    target: &'a CloseDirectTurnSettlementTarget,
+}
+
+pub(crate) async fn require_exact_live_settlement_target_tx<'a, 'db>(
+    tx: &'a mut crate::workflow::WorkflowTx<'db>,
+    attempt_id: &'a CloseAttemptId,
+    target: &'a CloseDirectTurnSettlementTarget,
+) -> DbResult<Option<LiveCloseSettlementTarget<'a, 'db>>> {
+    let turn_id = i64::try_from(target.turn_id)
+        .map_err(|error| DbError::Serialization(format!("turn id overflow: {error}")))?;
+    let generation = i64::try_from(target.expected_generation)
+        .map_err(|error| DbError::Serialization(format!("turn generation overflow: {error}")))?;
+    let row = sqlx::query(
+        "SELECT settlement.settled_at, turn.generation, turn.terminal_kind,
+                turn.owns_conversation, turn.conversation_id, captured.settlement_state
+         FROM close_attempt_direct_turn_settlements settlement
+         JOIN durable_turns turn ON turn.turn_id = settlement.turn_id
+         JOIN close_attempt_participants captured
+           ON captured.attempt_id = settlement.attempt_id
+          AND captured.conversation_id = turn.conversation_id
+         WHERE settlement.attempt_id = ?1 AND settlement.turn_id = ?2
+           AND settlement.expected_generation = ?3",
+    )
+    .bind(attempt_id.as_str())
+    .bind(turn_id)
+    .bind(generation)
+    .fetch_optional(&mut *tx.tx)
+    .await?
+    .ok_or_else(|| close_precondition("direct-turn target is not a captured settlement target"))?;
+    let settled: Option<String> = row.try_get("settled_at")?;
+    let actual_generation: i64 = row.try_get("generation")?;
+    let terminal: Option<String> = row.try_get("terminal_kind")?;
+    let owns_conversation: i64 = row.try_get("owns_conversation")?;
+    let conversation_id: String = row.try_get("conversation_id")?;
+    let settlement_state: String = row.try_get("settlement_state")?;
+    if conversation_id != target.conversation_id {
+        return Err(DbError::CloseFoundationPrecondition(
+            "direct-turn target conversation changed".into(),
+        ));
+    }
+    if settled.is_some() {
+        return Ok(None);
+    }
+    if generation.checked_add(1) == Some(actual_generation)
+        && terminal.is_some()
+        && owns_conversation == 0
+    {
+        let released = sqlx::query(
+            "UPDATE close_attempt_direct_turn_settlements SET settled_at = ?4
+             WHERE attempt_id = ?1 AND turn_id = ?2 AND expected_generation = ?3
+               AND settled_at IS NULL",
+        )
+        .bind(attempt_id.as_str())
+        .bind(turn_id)
+        .bind(generation)
+        .bind(Utc::now().to_rfc3339())
+        .execute(&mut *tx.tx)
+        .await?;
+        if released.rows_affected() != 1 {
+            return Err(close_precondition("exact direct-turn settlement receipt was not released"));
+        }
+        return Ok(None);
+    }
+    if settlement_state != "live"
+        || actual_generation != generation
+        || terminal.is_some()
+        || owns_conversation != 1
+    {
+        return Err(DbError::CloseFoundationPrecondition(
+            "direct-turn target generation or live ownership changed".into(),
+        ));
+    }
+    Ok(Some(LiveCloseSettlementTarget { tx, attempt_id, target }))
+}
+
+impl LiveCloseSettlementTarget<'_, '_> {
+    pub(crate) async fn cancel_without_actor(
+        self,
+        workflow: &crate::workflow::WorkflowRepository,
+    ) -> DbResult<()> {
+        let terminal = crate::workflow::TerminalizeAuthoritativeTurnInput {
+            command: phoenix_workflow::TurnCommand::Cancel {
+                turn_id: phoenix_workflow::TurnAuthorityId(self.target.turn_id),
+                expected_generation: self.target.expected_generation,
+            },
+            projection: None,
+            provider_replay_settlement:
+                phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
+        };
+        workflow
+            .terminalize_authoritative_turn_in_tx(self.tx, &terminal)
+            .await?;
+        if require_exact_live_settlement_target_tx(self.tx, self.attempt_id, self.target)
+            .await?
+            .is_some()
+        {
+            return Err(close_precondition(
+                "fallback terminalization did not release its exact settlement target",
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Database-admitted input for the generic Close settlement worker.
 ///
 /// Initial-origin receipts are immutable: observation adoption does not transfer
@@ -50,6 +157,30 @@ impl GenericCloseSettlement {
     pub fn is_committed_ingress(&self) -> bool {
         self.provenance == GenericSettlementProvenance::CommittedIngress
     }
+
+    #[must_use]
+    pub fn offer_turn(&self, target: CloseDirectTurnSettlementTarget) -> Option<GenericCloseTurnOffer> {
+        self.is_committed_ingress().then(|| GenericCloseTurnOffer {
+            attempt: self.obligation.attempt_id().clone(),
+            product: self.obligation.product_conversation_id().clone(),
+            target,
+        })
+    }
+}
+
+/// Exact receiver-side witness for a generic settlement cancellation.
+/// This does not carry native occurrence authority or grant continuation.
+pub struct GenericCloseTurnOffer {
+    attempt: CloseAttemptId,
+    product: ProductConversationId,
+    target: CloseDirectTurnSettlementTarget,
+}
+
+impl GenericCloseTurnOffer {
+    #[must_use]
+    pub fn target(&self) -> &CloseDirectTurnSettlementTarget {
+        &self.target
+    }
 }
 
 #[derive(Debug)]
@@ -67,6 +198,12 @@ pub enum GenericCloseSettlementAdvance {
     Interrupted(CloseRunRef),
     WaitingForQuiescence,
     Cancelled,
+    NoTransition,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum GenericCloseTurnRelease {
+    Released,
     NoTransition,
 }
 
@@ -3193,23 +3330,27 @@ impl Database {
         settlement: &GenericCloseSettlement,
     ) -> DbResult<bool> {
         let mut tx = self.pool.begin().await?;
-        Self::require_generic_close_settlement_tx(
-            &mut tx,
-            settlement.obligation.attempt_id().as_str(),
-            settlement.obligation.product_conversation_id().as_str(),
-        )
-        .await?;
-        let current =
-            close_obligation_for_update(&mut tx, settlement.obligation.attempt_id().as_str())
-                .await?;
+        let current = Self::running_generic_settlement_tx(&mut tx, settlement).await?;
         tx.commit().await?;
-        Ok(
-            current.product_conversation_id() == settlement.obligation.product_conversation_id()
-                && matches!(
-                    current.phase(),
-                    ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
-                ),
-        )
+        Ok(current.is_some())
+    }
+
+    async fn running_generic_settlement_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        settlement: &GenericCloseSettlement,
+    ) -> DbResult<Option<CloseObligation>> {
+        let run = CloseRunRef::initial(settlement.obligation.attempt_id().clone());
+        let (status, current) = Self::interrupted_close_run_for_update(tx, &run).await?;
+        if status != CloseRunStatus::Running
+            || current.product_conversation_id() != settlement.obligation.product_conversation_id()
+            || !matches!(current.phase(), ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement)
+        {
+            return Ok(None);
+        }
+        Self::require_generic_close_settlement_tx(
+            tx, run.attempt_id.as_str(), current.product_conversation_id().as_str(),
+        ).await?;
+        Ok(Some(current))
     }
 
     pub async fn finish_generic_close_settlement(
@@ -3218,10 +3359,18 @@ impl Database {
     ) -> DbResult<GenericCloseSettlementAdvance> {
         let attempt_id = settlement.obligation.attempt_id();
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let current =
-            Self::generic_close_settlement_for_update(&mut tx, attempt_id.as_str()).await?;
+        let run = CloseRunRef::initial(attempt_id.clone());
+        let (status, current) = Self::interrupted_close_run_for_update(&mut tx, &run).await?;
         if current.product_conversation_id() != settlement.obligation.product_conversation_id() {
             return Err(close_precondition("generic Close settlement target changed"));
+        }
+        Self::require_generic_close_settlement_tx(
+            &mut tx, attempt_id.as_str(), current.product_conversation_id().as_str(),
+        )
+        .await?;
+        if status != CloseRunStatus::Running {
+            tx.rollback().await?;
+            return Ok(GenericCloseSettlementAdvance::NoTransition);
         }
         let phase = current.phase();
         if matches!(phase, ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement)
@@ -3407,6 +3556,136 @@ impl Database {
             .collect()
     }
 
+    /// Cancel provisioning only under the current committed Close settlement.
+    pub async fn cancel_generic_close_provisioning(
+        &self,
+        settlement: &GenericCloseSettlement,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<bool>> {
+        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+
+        if !settlement.is_committed_ingress() {
+            return DurableFactEstablished(Ok(false));
+        }
+        let workflow = self.workflow_repository();
+        let mut tx = match workflow.begin_immediate_tx().await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error)),
+        };
+        let result = async {
+            let Some(current) = Self::running_generic_settlement_tx(&mut tx.tx, settlement).await? else {
+                return Ok(false);
+            };
+            let participants: Vec<String> = sqlx::query_scalar(
+                "SELECT conversation_id FROM close_attempt_participants
+                 WHERE attempt_id = ?1 ORDER BY conversation_id",
+            )
+            .bind(current.attempt_id().as_str())
+            .fetch_all(&mut *tx.tx)
+            .await?;
+            for participant in participants {
+                Self::cancel_conversation_creation_tx(&mut tx.tx, &participant, Utc::now()).await?;
+            }
+            Ok(true)
+        }.await;
+        let classified = if result.is_ok() { tx.commit().await } else { tx.rollback().await };
+        match classified {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    /// Admit an exact cancellation offer to the receiving actor after checking
+    /// its durable Close authority. The inbox is not a settlement receipt.
+    pub async fn validate_generic_close_turn_offer(
+        &self,
+        offer: GenericCloseTurnOffer,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<bool>> {
+        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+
+        let workflow = self.workflow_repository();
+        let mut tx = match workflow.begin_immediate_tx().await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error)),
+        };
+        let result = async {
+            let run = CloseRunRef::initial(offer.attempt);
+            let (status, current) = Self::interrupted_close_run_for_update(&mut tx.tx, &run).await?;
+            if status != CloseRunStatus::Running
+                || current.product_conversation_id() != &offer.product
+                || !matches!(current.phase(), ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement)
+            {
+                return Ok(false);
+            }
+            Self::require_generic_close_settlement_tx(
+                &mut tx.tx, run.attempt_id.as_str(), offer.product.as_str(),
+            ).await?;
+            Ok(require_exact_live_settlement_target_tx(&mut tx, &run.attempt_id, &offer.target)
+                .await?.is_some())
+        }.await;
+        let classified = if result.is_ok() { tx.commit().await } else { tx.rollback().await };
+        match classified {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    /// Settle the captured turn while the runtime owner fences actor materialization.
+    ///
+    /// # Errors
+    /// Returns a classified error for invalid settlement evidence or a failed write.
+    /// An unclassified transaction release is not a settlement outcome.
+    pub async fn cancel_generic_close_turn_without_actor(
+        &self,
+        settlement: &GenericCloseSettlement,
+        target: &CloseDirectTurnSettlementTarget,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<GenericCloseTurnRelease>> {
+        use crate::workflow::LocalAuthorityResult::{DurableFactEstablished, DurableFactUnclassified};
+
+        let workflow = self.workflow_repository();
+        let mut tx = match workflow.begin_immediate_tx().await {
+            Ok(tx) => tx,
+            Err(error) => return DurableFactEstablished(Err(error)),
+        };
+        let result = async {
+            let run = CloseRunRef::initial(settlement.obligation.attempt_id().clone());
+            let (status, current) = Self::interrupted_close_run_for_update(&mut tx.tx, &run).await?;
+            if current.product_conversation_id() != settlement.obligation.product_conversation_id() {
+                return Err(close_precondition("generic Close settlement target changed"));
+            }
+            Self::require_generic_close_settlement_tx(
+                &mut tx.tx,
+                run.attempt_id.as_str(),
+                current.product_conversation_id().as_str(),
+            )
+            .await?;
+            if status != CloseRunStatus::Running
+                || !matches!(
+                    current.phase(),
+                    ClosePhase::SettlingActiveWork | ClosePhase::CancelRequestedDuringSettlement
+                )
+            {
+                return Ok(GenericCloseTurnRelease::NoTransition);
+            }
+            if let Some(live_target) =
+                require_exact_live_settlement_target_tx(&mut tx, &run.attempt_id, target).await?
+            {
+                live_target.cancel_without_actor(&workflow).await?;
+            }
+            Ok(GenericCloseTurnRelease::Released)
+        }
+        .await;
+        let classified = if result.is_ok() {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match classified {
+            Ok(()) => DurableFactEstablished(result),
+            Err(_) => DurableFactUnclassified,
+        }
+    }
+
+    #[cfg(test)]
     pub async fn record_close_direct_turn_settlement_if_released(
         &self,
         attempt_id: &str,

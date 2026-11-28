@@ -114,16 +114,22 @@ jobs:
           printf 'PHOENIX_BASH_LAUNCH_TEST_EXE=%s\n' "$GITHUB_WORKSPACE/target/debug/phoenix_ide" >> "$GITHUB_ENV"
           printf 'PHOENIX_BASH_LAUNCH_TEST_REQUIRED=1\n' >> "$GITHUB_ENV"
           (cd crates/phoenix-ide && "$runtime_test_binary" --list) | tee "$evidence/runtime-inventory.log"
-      - name: Verify concurrent generic dispatch after native Observe adoption
+      - name: Verify generic and native durable settlement controls
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           evidence="$RUNNER_TEMP/close-http-evidence"
-          selector=generic_dispatch_and_failure_preserve_observe_adopted_legacy_initial
-          cargo test --locked -p phoenix-db --lib "$selector" -- --nocapture 2>&1 | tee "$evidence/$selector.log"
-          grep -E "^test .*::$selector \.\.\. ok$" "$evidence/$selector.log"
-          grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$evidence/$selector.log"
+          for selector in \
+            generic_dispatch_and_failure_preserve_observe_adopted_legacy_initial \
+            generic_close_no_actor_cancels_and_releases_exact_target_atomically \
+            generic_close_stopped_run_cannot_cancel_captured_turn \
+            interrupted_generic_handoffs_stop_without_retirement_authority \
+            settlement_dispatch_no_actor_terminalizes_only_the_captured_target; do
+            cargo test --locked -p phoenix-db --lib "$selector" -- --nocapture 2>&1 | tee "$evidence/$selector.log"
+            grep -E "^test .*::$selector \.\.\. ok$" "$evidence/$selector.log"
+            grep -F 'test result: ok. 1 passed; 0 failed; 0 ignored;' "$evidence/$selector.log"
+          done
       - name: Required production writer detection on the ordinary Linux runner
         if: ${{ !cancelled() && steps.controls.outcome == 'success' }}
         shell: bash
@@ -170,6 +176,9 @@ jobs:
             public_close_does_not_report_fenced_settlement_as_in_progress \
             initial_close_owner_survives_waiter_drop_before_admission \
             generic_settlement_failure_is_classified_or_fences_authority \
+            close_settlement_sends_live_runtime_cancel_without_terminalizing_its_turn \
+            process_exit_and_reopen_observes_persisted_generic_close_without_redrive \
+            close_settlement_treats_evicted_actor_as_pending_until_cleanup \
             failed_pre_runtime_worktree_reinspection_persists_typed_residual \
             anchored_native_retry_assessment_preserves_writer_inspection_gap \
             registered_native_close_origin_only_fetched_pin_public_retry_preserves_owner_ref \

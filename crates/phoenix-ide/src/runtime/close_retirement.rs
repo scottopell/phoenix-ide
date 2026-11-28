@@ -1836,7 +1836,10 @@ impl RuntimeManager {
                 };
                 Ok(match admission {
                     GenericCloseAdmission::InsertedSettling(settlement) => {
-                        manager.settle_close_obligation(settlement).await?;
+                        manager.settle_close_obligation(super::GenericCloseSettlementOwner {
+                            settlement,
+                            deliveries: Default::default(),
+                        }).await?;
                         GenericCloseIngressOutcome::Continued
                     }
                     GenericCloseAdmission::InsertedAwaitingStopWork(obligation)
@@ -1852,15 +1855,19 @@ impl RuntimeManager {
         self: &Arc<Self>,
         settlement: crate::db::GenericCloseSettlement,
     ) -> Result<tokio::task::JoinHandle<Result<bool, String>>, String> {
-        let attempt_id = settlement.obligation().attempt_id().clone();
+        self.start_generic_close_recheck(settlement.obligation().attempt_id().clone())
+    }
+
+    pub(super) fn start_generic_close_recheck(
+        self: &Arc<Self>,
+        attempt_id: CloseAttemptId,
+    ) -> Result<tokio::task::JoinHandle<Result<bool, String>>, String> {
         self.spawn_generic_close_owner(attempt_id.clone(), None, move |manager, _| async move {
-            let settlement = manager
-                .waiting_generic_close_owners
-                .lock()
-                .await
-                .remove(&attempt_id)
-                .unwrap_or(settlement);
-            manager.settle_close_obligation(settlement).await
+            let owner = manager.waiting_generic_close_owners.lock().await.remove(&attempt_id);
+            match owner {
+                Some(owner) => manager.settle_close_obligation(owner).await,
+                None => Ok(false),
+            }
         })
     }
 

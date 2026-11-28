@@ -150,7 +150,6 @@ pub(crate) async fn observe_running_close_runs(
     Ok(classified)
 }
 
-#[allow(clippy::items_after_test_module)]
 #[cfg(test)]
 mod close_startup_tests {
     use super::*;
@@ -207,6 +206,10 @@ mod close_startup_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "api/close_startup_tests.rs"]
+mod close_startup_process_tests;
 
 impl AppState {
     /// Create new application state and start the sub-agent handler

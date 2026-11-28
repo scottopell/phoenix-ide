@@ -96,7 +96,7 @@ pub(super) struct NativeCloseInitialContinuation {
     inspection_collection_test_barrier: Option<InspectionCollectionTestBarrier>,
     inspection_failure: Option<NativeInitialInspectionFailureIntent>,
     loss_terminalization: Option<NativeInitialLossTerminalizationIntent>,
-    confirmed_settlement_deliveries: std::collections::HashMap<u64, crate::runtime::NativeCloseSettlementDelivery>,
+    confirmed_settlement_deliveries: std::collections::HashMap<u64, crate::runtime::CloseSettlementDelivery>,
     pub(super) terminal_observation_retry: bool,
     pub(super) authority: RuntimeSettlementAuthority,
     pub(super) target_gate: std::sync::Arc<tokio::sync::OwnedMutexGuard<()>>,

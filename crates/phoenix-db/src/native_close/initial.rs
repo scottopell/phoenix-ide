@@ -15,7 +15,10 @@ use super::{
     CloseTargetControlResolution, NativeCloseCommand, NativeCloseInitialControl,
     NativeCloseInitialControlRoute, NativeCloseIntent,
 };
-use crate::close_foundation::{ensure_close_retirement_loss_free_tx, require_control_target_latest_tx};
+use crate::close_foundation::{
+    ensure_close_retirement_loss_free_tx, require_control_target_latest_tx,
+    require_exact_live_settlement_target_tx,
+};
 use crate::workflow::LocalAuthorityResult;
 use crate::{
     BindCloseWorktreeFinalTombstoneObjectRequest, BindCloseWorktreeFinalTombstoneRequest,
@@ -2303,15 +2306,14 @@ impl Database {
                 &mut tx.tx, command, receipt, live_source,
             )
             .await?;
-            let target_state = require_exact_live_settlement_target_tx(
-                &mut tx.tx,
-                &admitted,
-                target,
-            )
-            .await?;
-            if target_state.is_none() {
+            let already_claimed =
+                native_initial_stop_claim_exists_tx(&mut tx.tx, &admitted, target).await?;
+            let Some(live_target) =
+                require_exact_live_settlement_target_tx(&mut tx, &admitted.attempt_id, target)
+                    .await?
+            else {
                 return Ok(NativeCloseInitialTurnDispatchResult::Released);
-            }
+            };
             match reserve() {
                 NativeCloseInitialTurnDispatch::Reserved(reservation) => {
                     Ok(NativeCloseInitialTurnDispatchResult::Reserved(reservation))
@@ -2320,42 +2322,12 @@ impl Database {
                     Ok(NativeCloseInitialTurnDispatchResult::Backpressure)
                 }
                 NativeCloseInitialTurnDispatch::NoLiveActor => {
-                    if native_initial_stop_claim_exists_tx(&mut tx.tx, &admitted, target).await? {
+                    if already_claimed {
                         return Err(DbError::CloseFoundationPrecondition(
                             "claimed settlement Stop lost its actor before durable turn release".into(),
                         ));
                     }
-                    let id = i64::try_from(target.turn_id).map_err(|error| {
-                        DbError::Serialization(format!("turn id overflow: {error}"))
-                    })?;
-                    let terminal = crate::workflow::TerminalizeAuthoritativeTurnInput {
-                        command: phoenix_workflow::TurnCommand::Cancel {
-                            turn_id: phoenix_workflow::TurnAuthorityId(target.turn_id),
-                            expected_generation: target.expected_generation,
-                        },
-                        projection: None,
-                        provider_replay_settlement:
-                            phoenix_core::domain::provider_replay::ProviderReplaySettlement::Preserve,
-                    };
-                    workflow.terminalize_authoritative_turn_in_tx(&mut tx, &terminal).await?;
-                    Database::reconcile_close_direct_turn_settlement_receipts_tx(
-                        &mut tx.tx,
-                        admitted.attempt_id.as_str(),
-                    )
-                    .await?;
-                    let unsettled: Option<i64> = sqlx::query_scalar(
-                        "SELECT expected_generation FROM close_attempt_direct_turn_settlements
-                         WHERE attempt_id = ?1 AND turn_id = ?2 AND settled_at IS NULL",
-                    )
-                    .bind(admitted.attempt_id.as_str())
-                    .bind(id)
-                    .fetch_optional(&mut *tx.tx)
-                    .await?;
-                    if unsettled.is_some() {
-                        return Err(DbError::CloseFoundationPrecondition(
-                            "fallback terminalization did not release its exact settlement target".into(),
-                        ));
-                    }
+                    live_target.cancel_without_actor(&workflow).await?;
                     Ok(NativeCloseInitialTurnDispatchResult::Released)
                 }
             }
@@ -2398,7 +2370,7 @@ impl Database {
                 &mut tx.tx, command, receipt, live_source,
             )
             .await?;
-            if require_exact_live_settlement_target_tx(&mut tx.tx, &admitted, target)
+            if require_exact_live_settlement_target_tx(&mut tx, &admitted.attempt_id, target)
                 .await?
                 .is_none()
             {
@@ -2753,65 +2725,6 @@ async fn native_initial_stop_claim_exists_tx(
     .bind(generation)
     .fetch_one(&mut **tx)
     .await?)
-}
-
-async fn require_exact_live_settlement_target_tx(
-    tx: &mut Transaction<'_, Sqlite>,
-    admitted: &NativeCloseRunRef,
-    target: &crate::CloseDirectTurnSettlementTarget,
-) -> DbResult<Option<()>> {
-    Database::reconcile_close_direct_turn_settlement_receipts_tx(
-        tx,
-        admitted.attempt_id.as_str(),
-    )
-    .await?;
-    let turn_id = i64::try_from(target.turn_id)
-        .map_err(|error| DbError::Serialization(format!("turn id overflow: {error}")))?;
-    let generation = i64::try_from(target.expected_generation)
-        .map_err(|error| DbError::Serialization(format!("turn generation overflow: {error}")))?;
-    let row = sqlx::query(
-        "SELECT settlement.settled_at, turn.generation, turn.terminal_kind,
-                turn.owns_conversation, turn.conversation_id, captured.settlement_state
-         FROM close_attempt_direct_turn_settlements settlement
-         JOIN durable_turns turn ON turn.turn_id = settlement.turn_id
-         JOIN close_attempt_participants captured
-           ON captured.attempt_id = settlement.attempt_id
-          AND captured.conversation_id = turn.conversation_id
-         WHERE settlement.attempt_id = ?1 AND settlement.turn_id = ?2
-           AND settlement.expected_generation = ?3",
-    )
-    .bind(admitted.attempt_id.as_str())
-    .bind(turn_id)
-    .bind(generation)
-    .fetch_optional(&mut **tx)
-    .await?
-    .ok_or_else(|| DbError::CloseFoundationPrecondition(
-        "direct-turn target is not a captured settlement target".into(),
-    ))?;
-    let settled: Option<String> = row.try_get("settled_at")?;
-    let actual_generation: i64 = row.try_get("generation")?;
-    let terminal: Option<String> = row.try_get("terminal_kind")?;
-    let owns_conversation: i64 = row.try_get("owns_conversation")?;
-    let conversation_id: String = row.try_get("conversation_id")?;
-    let settlement_state: String = row.try_get("settlement_state")?;
-    if conversation_id != target.conversation_id {
-        return Err(DbError::CloseFoundationPrecondition(
-            "direct-turn target conversation changed".into(),
-        ));
-    }
-    if settled.is_some() {
-        return Ok(None);
-    }
-    if settlement_state != "live"
-        || actual_generation != generation
-        || terminal.is_some()
-        || owns_conversation != 1
-    {
-        return Err(DbError::CloseFoundationPrecondition(
-            "direct-turn target generation or live ownership changed".into(),
-        ));
-    }
-    Ok(Some(()))
 }
 
 async fn require_initial_execution_tx(
