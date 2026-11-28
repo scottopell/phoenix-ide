@@ -1430,25 +1430,10 @@ impl Database {
                     "initial process dispatch batch must match the exact process-kind inventory".into(),
                 ));
             }
-            let mut claimed = Vec::with_capacity(requests.len());
-            for request in requests {
-                match Self::insert_close_retirement_dispatch_tx(&mut tx, request).await? {
-                    CloseRetirementDispatch::First(dispatch) => claimed.push(dispatch),
-                    CloseRetirementDispatch::Replay => return Ok(CloseRetirementBatchDispatch::Replay),
-                }
-            }
-            Ok(CloseRetirementBatchDispatch::First(claimed))
+            Self::insert_close_process_dispatch_batch_tx(&mut tx, requests).await
         }
         .await;
-        let finalized = if matches!(&result, Ok(CloseRetirementBatchDispatch::First(_))) {
-            tx.commit().await
-        } else {
-            tx.rollback().await
-        };
-        match finalized {
-            Ok(()) => LocalAuthorityResult::DurableFactEstablished(result),
-            Err(_) => LocalAuthorityResult::DurableFactUnclassified,
-        }
+        Self::release_close_process_dispatch_batch(tx, result).await
     }
 
     /// Records process teardown success only under the exact source-owned initial authority.

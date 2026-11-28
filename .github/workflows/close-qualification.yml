@@ -122,6 +122,7 @@ jobs:
           evidence="$RUNNER_TEMP/close-http-evidence"
           for selector in \
             generic_dispatch_and_failure_preserve_observe_adopted_legacy_initial \
+            generic_close_process_batch_replay_rolls_back_unclaimed_resources \
             generic_close_no_actor_cancels_and_releases_exact_target_atomically \
             generic_close_stopped_run_cannot_cancel_captured_turn \
             interrupted_generic_handoffs_stop_without_retirement_authority \

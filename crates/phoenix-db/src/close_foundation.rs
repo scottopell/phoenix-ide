@@ -5573,6 +5573,124 @@ impl Database {
         Ok(())
     }
 
+    /// Claims API process teardown for an exact running Initial scope. The whole
+    /// batch is rolled back on replay, so none of its effects can be redriven.
+    pub async fn claim_generic_close_process_dispatches(
+        &self,
+        requests: &[RecordCloseRetirementDispatchRequest],
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<CloseRetirementBatchDispatch>> {
+        use crate::workflow::LocalAuthorityResult;
+
+        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+            Ok(tx) => tx,
+            Err(error) => return LocalAuthorityResult::DurableFactEstablished(Err(error.into())),
+        };
+        let result = async {
+            let first = requests.first().ok_or_else(|| {
+                close_precondition("generic Close process dispatch requires a nonempty batch")
+            })?;
+            let current = Self::generic_close_settlement_for_update(
+                &mut tx,
+                first.attempt_id.as_str(),
+            )
+            .await?;
+            let running_initial: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM close_runs
+                   WHERE attempt_id = ?1 AND run_ordinal = 1 AND status = 'running')",
+            )
+            .bind(first.attempt_id.as_str())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !running_initial
+                || current.phase() != ClosePhase::RetirementRequested
+                || current.snapshot() != Some(&first.snapshot)
+            {
+                return Err(close_precondition(
+                    "process dispatch requires the exact running generic Initial retirement",
+                ));
+            }
+            ensure_close_retirement_loss_free_tx(&mut tx, first.attempt_id.as_str()).await?;
+            let expected =
+                list_close_expected_retirement_resources_tx(&mut tx, first.attempt_id.as_str())
+                    .await?;
+            for request in requests {
+                if request.scope != first.scope
+                    || matches!(
+                        request.resource.kind(),
+                        RetiredResourceKind::Worktree | RetiredResourceKind::WorkScope
+                    )
+                    || !expected.iter().any(|item| {
+                        item.attempt_id == request.attempt_id
+                            && item.scope == request.scope
+                            && item.snapshot == request.snapshot
+                            && item.resource == request.resource
+                    })
+                {
+                    return Err(close_precondition(
+                        "process dispatch does not match the sealed generic inventory",
+                    ));
+                }
+            }
+            // Legacy reinspection can rotate the snapshot without creating a new run.
+            for request in requests {
+                let identity = request.resource.identity();
+                let prior_snapshot: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM close_retirement_resource_dispatches
+                       WHERE attempt_id = ?1 AND scope = ?2 AND resource_kind = ?3
+                         AND identity_kind = ?4 AND identity_codec = ?5 AND identity_value = ?6
+                         AND (inspection_generation <> ?7 OR inspection_fingerprint <> ?8))",
+                )
+                .bind(request.attempt_id.as_str())
+                .bind(request.scope.as_str())
+                .bind(request.resource.kind().as_str())
+                .bind(identity.identity_kind())
+                .bind(identity.codec())
+                .bind(identity.value())
+                .bind(request.snapshot.generation())
+                .bind(request.snapshot.fingerprint())
+                .fetch_one(&mut *tx)
+                .await?;
+                if prior_snapshot {
+                    return Ok(CloseRetirementBatchDispatch::Replay);
+                }
+            }
+            Self::insert_close_process_dispatch_batch_tx(&mut tx, requests).await
+        }
+        .await;
+        Self::release_close_process_dispatch_batch(tx, result).await
+    }
+
+    pub(crate) async fn insert_close_process_dispatch_batch_tx(
+        tx: &mut Transaction<'_, Sqlite>,
+        requests: &[RecordCloseRetirementDispatchRequest],
+    ) -> DbResult<CloseRetirementBatchDispatch> {
+        let mut claimed = Vec::with_capacity(requests.len());
+        for request in requests {
+            match Self::insert_close_retirement_dispatch_tx(tx, request).await? {
+                CloseRetirementDispatch::First(dispatch) => claimed.push(dispatch),
+                CloseRetirementDispatch::Replay => return Ok(CloseRetirementBatchDispatch::Replay),
+            }
+        }
+        Ok(CloseRetirementBatchDispatch::First(claimed))
+    }
+
+    pub(crate) async fn release_close_process_dispatch_batch(
+        tx: Transaction<'_, Sqlite>,
+        result: DbResult<CloseRetirementBatchDispatch>,
+    ) -> crate::workflow::LocalAuthorityResult<DbResult<CloseRetirementBatchDispatch>> {
+        use crate::workflow::LocalAuthorityResult;
+
+        let released = if matches!(&result, Ok(CloseRetirementBatchDispatch::First(_))) {
+            tx.commit().await
+        } else {
+            tx.rollback().await
+        };
+        match released {
+            Ok(()) => LocalAuthorityResult::DurableFactEstablished(result),
+            Err(_) => LocalAuthorityResult::DurableFactUnclassified,
+        }
+    }
+
     /// Claims the first generic dispatch and commits its exact cleanup plan
     /// together. A replay grants no ownership and cannot install a plan. Neither
     /// result authorizes relaxed writer inspection.
@@ -19600,6 +19718,69 @@ mod tests {
                 residual_reason: RetirementFailureReason::ManualRepairRequired
             }
         ) && item.detail.as_deref() == Some("manual cleanup")));
+    }
+
+    #[tokio::test]
+    async fn generic_close_process_batch_replay_rolls_back_unclaimed_resources() {
+        use crate::workflow::LocalAuthorityResult::DurableFactEstablished;
+
+        let db = Database::open_in_memory().await.unwrap();
+        create_root(&db, "root").await;
+        let scope = allocate_scope_worktree(&db, "root").await;
+        let attempt_id = CloseAttemptId::parse("process-dispatch").unwrap();
+        db.begin_close_foundation(
+            &product_id("root"),
+            &transcript_id("root"),
+            attempt_id.as_str(),
+        )
+        .await
+        .unwrap();
+        set_close_phase(&db, attempt_id.as_str(), ClosePhase::RetirementRequested).await;
+        let snapshot = current_test_snapshot(&db, attempt_id.as_str()).await;
+        let request = |identity: &str| RecordCloseRetirementDispatchRequest {
+            attempt_id: attempt_id.clone(),
+            scope: scope.clone(),
+            snapshot: snapshot.clone(),
+            resource: RetiredResourceIdentity::parse(
+                RetiredResourceKind::PtySession,
+                LossItemIdentity::Opaque(OpaqueIdentity::parse(identity).unwrap()),
+            )
+            .unwrap(),
+        };
+        let first = request("process-first");
+        let second = request("process-second");
+        capture_test_inventory(
+            &db,
+            attempt_id.as_str(),
+            &scope,
+            &snapshot,
+            vec![first.resource.clone(), second.resource.clone()],
+        )
+        .await;
+
+        // Drop the first committed claim without dispatching.
+        assert!(matches!(
+            db.claim_generic_close_process_dispatches(std::slice::from_ref(&first))
+                .await,
+            DurableFactEstablished(Ok(CloseRetirementBatchDispatch::First(_)))
+        ));
+        assert!(matches!(
+            db.claim_generic_close_process_dispatches(&[second.clone(), first])
+                .await,
+            DurableFactEstablished(Ok(CloseRetirementBatchDispatch::Replay))
+        ));
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM close_retirement_resource_dispatches WHERE attempt_id = ?1",
+        )
+        .bind(attempt_id.as_str())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(retained, 1);
+        assert!(matches!(
+            db.claim_generic_close_process_dispatches(&[second]).await,
+            DurableFactEstablished(Ok(CloseRetirementBatchDispatch::First(_)))
+        ));
     }
 
     #[tokio::test]

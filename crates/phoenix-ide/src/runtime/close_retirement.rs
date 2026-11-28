@@ -83,7 +83,8 @@ use crate::db::{
     CaptureCloseRetirementInventoryRequest, CaptureCloseRetirementInventoryScopeRequest,
     CloseCleanupFailureAuthority, CloseCleanupFailureResource, CloseCleanupResourceDisposition,
     CloseProcessResourceKind, CloseProcessStepOutcome, CloseProcessStepSuccess,
-    CloseRetirementDispatch, CloseSafeRetryEffect, CloseWorktreeFinalTombstone,
+    CloseRetirementBatchDispatch, CloseRetirementDispatch, CloseSafeRetryEffect,
+    CloseWorktreeFinalTombstone,
     FirstCloseRetirementDispatch, RecordCloseRetirementDispatchRequest,
     RecordCloseRetirementEvidenceRequest, RecordCloseWorktreeCleanupPlanRequest,
     ReplaceCloseInspectionRequest, ReplaceCloseInspectionScopeRequest,
@@ -1238,6 +1239,7 @@ impl RuntimeManager {
         };
         match result {
             Ok(()) => Ok(()),
+            Err(error) if self.fatal_local_authority_is_latched() => Err(error),
             Err(error) => Err(self.record_interrupted_generic_handoff(&run, error).await),
         }
     }
@@ -1781,6 +1783,9 @@ impl RuntimeManager {
         let Err(error) = self.run_admitted_generic_retry_inspection(attempt_id.clone()).await else {
             return Ok(());
         };
+        if self.fatal_local_authority_is_latched() {
+            return Err(GenericCloseRetryError::Internal(error));
+        }
         let current = self.db().get_close_obligation(attempt_id.as_str()).await
             .map_err(|error| GenericCloseRetryError::Internal(error.to_string()))?;
         if current.phase() == ClosePhase::RetirementRequested {
@@ -1957,6 +1962,46 @@ impl RuntimeManager {
         }))
     }
 
+    async fn claim_generic_close_processes(
+        &self,
+        run: &CloseRunRef,
+        snapshot: &CloseRetirementSnapshot,
+        scope: &WorkScopeId,
+        expected: &[RetiredResourceIdentity],
+    ) -> Result<Vec<FirstCloseRetirementDispatch>, String> {
+        use phoenix_db::workflow::LocalAuthorityResult;
+
+        self.require_local_authority_admission()?;
+        if expected.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requests: Vec<_> = expected
+            .iter()
+            .map(|resource| RecordCloseRetirementDispatchRequest {
+                attempt_id: run.attempt_id.clone(),
+                scope: scope.clone(),
+                snapshot: snapshot.clone(),
+                resource: resource.clone(),
+            })
+            .collect();
+        match self.db().claim_generic_close_process_dispatches(&requests).await {
+            LocalAuthorityResult::DurableFactEstablished(Ok(
+                CloseRetirementBatchDispatch::First(claimed),
+            )) => {
+                self.require_local_authority_admission()?;
+                Ok(claimed)
+            }
+            LocalAuthorityResult::DurableFactEstablished(Ok(
+                CloseRetirementBatchDispatch::Replay,
+            )) => Err("Close process dispatch already recorded; refusing teardown replay".into()),
+            LocalAuthorityResult::DurableFactEstablished(Err(error)) => Err(error.to_string()),
+            LocalAuthorityResult::DurableFactUnclassified => {
+                self.signal_fatal_local_authority("generic Close process dispatch release");
+                Err("Close process dispatch release is unclassified".into())
+            }
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     async fn run_close_runtime_retirement(
         &self,
@@ -2086,15 +2131,6 @@ impl RuntimeManager {
                             )
                             .await;
                     };
-                    self.db()
-                        .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
-                            attempt_id: attempt_id.clone(),
-                            scope: scope.clone(),
-                            snapshot: snapshot.clone(),
-                            resource: resource.clone(),
-                        })
-                        .await
-                        .map_err(|error| error.to_string())?;
                     let tmux_expires = phoenix_tools::tmux::registry::close_deadline();
                     match self
                         .tmux_registry()
@@ -2106,6 +2142,15 @@ impl RuntimeManager {
                         .await
                     {
                         Ok(TmuxRetirementRehydration::Permit(permit)) => {
+                            self.require_local_authority_admission()?;
+                            let _dispatch = self
+                                .claim_generic_close_processes(
+                                    &run,
+                                    &snapshot,
+                                    &scope,
+                                    std::slice::from_ref(resource),
+                                )
+                                .await?;
                             let outcome = self
                                 .tmux_registry()
                                 .complete_retirement(permit.as_ref())
@@ -2148,6 +2193,19 @@ impl RuntimeManager {
                             }
                         }
                         Ok(TmuxRetirementRehydration::AbsenceVerified) => {
+                            self.require_local_authority_admission()?;
+                            self.db()
+                                .record_close_retirement_dispatch(
+                                    RecordCloseRetirementDispatchRequest {
+                                        attempt_id: attempt_id.clone(),
+                                        scope: scope.clone(),
+                                        snapshot: snapshot.clone(),
+                                        resource: resource.clone(),
+                                    },
+                                )
+                                .await
+                                .map_err(|error| error.to_string())?;
+                            self.require_local_authority_admission()?;
                             self.record_close_absence_adopted(
                                 &run,
                                 &snapshot,
@@ -2185,19 +2243,11 @@ impl RuntimeManager {
                 }
                 continue;
             }
-            for resource in &expected {
-                self.db()
-                    .record_close_retirement_dispatch(RecordCloseRetirementDispatchRequest {
-                        attempt_id: attempt_id.clone(),
-                        scope: scope.clone(),
-                        snapshot: snapshot.clone(),
-                        resource: resource.clone(),
-                    })
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
+            let dispatches = self
+                .claim_generic_close_processes(&run, &snapshot, &scope, &expected)
+                .await?;
             match self
-                .complete_close_resource_lease(&run, &snapshot, &scope, &expected)
+                .complete_close_resource_lease(&run, &snapshot, &scope, dispatches)
                 .await
             {
                 Ok(()) => (),
@@ -4085,8 +4135,23 @@ impl RuntimeManager {
         run: &CloseRunRef,
         snapshot: &CloseRetirementSnapshot,
         scope: &WorkScopeId,
-        expected: &[RetiredResourceIdentity],
+        dispatches: Vec<FirstCloseRetirementDispatch>,
     ) -> Result<(), CloseLeaseFailure> {
+        let expected = dispatches
+            .into_iter()
+            .map(|dispatch| {
+                let request = dispatch.into_request();
+                if request.attempt_id != run.attempt_id
+                    || &request.scope != scope
+                    || &request.snapshot != snapshot
+                {
+                    return Err(CloseLeaseFailure::Persistence(
+                        "Close process dispatch does not match its lease".into(),
+                    ));
+                }
+                Ok(request.resource)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let key = (run.attempt_id.as_str().to_string(), scope.clone());
         // Keep both the store guard and the original entry in place across every
         // await. The lease owns the sole process-epoch permits; removing it here
@@ -4114,6 +4179,8 @@ impl RuntimeManager {
                     detail: "live Close lease differs from sealed unresolved inventory".to_string(),
                 });
             }
+            self.require_local_authority_admission()
+                .map_err(CloseLeaseFailure::Persistence)?;
             let identities = CloseProcessStepIdentities {
                 bash: lease
                     .bash
@@ -4148,7 +4215,7 @@ impl RuntimeManager {
                 snapshot,
                 scope,
                 &identities,
-                expected,
+                &expected,
                 &mut executor,
             )
             .await
@@ -14298,7 +14365,7 @@ mod tests {
             // spawned task. Leaving this block drops the borrowed future while
             // it holds the original lease at its first post-lookup await.
             let completion =
-                manager.complete_close_resource_lease(&fixture.run, &fixture.snapshot, scope, &[]);
+                manager.complete_close_resource_lease(&fixture.run, &fixture.snapshot, scope, Vec::new());
             tokio::pin!(completion);
             tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 tokio::select! {
